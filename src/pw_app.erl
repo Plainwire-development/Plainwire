@@ -8,6 +8,7 @@ start(_Type, _Args) ->
     Dispatch = cowboy_router:compile([
         {'_', [
             {"/ws", pw_ws, []},
+            {"/api/media/[...]", pw_media_hdl, []},
             {"/api/[...]", pw_api, []},
             {"/assets/[...]", cowboy_static, {priv_dir, plainwire_relay, "static"}},
             {"/[...]", pw_page, []}

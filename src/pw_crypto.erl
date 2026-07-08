@@ -1,0 +1,92 @@
+-module(pw_crypto).
+-export([enabled/0, encrypt/1, decrypt/1, proxy_token/1, verify_proxy_token/2]).
+
+%% AES-256-GCM field encryption for message bodies at rest.
+%% Set PLAINWIRE_ENC_KEY to a base64-encoded 32-byte key.
+
+enabled() ->
+    case key() of
+        {ok, _} -> true;
+        _ -> false
+    end.
+
+encrypt(Plain0) when is_binary(Plain0) ->
+    case key() of
+        {ok, Key} ->
+            IV = crypto:strong_rand_bytes(12),
+            AAD = <<>>,
+            {Cipher, Tag} = crypto:crypto_one_time_aead(aes_256_gcm, Key, IV, Plain0, AAD, true),
+            <<$e, $1, $:, (base64:encode(<<IV/binary, Tag/binary, Cipher/binary>>))/binary>>;
+        _ ->
+            Plain0
+    end;
+encrypt(Plain) -> encrypt(pw_util:bin(Plain)).
+
+decrypt(Bin0) when is_binary(Bin0) ->
+    case Bin0 of
+        <<$e, $1, $:, Enc/binary>> ->
+            case key() of
+                {ok, Key} ->
+                    case base64:decode(Enc) of
+                        <<IV:12/binary, Tag:16/binary, Cipher/binary>> ->
+                            AAD = <<>>,
+                            case crypto:crypto_one_time_aead(aes_256_gcm, Key, IV, Cipher, AAD, Tag, false) of
+                                Plain when is_binary(Plain) -> Plain;
+                                _ -> Bin0
+                            end;
+                        _ ->
+                            Bin0
+                    end;
+                _ ->
+                    Bin0
+            end;
+        _ ->
+            Bin0
+    end;
+decrypt(X) -> decrypt(pw_util:bin(X)).
+
+%% Signed opaque tokens for proxied media URLs (no raw URL in client requests).
+proxy_token(Url) ->
+    case key() of
+        {ok, Key} ->
+            Nonce = crypto:strong_rand_bytes(8),
+            Mac = crypto:mac(hmac, sha256, Key, <<Nonce/binary, Url/binary>>),
+            <<$p, $1, $:, (pw_util:base64url(<<Nonce/binary, Mac:16/binary>>))/binary, $., (pw_util:base64url(Url))/binary>>;
+        _ ->
+            pw_util:base64url(Url)
+    end.
+
+verify_proxy_token(Token, Url) ->
+    case key() of
+        {ok, Key} ->
+            case Token of
+                <<$p, $1, $:, Rest/binary>> ->
+                    case binary:split(Rest, <<".">>, []) of
+                        [SigB64, UrlB64] ->
+                            case {pw_util:base64url_decode(SigB64), pw_util:base64url_decode(UrlB64)} of
+                                {<<Nonce:8/binary, Mac:16/binary>>, DecUrl} when DecUrl =:= Url ->
+                                    Expected = crypto:mac(hmac, sha256, Key, <<Nonce/binary, Url/binary>>),
+                                    crypto:mac_equals(Mac, Expected);
+                                _ ->
+                                    false
+                            end;
+                        _ ->
+                            false
+                    end;
+                _ ->
+                    pw_util:base64url_decode(Token) =:= Url
+            end;
+        _ ->
+            pw_util:base64url_decode(Token) =:= Url
+    end.
+
+key() ->
+    case os:getenv("PLAINWIRE_ENC_KEY") of
+        false ->
+            {error, no_key};
+        V ->
+            case catch base64:decode(list_to_binary(V)) of
+                Key when byte_size(Key) =:= 32 -> {ok, Key};
+                _ -> {error, bad_key}
+            end
+    end.

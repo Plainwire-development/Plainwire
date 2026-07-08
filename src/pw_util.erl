@@ -1,9 +1,10 @@
 -module(pw_util).
 -export([
-    env_int/2, env_bool/2, now_ms/0, random_token/1, sha256_hex/1, pbkdf2/2, verify_password/3,
+    env_int/2, env_bool/2, env_str/2, now_ms/0, random_token/1, sha256_hex/1,
+    base64url/1, base64url_decode/1, pbkdf2/2, verify_password/3,
     normalize_username/1, clean_text/2, int/1, bool/1, bin/1, json/1,
     read_json/1, ok_json/2, err_json/3, set_cookie/3, clear_cookie/1, cookie_value/2,
-    require_csrf/2, ip/1
+    require_csrf/2, ip/1, security_headers/0, proxied_image/1
 ]).
 
 env_int(Name, Default) ->
@@ -22,6 +23,12 @@ env_bool(Name, Default) ->
         _ -> false
     end.
 
+env_str(Name, Default) ->
+    case os:getenv(Name) of
+        false -> Default;
+        V -> list_to_binary(V)
+    end.
+
 now_ms() -> erlang:system_time(millisecond).
 
 random_token(N) ->
@@ -31,6 +38,19 @@ base64url(Bin) ->
     B64 = base64:encode(Bin),
     NoPad = binary:replace(B64, <<"=">>, <<>>, [global]),
     binary:replace(binary:replace(NoPad, <<"+">>, <<"-">>, [global]), <<"/">>, <<"_">>, [global]).
+
+base64url_decode(Bin0) ->
+    Bin = binary:replace(binary:replace(Bin0, <<"-">>, <<"+">>, [global]), <<"_">>, <<"/">>, [global]),
+    Pad = case byte_size(Bin) rem 4 of
+        0 -> <<>>;
+        2 -> <<"==">>;
+        3 -> <<"=">>;
+        _ -> <<>>
+    end,
+    case catch base64:decode(<<Bin/binary, Pad/binary>>) of
+        Dec when is_binary(Dec) -> Dec;
+        _ -> <<>>
+    end.
 
 sha256_hex(Bin0) -> hex(crypto:hash(sha256, bin(Bin0))).
 
@@ -132,11 +152,29 @@ err_json(Req0, Code, Error) ->
     Req = cowboy_req:reply(Code, headers(), json(#{ok=>false,error=>Error}), Req0),
     {ok, Req, undefined}.
 
-headers() -> #{
-    <<"content-type">> => <<"application/json; charset=utf-8">>,
+headers() ->
+    maps:merge(security_headers(), #{
+        <<"content-type">> => <<"application/json; charset=utf-8">>
+    }).
+
+security_headers() -> #{
     <<"cache-control">> => <<"no-store">>,
-    <<"x-content-type-options">> => <<"nosniff">>
+    <<"x-content-type-options">> => <<"nosniff">>,
+    <<"x-frame-options">> => <<"SAMEORIGIN">>,
+    <<"referrer-policy">> => <<"same-origin">>,
+    <<"permissions-policy">> => <<"camera=(), microphone=(self), geolocation=()">>
 }.
+
+proxied_image(Url0) ->
+    Url = bin(Url0),
+    case Url of
+        <<>> -> <<>>;
+        <<"data:", _/binary>> -> Url;
+        <<"/api/media/", _/binary>> -> Url;
+        <<"http://", _/binary>> -> pw_media:proxy_url(Url);
+        <<"https://", _/binary>> -> pw_media:proxy_url(Url);
+        _ -> Url
+    end.
 
 set_cookie(Req, Name, Value) ->
     Secure = env_bool("COOKIE_SECURE", false),

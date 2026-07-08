@@ -74,9 +74,22 @@ authed(<<"POST">>, [<<"friends">>, <<"block">>], Req0, Session, _) -> with_json(
 authed(<<"GET">>, [<<"servers">>], Req, Session, _) -> result(Req, pw_db:servers(uid(Session)));
 authed(<<"POST">>, [<<"servers">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_server(uid(Session), maps:get(<<"name">>,M,<<>>), maps:get(<<"description">>,M,<<>>))) end);
 authed(<<"GET">>, [<<"server">>, Id], Req, Session, _) -> result(Req, pw_db:server(uid(Session), Id));
+authed(<<"POST">>, [<<"server">>, Id], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_server(uid(Session), Id, M)) end);
 authed(<<"POST">>, [<<"server">>, Id, <<"channels">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_channel(uid(Session), Id, maps:get(<<"name">>,M,<<>>), maps:get(<<"kind">>,M,<<"text">>))) end);
 authed(<<"POST">>, [<<"server">>, Id, <<"invites">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_invite(uid(Session), Id, maps:get(<<"channel_id">>,M,undefined), maps:get(<<"max_uses">>,M,0))) end);
 authed(<<"POST">>, [<<"invites">>, Code, <<"join">>], Req, Session, _) -> result(Req, pw_db:join_invite(uid(Session), Code));
+authed(<<"GET">>, [<<"invites">>, Code], Req, _, _) -> result(Req, pw_db:invite_preview(Code));
+authed(<<"GET">>, [<<"embed">>], Req, _, _) ->
+    case qs(Req, <<"url">>) of
+        undefined -> pw_util:err_json(Req, 400, <<"missing_url">>);
+        Url ->
+            case pw_embed:fetch(Url) of
+                {ok, Meta} -> pw_util:ok_json(Req, #{ok => true, data => Meta});
+                {error, blocked_url} -> pw_util:err_json(Req, 403, <<"blocked_url">>);
+                {error, _} -> pw_util:err_json(Req, 502, <<"embed_failed">>)
+            end
+    end;
 authed(<<"GET">>, [<<"messages">>], Req, Session, _) -> result(Req, pw_db:messages(uid(Session), qs(Req, <<"scope">>), qs(Req, <<"scope_id">>), qs(Req, <<"before">>), qs(Req, <<"after">>)));
 authed(<<"POST">>, [<<"channels">>, Id, <<"messages">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:post_channel_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
 authed(<<"GET">>, [<<"conversations">>], Req, Session, _) -> result(Req, pw_db:conversations(uid(Session)));

@@ -8,10 +8,7 @@ init(Req0, State) ->
         {ok, Bin} -> Bin;
         _ -> <<"Plainwire Relay: index.html missing">>
     end,
-    Req = cowboy_req:reply(200, #{
-        <<"content-type">> => <<"text/html; charset=utf-8">>,
-        <<"cache-control">> => <<"no-store">>,
-        <<"x-content-type-options">> => <<"nosniff">>,
-        <<"referrer-policy">> => <<"same-origin">>
-    }, Body, Req0),
+    Req = cowboy_req:reply(200, maps:merge(pw_util:security_headers(), #{
+        <<"content-type">> => <<"text/html; charset=utf-8">>
+    }), Body, Req0),
     {ok, Req, State}.

@@ -23,7 +23,9 @@ websocket_handle({text, Data}, State0) ->
     end;
 websocket_handle(_Frame, State) -> {ok, State}.
 
-handle_msg(#{<<"type">> := <<"subscribe">>, <<"key">> := Key0}, State=#{subs:=Subs}) ->
+handle_msg(#{<<"type">> := <<"ping">>}, State) ->
+    {reply, {text, pw_util:json(#{type => pong, ts => pw_util:now_ms()})}, State};
+handle_msg(#{<<"type">> := <<"subscribe">>, <<"key">> := Key0}, State=#{subs := Subs}) ->
     case parse_key(Key0) of
         undefined -> {ok, State};
         Key -> pw_hub:subscribe(self(), Key), {ok, State#{subs=>lists:usort([Key|Subs])}}
@@ -43,10 +45,41 @@ handle_msg(#{<<"type">> := <<"voice_state">>, <<"patch">> := Patch}, State=#{uid
     pw_hub:voice_state(Cid, Uid, Clean, maps:get(user,Session)), {ok, State};
 handle_msg(#{<<"type">> := <<"voice_signal">>, <<"to_user_id">> := To0, <<"signal">> := Sig}, State=#{uid:=Uid, voice:=Cid}) when is_integer(Cid) ->
     pw_hub:voice_signal(Cid, Uid, pw_util:int(To0), Sig), {ok, State};
+handle_msg(#{<<"type">> := <<"call_ring">>, <<"conversation_id">> := Cid0}, State=#{uid:=Uid, session:=Session}) ->
+    Cid = pw_util:int(Cid0),
+    case pw_db:conversation_peer_ids(Uid, Cid) of
+        {ok, Targets} when Targets =/= [] ->
+            pw_hub:call_ring(Cid, Uid, self(), maps:get(user, Session), Targets),
+            {ok, State};
+        {ok, []} ->
+            reply_error(State, no_peers);
+        false ->
+            reply_error(State, forbidden);
+        {error, _} ->
+            reply_error(State, forbidden)
+    end;
+handle_msg(#{<<"type">> := <<"call_accept">>, <<"conversation_id">> := Cid0}, State=#{uid:=Uid, session:=Session}) ->
+    Cid = pw_util:int(Cid0),
+    case pw_db:member_of_conversation(Uid, Cid) of
+        true ->
+            S1 = maybe_leave_call(State),
+            pw_hub:call_accept(Cid, Uid, self(), maps:get(user, Session)),
+            {ok, S1#{call => Cid}};
+        false ->
+            reply_error(State, forbidden)
+    end;
+handle_msg(#{<<"type">> := <<"call_decline">>, <<"conversation_id">> := Cid0}, State=#{uid:=Uid}) ->
+    Cid = pw_util:int(Cid0),
+    pw_hub:call_decline(Cid, Uid),
+    {ok, State};
+handle_msg(#{<<"type">> := <<"call_cancel">>, <<"conversation_id">> := Cid0}, State=#{uid:=Uid}) ->
+    Cid = pw_util:int(Cid0),
+    pw_hub:call_cancel(Cid, Uid),
+    {ok, State};
 handle_msg(#{<<"type">> := <<"call_join">>, <<"conversation_id">> := Cid0}, State=#{uid:=Uid, session:=Session}) ->
     Cid = pw_util:int(Cid0),
     case pw_db:member_of_conversation(Uid, Cid) of
-        true -> maybe_leave_call(State), pw_hub:call_join(Cid, Uid, self(), maps:get(user,Session)), {ok, State#{call=>Cid}};
+        true -> maybe_leave_call(State), pw_hub:call_accept(Cid, Uid, self(), maps:get(user,Session)), {ok, State#{call=>Cid}};
         false -> reply_error(State, forbidden)
     end;
 handle_msg(#{<<"type">> := <<"call_leave">>}, State) -> S1 = maybe_leave_call(State), {ok, S1#{call=>undefined}};
