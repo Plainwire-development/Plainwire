@@ -1,0 +1,8 @@
+{application, plainwire_relay,
+ [{description, "Plainwire Relay"},
+  {vsn, "1.0.0"},
+  {registered, [pw_sup, pw_db, pw_hub, pw_rate]},
+  {mod, {pw_app, []}},
+  {applications, [kernel, stdlib, crypto, public_key, ssl, ranch, cowlib, cowboy, jsx, esqlite]},
+  {env, []},
+  {modules, []}] }.
