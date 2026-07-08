@@ -1,3 +1,7 @@
+# (placeholder readme, to be replaced by human documentation when publicized
+
+
+
 # Plainwire Relay 1.1.0
 
 Plainwire Relay is a self-hosted forum/chat platform with a Discord-like real-time workspace, Reddit/forum-style threads, PostgreSQL persistence, and an Erlang/Cowboy backend.
