@@ -30,14 +30,36 @@ fetch(Url0) ->
 
 http_get(Url) ->
     Headers = [{"user-agent", "PlainwireRelay/1.1"}],
-    case httpc:request(get, {binary_to_list(Url), Headers}, [{timeout, 8000}, {body_format, binary}], []) of
-        {ok, {{_, Code, _}, _, Body}} when Code >= 200, Code < 300, byte_size(Body) =< ?MAX_BYTES ->
-            {ok, Body};
+    case httpc:request(get, {binary_to_list(Url), Headers}, [{timeout, 8000}], [{body_format, binary}]) of
+        {ok, {{_, Code, _}, RespHeaders, Body}} when Code >= 200, Code < 300 ->
+            case content_length_ok(RespHeaders) andalso byte_size(Body) =< ?MAX_BYTES of
+                true -> {ok, Body};
+                false -> {error, too_large}
+            end;
         {ok, {{_, Code, _}, _, _}} ->
             {error, {http, Code}};
         {error, Reason} ->
             {error, Reason}
     end.
+
+content_length_ok(Headers) ->
+    case header_value("content-length", Headers) of
+        undefined -> true;
+        Len -> case safe_list_to_integer(string:trim(Len)) of
+            N when is_integer(N), N =< ?MAX_BYTES -> true;
+            _ -> false
+        end
+    end.
+
+header_value(Name, Headers) ->
+    Lower = string:lowercase(Name),
+    case [V || {K, V} <- Headers, string:lowercase(K) =:= Lower] of
+        [V | _] -> V;
+        [] -> undefined
+    end.
+
+safe_list_to_integer(V) ->
+    try list_to_integer(V) catch _:_ -> undefined end.
 
 parse_og(Html, Url) ->
     Title = meta(Html, "og:title"),

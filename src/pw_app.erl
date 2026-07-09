@@ -22,5 +22,5 @@ start(_Type, _Args) ->
     {ok, Sup}.
 
 stop(_State) ->
-    catch cowboy:stop_listener(plainwire_http),
+    try cowboy:stop_listener(plainwire_http) catch _:_ -> ok end,
     ok.

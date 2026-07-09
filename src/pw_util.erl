@@ -10,7 +10,7 @@
 env_int(Name, Default) ->
     case os:getenv(Name) of
         false -> Default;
-        V -> case catch list_to_integer(V) of I when is_integer(I) -> I; _ -> Default end
+        V -> case safe_list_to_integer(V) of I when is_integer(I) -> I; _ -> Default end
     end.
 
 env_bool(Name, Default) ->
@@ -47,7 +47,7 @@ base64url_decode(Bin0) ->
         3 -> <<"=">>;
         _ -> <<>>
     end,
-    case catch base64:decode(<<Bin/binary, Pad/binary>>) of
+    case safe_base64_decode(<<Bin/binary, Pad/binary>>) of
         Dec when is_binary(Dec) -> Dec;
         _ -> <<>>
     end.
@@ -110,8 +110,8 @@ int(undefined) -> undefined;
 int(null) -> undefined;
 int(<<>>) -> undefined;
 int(I) when is_integer(I) -> I;
-int(B) when is_binary(B) -> case catch binary_to_integer(B) of I when is_integer(I) -> I; _ -> undefined end;
-int(L) when is_list(L) -> case catch list_to_integer(L) of I when is_integer(I) -> I; _ -> undefined end;
+int(B) when is_binary(B) -> case safe_binary_to_integer(B) of I when is_integer(I) -> I; _ -> undefined end;
+int(L) when is_list(L) -> case safe_list_to_integer(L) of I when is_integer(I) -> I; _ -> undefined end;
 int(_) -> undefined.
 
 bool(true) -> true; bool(false) -> false; bool(1) -> true; bool(0) -> false;
@@ -122,11 +122,13 @@ json(Term) -> jsx:encode(jsonable(Term)).
 jsonable(M) when is_map(M) -> maps:fold(fun(K,V,A) -> A#{key(K)=>jsonable(V)} end, #{}, M);
 jsonable(L) when is_list(L) -> [jsonable(X) || X <- L];
 jsonable(T) when is_tuple(T) -> jsonable(tuple_to_list(T));
+jsonable(true) -> true;
+jsonable(false) -> false;
+jsonable(undefined) -> null;
 jsonable(A) when is_atom(A) -> atom_to_binary(A, utf8);
 jsonable(B) when is_binary(B) -> B;
 jsonable(I) when is_integer(I) -> I;
 jsonable(F) when is_float(F) -> F;
-jsonable(undefined) -> null;
 jsonable(X) -> bin(X).
 
 key(K) when is_atom(K) -> atom_to_binary(K, utf8);
@@ -134,15 +136,39 @@ key(K) when is_binary(K) -> K;
 key(K) -> bin(K).
 
 read_json(Req0) ->
-    case cowboy_req:read_body(Req0, #{length => 1048576, period => 5000}) of
+    read_json_body(Req0, <<>>, 1048576).
+
+read_json_body(Req0, Acc, Remaining) when Remaining > 0 ->
+    case cowboy_req:read_body(Req0, #{length => Remaining, period => 5000}) of
         {ok, Body, Req1} ->
-            case catch jsx:decode(Body, [return_maps]) of
-                M when is_map(M) -> {ok, M, Req1};
-                _ -> {error, invalid_json, Req1}
-            end;
-        {more, _, Req1} -> {error, too_large, Req1};
-        Other -> {error, Other, Req0}
+            decode_json_body(<<Acc/binary, Body/binary>>, Req1);
+        {more, Body, Req1} when byte_size(Body) < Remaining ->
+            read_json_body(Req1, <<Acc/binary, Body/binary>>, Remaining - byte_size(Body));
+        {more, _, Req1} ->
+            {error, too_large, Req1};
+        Other ->
+            {error, Other, Req0}
+    end;
+read_json_body(Req0, _Acc, _Remaining) ->
+    {error, too_large, Req0}.
+
+decode_json_body(Body, Req) ->
+    case safe_json_decode(Body) of
+        M when is_map(M) -> {ok, M, Req};
+        _ -> {error, invalid_json, Req}
     end.
+
+safe_list_to_integer(V) ->
+    try list_to_integer(V) catch _:_ -> undefined end.
+
+safe_binary_to_integer(V) ->
+    try binary_to_integer(V) catch _:_ -> undefined end.
+
+safe_base64_decode(V) ->
+    try base64:decode(V) catch _:_ -> error end.
+
+safe_json_decode(V) ->
+    try jsx:decode(V, [return_maps]) catch _:_ -> error end.
 
 ok_json(Req0, Data) ->
     Req = cowboy_req:reply(200, headers(), json(Data), Req0),
@@ -161,6 +187,7 @@ security_headers() -> #{
     <<"cache-control">> => <<"no-store">>,
     <<"x-content-type-options">> => <<"nosniff">>,
     <<"x-frame-options">> => <<"SAMEORIGIN">>,
+    <<"cross-origin-resource-policy">> => <<"same-origin">>,
     <<"referrer-policy">> => <<"same-origin">>,
     <<"permissions-policy">> => <<"camera=(), microphone=(self), geolocation=()">>
 }.

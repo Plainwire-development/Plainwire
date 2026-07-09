@@ -92,12 +92,14 @@ authed(<<"GET">>, [<<"embed">>], Req, _, _) ->
     end;
 authed(<<"GET">>, [<<"messages">>], Req, Session, _) -> result(Req, pw_db:messages(uid(Session), qs(Req, <<"scope">>), qs(Req, <<"scope_id">>), qs(Req, <<"before">>), qs(Req, <<"after">>)));
 authed(<<"POST">>, [<<"channels">>, Id, <<"messages">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:post_channel_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
+authed(<<"POST">>, [<<"delete_message">>, MsgId], Req, Session, _) -> result(Req, pw_db:delete_message(uid(Session), MsgId));
 authed(<<"GET">>, [<<"conversations">>], Req, Session, _) -> result(Req, pw_db:conversations(uid(Session)));
 authed(<<"POST">>, [<<"conversations">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_conversation(uid(Session), maps:get(<<"name">>,M,<<>>), maps:get(<<"user_ids">>,M,[]))) end);
 authed(<<"GET">>, [<<"conversation">>, Id], Req, Session, _) -> result(Req, pw_db:conversation(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_conversation(uid(Session), Id, maps:get(<<"name">>,M,<<>>), M)) end);
 authed(<<"POST">>, [<<"conversation">>, Id, <<"members">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:add_conversation_members(uid(Session), Id, maps:get(<<"user_ids">>,M,[]))) end);
-authed(<<"POST">>, [<<"conversation">>, Id, <<"messages">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:post_direct_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>))) end);
+authed(<<"POST">>, [<<"conversation">>, Id, <<"messages">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:post_direct_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
+authed(<<"POST">>, [<<"conversation">>, Id, <<"leave">>], Req, Session, _) -> result(Req, pw_db:leave_conversation(uid(Session), Id));
 authed(<<"GET">>, [<<"notifications">>], Req, Session, _) -> result(Req, pw_db:notifications(uid(Session)));
 authed(<<"POST">>, [<<"notifications">>, <<"seen">>], Req, Session, _) -> result(Req, pw_db:mark_notifications_seen(uid(Session)));
 authed(_, _, Req, _, _) -> pw_util:err_json(Req, 404, <<"not_found">>).

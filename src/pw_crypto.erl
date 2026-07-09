@@ -27,10 +27,10 @@ decrypt(Bin0) when is_binary(Bin0) ->
         <<$e, $1, $:, Enc/binary>> ->
             case key() of
                 {ok, Key} ->
-                    case base64:decode(Enc) of
+                    case safe_base64_decode(Enc) of
                         <<IV:12/binary, Tag:16/binary, Cipher/binary>> ->
                             AAD = <<>>,
-                            case crypto:crypto_one_time_aead(aes_256_gcm, Key, IV, Cipher, AAD, Tag, false) of
+                            case safe_decrypt(Key, IV, Cipher, AAD, Tag) of
                                 Plain when is_binary(Plain) -> Plain;
                                 _ -> Bin0
                             end;
@@ -74,7 +74,7 @@ verify_proxy_token(Token, Url) ->
                             false
                     end;
                 _ ->
-                    pw_util:base64url_decode(Token) =:= Url
+                    false
             end;
         _ ->
             pw_util:base64url_decode(Token) =:= Url
@@ -85,8 +85,16 @@ key() ->
         false ->
             {error, no_key};
         V ->
-            case catch base64:decode(list_to_binary(V)) of
+            case safe_base64_decode(list_to_binary(V)) of
                 Key when byte_size(Key) =:= 32 -> {ok, Key};
                 _ -> {error, bad_key}
             end
+    end.
+
+safe_base64_decode(V) ->
+    try base64:decode(V) catch _:_ -> error end.
+
+safe_decrypt(Key, IV, Cipher, AAD, Tag) ->
+    try crypto:crypto_one_time_aead(aes_256_gcm, Key, IV, Cipher, AAD, Tag, false)
+    catch _:_ -> error
     end.

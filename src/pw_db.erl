@@ -8,10 +8,10 @@
     forums/0, threads/2, thread/2, create_thread/4, reply_thread/3,
     servers/1, create_server/3, update_server/3, server/2, create_channel/4,
     create_invite/4, invite_preview/1, join_invite/2,
-    messages/5, post_channel_message/4,
+    messages/5, post_channel_message/4, delete_message/2,
     conversations/1, create_conversation/3, update_conversation/4,
-    add_conversation_members/3, conversation/2, post_direct_message/3,
-    notifications/1, mark_notifications_seen/1, mark_url_seen/2,
+    add_conversation_members/3, conversation/2, post_direct_message/4,
+    leave_conversation/2, notifications/1, mark_notifications_seen/1, mark_url_seen/2,
     member_of_channel/2, member_of_conversation/2, conversation_peer_ids/2
 ]).
 -export([init/1, handle_call/3, handle_cast/2, terminate/2, code_change/3]).
@@ -53,12 +53,14 @@ invite_preview(Code) -> call({invite_preview, Code}).
 join_invite(Uid, Code) -> call({join_invite, Uid, Code}).
 messages(Uid, Scope, ScopeId, Before, After) -> call({messages, Uid, Scope, ScopeId, Before, After}).
 post_channel_message(Uid, ChannelId, Body, ReplyTo) -> call({post_channel_message, Uid, ChannelId, Body, ReplyTo}).
+delete_message(Uid, Mid) -> call({delete_message, Uid, Mid}).
 conversations(Uid) -> call({conversations, Uid}).
 create_conversation(Uid, Name, UserIds) -> call({create_conversation, Uid, Name, UserIds}).
 update_conversation(Uid, Cid, Name, Patch) -> call({update_conversation, Uid, Cid, Name, Patch}).
 add_conversation_members(Uid, Cid, UserIds) -> call({add_conversation_members, Uid, Cid, UserIds}).
 conversation(Uid, Cid) -> call({conversation, Uid, Cid}).
-post_direct_message(Uid, Cid, Body) -> call({post_direct_message, Uid, Cid, Body}).
+leave_conversation(Uid, Cid) -> call({leave_conversation, Uid, Cid}).
+post_direct_message(Uid, Cid, Body, ReplyTo) -> call({post_direct_message, Uid, Cid, Body, ReplyTo}).
 notifications(Uid) -> call({notifications, Uid}).
 mark_notifications_seen(Uid) -> call({mark_notifications_seen, Uid}).
 mark_url_seen(Uid, Url) -> call({mark_url_seen, Uid, Url}).
@@ -84,7 +86,7 @@ handle_call(Msg, _From, #st{conn = Conn} = St) ->
 handle_call(_, _From, St) -> {reply, {error, unknown}, St}.
 
 handle_cast(_, St) -> {noreply, St}.
-terminate(_, #st{conn = Conn}) -> catch epgsql:close(Conn), ok.
+terminate(_, #st{conn = Conn}) -> try epgsql:close(Conn) catch _:_ -> ok end, ok.
 code_change(_, St, _) -> {ok, St}.
 
 connect() ->
@@ -467,9 +469,23 @@ route({messages, Uid, Scope0, ScopeId0, Before0, After0}, Conn) ->
         true ->
             {Sql, Params} = message_sql(Scope, ScopeId, Before, After),
             {ok, Rows} = rows(Conn, Sql, Params),
-            {ok, [message_map(R) || R <- Rows]};
+            {ok, [message_map(Conn, R) || R <- Rows]};
         false ->
             {error, forbidden}
+    end;
+route({delete_message, Uid, Mid0}, Conn) ->
+    Mid = pw_util:int(Mid0),
+    case one(Conn, "SELECT user_id, scope, scope_id FROM messages WHERE id = $1 AND deleted_at IS NULL", [Mid]) of
+        {ok, [Uid, Scope, ScopeId]} ->
+            Now = pw_util:now_ms(),
+            ok = exec(Conn, "UPDATE messages SET deleted_at = $1, body = '' WHERE id = $2", [Now, Mid]),
+            BroadcastKey = case Scope of <<"direct">> -> {direct, ScopeId}; <<"channel">> -> {channel, ScopeId} end,
+            pw_hub:broadcast(BroadcastKey, #{type => message_deleted, scope => Scope, scope_id => ScopeId, message_id => Mid}),
+            {ok, #{deleted => true}};
+        {ok, _} ->
+            {error, forbidden};
+        _ ->
+            {error, not_found}
     end;
 route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
     Cid = pw_util:int(ChannelId0),
@@ -482,7 +498,7 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
                 "INSERT INTO messages(scope, scope_id, user_id, body, reply_to_id, created_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
                 [<<"channel">>, Cid, Uid, Body, ReplyTo, Now]),
             {ok, Row} = one(Conn, message_select() ++ " WHERE m.id = $1", [Mid]),
-            Msg = message_map(Row),
+            Msg = message_map(Conn, Row),
             pw_hub:broadcast({channel, Cid}, #{type => message_created, scope => channel, scope_id => Cid, message => Msg}),
             notify_channel_members(Conn, Sid, Uid, Cid, Msg, Now),
             {ok, Msg};
@@ -549,6 +565,15 @@ route({add_conversation_members, Uid, Cid0, UserIds0}, Conn) ->
         false ->
             {error, forbidden}
     end;
+route({leave_conversation, Uid, Cid0}, Conn) ->
+    Cid = pw_util:int(Cid0),
+    case is_conversation_member(Conn, Uid, Cid) of
+        true ->
+            ok = exec(Conn, "DELETE FROM direct_members WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]),
+            {ok, #{left => true}};
+        false ->
+            {error, not_found}
+    end;
 route({conversation, Uid, Cid0}, Conn) ->
     Cid = pw_util:int(Cid0),
     case is_conversation_member(Conn, Uid, Cid) of
@@ -563,18 +588,19 @@ route({conversation, Uid, Cid0}, Conn) ->
         false ->
             {error, forbidden}
     end;
-route({post_direct_message, Uid, Cid0, Body0}, Conn) ->
+route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
     Cid = pw_util:int(Cid0),
     Body = store_message(pw_util:clean_text(Body0, ?MAX_MSG)),
+    ReplyTo = pw_util:int(ReplyTo0),
     case {byte_size(Body) > 0, is_conversation_member(Conn, Uid, Cid)} of
         {true, true} ->
             Now = pw_util:now_ms(),
             {ok, Mid} = insert_returning(Conn,
-                "INSERT INTO messages(scope, scope_id, user_id, body, created_at) VALUES($1,$2,$3,$4,$5) RETURNING id",
-                [<<"direct">>, Cid, Uid, Body, Now]),
+                "INSERT INTO messages(scope, scope_id, user_id, body, reply_to_id, created_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
+                [<<"direct">>, Cid, Uid, Body, ReplyTo, Now]),
             ok = exec(Conn, "UPDATE direct_threads SET updated_at = $1 WHERE id = $2", [Now, Cid]),
             {ok, Row} = one(Conn, message_select() ++ " WHERE m.id = $1", [Mid]),
-            Msg = message_map(Row),
+            Msg = message_map(Conn, Row),
             pw_hub:broadcast({direct, Cid}, #{type => message_created, scope => direct, scope_id => Cid, message => Msg}),
             notify_direct_members(Conn, Cid, Uid, #{type => direct_message, conversation_id => Cid, message => Msg}, Now),
             {ok, Msg};
@@ -694,22 +720,37 @@ migrations() -> [
 ].
 
 safe_exec(Conn, Sql) ->
-    case catch exec(Conn, Sql, []) of
+    case try_exec(Conn, Sql) of
         ok -> ok;
         _ -> ok
     end.
 
+try_exec(Conn, Sql) ->
+    try exec(Conn, Sql, []) catch _:_ -> error end.
+
 exec(Conn, Sql, Params) ->
-    case epgsql:query(Conn, Sql, Params) of
+    R = if Params =:= [] -> epgsql:squery(Conn, Sql);
+           true -> epgsql:equery(Conn, Sql, Params)
+        end,
+    case R of
         {ok, _} -> ok;
+        {ok, _, _} -> ok;
+        {ok, _, _, _} -> ok;
         {error, Reason} -> erlang:error({sql_error, Reason, Sql})
     end.
 
 rows(Conn, Sql, Params) ->
-    case epgsql:query(Conn, Sql, Params) of
-        {ok, _, Rows} -> {ok, Rows};
+    R = if Params =:= [] -> epgsql:squery(Conn, Sql);
+           true -> epgsql:equery(Conn, Sql, Params)
+        end,
+    case R of
+        {ok, _, Rows} -> {ok, lists:map(fun to_list/1, Rows)};
+        {ok, _, _, Rows} -> {ok, lists:map(fun to_list/1, Rows)};
         {error, Reason} -> {error, Reason}
     end.
+
+to_list(L) when is_list(L) -> L;
+to_list(T) when is_tuple(T) -> tuple_to_list(T).
 
 one(Conn, Sql, Params) ->
     case rows(Conn, Sql, Params) of
@@ -719,10 +760,13 @@ one(Conn, Sql, Params) ->
     end.
 
 insert_returning(Conn, Sql, Params) ->
-    case epgsql:query(Conn, Sql, Params) of
-        {ok, 1, _, [[Id]]} -> {ok, Id};
-        {ok, 1, _, [Row]} when is_list(Row) -> {ok, hd(Row)};
-        {ok, 1, _, [Row]} when is_tuple(Row) -> {ok, element(1, Row)};
+    R = if Params =:= [] -> epgsql:squery(Conn, Sql);
+           true -> epgsql:equery(Conn, Sql, Params)
+        end,
+    case R of
+        {ok, _, _, Rows} when is_list(Rows), Rows =/= [] -> {ok, hd(to_list(hd(Rows)))};
+        {ok, _, _} -> {ok, 1};
+        {ok, _} -> {ok, 1};
         {error, Reason} -> {error, Reason};
         Other -> {error, Other}
     end.
@@ -758,8 +802,8 @@ user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen]) ->
       status => Status, theme => Theme, created_at => Created, last_seen => LastSeen}.
 
 forum_map([Id, Slug, Name, Desc, Pos, Tc, Rc, Last]) ->
-    #{id => Id, slug => Slug, name => Name, description => Desc, position => Pos,
-      thread_count => Tc, reply_count => Rc, last_at => Last}.
+    #{id => pw_util:int(Id), slug => Slug, name => Name, description => Desc, position => pw_util:int(Pos),
+      thread_count => pw_util:int(Tc), reply_count => pw_util:int(Rc), last_at => db_null(Last)}.
 
 thread_row_map([Id, Fid, Fname, Uid, U, D, Title, Created, Updated, Rc, Views, Pinned]) ->
     #{id => Id, forum_id => Fid, forum_name => Fname, user_id => Uid, username => U,
@@ -800,8 +844,24 @@ member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, Role, M
 
 message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted]) ->
     #{id => Id, scope => Scope, scope_id => ScopeId, user_id => Uid, username => U, display_name => D,
-      avatar_url => pw_util:proxied_image(Avatar), body => load_message(Body), reply_to_id => ReplyTo,
-      created_at => Created, edited_at => Edited, deleted_at => Deleted}.
+      avatar_url => pw_util:proxied_image(Avatar), body => load_message(Body), reply_to_id => db_null(ReplyTo),
+      created_at => Created, edited_at => db_null(Edited), deleted_at => db_null(Deleted)}.
+
+db_null(null) -> undefined;
+db_null(X) -> X.
+message_map(Conn, Row = [_,_,_,_,_,_,_,_,ReplyTo|_]) ->
+    M = message_map(Row),
+    case ReplyTo of
+        null -> M;
+        _ -> M#{reply_to => replied_message(Conn, ReplyTo)}
+    end.
+replied_message(Conn, ReplyTo) ->
+    Sql = "SELECT body, user_id, display_name FROM messages JOIN users ON users.id = messages.user_id WHERE messages.id = $1",
+    case one(Conn, Sql, [ReplyTo]) of
+        {ok, [Body, RUid, RName]} ->
+            #{id => ReplyTo, user_id => RUid, display_name => RName, body => load_message(Body)};
+        _ -> undefined
+    end.
 
 conversation_row_map([Id, Name, Avatar, Owner, Created, Updated, LastRead, Muted, Count, LastBody, LastMsg, Unread]) ->
     #{id => Id, name => Name, avatar_url => pw_util:proxied_image(Avatar), owner_id => Owner,
@@ -943,8 +1003,8 @@ mark_url_seen0(Conn, Uid, Url) ->
     ok.
 
 seed_forums(Conn) ->
-    case one(Conn, "SELECT count(*) FROM forums", []) of
-        {ok, [0]} ->
+    case rows(Conn, "SELECT count(*) FROM forums", []) of
+        {ok, [[C]]} when C =:= 0; C =:= <<"0">> ->
             Fs = [{<<"general">>, <<"General">>, <<"Community discussion and project notes.">>, 1},
                   {<<"support">>, <<"Support">>, <<"Errors, logs, drivers, packages, services.">>, 2},
                   {<<"development">>, <<"Development">>, <<"Programming, systems, tooling, and releases.">>, 3},

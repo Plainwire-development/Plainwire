@@ -81,7 +81,7 @@ cache_key(Url) -> pw_util:sha256_hex(Url).
 validate_url(Url) ->
     case uri_string:parse(binary_to_list(Url)) of
         #{scheme := Scheme, host := Host} when Scheme =:= "http"; Scheme =:= "https" ->
-            case blocked_host(string:lowercase(Host)) of
+            case blocked_host_or_addr(string:lowercase(Host)) of
                 true -> {error, blocked_url};
                 false -> ok
             end;
@@ -96,14 +96,48 @@ blocked_host(H) ->
          "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
          "172.30.", "172.31.", "[::1]", "::1"]) orelse H =:= "169.254.169.254".
 
+blocked_host_or_addr(H) ->
+    blocked_host(H) orelse addresses_blocked(H).
+
+addresses_blocked(H) ->
+    Addrs = resolve_addrs(H, inet) ++ resolve_addrs(H, inet6),
+    case Addrs of
+        [] -> true;
+        _ -> lists:any(fun blocked_addr/1, Addrs)
+    end.
+
+resolve_addrs(H, Family) ->
+    case inet:getaddrs(H, Family) of
+        {ok, Addrs} -> Addrs;
+        _ -> []
+    end.
+
+blocked_addr({10,_,_,_}) -> true;
+blocked_addr({127,_,_,_}) -> true;
+blocked_addr({0,_,_,_}) -> true;
+blocked_addr({169,254,_,_}) -> true;
+blocked_addr({172,B,_,_}) when B >= 16, B =< 31 -> true;
+blocked_addr({192,168,_,_}) -> true;
+blocked_addr({_,_,_,_}) -> false;
+blocked_addr({0,0,0,0,0,0,0,1}) -> true;
+blocked_addr({S,_,_,_,_,_,_,_}) when S >= 16#fc00, S =< 16#fdff -> true;
+blocked_addr({S,_,_,_,_,_,_,_}) when S >= 16#fe80, S =< 16#febf -> true;
+blocked_addr({_,_,_,_,_,_,_,_}) -> false;
+blocked_addr(_) -> true.
+
 http_get(Url) ->
     Headers = [{"user-agent", "PlainwireRelay/1.1"}],
-    case httpc:request(get, {binary_to_list(Url), Headers}, [{timeout, 8000}, {body_format, binary}], []) of
-        {ok, {{_, Code, _}, RespHeaders, Body}} when Code >= 200, Code < 300, byte_size(Body) =< ?MAX_BYTES ->
-            Type = content_type(RespHeaders),
-            case allowed_type(Type) of
-                true -> {ok, Body, Type};
-                false -> {error, unsupported_type}
+    case httpc:request(get, {binary_to_list(Url), Headers}, [{timeout, 8000}], [{body_format, binary}]) of
+        {ok, {{_, Code, _}, RespHeaders, Body}} when Code >= 200, Code < 300 ->
+            case content_length_ok(RespHeaders) andalso byte_size(Body) =< ?MAX_BYTES of
+                true ->
+                    Type = content_type(RespHeaders),
+                    case allowed_type(Type) of
+                        true -> {ok, Body, Type};
+                        false -> {error, unsupported_type}
+                    end;
+                false ->
+                    {error, too_large}
             end;
         {ok, {{_, Code, _}, _, _}} ->
             {error, {http, Code}};
@@ -112,10 +146,29 @@ http_get(Url) ->
     end.
 
 content_type(Headers) ->
-    case proplists:get_value("content-type", Headers) of
+    case header_value("content-type", Headers) of
         undefined -> <<"application/octet-stream">>;
         CT -> pw_util:bin(string:trim(hd(string:split(CT, ";"))))
     end.
+
+content_length_ok(Headers) ->
+    case header_value("content-length", Headers) of
+        undefined -> true;
+        Len -> case safe_list_to_integer(string:trim(Len)) of
+            N when is_integer(N), N =< ?MAX_BYTES -> true;
+            _ -> false
+        end
+    end.
+
+header_value(Name, Headers) ->
+    Lower = string:lowercase(Name),
+    case [V || {K, V} <- Headers, string:lowercase(K) =:= Lower] of
+        [V | _] -> V;
+        [] -> undefined
+    end.
+
+safe_list_to_integer(V) ->
+    try list_to_integer(V) catch _:_ -> undefined end.
 
 allowed_type(<<"image/", _/binary>>) -> true;
 allowed_type(<<"application/octet-stream">>) -> true;
