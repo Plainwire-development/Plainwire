@@ -123,7 +123,7 @@
   recv(app.ports.setTitle, (title) => {
     document.title = title;
   });
-  recv(app.ports.notify, ({ title = 'Plainwire Relay', body = '' } = {}) => {
+  recv(app.ports.notify, ({ title = 'Plainwire', body = '' } = {}) => {
     if ('Notification' in window && Notification.permission === 'granted') {
       new Notification(title, { body });
     }
@@ -187,11 +187,14 @@
         ringtoneTimer = setInterval(() => playTone({ freq: 740, dur: 180 }), 700);
         break;
       case 'friend_user':
-        api({ method: 'POST', path: '/friends/request', body: { user_id: data } });
+        api({ method: 'POST', path: '/friends/request', body: { user_id: data } }).then(() => {
+          api({ method: 'GET', path: '/sync?since=0' });
+        });
         break;
       case 'accept_friend':
-        api({ method: 'POST', path: '/friends/accept', body: { user_id: data } });
-        api({ method: 'GET', path: '/sync?since=0' });
+        api({ method: 'POST', path: '/friends/accept', body: { user_id: data } }).then(() => {
+          api({ method: 'GET', path: '/sync?since=0' });
+        });
         break;
       case 'dm_user':
         api({ method: 'POST', path: '/conversations', body: { user_ids: [data], name: '' } }).then((res) => {
@@ -235,7 +238,7 @@
         location.reload();
         break;
       case 'new_thread': {
-        const forumId = data || Number(ask('Forum ID'));
+        const forumId = data || Number(ask('Thread category ID'));
         const title = ask('Thread title');
         const body = ask('Thread body');
         if (forumId && title) {
@@ -256,7 +259,7 @@
         break;
       }
       case 'search_users': {
-        const query = ask('Search users and threads');
+        const query = ask('Search people and threads');
         if (query) location.hash = '#search/' + encodeURIComponent(query);
         break;
       }
@@ -292,12 +295,12 @@
       }
       case 'edit_conversation': {
         const name = ask('Conversation name');
-        if (name) api({ method: 'POST', path: '/conversation/' + data, body: { name } });
+        if (name) api({ method: 'POST', path: '/conversation/' + data, body: { name } }).then(() => api({ method: 'GET', path: '/sync?since=0' }));
         break;
       }
       case 'add_people': {
         const userIds = askCsvInts('User IDs to add, comma separated');
-        if (userIds.length) api({ method: 'POST', path: '/conversation/' + data + '/members', body: { user_ids: userIds } });
+        if (userIds.length) api({ method: 'POST', path: '/conversation/' + data + '/members', body: { user_ids: userIds } }).then(() => api({ method: 'GET', path: '/sync?since=0' }));
         break;
       }
       default:

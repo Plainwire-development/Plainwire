@@ -9,10 +9,13 @@ allow(Key, Limit, WindowMs) -> gen_server:call(?MODULE, {allow, Key, Limit, Wind
 init([]) -> {ok, #{}}.
 handle_call({allow, Key, Limit, WindowMs}, _From, State0) ->
     Now = erlang:monotonic_time(millisecond),
-    Bucket = maps:get(Key, State0, []),
-    Fresh = [T || T <- Bucket, Now - T < WindowMs],
-    Allowed = length(Fresh) < Limit,
-    State = case Allowed of true -> maps:put(Key, [Now|Fresh], State0); false -> maps:put(Key, Fresh, State0) end,
+    {Start, Count0} = maps:get(Key, State0, {Now, 0}),
+    {WindowStart, Count1} = case Now - Start < WindowMs of
+        true -> {Start, Count0};
+        false -> {Now, 0}
+    end,
+    Allowed = Count1 < Limit,
+    State = case Allowed of true -> maps:put(Key, {WindowStart, Count1 + 1}, State0); false -> maps:put(Key, {WindowStart, Count1}, State0) end,
     {reply, Allowed, maybe_gc(State, Now)};
 handle_call(_, _, State) -> {reply, false, State}.
 handle_cast(_, State) -> {noreply, State}.
@@ -21,5 +24,5 @@ terminate(_, _) -> ok.
 code_change(_, State, _) -> {ok, State}.
 
 maybe_gc(State, Now) when map_size(State) > 20000 ->
-    maps:filter(fun(_, Times) -> lists:any(fun(T) -> Now - T < 300000 end, Times) end, State);
+    maps:filter(fun(_, {Start, _}) -> Now - Start < 300000 end, State);
 maybe_gc(State, _) -> State.

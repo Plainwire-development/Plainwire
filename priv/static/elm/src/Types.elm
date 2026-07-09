@@ -3,7 +3,7 @@ module Types exposing
     , Server, Channel, ServerMember, ServerData, InvitePreview, Friend, Notification
     , VoiceState, CallUI, CallPopup, CallMode(..)
     , ActiveRoute(..), Route(..), Model, PageState
-    , Status(..), Relationship(..), Msg(..)
+    , Status(..), Relationship(..), ContextMenu, CtxItem, Msg(..)
     , decodeUser, decodeConversation, decodeMessage, decodeForum
     , decodeThread, decodeReply, decodeServer, decodeChannel
     , decodeServerMember, decodeFriend, decodeNotification
@@ -13,6 +13,7 @@ module Types exposing
 import Json.Decode as D
 import Json.Encode as E
 import Dict exposing (Dict)
+import Time
 import Set exposing (Set)
 
 
@@ -46,6 +47,7 @@ type alias Conversation =
     , createdAt : Int, updatedAt : Int, lastReadMessageId : Int
     , muted : Bool, memberCount : Int, lastBody : Maybe String
     , lastMessageId : Maybe Int, unread : Int, members : List MemberUser
+    , peerName : String, peerAvatarUrl : String, peerUsername : String
     }
 
 type alias MemberUser =
@@ -146,7 +148,7 @@ type alias ServerData =
 type alias Drafts = Dict String String
 
 type alias Model =
-    { me : Maybe User, csrf : String, serverTime : Int
+    { me : Maybe User, csrf : String, serverTime : Int, timeZone : Time.Zone, absoluteTimestamps : Bool
     , forums : List Forum, threads : List ForumThread
     , currentThread : Maybe ForumThread, replies : List Reply
     , servers : List Server, convs : List Conversation
@@ -164,9 +166,13 @@ type alias Model =
     , settingsTab : String, inputText : String
     , sidebarOpen : Bool, ctxMenu : Maybe ContextMenu
     , threadReply : String, searchQuery : String
-    , authMode : String, authUsername : String
+    , authMode : String, authUsername : String, authBusy : Bool
     , authDisplayName : String, authPassword : String
+    , profileDisplayName : String, profileBio : String
+    , profileAvatarUrl : String, profileBannerUrl : String
+    , profileStatus : String, profileTheme : String
     , serverName : String, serverDescription : String
+    , modalTitle : String, modalBody : String, modalUserIds : String
     , booting : Bool
     }
 
@@ -211,6 +217,8 @@ type Msg
     | CloseModal
     | Toast String
     | DismissToast
+    | GotTimeZone Time.Zone
+    | ToggleTimestampMode
     | SetReplyTo Message
     | CancelReply
     | InputText String
@@ -218,6 +226,8 @@ type Msg
     | DeleteMessage Int
     | LeaveConversation Int
     | MarkConvRead Int
+    | OpenMessageCtx Message Int Int
+    | OpenConvCtx Conversation Int Int
     | CopyText String
     | JoinInvite
     | NewDmModal
@@ -227,10 +237,20 @@ type Msg
     | EditServerModal Server
     | EditConversationModal Conversation
     | NewThreadModal (Maybe Int)
+    | ModalTitle String
+    | ModalBody String
+    | ModalUserIds String
+    | SubmitModal
     | CreateThread Int String String
     | CreateServer String String
     | CreateChannel Int String String
-    | UpdateProfile String Status String String String
+    | ProfileDisplayName String
+    | ProfileBio String
+    | ProfileAvatarUrl String
+    | ProfileBannerUrl String
+    | ProfileStatus String
+    | ProfileTheme String
+    | SaveProfile
     | ServerName String
     | ServerDescription String
     | ToggleSound
@@ -239,7 +259,7 @@ type Msg
     | CtxAction Int
     | LoadMoreMessages
     | SilentSync Bool
-    | Tick Int
+    | Tick Time.Posix
     | FileUpload String (Maybe String)
     | ReadFile String
     | SetSettingsTab String
@@ -286,6 +306,9 @@ decodeConversation = D.succeed Conversation
     |> andMap (D.field "last_message_id" (D.nullable D.int))
     |> andMap (D.field "unread" D.int |> defaultValue 0)
     |> andMap (D.field "members" (D.list decodeMemberUser) |> defaultValue [])
+    |> andMap (D.field "peer_name" D.string |> defaultValue "")
+    |> andMap (D.field "peer_avatar_url" D.string |> defaultValue "")
+    |> andMap (D.field "peer_username" D.string |> defaultValue "")
 
 decodeMemberUser : D.Decoder MemberUser
 decodeMemberUser = D.map4 MemberUser
@@ -304,7 +327,7 @@ decodeMessage = D.succeed Message
     |> andMap (D.field "avatar_url" D.string |> defaultValue "")
     |> andMap (D.field "body" D.string)
     |> andMap (D.field "reply_to_id" (D.nullable D.int))
-    |> andMap (D.field "reply_to" (D.nullable decodeReplyPreview))
+    |> andMap (D.field "reply_to" (D.nullable decodeReplyPreview) |> defaultValue Nothing)
     |> andMap (D.field "created_at" D.int)
     |> andMap (D.field "edited_at" (D.nullable D.int))
     |> andMap (D.field "deleted_at" (D.nullable D.int))

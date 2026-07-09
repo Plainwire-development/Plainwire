@@ -61,6 +61,10 @@ Message encryption is encryption at rest, not end-to-end encryption. The server 
 * WebRTC
 * rebar3
 
+# Below is information on how to host (If you want to be a hosting candidate)
+
+> Or you're a contributor and want to code, test, build, and push. either goes.
+
 ## Hosting model
 
 Plainwire is hosted-first.

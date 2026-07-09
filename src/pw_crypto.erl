@@ -65,8 +65,8 @@ verify_proxy_token(Token, Url) ->
                         [SigB64, UrlB64] ->
                             case {pw_util:base64url_decode(SigB64), pw_util:base64url_decode(UrlB64)} of
                                 {<<Nonce:8/binary, Mac:16/binary>>, DecUrl} when DecUrl =:= Url ->
-                                    Expected = crypto:mac(hmac, sha256, Key, <<Nonce/binary, Url/binary>>),
-                                    crypto:mac_equals(Mac, Expected);
+                                    <<Expected:16/binary, _/binary>> = crypto:mac(hmac, sha256, Key, <<Nonce/binary, Url/binary>>),
+                                    constant_time(Mac, Expected);
                                 _ ->
                                     false
                             end;
@@ -98,3 +98,8 @@ safe_decrypt(Key, IV, Cipher, AAD, Tag) ->
     try crypto:crypto_one_time_aead(aes_256_gcm, Key, IV, Cipher, AAD, Tag, false)
     catch _:_ -> error
     end.
+
+constant_time(A, B) when byte_size(A) =/= byte_size(B) -> false;
+constant_time(A, B) -> constant_time(binary_to_list(A), binary_to_list(B), 0) =:= 0.
+constant_time([], [], Acc) -> Acc;
+constant_time([A|As], [B|Bs], Acc) -> constant_time(As, Bs, Acc bor (A bxor B)).

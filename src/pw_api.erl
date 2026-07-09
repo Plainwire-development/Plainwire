@@ -25,6 +25,9 @@ handle(<<"POST">>, [<<"register">>], Req0, _) ->
         U=maps:get(<<"username">>,M,<<>>), D=maps:get(<<"display_name">>,M,U), P=maps:get(<<"password">>,M,<<>>),
         case pw_db:register(U,D,P) of
             {ok, #{token:=Token}=Data} -> pw_util:ok_json(pw_util:set_cookie(Req, <<"pw_session">>, Token), #{ok=>true,data=>maps:remove(token,Data)});
+            {error, username_taken} -> pw_util:err_json(Req, 409, <<"username_taken">>);
+            {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+            {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
             {error,E} -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8))
         end
     end);
@@ -32,6 +35,8 @@ handle(<<"POST">>, [<<"login">>], Req0, _) ->
     with_json_public(Req0, fun(M, Req) ->
         case pw_db:login(maps:get(<<"username">>,M,<<>>), maps:get(<<"password">>,M,<<>>)) of
             {ok, #{token:=Token}=Data} -> pw_util:ok_json(pw_util:set_cookie(Req, <<"pw_session">>, Token), #{ok=>true,data=>maps:remove(token,Data)});
+            {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+            {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
             {error,E} -> pw_util:err_json(Req, 401, atom_to_binary(E, utf8))
         end
     end);
@@ -46,6 +51,8 @@ handle(Method, Path, Req0, State) ->
                 true -> authed(Method, Path, Req0, Session, State);
                 false -> pw_util:err_json(Req0, 403, <<"bad_csrf">>)
             end;
+        {error, database_unavailable} -> pw_util:err_json(Req0, 503, <<"database_unavailable">>);
+        {error, timeout} -> pw_util:err_json(Req0, 503, <<"database_timeout">>);
         {error,_} -> pw_util:err_json(Req0, 401, <<"not_authenticated">>)
     end.
 
@@ -98,6 +105,7 @@ authed(<<"POST">>, [<<"conversations">>], Req0, Session, _) -> with_json(Req0, f
 authed(<<"GET">>, [<<"conversation">>, Id], Req, Session, _) -> result(Req, pw_db:conversation(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_conversation(uid(Session), Id, maps:get(<<"name">>,M,<<>>), M)) end);
 authed(<<"POST">>, [<<"conversation">>, Id, <<"members">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:add_conversation_members(uid(Session), Id, maps:get(<<"user_ids">>,M,[]))) end);
+authed(<<"POST">>, [<<"conversation">>, Id, <<"read">>], Req, Session, _) -> result(Req, pw_db:mark_conversation_read(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"messages">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:post_direct_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
 authed(<<"POST">>, [<<"conversation">>, Id, <<"leave">>], Req, Session, _) -> result(Req, pw_db:leave_conversation(uid(Session), Id));
 authed(<<"GET">>, [<<"notifications">>], Req, Session, _) -> result(Req, pw_db:notifications(uid(Session)));
@@ -105,11 +113,17 @@ authed(<<"POST">>, [<<"notifications">>, <<"seen">>], Req, Session, _) -> result
 authed(_, _, Req, _, _) -> pw_util:err_json(Req, 404, <<"not_found">>).
 
 with_json_public(Req0, Fun) ->
-    case pw_util:read_json(Req0) of {ok,M,Req}->Fun(M,Req); {error,_,Req}->pw_util:err_json(Req,400,<<"invalid_json">>) end.
+    case pw_util:read_json(Req0) of
+        {ok, M, Req} -> Fun(M, Req);
+        {error, too_large, Req} -> pw_util:err_json(Req, 413, <<"body_too_large">>);
+        {error, _, Req} -> pw_util:err_json(Req, 400, <<"invalid_json">>)
+    end.
 with_json(Req0, Fun) -> with_json_public(Req0, Fun).
 
 result(Req, {ok, Data}) -> pw_util:ok_json(Req, #{ok=>true,data=>Data});
 result(Req, ok) -> pw_util:ok_json(Req, #{ok=>true});
+result(Req, {error, database_unavailable}) -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+result(Req, {error, timeout}) -> pw_util:err_json(Req, 503, <<"database_timeout">>);
 result(Req, {error, forbidden}) -> pw_util:err_json(Req, 403, <<"forbidden">>);
 result(Req, {error, not_found}) -> pw_util:err_json(Req, 404, <<"not_found">>);
 result(Req, {error, E}) when is_atom(E) -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8));
