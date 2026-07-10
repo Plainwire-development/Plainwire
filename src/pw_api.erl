@@ -20,30 +20,49 @@ api_path(Path) ->
     case Segs of [<<"api">>|Rest] -> Rest; _ -> Segs end.
 qs(Req, Key) -> proplists:get_value(Key, cowboy_req:parse_qs(Req)).
 
+auth_attempt_allowed(Kind, Req, Username0) ->
+    Username = pw_util:normalize_username(Username0),
+    Ip = pw_util:ip(Req),
+    pw_rate:allow({Kind, ip, Ip}, 30, 600000) andalso
+        pw_rate:allow({Kind, username, Username}, 12, 600000) andalso
+        pw_rate:allow({Kind, pair, Ip, Username}, 8, 600000).
+
 handle(<<"POST">>, [<<"register">>], Req0, _) ->
     with_json_public(Req0, fun(M, Req) ->
         U=maps:get(<<"username">>,M,<<>>), D=maps:get(<<"display_name">>,M,U), P=maps:get(<<"password">>,M,<<>>),
-        case pw_db:register(U,D,P) of
-            {ok, #{token:=Token}=Data} -> pw_util:ok_json(pw_util:set_cookie(Req, <<"pw_session">>, Token), #{ok=>true,data=>maps:remove(token,Data)});
-            {error, username_taken} -> pw_util:err_json(Req, 409, <<"username_taken">>);
-            {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
-            {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
-            {error,E} -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8))
+        case auth_attempt_allowed(register, Req, U) of
+            false ->
+                pw_util:err_json(Req, 429, <<"rate_limited">>);
+            true ->
+                case pw_db:register(U,D,P) of
+                    {ok, #{token:=Token}=Data} -> pw_util:ok_json(pw_util:set_cookie(Req, <<"pw_session">>, Token), #{ok=>true,data=>maps:remove(token,Data)});
+                    {error, username_taken} -> pw_util:err_json(Req, 409, <<"username_taken">>);
+                    {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+                    {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
+                    {error,E} -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8))
+                end
         end
     end);
 handle(<<"POST">>, [<<"login">>], Req0, _) ->
     with_json_public(Req0, fun(M, Req) ->
-        case pw_db:login(maps:get(<<"username">>,M,<<>>), maps:get(<<"password">>,M,<<>>)) of
-            {ok, #{token:=Token}=Data} -> pw_util:ok_json(pw_util:set_cookie(Req, <<"pw_session">>, Token), #{ok=>true,data=>maps:remove(token,Data)});
-            {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
-            {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
-            {error,E} -> pw_util:err_json(Req, 401, atom_to_binary(E, utf8))
+        U = maps:get(<<"username">>,M,<<>>),
+        case auth_attempt_allowed(login, Req, U) of
+            false ->
+                pw_util:err_json(Req, 429, <<"rate_limited">>);
+            true ->
+                case pw_db:login(U, maps:get(<<"password">>,M,<<>>)) of
+                    {ok, #{token:=Token}=Data} -> pw_util:ok_json(pw_util:set_cookie(Req, <<"pw_session">>, Token), #{ok=>true,data=>maps:remove(token,Data)});
+                    {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+                    {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
+                    {error,E} -> pw_util:err_json(Req, 401, atom_to_binary(E, utf8))
+                end
         end
     end);
-handle(<<"POST">>, [<<"logout">>], Req0, _) ->
-    Token = pw_util:cookie_value(Req0, <<"pw_session">>),
-    _ = case Token of undefined -> ok; _ -> pw_db:logout(Token) end,
-    pw_util:ok_json(pw_util:clear_cookie(Req0), #{ok=>true});
+handle(<<"GET">>, [<<"health">>], Req0, _) ->
+    case pw_db:health() of
+        {ok, Data} -> pw_util:ok_json(Req0, #{ok=>true,data=>Data#{app => ok}});
+        {error, _} -> pw_util:err_json(Req0, 503, <<"unhealthy">>)
+    end;
 handle(Method, Path, Req0, State) ->
     case auth(Req0) of
         {ok, Session} ->
@@ -64,6 +83,10 @@ auth(Req) ->
 uid(Session) -> maps:get(id, maps:get(user, Session)).
 
 authed(<<"GET">>, [<<"me">>], Req, Session, _) -> pw_util:ok_json(Req, #{ok=>true,data=>Session});
+authed(<<"POST">>, [<<"logout">>], Req0, _, _) ->
+    Token = pw_util:cookie_value(Req0, <<"pw_session">>),
+    _ = case Token of undefined -> ok; _ -> pw_db:logout(Token) end,
+    pw_util:ok_json(pw_util:clear_cookie(Req0), #{ok=>true});
 authed(<<"GET">>, [<<"sync">>], Req, Session, _) -> result(Req, pw_db:sync(uid(Session), qs(Req, <<"since">>)));
 authed(<<"POST">>, [<<"profile">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_profile(uid(Session), maps:get(<<"display_name">>, M, maps:get(display_name, maps:get(user,Session))), M)) end);
 authed(<<"GET">>, [<<"forums">>], Req, Session, _) -> result(Req, pw_db:forums(uid(Session)));

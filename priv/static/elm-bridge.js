@@ -15,48 +15,77 @@
   let localStream = null;
   let room = null;
   let speakerOn = true;
+  let micMuted = false;
+  let deafened = false;
+  let remoteAudioUnlockInstalled = false;
   const peers = new Map();
   const rtcConfig = window.PLAINWIRE_RTC_CONFIG || { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
   // ---- Presence / idle tracking ----
-  let userStatus = 'online';          // our current effective status
+  let desiredStatus = 'online';       // user preference: online, busy, invisible
+  let effectiveStatus = null;         // visible status sent to the server
+  let idle = false;
   let idleTimer = null;
   const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-  let activityRecent = false;
 
-  const setStatus = (status) => {
-    if (status === userStatus) return;
-    userStatus = status;
+  const normalizeDesiredStatus = (status) => {
+    if (status === 'busy' || status === 'invisible') return status;
+    return 'online';
+  };
+
+  const nextEffectiveStatus = () => {
+    if (desiredStatus === 'invisible') return 'invisible';
+    if (desiredStatus === 'busy') return 'busy';
+    return idle ? 'away' : 'online';
+  };
+
+  const publishPresence = (force = false) => {
+    const status = nextEffectiveStatus();
+    if (!force && status === effectiveStatus) return;
+    effectiveStatus = status;
     if (ws && ws.readyState === WebSocket.OPEN) {
       sendWs({ type: 'presence_update', status });
     }
-    send(app.ports.bridgeReceive, { tag: 'status_change', data: status });
+  };
+
+  const setDesiredStatus = (status) => {
+    desiredStatus = normalizeDesiredStatus(status);
+    if (desiredStatus !== 'online') idle = false;
+    publishPresence(true);
   };
 
   const resetIdleTimer = () => {
     if (idleTimer) clearTimeout(idleTimer);
-    if (userStatus === 'online' || userStatus === 'away') {
-      if (!activityRecent && userStatus === 'away') {
-        setStatus('online');
+    if (desiredStatus === 'online') {
+      if (idle) {
+        idle = false;
+        publishPresence();
       }
-      activityRecent = true;
       idleTimer = setTimeout(() => {
-        activityRecent = false;
-        if (userStatus === 'online') {
-          setStatus('away');
-        }
+        idle = true;
+        publishPresence();
       }, IDLE_TIMEOUT_MS);
     }
   };
 
   const activityEvents = ['mousemove', 'keydown', 'mousedown', 'touchstart', 'scroll', 'wheel'];
   const activityHandler = () => { resetIdleTimer(); };
+  const visibilityHandler = () => {
+    if (document.hidden && desiredStatus === 'online') {
+      idle = true;
+      publishPresence();
+    } else {
+      resetIdleTimer();
+    }
+  };
   const startActivityTracking = () => {
     activityEvents.forEach((ev) => document.addEventListener(ev, activityHandler, { passive: true }));
+    document.addEventListener('visibilitychange', visibilityHandler);
     resetIdleTimer();
   };
   const stopActivityTracking = () => {
     activityEvents.forEach((ev) => document.removeEventListener(ev, activityHandler));
+    document.removeEventListener('visibilitychange', visibilityHandler);
     if (idleTimer) clearTimeout(idleTimer);
   };
 
@@ -123,7 +152,7 @@
       });
       return json.ok ? json.data : null;
     } catch (_) {
-      send(app.ports.apiReceive, { path, ok: false, data: null, error: 'request_failed' });
+      send(app.ports.apiReceive, { path, method, ok: false, data: null, error: 'request_failed' });
       return null;
     }
   };
@@ -136,7 +165,7 @@
       const queued = wsQueue;
       wsQueue = [];
       queued.forEach((value) => sendWs(value));
-      sendWs({ type: 'presence_update', status: userStatus });
+      publishPresence(true);
     };
     ws.onmessage = (event) => {
       try {
@@ -181,6 +210,7 @@
     }
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
+      localStream.getAudioTracks().forEach((t) => { t.enabled = !micMuted; });
     } catch (e) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone access is needed for calls.' });
       throw e;
@@ -204,17 +234,32 @@
       el.playsInline = true;
       el.controls = false;
       el.volume = 1;
-      el.style.display = 'none';
+      el.style.position = 'fixed';
+      el.style.left = '-9999px';
+      el.style.top = '0';
+      el.style.width = '1px';
+      el.style.height = '1px';
+      el.style.opacity = '0';
+      el.style.pointerEvents = 'none';
       document.body.appendChild(el);
     }
     return el;
   };
 
+  const playAllRemoteAudio = () => {
+    document.querySelectorAll('audio[id^="remote-audio-"]').forEach((audio) => {
+      audio.play().catch(() => false);
+    });
+  };
+
   const playRemoteAudio = (audio) => {
-    const attempt = () => audio.play().catch(() => false);
-    attempt();
-    document.addEventListener('click', attempt, { once: true });
-    document.addEventListener('touchend', attempt, { once: true });
+    audio.play().catch(() => false);
+    if (!remoteAudioUnlockInstalled) {
+      remoteAudioUnlockInstalled = true;
+      ['click', 'touchend', 'keydown'].forEach((ev) => {
+        document.addEventListener(ev, playAllRemoteAudio, { passive: true });
+      });
+    }
   };
 
   const applySpeaker = async () => {
@@ -227,7 +272,10 @@
 
   const closePeer = (uid) => {
     const pc = peers.get(uid);
-    if (pc) pc.close();
+    if (pc) {
+      if (pc._restartTimer) clearTimeout(pc._restartTimer);
+      pc.close();
+    }
     peers.delete(uid);
     document.getElementById('remote-audio-' + uid)?.remove();
     send(app.ports.bridgeReceive, { tag: 'rtc_peer_connected', user_id: uid, connected: false });
@@ -247,6 +295,26 @@
     room = null;
   };
 
+  const makeOffer = async (uid, pc, options = {}) => {
+    if (!pc || pc.signalingState !== 'stable' || pc._makingOffer) return;
+    pc._makingOffer = true;
+    try {
+      const offer = await pc.createOffer(options);
+      await pc.setLocalDescription(offer);
+      sendSignal(uid, { kind: 'offer', sdp: pc.localDescription });
+    } finally {
+      pc._makingOffer = false;
+    }
+  };
+
+  const restartPeerIce = (uid, pc) => {
+    if (!pc || pc.signalingState === 'closed') return;
+    if (pc._restartTimer) clearTimeout(pc._restartTimer);
+    pc._restartTimer = setTimeout(() => {
+      makeOffer(uid, pc, { iceRestart: true }).catch(() => closePeer(uid));
+    }, 600);
+  };
+
   const ensurePeer = async (uid, polite = false) => {
     if (!uid || uid === meId) return null;
     const existing = peers.get(uid);
@@ -254,8 +322,12 @@
     const stream = await ensureMedia();
     const pc = new RTCPeerConnection(rtcConfig);
     pc._polite = polite;
+    pc._makingOffer = false;
     pc._pendingCandidates = [];
     stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    pc.onnegotiationneeded = () => {
+      makeOffer(uid, pc).catch(() => closePeer(uid));
+    };
     pc.onicecandidate = (ev) => {
       if (ev.candidate) sendSignal(uid, { kind: 'candidate', candidate: ev.candidate });
     };
@@ -268,7 +340,7 @@
         stream.addTrack(ev.track);
         audio.srcObject = stream;
       }
-      audio.muted = false;
+      audio.muted = deafened;
       playRemoteAudio(audio);
       applySpeaker();
     };
@@ -281,14 +353,12 @@
       }
       if (pc.connectionState === 'disconnected' && reconnectAttempts < 3) {
         reconnectAttempts++;
-        setTimeout(() => { if (pc.connectionState === 'disconnected') pc.restartIce?.(); }, 2000);
+        setTimeout(() => { if (pc.connectionState === 'disconnected') restartPeerIce(uid, pc); }, 2000);
       }
       if (pc.connectionState === 'failed') {
         if (reconnectAttempts < 2) {
           reconnectAttempts++;
-          setTimeout(() => {
-            pc.restartIce?.();
-          }, 1000);
+          restartPeerIce(uid, pc);
         } else {
           closePeer(uid);
         }
@@ -297,7 +367,7 @@
     pc.oniceconnectionstatechange = () => {
       if (pc.iceConnectionState === 'failed' && reconnectAttempts < 3) {
         reconnectAttempts++;
-        setTimeout(() => { pc.restartIce?.(); }, 1500);
+        restartPeerIce(uid, pc);
       }
     };
     peers.set(uid, pc);
@@ -307,13 +377,7 @@
   const callPeer = async (uid) => {
     const pc = await ensurePeer(uid, false);
     if (!pc) return;
-    if (pc._offerSent || pc.signalingState !== 'stable') return;
-    try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      pc._offerSent = true;
-      sendSignal(uid, { kind: 'offer', sdp: pc.localDescription });
-    } catch (e) { /* ignore signaling errors */ }
+    await makeOffer(uid, pc);
   };
 
   const handleSignal = async (msg) => {
@@ -326,10 +390,12 @@
     if (!pc) return;
     try {
       if (signal.kind === 'offer') {
-        if (pc.signalingState === 'have-local-offer') {
+        const offerCollision = pc._makingOffer || pc.signalingState !== 'stable';
+        if (offerCollision) {
           if (!pc._polite) return; // impolite peer ignores late offers
           await pc.setLocalDescription({ type: 'rollback' });
         }
+        pc._makingOffer = false;
         await pc.setRemoteDescription(signal.sdp);
         while (pc._pendingCandidates.length) {
           await pc.addIceCandidate(pc._pendingCandidates.shift()).catch(() => {});
@@ -388,10 +454,12 @@
   };
 
   const setMuted = (muted) => {
-    if (localStream) localStream.getAudioTracks().forEach((t) => { t.enabled = !muted; });
+    micMuted = !!muted;
+    if (localStream) localStream.getAudioTracks().forEach((t) => { t.enabled = !micMuted; });
   };
 
-  const setDeafened = (deafened) => {
+  const setDeafened = (value) => {
+    deafened = !!value;
     document.querySelectorAll('audio[id^="remote-audio-"]').forEach((el) => { el.muted = deafened; });
     if (deafened) setMuted(true);
   };
@@ -507,29 +575,58 @@
       case 'call_user':
         api({ method: 'POST', path: '/conversations', body: { user_ids: [data], name: '' } }).then((res) => {
           if (res && res.id) {
-            stopRingtones();
-            outgoingTimer = setInterval(() => playTone({ freq: 520, dur: 140, type: 'triangle', vol: 0.12 }), 900);
-            sendWs({ type: 'call_ring', conversation_id: res.id });
+            ensureMedia()
+              .then(() => {
+                stopRingtones();
+                outgoingTimer = setInterval(() => playTone({ freq: 520, dur: 140, type: 'triangle', vol: 0.12 }), 900);
+                sendWs({ type: 'call_ring', conversation_id: res.id });
+              })
+              .catch(() => {
+                stopRingtones();
+                send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'call' });
+                send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for calls.' });
+              });
           }
         });
         break;
       case 'start_call':
-        stopRingtones();
-        outgoingTimer = setInterval(() => playTone({ freq: 520, dur: 140, type: 'triangle', vol: 0.12 }), 900);
-        sendWs({ type: 'call_ring', conversation_id: data });
+        ensureMedia()
+          .then(() => {
+            stopRingtones();
+            outgoingTimer = setInterval(() => playTone({ freq: 520, dur: 140, type: 'triangle', vol: 0.12 }), 900);
+            sendWs({ type: 'call_ring', conversation_id: data });
+          })
+          .catch(() => {
+            stopRingtones();
+            send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'call' });
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for calls.' });
+          });
         break;
       case 'join_voice':
         leaveRtcRoom();
         room = { kind: 'voice', id: data };
-        ensureMedia().catch(() => send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for voice.' }));
-        sendWs({ type: 'voice_join', channel_id: data });
+        ensureMedia()
+          .then(() => sendWs({ type: 'voice_join', channel_id: data }))
+          .catch(() => {
+            room = null;
+            send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'voice' });
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for voice.' });
+          });
         break;
       case 'accept_call':
         leaveRtcRoom();
         room = { kind: 'call', id: data };
-        ensureMedia().catch(() => send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for calls.' }));
-        sendWs({ type: 'call_accept', conversation_id: data });
-        stopRingtones();
+        ensureMedia()
+          .then(() => {
+            sendWs({ type: 'call_accept', conversation_id: data });
+            stopRingtones();
+          })
+          .catch(() => {
+            room = null;
+            stopRingtones();
+            send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'call' });
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for calls.' });
+          });
         break;
       case 'decline_call':
         sendWs({ type: 'call_decline', conversation_id: data });
@@ -552,8 +649,12 @@
         break;
       case 'voice_deafen':
         setDeafened(!!data);
-        sendWs({ type: 'voice_state', patch: { deafened: !!data } });
-        sendWs({ type: 'call_state', patch: { deafened: !!data } });
+        sendWs({ type: 'voice_state', patch: { deafened: !!data, muted: !!data ? true : micMuted } });
+        sendWs({ type: 'call_state', patch: { deafened: !!data, muted: !!data ? true : micMuted } });
+        break;
+      case 'unlock_audio':
+        audioContext()?.resume?.();
+        playAllRemoteAudio();
         break;
       case 'toggle_speaker':
         speakerOn = !speakerOn;
@@ -638,7 +739,7 @@
         }
         break;
       case 'presence_update':
-        setStatus(String(data));
+        setDesiredStatus(String(data));
         break;
       default:
         break;

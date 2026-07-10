@@ -72,7 +72,7 @@ type alias Forum =
 
 type alias ForumThread =
     { id : Int, forumId : Int, forumName : String, userId : Int
-    , username : String, displayName : String, title : String, body : String
+    , username : String, displayName : String, avatarUrl : String, title : String, body : String
     , createdAt : Int, updatedAt : Int, replyCount : Int, views : Int
     , locked : Bool, pinned : Bool, score : Int, userVote : Int
     }
@@ -300,6 +300,7 @@ type Msg
     | PresenceOffline Int
     | PresenceStatus Int String
     | SetMyStatus String
+    | RtcJoinFailed String
 
 
 -- DECODERS
@@ -383,6 +384,7 @@ decodeThread = D.succeed ForumThread
     |> andMap (D.field "user_id" D.int)
     |> andMap (D.field "username" D.string)
     |> andMap (D.field "display_name" D.string)
+    |> andMap (D.field "avatar_url" D.string |> defaultValue "")
     |> andMap (D.field "title" D.string)
     |> andMap (D.field "body" D.string |> defaultValue "")
     |> andMap (D.field "created_at" D.int)

@@ -7,6 +7,10 @@ init(Req0, _) ->
         {ok, Uid} ->
             Path = cowboy_req:path(Req0),
             Token = extract_token(Path),
+            case pw_rate:allow({media, pw_util:ip(Req0), Uid}, 120, 60000) of
+                false ->
+                    pw_util:err_json(Req0, 429, <<"rate_limited">>);
+                true ->
             case pw_media:fetch(Uid, Token) of
                 {ok, Body, Type} ->
                     Headers = maps:merge(pw_util:security_headers(), #{
@@ -21,6 +25,7 @@ init(Req0, _) ->
                     pw_util:err_json(Req0, 400, <<"invalid_url">>);
                 {error, _} ->
                     pw_util:err_json(Req0, 502, <<"fetch_failed">>)
+            end
             end;
         {error, _} ->
             pw_util:err_json(Req0, 401, <<"not_authenticated">>)

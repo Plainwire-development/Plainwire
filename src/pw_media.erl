@@ -116,10 +116,18 @@ blocked_addr({10,_,_,_}) -> true;
 blocked_addr({127,_,_,_}) -> true;
 blocked_addr({0,_,_,_}) -> true;
 blocked_addr({169,254,_,_}) -> true;
+blocked_addr({100,B,_,_}) when B >= 64, B =< 127 -> true;
 blocked_addr({172,B,_,_}) when B >= 16, B =< 31 -> true;
+blocked_addr({192,0,0,_}) -> true;
+blocked_addr({192,0,2,_}) -> true;
 blocked_addr({192,168,_,_}) -> true;
-blocked_addr({_,_,_,_}) -> false;
+blocked_addr({198,18,_,_}) -> true;
+blocked_addr({198,19,_,_}) -> true;
+blocked_addr({198,51,100,_}) -> true;
+blocked_addr({203,0,113,_}) -> true;
+    blocked_addr({_,_,_,_}) -> false;
 blocked_addr({0,0,0,0,0,0,0,1}) -> true;
+blocked_addr({0,0,0,0,0,16#ffff,A,B}) -> blocked_addr({A bsr 8, A band 255, B bsr 8, B band 255});
 blocked_addr({S,_,_,_,_,_,_,_}) when S >= 16#fc00, S =< 16#fdff -> true;
 blocked_addr({S,_,_,_,_,_,_,_}) when S >= 16#fe80, S =< 16#febf -> true;
 blocked_addr({_,_,_,_,_,_,_,_}) -> false;
@@ -127,7 +135,7 @@ blocked_addr(_) -> true.
 
 http_get(Url) ->
     Headers = [{"user-agent", "PlainwireRelay/1.1"}],
-    case httpc:request(get, {binary_to_list(Url), Headers}, [{timeout, 8000}], [{body_format, binary}]) of
+    case httpc:request(get, {binary_to_list(Url), Headers}, [{timeout, 8000}, {autoredirect, false}], [{body_format, binary}]) of
         {ok, {{_, Code, _}, RespHeaders, Body}} when Code >= 200, Code < 300 ->
             case content_length_ok(RespHeaders) andalso byte_size(Body) =< ?MAX_BYTES of
                 true ->
@@ -139,6 +147,8 @@ http_get(Url) ->
                 false ->
                     {error, too_large}
             end;
+        {ok, {{_, Code, _}, _, _}} when Code >= 300, Code < 400 ->
+            {error, blocked_url};
         {ok, {{_, Code, _}, _, _}} ->
             {error, {http, Code}};
         {error, Reason} ->
@@ -153,7 +163,7 @@ content_type(Headers) ->
 
 content_length_ok(Headers) ->
     case header_value("content-length", Headers) of
-        undefined -> true;
+        undefined -> false;
         Len -> case safe_list_to_integer(string:trim(Len)) of
             N when is_integer(N), N =< ?MAX_BYTES -> true;
             _ -> false
@@ -171,7 +181,6 @@ safe_list_to_integer(V) ->
     try list_to_integer(V) catch _:_ -> undefined end.
 
 allowed_type(<<"image/", _/binary>>) -> true;
-allowed_type(<<"application/octet-stream">>) -> true;
 allowed_type(_) -> false.
 
 prune_cache(Now) ->

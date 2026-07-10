@@ -1,7 +1,7 @@
 -module(pw_hub).
 -behaviour(gen_server).
 -export([
-    start_link/0, connect/2, disconnect/1, subscribe/2, unsubscribe_all/1,
+    start_link/0, connect/2, connect/3, disconnect/1, subscribe/2, unsubscribe_all/1,
     notify_user/2, broadcast/2, status_update/2,
     voice_join/4, voice_leave/2, voice_state/4, voice_signal/4,
     call_ring/5, call_decline/2, call_cancel/2, call_accept/4,
@@ -14,7 +14,8 @@
 -record(st, {users = #{}, pids = #{}, subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}}).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
-connect(Uid, Pid) -> gen_server:cast(?MODULE, {connect, Uid, Pid}).
+connect(Uid, Pid) -> connect(Uid, Pid, <<"online">>).
+connect(Uid, Pid, Status) -> gen_server:cast(?MODULE, {connect, Uid, Pid, Status}).
 disconnect(Pid) -> gen_server:cast(?MODULE, {disconnect, Pid}).
 subscribe(Pid, Key) -> gen_server:cast(?MODULE, {subscribe, Pid, Key}).
 unsubscribe_all(Pid) -> gen_server:cast(?MODULE, {unsubscribe_all, Pid}).
@@ -38,15 +39,21 @@ init([]) -> {ok, #st{}}.
 
 handle_call(_, _, St) -> {reply, ok, St}.
 
-handle_cast({connect, Uid, Pid}, St) ->
+handle_cast({connect, Uid, Pid, Status0}, St) ->
     monitor(process, Pid),
     Users = add_to_set(Uid, Pid, St#st.users),
     Pids = maps:put(Pid, Uid, St#st.pids),
     WasOffline = not maps:is_key(Uid, St#st.online),
+    Status = normalize_status(Status0),
     Online = case WasOffline of
         true ->
-            send_to_others(Pids, #{type => presence_online, user_id => Uid, status => <<"online">>}, Pid),
-            maps:put(Uid, <<"online">>, St#st.online);
+            case visible_status(Status) of
+                true ->
+                    send_to_others(Pids, #{type => presence_online, user_id => Uid, status => Status}, Pid),
+                    maps:put(Uid, Status, St#st.online);
+                false ->
+                    St#st.online
+            end;
         false ->
             St#st.online
     end,
@@ -96,7 +103,7 @@ handle_cast({voice_state, ChannelId, Uid, Patch, Profile}, St0) ->
 handle_cast({voice_signal, ChannelId, From, To, Signal}, St) ->
     Key = {voice, ChannelId},
     Room = maps:get(Key, St#st.voices, #{}),
-    relay_signal(Room, To, #{type => voice_signal, channel_id => ChannelId, from_user_id => From, signal => Signal}),
+    relay_signal(Room, From, To, #{type => voice_signal, channel_id => ChannelId, from_user_id => From, signal => Signal}),
     {noreply, St};
 handle_cast({call_ring, Cid, Uid, Pid, Profile, Targets}, St0) ->
     Key = {ring, Cid},
@@ -164,7 +171,7 @@ handle_cast({call_leave, ConversationId, Uid}, St0) ->
     Room = maps:remove(Uid, Room0),
     send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => call_peer_left, conversation_id => ConversationId, user_id => Uid}),
     send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => call_state, conversation_id => ConversationId, users => room_users(Room)}),
-    Calls = maps:put(Key, Room, St0#st.calls),
+    Calls = put_or_remove(Key, Room, St0#st.calls),
     {noreply, St0#st{calls = Calls}};
 handle_cast({call_state, ConversationId, Uid, Patch, Profile}, St0) ->
     Key = {call, ConversationId},
@@ -177,16 +184,26 @@ handle_cast({call_state, ConversationId, Uid, Patch, Profile}, St0) ->
 handle_cast({call_signal, ConversationId, From, To, Signal}, St) ->
     Key = {call, ConversationId},
     Room = maps:get(Key, St#st.calls, #{}),
-    relay_signal(Room, To, #{type => call_signal, conversation_id => ConversationId, from_user_id => From, signal => Signal}),
+    relay_signal(Room, From, To, #{type => call_signal, conversation_id => ConversationId, from_user_id => From, signal => Signal}),
     {noreply, St};
-handle_cast({status_update, Uid, Status}, St) ->
-    case maps:is_key(Uid, St#st.online) of
-        true ->
-            Pids = St#st.pids,
-            send_to_others(Pids, #{type => presence_status, user_id => Uid, status => Status}, undefined),
-            Online = maps:put(Uid, Status, St#st.online),
-            {noreply, St#st{online = Online}};
-        false ->
+handle_cast({status_update, Uid, Status0}, St) ->
+    Status = normalize_status(Status0),
+    Online0 = St#st.online,
+    WasVisible = maps:is_key(Uid, Online0),
+    IsConnected = maps:is_key(Uid, St#st.users),
+    case {IsConnected, WasVisible, visible_status(Status)} of
+        {false, _, _} ->
+            {noreply, St};
+        {true, true, false} ->
+            send_to_others(St#st.pids, #{type => presence_offline, user_id => Uid, status => Status}, undefined),
+            {noreply, St#st{online = maps:remove(Uid, Online0)}};
+        {true, false, true} ->
+            send_to_others(St#st.pids, #{type => presence_online, user_id => Uid, status => Status}, undefined),
+            {noreply, St#st{online = maps:put(Uid, Status, Online0)}};
+        {true, true, true} ->
+            send_to_others(St#st.pids, #{type => presence_status, user_id => Uid, status => Status}, undefined),
+            {noreply, St#st{online = maps:put(Uid, Status, Online0)}};
+        {true, false, false} ->
             {noreply, St}
     end;
 handle_cast(_, St) -> {noreply, St}.
@@ -232,10 +249,10 @@ notify_ring_parties(Targets, Event, Skip) ->
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref), ok.
 
-relay_signal(Room, To, Event) ->
-    case maps:get(To, Room, undefined) of
-        undefined -> ok;
-        Info -> maps:get(pid, Info) ! {hub_json, Event}
+relay_signal(Room, From, To, Event) ->
+    case {maps:is_key(From, Room), maps:get(To, Room, undefined)} of
+        {true, Info} when is_map(Info) -> maps:get(pid, Info) ! {hub_json, Event};
+        _ -> ok
     end,
     ok.
 
@@ -247,6 +264,14 @@ put_or_remove(Key, Room, Map) when map_size(Room) =:= 0 -> maps:remove(Key, Map)
 put_or_remove(Key, Room, Map) -> maps:put(Key, Room, Map).
 room_users(Room) -> [maps:merge(#{user_id => Uid}, maps:remove(pid, Info)) || {Uid, Info} <- maps:to_list(Room)].
 
+normalize_status(<<"busy">>) -> <<"busy">>;
+normalize_status(<<"away">>) -> <<"away">>;
+normalize_status(<<"invisible">>) -> <<"invisible">>;
+normalize_status(_) -> <<"online">>.
+
+visible_status(<<"invisible">>) -> false;
+visible_status(_) -> true.
+
 remove_pid(Pid, St0) ->
     Uid = maps:get(Pid, St0#st.pids, undefined),
     Users = case Uid of undefined -> St0#st.users; _ -> update_set(Uid, Pid, St0#st.users) end,
@@ -256,8 +281,12 @@ remove_pid(Pid, St0) ->
         _ ->
             case maps:find(Uid, Users) of
                 error -> % no longer any PIDs for this user
-                    PrevStatus = maps:get(Uid, St0#st.online, <<"online">>),
-                    send_to_others(Pids, #{type => presence_offline, user_id => Uid, status => PrevStatus}, Pid),
+                    case maps:find(Uid, St0#st.online) of
+                        {ok, PrevStatus} ->
+                            send_to_others(Pids, #{type => presence_offline, user_id => Uid, status => PrevStatus}, Pid);
+                        error ->
+                            ok
+                    end,
                     maps:remove(Uid, St0#st.online);
                 _ -> St0#st.online
             end
@@ -291,7 +320,6 @@ drop_pid_from_rooms(Pid, Rooms, Kind) ->
         Room = lists:foldl(fun(U, R) -> maps:remove(U, R) end, Room0, Gone),
         case {Gone, Room} of
             {[], _} -> maps:put(Key, Room, Acc);
-            {_, R} when map_size(R) =:= 0, Kind =:= call -> maps:put(Key, R, Acc);
             {_, R} when map_size(R) =:= 0 -> Acc;
             {[U | _], R} ->
                 EventType = case Kind of voice -> voice_peer_left; call -> call_peer_left end,

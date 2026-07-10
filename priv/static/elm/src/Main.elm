@@ -63,6 +63,7 @@ bridgeDecoder = D.field "tag" D.string |> D.andThen (\tag ->
         "presence_offline" -> D.map PresenceOffline (D.field "data" D.int)
         "presence_status" -> D.field "data" (D.map2 PresenceStatus (D.field "user_id" D.int) (D.field "status" D.string))
         "status_change" -> D.map SetMyStatus (D.field "data" D.string)
+        "rtc_join_failed" -> D.map RtcJoinFailed (D.field "data" D.string)
         _ -> D.succeed NoOp
     )
 
@@ -307,7 +308,11 @@ update msg model =
         ProfileBio s -> ( { model | profileBio = s }, Cmd.none )
         ProfileAvatarUrl s -> ( { model | profileAvatarUrl = s }, Cmd.none )
         ProfileBannerUrl s -> ( { model | profileBannerUrl = s }, Cmd.none )
-        ProfileStatus s -> ( { model | profileStatus = s }, Cmd.none )
+        ProfileStatus s ->
+            let status = statusPreference s
+            in ( { model | profileStatus = status }
+               , bridgeSend (E.object [("tag", E.string "presence_update"), ("data", E.string status)])
+               )
         ProfileTheme s -> ( { model | profileTheme = s }, bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string s)]) )
 
         SaveProfile ->
@@ -460,7 +465,7 @@ update msg model =
             in case tag of
                 "join_voice" ->
                     case D.decodeValue D.int data of
-                        Ok channelId -> ( { model | voice = updateVoiceMode "voice" channelId model.voice, callMode = InCall }, cmd )
+                        Ok _ -> ( model, cmd )
                         Err _ -> ( model, cmd )
                 "start_call" ->
                     case D.decodeValue D.int data of
@@ -474,9 +479,15 @@ update msg model =
                 "leave_voice" ->
                     ( { model | voice = clearVoice model.voice, callMode = Idle }, cmd )
                 "toggle_mute" ->
-                    ( { model | voice = toggleMute model.voice }, bridgeSend (E.object [("tag", E.string "voice_mute"), ("data", E.bool (not model.voice.muted))]) )
+                    if model.voice.deafened then
+                        ( model, bridgeSend (E.object [("tag", E.string "toast"), ("data", E.string "Undeafen before unmuting.")]) )
+                    else
+                        ( { model | voice = toggleMute model.voice }, bridgeSend (E.object [("tag", E.string "voice_mute"), ("data", E.bool (not model.voice.muted))]) )
                 "toggle_deafen" ->
-                    ( { model | voice = toggleDeafen model.voice }, bridgeSend (E.object [("tag", E.string "voice_deafen"), ("data", E.bool (not model.voice.deafened))]) )
+                    let nextDeafened = not model.voice.deafened
+                    in ( { model | voice = toggleDeafen model.voice }
+                       , bridgeSend (E.object [("tag", E.string "voice_deafen"), ("data", E.bool nextDeafened)])
+                       )
                 "toggle_speaker" ->
                     ( model, cmd )
                 _ ->
@@ -517,6 +528,8 @@ update msg model =
             ( { model | userStatuses = Dict.insert (String.fromInt uid) status model.userStatuses }, Cmd.none )
         SetMyStatus status ->
             ( { model | profileStatus = status }, Cmd.none )
+        RtcJoinFailed _ ->
+            ( { model | voice = clearVoice model.voice, callMode = Idle, callUI = { incoming = model.callUI.incoming, outgoing = Nothing, active = Nothing } }, Cmd.none )
 
         _ -> ( model, Cmd.none )
 
@@ -533,11 +546,12 @@ handleMe val model =
                                     , profileBio = user.bio
                                     , profileAvatarUrl = user.avatarUrl
                                     , profileBannerUrl = user.bannerUrl
-                                    , profileStatus = statusToString user.status
+                                    , profileStatus = statusPreference (statusToString user.status)
                                     , profileTheme = user.theme
                                     }
                                 , Cmd.batch
                                     [ bridgeSend (E.object [("tag", E.string "connect_ws"), ("data", E.null)])
+                                    , bridgeSend (E.object [("tag", E.string "presence_update"), ("data", E.string (statusPreference (statusToString user.status)))])
                                     , apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
                                     , routeCmd model.active
                                     ]
@@ -815,11 +829,19 @@ handleInvitePreview val model =
 
 invitePreviewDecoder : Decoder InvitePreview
 invitePreviewDecoder =
+    D.oneOf
+        [ invitePreviewRawDecoder
+        , D.field "data" invitePreviewRawDecoder
+        ]
+
+
+invitePreviewRawDecoder : Decoder InvitePreview
+invitePreviewRawDecoder =
     D.map8 InvitePreview
         (D.field "code" D.string)
         (D.field "server_id" D.int)
-        (D.field "channel_id" (D.nullable D.int))
-        (D.field "valid" D.bool)
+        (D.field "channel_id" (D.nullable D.int) |> defaultValue Nothing)
+        (D.field "valid" D.bool |> defaultValue True)
         (D.oneOf [ D.at [ "server", "name" ] D.string, D.succeed "Server" ])
         (D.oneOf [ D.at [ "server", "description" ] (D.nullable D.string) |> D.map (Maybe.withDefault ""), D.succeed "" ])
         (D.oneOf [ D.at [ "server", "icon_url" ] (D.nullable D.string) |> D.map (Maybe.withDefault ""), D.succeed "" ])
@@ -886,7 +908,10 @@ toggleMute voice =
 
 toggleDeafen : VoiceState -> VoiceState
 toggleDeafen voice =
-    { voice | deafened = not voice.deafened }
+    if voice.deafened then
+        { voice | deafened = False }
+    else
+        { voice | deafened = True, muted = True }
 
 
 sendMessage : Model -> ( Model, Cmd Msg )
@@ -1042,7 +1067,23 @@ handleWsEvent val model =
                     in ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Maybe.map updateActive model.callUI.active } }, Cmd.none )
                 Err _ -> ( model, Cmd.none )
         Ok ( "call_signal", ev ) -> ( model, Cmd.none )
-        Ok ( "voice_state", ev ) -> ( model, Cmd.none )
+        Ok ( "voice_state", ev ) ->
+            case D.decodeValue voiceStateDecoder ev of
+                Ok ( channelId, users ) ->
+                    let
+                        userDict = Dict.fromList (List.map (\u -> ( u.userId, u )) users)
+                        voice0 = model.voice
+                    in
+                    ( { model | voice = { voice0 | mode = Just "voice", id = Just channelId, users = userDict }, callMode = InCall }, Cmd.none )
+                Err _ ->
+                    ( model, Cmd.none )
+        Ok ( "voice_peer_left", ev ) ->
+            case D.decodeValue (D.field "user_id" D.int) ev of
+                Ok uid ->
+                    let voice0 = model.voice
+                    in ( { model | voice = { voice0 | users = Dict.remove uid model.voice.users } }, Cmd.none )
+                Err _ ->
+                    ( model, Cmd.none )
         Ok ( "voice_user_joined", ev ) -> ( model, Cmd.none )
         Ok ( "voice_user_left", ev ) -> ( model, Cmd.none )
         Ok ( "voice_signal", ev ) -> ( model, Cmd.none )
@@ -1145,6 +1186,19 @@ callStateDecoder =
     D.map2 Tuple.pair
         (D.field "conversation_id" D.int)
         (D.field "users" (D.list decodeCallUser))
+
+voiceStateDecoder : Decoder ( Int, List { userId : Int, muted : Bool, deafened : Bool } )
+voiceStateDecoder =
+    D.map2 Tuple.pair
+        (D.field "channel_id" D.int)
+        (D.field "users" (D.list voiceUserDecoder))
+
+voiceUserDecoder : Decoder { userId : Int, muted : Bool, deafened : Bool }
+voiceUserDecoder =
+    D.map3 (\uid muted deafened -> { userId = uid, muted = muted, deafened = deafened })
+        (D.field "user_id" D.int)
+        (D.field "muted" D.bool |> defaultValue False)
+        (D.field "deafened" D.bool |> defaultValue False)
 
 callPeerJoinedDecoder : Decoder CallUser
 callPeerJoinedDecoder =
@@ -1441,11 +1495,11 @@ renderCompactCallBar active model =
             (if overflow > 0 then [ div [ class "avatar small" ] [ text ("+" ++ String.fromInt overflow) ] ] else [])
           )
         , div [ class "call-bar-controls" ]
-            [ button [ class ("btn icon-btn" ++ if model.voice.muted then " call-muted" else ""), title "Toggle mute", onClick (BridgeEvent "toggle_mute" E.null) ]
+            [ button [ class ("btn icon-btn" ++ if model.voice.muted then " call-muted" else ""), title "Toggle mute", onClickStop (BridgeEvent "toggle_mute" E.null) ]
                 [ text (if model.voice.muted then "🔇" else "🎤") ]
-            , button [ class ("btn icon-btn" ++ if model.voice.deafened then " call-muted" else ""), title "Toggle deafen", onClick (BridgeEvent "toggle_deafen" E.null) ]
+            , button [ class ("btn icon-btn" ++ if model.voice.deafened then " call-muted" else ""), title "Toggle deafen", onClickStop (BridgeEvent "toggle_deafen" E.null) ]
                 [ text (if model.voice.deafened then "🔇" else "🔊") ]
-            , button [ class "btn icon-btn call-decline", title "Leave call", onClick EndCall ]
+            , button [ class "btn icon-btn call-decline", title "Leave call", onClickStop EndCall ]
                 [ text "✕" ]
             ]
         ]
@@ -1713,6 +1767,13 @@ statusClass userStatuses uid =
         Just "invisible" -> "invisible"
         Just _ -> "online"
         Nothing -> "offline"
+
+statusPreference : String -> String
+statusPreference status =
+    case status of
+        "busy" -> "busy"
+        "invisible" -> "invisible"
+        _ -> "online"
 
 renderRightPanel : Model -> Html Msg
 renderRightPanel model =
@@ -2109,7 +2170,8 @@ threadRow t =
                  ++ (if t.score >= 5 || t.replyCount > 10 then [ span [ class "pill hot" ] [ text "hot" ], text " " ] else [])
                  ++ [ text t.title ])
             , div [ class "thread-meta" ]
-                [ span [] [ text t.displayName ]
+                [ avatarImg t.avatarUrl t.displayName "tiny"
+                , span [] [ text t.displayName ]
                 , span [] [ text (String.fromInt t.score ++ " points") ]
                 , span [] [ text (String.fromInt t.replyCount ++ " replies") ]
                 , span [] [ text (String.fromInt t.views ++ " views") ]
@@ -2132,7 +2194,7 @@ renderThreadPage threadId model =
                     , div [ class "post-body" ]
                         [ h1 [ class "thread-title" ] [ text t.title ]
                         , div [ class "post-meta" ]
-                            [ avatarImg "" t.displayName ""
+                            [ avatarImg t.avatarUrl t.displayName ""
                             , b [] [ text t.displayName ]
                             , span [ class "muted" ] [ text (String.fromInt t.score ++ " points") ]
                             , span [ class "muted" ] [ text (ago t.createdAt ++ " ago") ]
@@ -2280,11 +2342,13 @@ memberRow userStatuses m =
 renderVoicePage : Int -> Model -> Html Msg
 renderVoicePage channelId model =
     let joined = model.voice.mode == Just "voice" && model.voice.id == Just channelId
+        members = Maybe.map .members model.currentServer |> Maybe.withDefault []
+        voiceUsers = Dict.values model.voice.users
     in
     div []
         [ div [ class "card pad" ]
             [ h2 [] [ text "Voice channel" ]
-            , p [ class "muted" ] [ text "Join when you want to talk." ]
+            , p [ class "muted" ] [ text "Join when you want to talk. Use Enable audio if your phone or browser blocks playback." ]
             , div [ class "voice-actions" ]
                 [ if joined then
                     button [ class "btn call-decline", onClick EndCall ] [ text "Leave" ]
@@ -2292,8 +2356,36 @@ renderVoicePage channelId model =
                     button [ class "btn", onClick (BridgeEvent "join_voice" (E.int channelId)) ] [ text "Join" ]
                 , button [ class ("btn" ++ if model.voice.muted then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_mute" E.null) ] [ text (if model.voice.muted then "Unmute" else "Mute") ]
                 , button [ class ("btn" ++ if model.voice.deafened then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_deafen" E.null) ] [ text (if model.voice.deafened then "Undeafen" else "Deafen") ]
+                , button [ class "btn secondary", onClick (BridgeEvent "unlock_audio" E.null) ] [ text "Enable audio" ]
                 ]
+            , div [ class "voice-participants" ]
+                (if List.isEmpty voiceUsers then
+                    [ div [ class "empty" ] [ text (if joined then "Waiting for others to join..." else "Join to see voice participants.") ] ]
+                 else
+                    List.map (voiceParticipantRow members) voiceUsers)
             ]
+        ]
+
+voiceParticipantRow : List ServerMember -> { userId : Int, muted : Bool, deafened : Bool } -> Html Msg
+voiceParticipantRow members vu =
+    let maybeMember = List.filter (\m -> m.user.id == vu.userId) members |> List.head
+        name = maybeMember |> Maybe.map (\m -> m.user.displayName) |> Maybe.withDefault ("User " ++ String.fromInt vu.userId)
+        avatarUrl = maybeMember |> Maybe.map (\m -> m.user.avatarUrl) |> Maybe.withDefault ""
+        stateText =
+            if vu.deafened then
+                "Deafened"
+            else if vu.muted then
+                "Muted"
+            else
+                "Speaking enabled"
+    in
+    div [ class "row voice-participant" ]
+        [ avatarImg avatarUrl name "small"
+        , div [ class "grow" ]
+            [ b [] [ text name ]
+            , small [ class "muted" ] [ text stateText ]
+            ]
+        , span [ class ("voice-state-pill" ++ if vu.deafened || vu.muted then " muted" else "") ] [ text (if vu.deafened then "D" else if vu.muted then "M" else "Live") ]
         ]
 
 renderProfilePage : Model -> Html Msg
@@ -2376,12 +2468,11 @@ renderProfileSettings u model =
         , div [ class "field" ]
             [ label [] [ text "Status" ]
             , select [ value model.profileStatus, onInput ProfileStatus ]
-                [ option [ value "online" ] [ text "Online" ]
-                , option [ value "away" ] [ text "Away" ]
+                [ option [ value "online" ] [ text "Online (auto idle)" ]
                 , option [ value "busy" ] [ text "Busy" ]
                 , option [ value "invisible" ] [ text "Invisible" ]
-                , option [ value "offline" ] [ text "Offline" ]
                 ]
+            , small [ class "muted" ] [ text "Online turns to idle automatically when you stop using Plainwire. Invisible shows you as offline." ]
             ]
         , div [ class "field" ]
             [ label [] [ text "Theme" ]
@@ -2671,7 +2762,9 @@ searchUserView u =
 searchThreadView : ForumThread -> Html Msg
 searchThreadView t =
     div [ class "row", onClick (Go ("#thread/" ++ String.fromInt t.id)) ]
-        [ div [] [ b [] [ text t.title ], small [ class "muted" ] [ text t.forumName ] ] ]
+        [ avatarImg t.avatarUrl t.displayName ""
+        , div [] [ b [] [ text t.title ], small [ class "muted" ] [ text (t.forumName ++ " · " ++ t.displayName) ] ]
+        ]
 
 
 -- HELPERS
@@ -2726,6 +2819,7 @@ fmtErr err =
         "invalid_server_name" -> "Server name must be at least 2 characters."
         "invalid_channel_name" -> "Channel name is required."
         "invalid_channel" -> "That invite channel does not belong to this server."
+        "invalid_invite" -> "That invite is invalid, expired, or has been revoked."
         "bad_login" -> "Username or password is incorrect."
         "invalid_json" -> "Could not send the form. Please try again."
         "database_unavailable" -> "The server database is temporarily unavailable."

@@ -30,12 +30,14 @@ fetch(Url0) ->
 
 http_get(Url) ->
     Headers = [{"user-agent", "PlainwireRelay/1.1"}],
-    case httpc:request(get, {binary_to_list(Url), Headers}, [{timeout, 8000}], [{body_format, binary}]) of
+    case httpc:request(get, {binary_to_list(Url), Headers}, [{timeout, 8000}, {autoredirect, false}], [{body_format, binary}]) of
         {ok, {{_, Code, _}, RespHeaders, Body}} when Code >= 200, Code < 300 ->
             case content_length_ok(RespHeaders) andalso byte_size(Body) =< ?MAX_BYTES of
                 true -> {ok, Body};
                 false -> {error, too_large}
             end;
+        {ok, {{_, Code, _}, _, _}} when Code >= 300, Code < 400 ->
+            {error, blocked_url};
         {ok, {{_, Code, _}, _, _}} ->
             {error, {http, Code}};
         {error, Reason} ->
@@ -44,7 +46,7 @@ http_get(Url) ->
 
 content_length_ok(Headers) ->
     case header_value("content-length", Headers) of
-        undefined -> true;
+        undefined -> false;
         Len -> case safe_list_to_integer(string:trim(Len)) of
             N when is_integer(N), N =< ?MAX_BYTES -> true;
             _ -> false

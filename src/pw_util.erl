@@ -189,6 +189,8 @@ security_headers() -> #{
     <<"x-frame-options">> => <<"SAMEORIGIN">>,
     <<"cross-origin-resource-policy">> => <<"same-origin">>,
     <<"referrer-policy">> => <<"same-origin">>,
+    <<"strict-transport-security">> => <<"max-age=31536000; includeSubDomains">>,
+    <<"content-security-policy">> => <<"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'">>,
     <<"permissions-policy">> => <<"camera=(), microphone=(self), geolocation=()">>
 }.
 
@@ -196,7 +198,7 @@ proxied_image(Url0) ->
     Url = bin(Url0),
     case Url of
         <<>> -> <<>>;
-        <<"data:", _/binary>> -> Url;
+        <<"data:", _/binary>> -> <<>>;
         <<"/api/media/", _/binary>> -> Url;
         <<"http://", _/binary>> -> pw_media:proxy_url(Url);
         <<"https://", _/binary>> -> pw_media:proxy_url(Url);
@@ -204,7 +206,7 @@ proxied_image(Url0) ->
     end.
 
 set_cookie(Req, Name, Value) ->
-    Secure = env_bool("COOKIE_SECURE", false),
+    Secure = cookie_secure_default(),
     cowboy_req:set_resp_cookie(Name, Value, Req, #{
         http_only => true,
         secure => Secure,
@@ -213,8 +215,19 @@ set_cookie(Req, Name, Value) ->
         max_age => 2592000
     }).
 
+cookie_secure_default() ->
+    case os:getenv("COOKIE_SECURE") of
+        false ->
+            case os:getenv("PLAINWIRE_PUBLIC_URL") of
+                "https://" ++ _ -> true;
+                _ -> false
+            end;
+        V ->
+            env_bool("COOKIE_SECURE", V =:= "1" orelse V =:= "true" orelse V =:= "TRUE" orelse V =:= "yes")
+    end.
+
 clear_cookie(Req) ->
-    cowboy_req:set_resp_cookie(<<"pw_session">>, <<>>, Req, #{http_only=>true, path=><<"/">>, max_age=>0}).
+    cowboy_req:set_resp_cookie(<<"pw_session">>, <<>>, Req, #{http_only=>true, secure=>cookie_secure_default(), same_site=>lax, path=><<"/">>, max_age=>0}).
 
 cookie_value(Req, Name) ->
     Cookies = cowboy_req:parse_cookies(Req),
