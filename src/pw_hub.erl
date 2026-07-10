@@ -2,7 +2,8 @@
 -behaviour(gen_server).
 -export([
     start_link/0, connect/2, disconnect/1, subscribe/2, unsubscribe_all/1,
-    notify_user/2, broadcast/2, voice_join/4, voice_leave/2, voice_state/4, voice_signal/4,
+    notify_user/2, broadcast/2, status_update/2,
+    voice_join/4, voice_leave/2, voice_state/4, voice_signal/4,
     call_ring/5, call_decline/2, call_cancel/2, call_accept/4,
     call_join/4, call_leave/2, call_state/4, call_signal/4
 ]).
@@ -10,7 +11,7 @@
 
 -define(RING_MS, 45000).
 
--record(st, {users = #{}, pids = #{}, subs = #{}, voices = #{}, calls = #{}, rings = #{}}).
+-record(st, {users = #{}, pids = #{}, subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}}).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 connect(Uid, Pid) -> gen_server:cast(?MODULE, {connect, Uid, Pid}).
@@ -19,6 +20,7 @@ subscribe(Pid, Key) -> gen_server:cast(?MODULE, {subscribe, Pid, Key}).
 unsubscribe_all(Pid) -> gen_server:cast(?MODULE, {unsubscribe_all, Pid}).
 notify_user(Uid, Event) -> gen_server:cast(?MODULE, {notify_user, Uid, Event}).
 broadcast(Key, Event) -> gen_server:cast(?MODULE, {broadcast, Key, Event}).
+status_update(Uid, Status) -> gen_server:cast(?MODULE, {status_update, Uid, Status}).
 voice_join(ChannelId, Uid, Pid, Profile) -> gen_server:cast(?MODULE, {voice_join, ChannelId, Uid, Pid, Profile}).
 voice_leave(ChannelId, Uid) -> gen_server:cast(?MODULE, {voice_leave, ChannelId, Uid}).
 voice_state(ChannelId, Uid, Patch, Profile) -> gen_server:cast(?MODULE, {voice_state, ChannelId, Uid, Patch, Profile}).
@@ -40,7 +42,17 @@ handle_cast({connect, Uid, Pid}, St) ->
     monitor(process, Pid),
     Users = add_to_set(Uid, Pid, St#st.users),
     Pids = maps:put(Pid, Uid, St#st.pids),
-    {noreply, St#st{users = Users, pids = Pids}};
+    WasOffline = not maps:is_key(Uid, St#st.online),
+    Online = case WasOffline of
+        true ->
+            send_to_others(Pids, #{type => presence_online, user_id => Uid, status => <<"online">>}, Pid),
+            maps:put(Uid, <<"online">>, St#st.online);
+        false ->
+            St#st.online
+    end,
+    Pid ! {hub_json, #{type => presence_state, online => maps:keys(Online),
+        statuses => maps:from_list([{U, S} || {U, S} <- maps:to_list(Online)])}},
+    {noreply, St#st{users = Users, pids = Pids, online = Online}};
 handle_cast({disconnect, Pid}, St) -> {noreply, remove_pid(Pid, St)};
 handle_cast({unsubscribe_all, Pid}, St) -> {noreply, St#st{subs = remove_from_all(Pid, St#st.subs)}};
 handle_cast({subscribe, Pid, Key}, St) -> {noreply, St#st{subs = add_to_set(Key, Pid, St#st.subs)}};
@@ -64,7 +76,7 @@ handle_cast({voice_join, ChannelId, Uid, Pid, Profile}, St0) ->
     Room0 = maps:get(Key, St0#st.voices, #{}),
     send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room0)], #{type => voice_peer_joined, channel_id => ChannelId, user_id => Uid, profile => Profile}),
     Room = maps:put(Uid, #{pid => Pid, profile => Profile, muted => false, deafened => false}, Room0),
-    Pid ! {hub_json, #{type => voice_state, channel_id => ChannelId, users => room_users(Room)}},
+    send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => voice_state, channel_id => ChannelId, users => room_users(Room)}),
     {noreply, St0#st{voices = maps:put(Key, Room, St0#st.voices)}};
 handle_cast({voice_leave, ChannelId, Uid}, St0) ->
     Key = {voice, ChannelId},
@@ -90,17 +102,18 @@ handle_cast({call_ring, Cid, Uid, Pid, Profile, Targets}, St0) ->
     Key = {ring, Cid},
     St1 = end_ring(St0, Key, call_cancelled, missed),
     Ref = erlang:send_after(?RING_MS, self(), {ring_timeout, Cid, Uid}),
+    Targets1 = lists:filter(fun(T) -> T =/= Uid end, Targets),
     Ring = #{
         caller_id => Uid,
         caller_pid => Pid,
         caller_profile => Profile,
-        targets => Targets,
+        targets => Targets1,
         declined => [],
         accepted => undefined,
         timer => Ref
     },
-    Pid ! {hub_json, #{type => call_ringing, conversation_id => Cid, targets => length(Targets), profile => Profile}},
-    [notify_user(T, #{type => call_incoming, conversation_id => Cid, from_user_id => Uid, profile => Profile}) || T <- Targets],
+    Pid ! {hub_json, #{type => call_ringing, conversation_id => Cid, targets => length(Targets1), profile => Profile}},
+    [notify_user(T, #{type => call_incoming, conversation_id => Cid, from_user_id => Uid, profile => Profile}) || T <- Targets1],
     {noreply, St1#st{rings = maps:put(Key, Ring, St1#st.rings)}};
 handle_cast({call_decline, Cid, Uid}, St0) ->
     Key = {ring, Cid},
@@ -133,7 +146,7 @@ handle_cast({call_accept, Cid, Uid, Pid, Profile}, St0) ->
     case maps:get(Key, St0#st.rings, undefined) of
         #{caller_id := Caller, caller_pid := CPid, caller_profile := CProfile, targets := Targets, timer := Ref} ->
             cancel_timer(Ref),
-            notify_ring_parties(Targets ++ [Caller], #{type => call_ended, conversation_id => Cid, reason => accepted}, Uid),
+            notify_ring_parties(Targets, #{type => call_ended, conversation_id => Cid, reason => accepted}, Uid),
             notify_user(Caller, #{type => call_accepted, conversation_id => Cid, user_id => Uid, profile => Profile}),
             notify_user(Uid, #{type => call_accepted, conversation_id => Cid, user_id => Caller, profile => CProfile}),
             St1 = St0#st{rings = maps:remove(Key, St0#st.rings)},
@@ -150,7 +163,8 @@ handle_cast({call_leave, ConversationId, Uid}, St0) ->
     Room0 = maps:get(Key, St0#st.calls, #{}),
     Room = maps:remove(Uid, Room0),
     send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => call_peer_left, conversation_id => ConversationId, user_id => Uid}),
-    Calls = put_or_remove(Key, Room, St0#st.calls),
+    send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => call_state, conversation_id => ConversationId, users => room_users(Room)}),
+    Calls = maps:put(Key, Room, St0#st.calls),
     {noreply, St0#st{calls = Calls}};
 handle_cast({call_state, ConversationId, Uid, Patch, Profile}, St0) ->
     Key = {call, ConversationId},
@@ -165,6 +179,16 @@ handle_cast({call_signal, ConversationId, From, To, Signal}, St) ->
     Room = maps:get(Key, St#st.calls, #{}),
     relay_signal(Room, To, #{type => call_signal, conversation_id => ConversationId, from_user_id => From, signal => Signal}),
     {noreply, St};
+handle_cast({status_update, Uid, Status}, St) ->
+    case maps:is_key(Uid, St#st.online) of
+        true ->
+            Pids = St#st.pids,
+            send_to_others(Pids, #{type => presence_status, user_id => Uid, status => Status}, undefined),
+            Online = maps:put(Uid, Status, St#st.online),
+            {noreply, St#st{online = Online}};
+        false ->
+            {noreply, St}
+    end;
 handle_cast(_, St) -> {noreply, St}.
 
 handle_info({ring_timeout, Cid, Uid}, St0) ->
@@ -186,12 +210,12 @@ do_call_join(ConversationId, Uid, Pid, Profile, St0) ->
     Room0 = maps:get(Key, St0#st.calls, #{}),
     send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room0)], #{type => call_peer_joined, conversation_id => ConversationId, user_id => Uid, profile => Profile}),
     Room = maps:put(Uid, #{pid => Pid, profile => Profile, muted => false, deafened => false}, Room0),
-    Pid ! {hub_json, #{type => call_state, conversation_id => ConversationId, users => room_users(Room)}},
+    send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => call_state, conversation_id => ConversationId, users => room_users(Room)}),
     St0#st{calls = maps:put(Key, Room, St0#st.calls)}.
 
 end_ring(St0, Key, EventType, Reason) ->
     case maps:get(Key, St0#st.rings, undefined) of
-        #{caller_id := Caller, caller_pid := CPid, targets := Targets, timer := Ref} ->
+        #{caller_pid := CPid, targets := Targets, timer := Ref} ->
             cancel_timer(Ref),
             Event = #{type => EventType, conversation_id => element(2, Key), reason => Reason},
             CPid ! {hub_json, Event},
@@ -216,6 +240,7 @@ relay_signal(Room, To, Event) ->
     ok.
 
 send_many(Pids, Event) -> [Pid ! {hub_json, Event} || Pid <- Pids, is_pid(Pid)], ok.
+send_to_others(Pids, Event, Skip) -> [Pid ! {hub_json, Event} || Pid <- maps:keys(Pids), Pid =/= Skip, is_pid(Pid)], ok.
 add_to_set(Key, Pid, Map) -> maps:put(Key, lists:usort([Pid | maps:get(Key, Map, [])]), Map).
 remove_from_all(Pid, Map) -> maps:map(fun(_, L) -> lists:delete(Pid, L) end, Map).
 put_or_remove(Key, Room, Map) when map_size(Room) =:= 0 -> maps:remove(Key, Map);
@@ -226,11 +251,22 @@ remove_pid(Pid, St0) ->
     Uid = maps:get(Pid, St0#st.pids, undefined),
     Users = case Uid of undefined -> St0#st.users; _ -> update_set(Uid, Pid, St0#st.users) end,
     Pids = maps:remove(Pid, St0#st.pids),
+    Online = case Uid of
+        undefined -> St0#st.online;
+        _ ->
+            case maps:find(Uid, Users) of
+                error -> % no longer any PIDs for this user
+                    PrevStatus = maps:get(Uid, St0#st.online, <<"online">>),
+                    send_to_others(Pids, #{type => presence_offline, user_id => Uid, status => PrevStatus}, Pid),
+                    maps:remove(Uid, St0#st.online);
+                _ -> St0#st.online
+            end
+    end,
     Subs = remove_from_all(Pid, St0#st.subs),
     Voices = drop_pid_from_rooms(Pid, St0#st.voices, voice),
     Calls = drop_pid_from_rooms(Pid, St0#st.calls, call),
     Rings = drop_caller_rings(Pid, St0#st.rings, St0#st.users),
-    St0#st{users = Users, pids = Pids, subs = Subs, voices = Voices, calls = Calls, rings = Rings}.
+    St0#st{users = Users, pids = Pids, online = Online, subs = Subs, voices = Voices, calls = Calls, rings = Rings}.
 
 update_set(Key, Pid, Map) ->
     L = lists:delete(Pid, maps:get(Key, Map, [])),
@@ -255,6 +291,7 @@ drop_pid_from_rooms(Pid, Rooms, Kind) ->
         Room = lists:foldl(fun(U, R) -> maps:remove(U, R) end, Room0, Gone),
         case {Gone, Room} of
             {[], _} -> maps:put(Key, Room, Acc);
+            {_, R} when map_size(R) =:= 0, Kind =:= call -> maps:put(Key, R, Acc);
             {_, R} when map_size(R) =:= 0 -> Acc;
             {[U | _], R} ->
                 EventType = case Kind of voice -> voice_peer_left; call -> call_peer_left end,

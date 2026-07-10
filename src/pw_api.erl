@@ -66,11 +66,15 @@ uid(Session) -> maps:get(id, maps:get(user, Session)).
 authed(<<"GET">>, [<<"me">>], Req, Session, _) -> pw_util:ok_json(Req, #{ok=>true,data=>Session});
 authed(<<"GET">>, [<<"sync">>], Req, Session, _) -> result(Req, pw_db:sync(uid(Session), qs(Req, <<"since">>)));
 authed(<<"POST">>, [<<"profile">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_profile(uid(Session), maps:get(<<"display_name">>, M, maps:get(display_name, maps:get(user,Session))), M)) end);
-authed(<<"GET">>, [<<"forums">>], Req, _, _) -> result(Req, pw_db:forums());
-authed(<<"GET">>, [<<"threads">>], Req, _, _) -> result(Req, pw_db:threads(qs(Req, <<"forum_id">>), qs(Req, <<"q">>)));
+authed(<<"GET">>, [<<"forums">>], Req, Session, _) -> result(Req, pw_db:forums(uid(Session)));
+authed(<<"POST">>, [<<"forums">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_forum(uid(Session), maps:get(<<"name">>,M,<<>>), maps:get(<<"slug">>,M,<<>>), maps:get(<<"description">>,M,<<>>))) end);
+authed(<<"POST">>, [<<"forum">>, Id, <<"join">>], Req, Session, _) -> result(Req, pw_db:join_forum(uid(Session), Id));
+authed(<<"POST">>, [<<"forum">>, Id, <<"leave">>], Req, Session, _) -> result(Req, pw_db:leave_forum(uid(Session), Id));
+authed(<<"GET">>, [<<"threads">>], Req, Session, _) -> result(Req, pw_db:threads(uid(Session), qs(Req, <<"forum_id">>), qs(Req, <<"q">>)));
 authed(<<"POST">>, [<<"threads">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_thread(uid(Session), maps:get(<<"forum_id">>,M,undefined), maps:get(<<"title">>,M,<<>>), maps:get(<<"body">>,M,<<>>))) end);
 authed(<<"GET">>, [<<"thread">>, Id], Req, Session, _) -> result(Req, pw_db:thread(uid(Session), Id));
 authed(<<"POST">>, [<<"thread">>, Id, <<"replies">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:reply_thread(uid(Session), Id, maps:get(<<"body">>,M,<<>>))) end);
+authed(<<"POST">>, [<<"thread">>, Id, <<"vote">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:vote_thread(uid(Session), Id, maps:get(<<"value">>,M,0))) end);
 authed(<<"GET">>, [<<"users">>], Req, _, _) -> result(Req, pw_db:users(qs(Req, <<"q">>)));
 authed(<<"GET">>, [<<"profile">>, Id], Req, Session, _) -> result(Req, pw_db:profile(uid(Session), Id));
 authed(<<"GET">>, [<<"friends">>], Req, Session, _) -> result(Req, pw_db:friends(uid(Session)));

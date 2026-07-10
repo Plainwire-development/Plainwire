@@ -5,7 +5,7 @@
     register/3, login/2, session/1, logout/1, me/1, update_profile/3,
     sync/2, users/1, profile/2,
     friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friends/1,
-    forums/0, threads/2, thread/2, create_thread/4, reply_thread/3,
+    forums/1, create_forum/4, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, reply_thread/3, vote_thread/3,
     servers/1, create_server/3, update_server/3, server/2, create_channel/4,
     create_invite/4, invite_preview/1, join_invite/2,
     messages/5, post_channel_message/4, delete_message/2,
@@ -48,11 +48,15 @@ friend_accept(Uid, Target) -> call({friend_accept, Uid, Target}).
 friend_remove(Uid, Target) -> call({friend_remove, Uid, Target}).
 friend_block(Uid, Target) -> call({friend_block, Uid, Target}).
 friends(Uid) -> call({friends, Uid}).
-forums() -> call(forums).
-threads(ForumId, Search) -> call({threads, ForumId, Search}).
+forums(Uid) -> call({forums, Uid}).
+create_forum(Uid, Name, Slug, Description) -> call({create_forum, Uid, Name, Slug, Description}).
+join_forum(Uid, ForumId) -> call({join_forum, Uid, ForumId}).
+leave_forum(Uid, ForumId) -> call({leave_forum, Uid, ForumId}).
+threads(Uid, ForumId, Search) -> call({threads, Uid, ForumId, Search}).
 thread(Uid, ThreadId) -> call({thread, Uid, ThreadId}).
 create_thread(Uid, ForumId, Title, Body) -> call({create_thread, Uid, ForumId, Title, Body}).
 reply_thread(Uid, ThreadId, Body) -> call({reply_thread, Uid, ThreadId, Body}).
+vote_thread(Uid, ThreadId, Value) -> call({vote_thread, Uid, ThreadId, Value}).
 servers(Uid) -> call({servers, Uid}).
 create_server(Uid, Name, Desc) -> call({create_server, Uid, Name, Desc}).
 update_server(Uid, Sid, Patch) -> call({update_server, Uid, Sid, Patch}).
@@ -395,27 +399,65 @@ route({friends, Uid}, Conn) ->
           "WHERE fr.user_low = $1 OR fr.user_high = $1 ORDER BY fr.updated_at DESC",
     {ok, Rows} = rows(Conn, Sql, [Uid]),
     {ok, [friend_map(R, Uid) || R <- Rows]};
-route(forums, Conn) ->
+route({forums, Uid}, Conn) ->
     Sql = "SELECT f.id, f.slug, f.name, f.description, f.position, "
-          "(SELECT count(*) FROM threads t WHERE t.forum_id = f.id), "
-          "(SELECT count(*) FROM replies r JOIN threads t2 ON t2.id = r.thread_id WHERE t2.forum_id = f.id), "
-          "(SELECT max(updated_at) FROM threads t3 WHERE t3.forum_id = f.id) "
-          "FROM forums f ORDER BY f.position ASC",
-    {ok, Rows} = rows(Conn, Sql, []),
+           "(SELECT count(*) FROM threads t WHERE t.forum_id = f.id), "
+           "(SELECT count(*) FROM replies r JOIN threads t2 ON t2.id = r.thread_id WHERE t2.forum_id = f.id), "
+          "(SELECT max(updated_at) FROM threads t3 WHERE t3.forum_id = f.id), "
+          "(SELECT count(*) FROM forum_members fm WHERE fm.forum_id = f.id), "
+          "EXISTS(SELECT 1 FROM forum_members fm2 WHERE fm2.forum_id = f.id AND fm2.user_id = $1) "
+          "FROM forums f ORDER BY f.position ASC, lower(f.name) ASC",
+    {ok, Rows} = rows(Conn, Sql, [Uid]),
     {ok, [forum_map(R) || R <- Rows]};
-route({threads, ForumId0, Search0}, Conn) ->
+route({create_forum, Uid, Name0, Slug0, Desc0}, Conn) ->
+    Name = pw_util:clean_text(Name0, 80),
+    Slug = clean_slug(Slug0, Name),
+    Desc = pw_util:clean_text(Desc0, 280),
+    case byte_size(Name) >= 2 andalso byte_size(Slug) >= 2 of
+        false ->
+            {error, invalid_forum};
+        true ->
+            case one(Conn, "SELECT id FROM forums WHERE lower(slug) = lower($1) LIMIT 1", [Slug]) of
+                {ok, [_]} ->
+                    {error, forum_exists};
+                _ ->
+                    Pos = forum_position(Conn),
+                    Now = pw_util:now_ms(),
+                    {ok, Fid} = insert_returning(Conn,
+                        "INSERT INTO forums(slug, name, description, position) VALUES($1,$2,$3,$4) RETURNING id",
+                        [Slug, Name, Desc, Pos]),
+                    ok = exec(Conn, "INSERT INTO forum_members(forum_id, user_id, joined_at) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", [Fid, Uid, Now]),
+                    {ok, #{id => Fid}}
+            end
+    end;
+route({join_forum, Uid, ForumId0}, Conn) ->
+    ForumId = pw_util:int(ForumId0),
+    case one(Conn, "SELECT id FROM forums WHERE id = $1", [ForumId]) of
+        {ok, [_]} ->
+            ok = exec(Conn, "INSERT INTO forum_members(forum_id, user_id, joined_at) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", [ForumId, Uid, pw_util:now_ms()]),
+            {ok, #{id => ForumId}};
+        _ -> {error, not_found}
+    end;
+route({leave_forum, Uid, ForumId0}, Conn) ->
+    ForumId = pw_util:int(ForumId0),
+    ok = exec(Conn, "DELETE FROM forum_members WHERE forum_id = $1 AND user_id = $2", [ForumId, Uid]),
+    {ok, #{id => ForumId}};
+route({threads, Uid, ForumId0, Search0}, Conn) ->
     ForumId = pw_util:int(ForumId0),
     Search = pw_util:clean_text(Search0, 80),
-    {Sql, Params} = thread_sql(ForumId, Search),
+    {Sql, Params0} = thread_sql(ForumId, Search),
+    Params = [Uid | Params0],
     {ok, Rows} = rows(Conn, Sql, Params),
     {ok, [thread_row_map(R) || R <- Rows]};
 route({thread, Uid, ThreadId0}, Conn) ->
     ThreadId = pw_util:int(ThreadId0),
     _ = exec(Conn, "UPDATE threads SET views = views + 1 WHERE id = $1", [ThreadId]),
-    Sql = "SELECT t.id, t.forum_id, f.name, t.user_id, u.username, u.display_name, u.avatar_url, "
-          "t.title, t.body, t.created_at, t.updated_at, t.reply_count, t.locked, t.pinned, t.views "
-          "FROM threads t JOIN forums f ON f.id = t.forum_id JOIN users u ON u.id = t.user_id WHERE t.id = $1",
-    case one(Conn, Sql, [ThreadId]) of
+    Sql1 = "SELECT t.id, t.forum_id, f.name, t.user_id, u.username, u.display_name, u.avatar_url, "
+           "t.title, t.body, t.created_at, t.updated_at, t.reply_count, t.locked, t.pinned, t.views, "
+           "COALESCE(t.score,0), COALESCE(tv.value,0) "
+           "FROM threads t JOIN forums f ON f.id = t.forum_id JOIN users u ON u.id = t.user_id "
+           "LEFT JOIN thread_votes tv ON tv.thread_id = t.id AND tv.user_id = $2 WHERE t.id = $1",
+    case one(Conn, Sql1, [ThreadId, Uid]) of
         {ok, T} when is_list(T) ->
             {ok, Rs} = rows(Conn,
                 "SELECT r.id, r.thread_id, r.user_id, u.username, u.display_name, u.avatar_url, "
@@ -464,6 +506,27 @@ route({reply_thread, Uid, ThreadId0, Body0}, Conn) ->
             {error, locked};
         _ ->
             {error, invalid_reply}
+    end;
+route({vote_thread, Uid, ThreadId0, Value0}, Conn) ->
+    ThreadId = pw_util:int(ThreadId0),
+    Value = case pw_util:int(Value0) of 1 -> 1; -1 -> -1; _ -> 0 end,
+    case one(Conn, "SELECT id FROM threads WHERE id = $1", [ThreadId]) of
+        {ok, [_]} ->
+            Now = pw_util:now_ms(),
+            ok = exec(Conn, "DELETE FROM thread_votes WHERE thread_id = $1 AND user_id = $2", [ThreadId, Uid]),
+            case Value of
+                0 -> ok;
+                _ -> ok = exec(Conn, "INSERT INTO thread_votes(thread_id, user_id, value, created_at) VALUES($1,$2,$3,$4)", [ThreadId, Uid, Value, Now])
+            end,
+            ok = exec(Conn,
+                "UPDATE threads SET score = COALESCE((SELECT sum(value) FROM thread_votes WHERE thread_id = $1), 0), "
+                "upvotes = (SELECT count(*) FROM thread_votes WHERE thread_id = $1 AND value = 1), "
+                "downvotes = (SELECT count(*) FROM thread_votes WHERE thread_id = $1 AND value = -1) WHERE id = $1",
+                [ThreadId]),
+            {ok, Row} = one(Conn, "SELECT score, COALESCE((SELECT value FROM thread_votes WHERE thread_id = $1 AND user_id = $2),0) FROM threads WHERE id = $1", [ThreadId, Uid]),
+            {ok, #{thread_id => ThreadId, score => lists:nth(1, Row), user_vote => lists:nth(2, Row)}};
+        _ ->
+            {error, not_found}
     end;
 route({servers, Uid}, Conn) ->
     Sql = "SELECT s.id, s.owner_id, s.name, s.description, s.icon_url, s.created_at, s.updated_at, sm.role, "
@@ -567,7 +630,7 @@ route({create_invite, Uid, Sid0, ChannelId0, MaxUses0}, Conn) ->
         {true, true} ->
             case existing_invite(Conn, Sid, ChannelId, MaxUses) of
                 {ok, Code} ->
-                    {ok, #{code => Code, url => <<"#/invite/", Code/binary>>, existing => true}};
+                    {ok, #{code => Code, url => <<"#invite/", Code/binary>>, existing => true}};
                 not_found ->
                     Code = pw_util:random_token(12),
                     Now = pw_util:now_ms(),
@@ -575,7 +638,7 @@ route({create_invite, Uid, Sid0, ChannelId0, MaxUses0}, Conn) ->
                         "INSERT INTO server_invites(code, server_id, channel_id, creator_id, max_uses, uses, created_at, expires_at, revoked) "
                         "VALUES($1,$2,$3,$4,$5,0,$6,0,false)",
                         [Code, Sid, ChannelId, Uid, MaxUses, Now]),
-                    {ok, #{code => Code, url => <<"#/invite/", Code/binary>>}}
+                    {ok, #{code => Code, url => <<"#invite/", Code/binary>>}}
             end;
         {false, _} ->
             {error, forbidden};
@@ -860,10 +923,13 @@ migrations() -> [
         "CREATE TABLE IF NOT EXISTS sessions(token_hash text PRIMARY KEY, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
         "csrf text NOT NULL, created_at bigint NOT NULL, expires_at bigint NOT NULL, last_seen bigint NOT NULL)",
         "CREATE TABLE IF NOT EXISTS forums(id serial PRIMARY KEY, slug text UNIQUE NOT NULL, name text NOT NULL, description text NOT NULL, position integer NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS forum_members(forum_id integer NOT NULL REFERENCES forums(id) ON DELETE CASCADE, "
+        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, joined_at bigint NOT NULL, PRIMARY KEY(forum_id, user_id))",
         "CREATE TABLE IF NOT EXISTS threads(id serial PRIMARY KEY, forum_id integer NOT NULL REFERENCES forums(id) ON DELETE CASCADE, "
         "user_id integer NOT NULL REFERENCES users(id), title text NOT NULL, body text NOT NULL, created_at bigint NOT NULL, "
         "updated_at bigint NOT NULL, reply_count integer NOT NULL DEFAULT 0, locked boolean NOT NULL DEFAULT false, "
-        "pinned boolean NOT NULL DEFAULT false, views integer NOT NULL DEFAULT 0)",
+        "pinned boolean NOT NULL DEFAULT false, views integer NOT NULL DEFAULT 0, score integer NOT NULL DEFAULT 0, "
+        "upvotes integer NOT NULL DEFAULT 0, downvotes integer NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS replies(id serial PRIMARY KEY, thread_id integer NOT NULL REFERENCES threads(id) ON DELETE CASCADE, "
         "user_id integer NOT NULL REFERENCES users(id), body text NOT NULL, created_at bigint NOT NULL, updated_at bigint NOT NULL)",
         "CREATE TABLE IF NOT EXISTS friendships(user_low integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
@@ -893,16 +959,35 @@ migrations() -> [
         "channel_id integer, creator_id integer NOT NULL REFERENCES users(id), max_uses integer NOT NULL DEFAULT 0, uses integer NOT NULL DEFAULT 0, "
         "created_at bigint NOT NULL, expires_at bigint NOT NULL DEFAULT 0, revoked boolean NOT NULL DEFAULT false)",
         "CREATE INDEX IF NOT EXISTS idx_threads_forum ON threads(forum_id, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_forum_members_user ON forum_members(user_id, forum_id)",
         "CREATE INDEX IF NOT EXISTS idx_replies_thread ON replies(thread_id, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_messages_scope ON messages(scope, scope_id, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, seen, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_direct_members_user ON direct_members(user_id, thread_id)",
         "CREATE INDEX IF NOT EXISTS idx_server_members_user ON server_members(user_id, server_id)",
-        "CREATE INDEX IF NOT EXISTS idx_invites_server ON server_invites(server_id, revoked)"
+        "CREATE INDEX IF NOT EXISTS idx_invites_server ON server_invites(server_id, revoked)",
+        "CREATE TABLE IF NOT EXISTS thread_votes(thread_id integer NOT NULL REFERENCES threads(id) ON DELETE CASCADE, "
+        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, value integer NOT NULL CHECK(value IN (-1, 1)), "
+        "created_at bigint NOT NULL, PRIMARY KEY(thread_id, user_id))",
+        "CREATE INDEX IF NOT EXISTS idx_thread_votes_user ON thread_votes(user_id, thread_id)"
     ]},
     {2, [
         "CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(scope, scope_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen DESC)"
+    ]},
+    {3, [
+        "ALTER TABLE threads ADD COLUMN IF NOT EXISTS score integer NOT NULL DEFAULT 0",
+        "ALTER TABLE threads ADD COLUMN IF NOT EXISTS upvotes integer NOT NULL DEFAULT 0",
+        "ALTER TABLE threads ADD COLUMN IF NOT EXISTS downvotes integer NOT NULL DEFAULT 0",
+        "CREATE TABLE IF NOT EXISTS thread_votes(thread_id integer NOT NULL REFERENCES threads(id) ON DELETE CASCADE, "
+        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, value integer NOT NULL CHECK(value IN (-1, 1)), "
+        "created_at bigint NOT NULL, PRIMARY KEY(thread_id, user_id))",
+        "CREATE INDEX IF NOT EXISTS idx_thread_votes_user ON thread_votes(user_id, thread_id)"
+    ]},
+    {4, [
+        "CREATE TABLE IF NOT EXISTS forum_members(forum_id integer NOT NULL REFERENCES forums(id) ON DELETE CASCADE, "
+        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, joined_at bigint NOT NULL, PRIMARY KEY(forum_id, user_id))",
+        "CREATE INDEX IF NOT EXISTS idx_forum_members_user ON forum_members(user_id, forum_id)"
     ]}
 ].
 
@@ -968,6 +1053,7 @@ store_image_url(Url0) ->
     case Url of
         <<>> -> <<>>;
         <<"data:", _/binary>> -> Url;
+        <<"/api/media/", _/binary>> -> Url;
         <<"http://", _/binary>> -> Url;
         <<"https://", _/binary>> -> Url;
         _ -> <<>>
@@ -977,6 +1063,19 @@ normalize_max_uses(undefined) -> 0;
 normalize_max_uses(I) when is_integer(I), I > 0, I =< 1000 -> I;
 normalize_max_uses(I) when is_integer(I), I > 1000 -> 1000;
 normalize_max_uses(_) -> 0.
+
+forum_position(Conn) ->
+    case one(Conn, "SELECT COALESCE(max(position), 0) + 1 FROM forums", []) of
+        {ok, [P]} -> pw_util:int(P);
+        _ -> 1
+    end.
+
+clean_slug(<<>>, Name) -> clean_slug(Name, <<>>);
+clean_slug(undefined, Name) -> clean_slug(Name, <<>>);
+clean_slug(Slug0, _Name) ->
+    Lower = string:lowercase(binary_to_list(pw_util:clean_text(Slug0, 40))),
+    Filtered = [C || C <- Lower, (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse C =:= $_ orelse C =:= $-],
+    pw_util:bin(Filtered).
 
 valid_invite_channel(_Conn, _Sid, undefined) -> true;
 valid_invite_channel(Conn, Sid, ChannelId) ->
@@ -1057,20 +1156,21 @@ user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen]) ->
       banner_url => pw_util:proxied_image(Banner),
       status => Status, theme => Theme, created_at => Created, last_seen => LastSeen}.
 
-forum_map([Id, Slug, Name, Desc, Pos, Tc, Rc, Last]) ->
+forum_map([Id, Slug, Name, Desc, Pos, Tc, Rc, Last, Members, Joined]) ->
     #{id => pw_util:int(Id), slug => Slug, name => Name, description => Desc, position => pw_util:int(Pos),
-      thread_count => pw_util:int(Tc), reply_count => pw_util:int(Rc), last_at => db_null(Last)}.
+      thread_count => pw_util:int(Tc), reply_count => pw_util:int(Rc), last_at => db_null(Last),
+      member_count => pw_util:int(Members), joined => Joined}.
 
-thread_row_map([Id, Fid, Fname, Uid, U, D, Title, Created, Updated, Rc, Views, Pinned]) ->
+thread_row_map([Id, Fid, Fname, Uid, U, D, Title, Body, Created, Updated, Rc, Views, Pinned, Score, UserVote]) ->
     #{id => Id, forum_id => Fid, forum_name => Fname, user_id => Uid, username => U,
-      display_name => D, title => Title, created_at => Created, updated_at => Updated,
-      reply_count => Rc, views => Views, pinned => Pinned}.
+       display_name => D, title => Title, body => Body, created_at => Created, updated_at => Updated,
+       reply_count => Rc, views => Views, pinned => Pinned, score => Score, user_vote => UserVote}.
 
-thread_full_map([Id, Fid, Fname, Uid, U, D, Avatar, Title, Body, Created, Updated, Rc, Locked, Pinned, Views]) ->
+thread_full_map([Id, Fid, Fname, Uid, U, D, Avatar, Title, Body, Created, Updated, Rc, Locked, Pinned, Views, Score, UserVote]) ->
     #{id => Id, forum_id => Fid, forum_name => Fname, user_id => Uid, username => U,
       display_name => D, avatar_url => pw_util:proxied_image(Avatar), title => Title, body => Body,
       created_at => Created, updated_at => Updated, reply_count => Rc, locked => Locked,
-      pinned => Pinned, views => Views}.
+      pinned => Pinned, views => Views, score => Score, user_vote => UserVote}.
 
 reply_map([Id, Tid, Uid, U, D, Avatar, Body, Created, Updated]) ->
     #{id => Id, thread_id => Tid, user_id => Uid, username => U, display_name => D,
@@ -1137,24 +1237,22 @@ notification_map([Id, Kind, Body, Url, Seen, Created]) ->
     #{id => Id, kind => Kind, body => Body, url => Url, seen => Seen, created_at => Created}.
 
 thread_sql(undefined, <<>>) ->
-    {"SELECT t.id, t.forum_id, f.name, t.user_id, u.username, u.display_name, t.title, t.created_at, t.updated_at, "
-     "t.reply_count, t.views, t.pinned FROM threads t JOIN forums f ON f.id = t.forum_id "
-     "JOIN users u ON u.id = t.user_id ORDER BY t.pinned DESC, t.updated_at DESC LIMIT 120", []};
+    {thread_select() ++ " ORDER BY t.pinned DESC, t.score DESC, t.updated_at DESC LIMIT 120", []};
 thread_sql(F, <<>>) ->
-    {"SELECT t.id, t.forum_id, f.name, t.user_id, u.username, u.display_name, t.title, t.created_at, t.updated_at, "
-     "t.reply_count, t.views, t.pinned FROM threads t JOIN forums f ON f.id = t.forum_id "
-     "JOIN users u ON u.id = t.user_id WHERE t.forum_id = $1 ORDER BY t.pinned DESC, t.updated_at DESC LIMIT 120", [F]};
+    {thread_select() ++ " WHERE t.forum_id = $2 ORDER BY t.pinned DESC, t.score DESC, t.updated_at DESC LIMIT 120", [F]};
 thread_sql(undefined, S) ->
     L = <<"%", S/binary, "%">>,
-    {"SELECT t.id, t.forum_id, f.name, t.user_id, u.username, u.display_name, t.title, t.created_at, t.updated_at, "
-     "t.reply_count, t.views, t.pinned FROM threads t JOIN forums f ON f.id = t.forum_id "
-     "JOIN users u ON u.id = t.user_id WHERE t.title ILIKE $1 OR t.body ILIKE $2 ORDER BY t.updated_at DESC LIMIT 120", [L, L]};
+    {thread_select() ++ " WHERE t.title ILIKE $2 OR t.body ILIKE $3 ORDER BY t.score DESC, t.updated_at DESC LIMIT 120", [L, L]};
 thread_sql(F, S) ->
     L = <<"%", S/binary, "%">>,
-    {"SELECT t.id, t.forum_id, f.name, t.user_id, u.username, u.display_name, t.title, t.created_at, t.updated_at, "
-     "t.reply_count, t.views, t.pinned FROM threads t JOIN forums f ON f.id = t.forum_id "
-     "JOIN users u ON u.id = t.user_id WHERE t.forum_id = $1 AND (t.title ILIKE $2 OR t.body ILIKE $3) "
-     "ORDER BY t.updated_at DESC LIMIT 120", [F, L, L]}.
+    {thread_select() ++ " WHERE t.forum_id = $2 AND (t.title ILIKE $3 OR t.body ILIKE $4) "
+     "ORDER BY t.score DESC, t.updated_at DESC LIMIT 120", [F, L, L]}.
+
+thread_select() ->
+    "SELECT t.id, t.forum_id, f.name, t.user_id, u.username, u.display_name, t.title, t.body, t.created_at, t.updated_at, "
+    "t.reply_count, t.views, t.pinned, COALESCE(t.score,0), COALESCE(tv.value,0) "
+    "FROM threads t JOIN forums f ON f.id = t.forum_id JOIN users u ON u.id = t.user_id "
+    "LEFT JOIN thread_votes tv ON tv.thread_id = t.id AND tv.user_id = $1".
 
 message_select() ->
     "SELECT m.id, m.scope, m.scope_id, m.user_id, u.username, u.display_name, u.avatar_url, "

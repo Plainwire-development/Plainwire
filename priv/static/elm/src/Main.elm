@@ -42,6 +42,12 @@ decodeBridge val = case D.decodeValue bridgeDecoder val of
     Ok msg -> msg
     Err _ -> NoOp
 
+decodeFileInput : E.Value -> Msg
+decodeFileInput val =
+    case D.decodeValue (D.map2 FileUpload (D.field "id" D.string) (D.field "data" (D.nullable D.string))) val of
+        Ok msg -> msg
+        Err _ -> NoOp
+
 bridgeDecoder : Decoder Msg
 bridgeDecoder = D.field "tag" D.string |> D.andThen (\tag ->
     case tag of
@@ -50,7 +56,13 @@ bridgeDecoder = D.field "tag" D.string |> D.andThen (\tag ->
         "sync_data" -> D.map handleSyncData (D.field "data" D.value)
         "hash_change" -> D.map SetRoute (D.field "data" D.string)
         "file_read" -> D.map2 FileUpload (D.field "id" D.string) (D.field "data" (D.nullable D.string))
+        "rtc_peer_connected" -> D.map2 SetCallPeerConnected (D.field "user_id" D.int) (D.field "connected" D.bool)
         "tick" -> D.succeed (Tick (Time.millisToPosix 0))
+        "presence_state" -> D.field "data" D.value |> D.map PresenceState
+        "presence_online" -> D.field "data" (D.map2 PresenceOnline (D.field "user_id" D.int) (D.field "status" D.string))
+        "presence_offline" -> D.map PresenceOffline (D.field "data" D.int)
+        "presence_status" -> D.field "data" (D.map2 PresenceStatus (D.field "user_id" D.int) (D.field "status" D.string))
+        "status_change" -> D.map SetMyStatus (D.field "data" D.string)
         _ -> D.succeed NoOp
     )
 
@@ -88,13 +100,13 @@ init _ url _ =
       , voice = { mode = Nothing, id = Nothing, stream = Nothing
                 , peers = Dict.empty, users = Dict.empty
                 , muted = False, deafened = False }
-      , callUI = { incoming = Nothing, outgoing = Nothing }
+      , callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
       , callMode = Idle, soundEnabled = True, replyTo = Nothing
       , toast = Nothing, modal = Nothing, settingsTab = "profile"
       , inputText = "", sidebarOpen = False, ctxMenu = Nothing
       , threadReply = "", searchQuery = ""
       , authMode = "login", authUsername = "", authBusy = False, authDisplayName = ""
-      , authPassword = "", serverName = "", serverDescription = "", booting = True
+      , authPassword = "", serverName = "", serverDescription = "", booting = True, userStatuses = Dict.empty
       , profileDisplayName = "", profileBio = ""
       , profileAvatarUrl = "", profileBannerUrl = ""
       , profileStatus = "online", profileTheme = "system"
@@ -118,8 +130,18 @@ update msg model =
         SetRoute hash ->
             let route = String.dropLeft 1 hash
                 active = parseRoute route
+                clearedInvite =
+                    case active of
+                        InviteView _ -> Nothing
+                        _ -> model.invitePreview
+                clearedThread =
+                    case active of
+                        ThreadView _ -> Nothing
+                        _ -> model.currentThread
             in ( { model | active = active
                   , msg = [], sidebarOpen = False
+                  , invitePreview = clearedInvite
+                  , currentThread = clearedThread
                   }
                , Cmd.batch
                     [ bridgeSend (E.object
@@ -150,25 +172,30 @@ update msg model =
                 Just err -> ( { model | toast = Just err }, Cmd.none )
                 Nothing -> ( { model | authBusy = True, toast = Nothing }, apiSend (encodeApiRequest (ApiPost path body)) )
 
-        ApiSuccess tag val ->
-            case tag of
-                "/me" -> handleMe val model
-                "/login" -> handleMe val model
-                "/register" -> handleMe val model
-                "/sync?since=0" -> handleSync val model
-                "/forums" -> handleList (D.list decodeForum) (\items m -> { m | forums = items }) val model
-                "/logout" -> ( model, bridgeSend (E.object [("tag", E.string "reload"), ("data", E.null)]) )
-                "/profile" -> ( { model | toast = Just "Profile saved" }, apiSend (encodeApiRequest (ApiGet "/me")) )
-                "/notifications/seen" -> ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
-                "/friends/request" -> ( { model | toast = Just "Friend request sent" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
-                "/friends/accept" -> ( { model | toast = Just "Friend added" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
-                "/friends/remove" -> ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
-                "/friends/block" -> ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
-                "/conversations" -> handleCreateConversation val model
-                "/threads" -> handleCreateThread val model
-                _ ->
+        ApiSuccess tag method val ->
+            case ( tag, method ) of
+                ( "/me", _ ) -> handleMe val model
+                ( "/login", _ ) -> handleMe val model
+                ( "/register", _ ) -> handleMe val model
+                ( "/sync?since=0", _ ) -> handleSync val model
+                ( "/forums", "GET" ) -> handleList (D.list decodeForum) (\items m -> { m | forums = items }) val model
+                ( "/forums", _ ) -> handleCreateForum val model
+                ( "/logout", _ ) -> ( model, bridgeSend (E.object [("tag", E.string "reload"), ("data", E.null)]) )
+                ( "/profile", _ ) -> ( { model | toast = Just "Profile saved" }, apiSend (encodeApiRequest (ApiGet "/me")) )
+                ( "/notifications/seen", _ ) -> ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
+                ( "/friends/request", _ ) -> ( { model | toast = Just "Friend request sent" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
+                ( "/friends/accept", _ ) -> ( { model | toast = Just "Friend added" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
+                ( "/friends/remove", _ ) -> ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
+                ( "/friends/block", _ ) -> ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
+                ( "/conversations", _ ) -> handleCreateConversation val model
+                ( "/threads", _ ) -> handleCreateThread val model
+                ( _, _ ) ->
                     if String.startsWith "/threads?forum_id=" tag then
                         handleList (D.list decodeThread) (\items m -> { m | threads = items }) val model
+                    else if String.startsWith "/thread/" tag && String.endsWith "/vote" tag then
+                        handleThreadVote val model
+                    else if String.startsWith "/forum/" tag && (String.endsWith "/join" tag || String.endsWith "/leave" tag) then
+                        ( model, apiSend (encodeApiRequest (ApiGet "/forums")) )
                     else if String.startsWith "/thread/" tag && String.endsWith "/replies" tag then
                         handleReplyCreated val model
                     else if String.startsWith "/thread/" tag then
@@ -208,8 +235,10 @@ update msg model =
                     else
                         ( model, Cmd.none )
 
-        ApiError tag err ->
-            if err == "not_authenticated" && model.me == Nothing then
+        ApiError tag method err ->
+            if String.startsWith "/invites/" tag && not (String.endsWith "/join" tag) then
+                ( { model | invitePreview = Nothing, toast = Just (fmtErr err), modal = Just "join_invite", modalUserIds = "" }, setHash "#" )
+            else if err == "not_authenticated" && model.me == Nothing then
                 ( { model | booting = False }, Cmd.none )
             else
                 ( { model | booting = False, authBusy = False, toast = Just (fmtErr err) }, Cmd.none )
@@ -234,6 +263,11 @@ update msg model =
             { id = m.id, userId = m.userId, displayName = m.displayName
             , body = m.body } }, Cmd.none )
         CancelReply -> ( { model | replyTo = Nothing }, Cmd.none )
+
+        VoteThread threadId value ->
+            ( model
+            , apiSend (encodeApiRequest (ApiPost ("/thread/" ++ String.fromInt threadId ++ "/vote") (Just (E.object [("value", E.int value)]))))
+            )
 
         DeleteMessage mid ->
             ( { model | ctxMenu = Nothing }, apiSend (encodeApiRequest (ApiPost ("/delete_message/" ++ String.fromInt mid) (Just (E.object [])))) )
@@ -274,18 +308,21 @@ update msg model =
         ProfileAvatarUrl s -> ( { model | profileAvatarUrl = s }, Cmd.none )
         ProfileBannerUrl s -> ( { model | profileBannerUrl = s }, Cmd.none )
         ProfileStatus s -> ( { model | profileStatus = s }, Cmd.none )
-        ProfileTheme s -> ( { model | profileTheme = s }, Cmd.none )
+        ProfileTheme s -> ( { model | profileTheme = s }, bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string s)]) )
 
         SaveProfile ->
             ( model
-            , apiSend (encodeApiRequest (ApiPost "/profile" (Just (E.object
-                [ ("display_name", E.string model.profileDisplayName)
-                , ("bio", E.string model.profileBio)
-                , ("avatar_url", E.string model.profileAvatarUrl)
-                , ("banner_url", E.string model.profileBannerUrl)
-                , ("status", E.string model.profileStatus)
-                , ("theme", E.string model.profileTheme)
-                ]))))
+            , Cmd.batch
+                [ apiSend (encodeApiRequest (ApiPost "/profile" (Just (E.object
+                    [ ("display_name", E.string model.profileDisplayName)
+                    , ("bio", E.string model.profileBio)
+                    , ("avatar_url", E.string model.profileAvatarUrl)
+                    , ("banner_url", E.string model.profileBannerUrl)
+                    , ("status", E.string model.profileStatus)
+                    , ("theme", E.string model.profileTheme)
+                    ]))))
+                , bridgeSend (E.object [("tag", E.string "presence_update"), ("data", E.string model.profileStatus)])
+                ]
             )
 
         SearchQuery q -> ( { model | searchQuery = q }, Cmd.none )
@@ -307,7 +344,9 @@ update msg model =
                     ( { model | toast = Just "Open an invite link like /#invite/CODE to join." }, Cmd.none )
 
         AcceptCall conversationId ->
-            ( { model | callUI = { incoming = Nothing, outgoing = Nothing }, callMode = Connected, voice = updateVoiceMode "call" conversationId model.voice }
+            let active = { conversationId = conversationId, users = [], startTime = model.serverTime, expanded = False }
+            in
+            ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Just active }, callMode = Connected, voice = updateVoiceMode "call" conversationId model.voice }
             , Cmd.batch
                 [ bridgeSend (E.object [("tag", E.string "accept_call"), ("data", E.int conversationId)])
                 , playRingtone False
@@ -315,7 +354,7 @@ update msg model =
             )
 
         DeclineCall conversationId ->
-            ( { model | callUI = { incoming = Nothing, outgoing = Nothing }, callMode = Idle }
+            ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }, callMode = Idle }
             , Cmd.batch
                 [ bridgeSend (E.object [("tag", E.string "decline_call"), ("data", E.int conversationId)])
                 , playRingtone False
@@ -324,12 +363,65 @@ update msg model =
             )
 
         EndCall ->
-            ( { model | callUI = { incoming = Nothing, outgoing = Nothing }, callMode = Idle, voice = clearVoice model.voice }
+            let
+                myId = Maybe.map .id model.me
+                markLeft active =
+                    let remaining = List.filter (\u -> Just u.userId /= myId) active.users
+                    in { active | users = remaining }
+                clearedActive = case model.callUI.active of
+                    Just a ->
+                        let remaining = List.filter (\u -> Just u.userId /= myId) a.users
+                        in if List.isEmpty remaining then Nothing else Just { a | users = remaining }
+                    Nothing -> Nothing
+            in
+            ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = clearedActive }, callMode = Idle, voice = clearVoice model.voice }
             , bridgeSend (E.object [("tag", E.string "end_call"), ("data", E.null)])
             )
 
+        ToggleCallOverlay ->
+            let toggle a = { a | expanded = not a.expanded }
+            in ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Maybe.map toggle model.callUI.active } }, Cmd.none )
+
+        SetCallPeerConnected userId connected ->
+            let
+                updateUser u =
+                    if u.userId == userId then
+                        { u | connected = connected }
+                    else
+                        u
+                updateActive active =
+                    { active | users = List.map updateUser active.users }
+            in
+            ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Maybe.map updateActive model.callUI.active } }, Cmd.none )
+
+        StartCall conversationId ->
+            let active = { conversationId = conversationId, users = [], startTime = model.serverTime, expanded = False }
+            in
+            ( { model | callUI = { incoming = Nothing, outgoing = model.callUI.outgoing, active = Just active }, callMode = Ringing, voice = updateVoiceMode "call" conversationId model.voice }
+            , bridgeSend (E.object [("tag", E.string "start_call"), ("data", E.int conversationId)])
+            )
+
+        JoinCall conversationId ->
+            let active = { conversationId = conversationId, users = [], startTime = model.serverTime, expanded = False }
+            in
+            ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Just active }, callMode = Connected, voice = updateVoiceMode "call" conversationId model.voice }
+            , bridgeSend (E.object [("tag", E.string "accept_call"), ("data", E.int conversationId)])
+            )
+
+        CallSignal _ _ ->
+            ( model, Cmd.none )
+
         NewThreadModal maybeForumId ->
             ( { model | modal = Just ("new_thread:" ++ maybeIntString maybeForumId), modalTitle = "", modalBody = "", modalUserIds = maybeIntString maybeForumId }, Cmd.none )
+
+        NewForumModal ->
+            ( { model | modal = Just "new_forum", modalTitle = "", modalBody = "", modalUserIds = "" }, Cmd.none )
+
+        JoinForum forumId ->
+            ( model, apiSend (encodeApiRequest (ApiPost ("/forum/" ++ String.fromInt forumId ++ "/join") (Just (E.object [])))) )
+
+        LeaveForum forumId ->
+            ( model, apiSend (encodeApiRequest (ApiPost ("/forum/" ++ String.fromInt forumId ++ "/leave") (Just (E.object [])))) )
 
         NewDmModal ->
             ( { model | modal = Just "new_dm", modalTitle = "", modalUserIds = "" }, Cmd.none )
@@ -343,7 +435,10 @@ update msg model =
         SubmitModal -> submitModal model
 
         InviteModal serverId ->
-            ( { model | modal = Just ("invite:" ++ String.fromInt serverId), modalTitle = "", modalBody = "0", modalUserIds = "" }, Cmd.none )
+            if serverId == 0 then
+                ( { model | modal = Just "join_invite", modalTitle = "", modalBody = "0", modalUserIds = "" }, Cmd.none )
+            else
+                ( { model | modal = Just ("invite:" ++ String.fromInt serverId), modalTitle = "", modalBody = "0", modalUserIds = "" }, Cmd.none )
 
         ChannelModal serverId ->
             ( { model | modal = Just ("channel:" ++ String.fromInt serverId), modalTitle = "", modalBody = "text" }, Cmd.none )
@@ -367,14 +462,40 @@ update msg model =
                     case D.decodeValue D.int data of
                         Ok channelId -> ( { model | voice = updateVoiceMode "voice" channelId model.voice, callMode = InCall }, cmd )
                         Err _ -> ( model, cmd )
+                "start_call" ->
+                    case D.decodeValue D.int data of
+                        Ok conversationId ->
+                            let active = { conversationId = conversationId, users = [], startTime = model.serverTime, expanded = False }
+                            in ( { model | callUI = { incoming = Nothing, outgoing = model.callUI.outgoing, active = Just active }, callMode = Ringing, voice = updateVoiceMode "call" conversationId model.voice }, cmd )
+                        Err _ ->
+                            ( model, cmd )
+                "cancel_call" ->
+                    ( { model | callUI = { incoming = model.callUI.incoming, outgoing = Nothing, active = Nothing }, callMode = Idle, voice = clearVoice model.voice }, cmd )
                 "leave_voice" ->
                     ( { model | voice = clearVoice model.voice, callMode = Idle }, cmd )
                 "toggle_mute" ->
                     ( { model | voice = toggleMute model.voice }, bridgeSend (E.object [("tag", E.string "voice_mute"), ("data", E.bool (not model.voice.muted))]) )
                 "toggle_deafen" ->
                     ( { model | voice = toggleDeafen model.voice }, bridgeSend (E.object [("tag", E.string "voice_deafen"), ("data", E.bool (not model.voice.deafened))]) )
+                "toggle_speaker" ->
+                    ( model, cmd )
                 _ ->
                     ( model, cmd )
+
+        ReadFile id ->
+            ( model, readFile id )
+
+        FileUpload id maybeData ->
+            case maybeData of
+                Just data ->
+                    if id == "profileAvatarFile" then
+                        ( { model | profileAvatarUrl = data }, Cmd.none )
+                    else if id == "profileBannerFile" then
+                        ( { model | profileBannerUrl = data }, Cmd.none )
+                    else
+                        ( model, Cmd.none )
+                Nothing ->
+                    ( { model | toast = Just "Could not read that file" }, Cmd.none )
 
         CloseCtx ->
             ( { model | ctxMenu = Nothing }, Cmd.none )
@@ -383,6 +504,19 @@ update msg model =
             case model.ctxMenu |> Maybe.andThen (\menu -> listAt idx menu.items) of
                 Just item -> update item.msg { model | ctxMenu = Nothing }
                 Nothing -> ( { model | ctxMenu = Nothing }, Cmd.none )
+
+        PresenceState val ->
+            case D.decodeValue (D.dict D.string) val of
+                Ok statuses -> ( { model | userStatuses = statuses }, Cmd.none )
+                Err _ -> ( model, Cmd.none )
+        PresenceOnline uid status ->
+            ( { model | userStatuses = Dict.insert (String.fromInt uid) status model.userStatuses }, Cmd.none )
+        PresenceOffline uid ->
+            ( { model | userStatuses = Dict.remove (String.fromInt uid) model.userStatuses }, Cmd.none )
+        PresenceStatus uid status ->
+            ( { model | userStatuses = Dict.insert (String.fromInt uid) status model.userStatuses }, Cmd.none )
+        SetMyStatus status ->
+            ( { model | profileStatus = status }, Cmd.none )
 
         _ -> ( model, Cmd.none )
 
@@ -487,6 +621,17 @@ handleCreateThread val model =
         Err _ -> ( model, apiSend (encodeApiRequest (ApiGet "/forums")) )
 
 
+handleCreateForum : E.Value -> Model -> ( Model, Cmd Msg )
+handleCreateForum val model =
+    case D.decodeValue (D.field "id" D.int) val of
+        Ok id ->
+            ( { model | modal = Nothing, modalTitle = "", modalBody = "", modalUserIds = "" }
+            , Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/forums")), setHash ("#forum/" ++ String.fromInt id) ]
+            )
+        Err _ ->
+            ( { model | modal = Nothing }, apiSend (encodeApiRequest (ApiGet "/forums")) )
+
+
 submitModal : Model -> ( Model, Cmd Msg )
 submitModal model =
     case model.modal of
@@ -506,6 +651,17 @@ submitModal model =
                             )
                     Nothing ->
                         ( { model | toast = Just "Choose a category ID" }, Cmd.none )
+            else if kind == "new_forum" then
+                if String.length (String.trim model.modalTitle) < 2 then
+                    ( { model | toast = Just "Add a community name" }, Cmd.none )
+                else
+                    ( { model | modal = Nothing }
+                    , apiSend (encodeApiRequest (ApiPost "/forums" (Just (E.object
+                        [ ("name", E.string model.modalTitle)
+                        , ("slug", E.string model.modalUserIds)
+                        , ("description", E.string model.modalBody)
+                        ]))))
+                    )
             else if kind == "new_dm" then
                 let ids = csvInts model.modalUserIds in
                 if List.isEmpty ids then
@@ -544,6 +700,15 @@ submitModal model =
                         )
                     Nothing ->
                         ( { model | modal = Nothing }, Cmd.none )
+            else if kind == "join_invite" then
+                let code = String.trim model.modalUserIds
+                in if String.isEmpty code then
+                    ( { model | toast = Just "Enter an invite code" }, Cmd.none )
+                else
+                    ( { model | modal = Nothing }
+                    , setHash ("#invite/" ++ code)
+                    )
+
             else if String.startsWith "edit_server:" kind then
                 case String.toInt (String.dropLeft 12 kind) of
                     Just serverId ->
@@ -572,6 +737,35 @@ handleReplyCreated val model =
         Err _ -> ( model, Cmd.none )
 
 
+handleThreadVote : E.Value -> Model -> ( Model, Cmd Msg )
+handleThreadVote val model =
+    case D.decodeValue threadVoteDecoder val of
+        Ok vote ->
+            let
+                updateThread t =
+                    if t.id == vote.threadId then
+                        { t | score = vote.score, userVote = vote.userVote }
+                    else
+                        t
+            in
+            ( { model
+                | threads = List.map updateThread model.threads
+                , currentThread = Maybe.map updateThread model.currentThread
+              }
+            , Cmd.none
+            )
+        Err _ ->
+            ( { model | toast = Just "Could not update vote." }, Cmd.none )
+
+
+threadVoteDecoder : Decoder { threadId : Int, score : Int, userVote : Int }
+threadVoteDecoder =
+    D.map3 (\threadId score userVote -> { threadId = threadId, score = score, userVote = userVote })
+        (D.field "thread_id" D.int)
+        (D.field "score" D.int)
+        (D.field "user_vote" D.int)
+
+
 threadDetailDecoder : Decoder { thread : ForumThread, replies : List Reply }
 threadDetailDecoder =
     D.map2 (\thread replies -> { thread = thread, replies = replies })
@@ -588,13 +782,13 @@ handleServerData val model =
 
 handleInviteCreated : E.Value -> Model -> ( Model, Cmd Msg )
 handleInviteCreated val model =
-    case D.decodeValue (D.field "url" D.string) val of
-        Ok url ->
-            ( { model | toast = Just "Invite copied" }
-            , Cmd.batch [ copyText ("/" ++ url), routeCmd model.active ]
+    case ( D.decodeValue (D.field "code" D.string) val, D.decodeValue (D.field "url" D.string) val ) of
+        ( Ok code, Ok url ) ->
+            ( { model | modal = Just ("invite_result:" ++ code ++ ":" ++ url) }
+            , Cmd.none
             )
-        Err _ ->
-            ( { model | toast = Just "Invite created" }, routeCmd model.active )
+        _ ->
+            ( { model | modal = Just ("invite_result:error:") }, Cmd.none )
 
 
 serverDataDecoder : Decoder ServerData
@@ -608,7 +802,7 @@ serverDataDecoder =
 handleProfile : E.Value -> Model -> ( Model, Cmd Msg )
 handleProfile val model =
     case D.decodeValue (D.field "user" decodeUser) val of
-        Ok user -> ( { model | currentProfile = Just user }, Cmd.none )
+        Ok user -> ( { model | currentProfile = Just user }, bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string user.theme)]) )
         Err _ -> ( model, Cmd.none )
 
 
@@ -616,7 +810,7 @@ handleInvitePreview : E.Value -> Model -> ( Model, Cmd Msg )
 handleInvitePreview val model =
     case D.decodeValue invitePreviewDecoder val of
         Ok invite -> ( { model | invitePreview = Just invite }, Cmd.none )
-        Err _ -> ( model, Cmd.none )
+        Err _ -> ( { model | invitePreview = Nothing, toast = Just "Could not load that invite.", modal = Just "join_invite", modalUserIds = "" }, setHash "#" )
 
 
 invitePreviewDecoder : Decoder InvitePreview
@@ -626,10 +820,10 @@ invitePreviewDecoder =
         (D.field "server_id" D.int)
         (D.field "channel_id" (D.nullable D.int))
         (D.field "valid" D.bool)
-        (D.at [ "server", "name" ] D.string)
-        (D.at [ "server", "description" ] D.string)
-        (D.at [ "server", "icon_url" ] D.string)
-        (D.at [ "server", "member_count" ] D.int)
+        (D.oneOf [ D.at [ "server", "name" ] D.string, D.succeed "Server" ])
+        (D.oneOf [ D.at [ "server", "description" ] (D.nullable D.string) |> D.map (Maybe.withDefault ""), D.succeed "" ])
+        (D.oneOf [ D.at [ "server", "icon_url" ] (D.nullable D.string) |> D.map (Maybe.withDefault ""), D.succeed "" ])
+        (D.oneOf [ D.at [ "server", "member_count" ] D.int, D.succeed 0 ])
 
 
 handleCreateServer : E.Value -> Model -> ( Model, Cmd Msg )
@@ -656,7 +850,7 @@ routeCmd active =
         ChannelView id -> apiSend (encodeApiRequest (ApiGet ("/messages?scope=channel&scope_id=" ++ String.fromInt id)))
         ServerView id -> apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt id)))
         ProfileView id -> apiSend (encodeApiRequest (ApiGet ("/profile/" ++ String.fromInt id)))
-        InviteView code -> apiSend (encodeApiRequest (ApiGet ("/invites/" ++ code)))
+        InviteView code -> if code /= "" then apiSend (encodeApiRequest (ApiGet ("/invites/" ++ code))) else Cmd.none
         SearchView q -> Cmd.batch
             [ apiSend (encodeApiRequest (ApiGet ("/users?q=" ++ q)))
             , apiSend (encodeApiRequest (ApiGet ("/threads?q=" ++ q)))
@@ -765,23 +959,108 @@ handleWsEvent val model =
         Ok ( "call_incoming", ev ) ->
             handleCallIncoming ev model
         Ok ( "call_ringing", ev ) ->
-            ( { model | callUI = { incoming = Nothing, outgoing = model.callUI.outgoing }, callMode = Ringing }, Cmd.none )
-        Ok ( "call_accepted", _ ) ->
-            ( { model | callUI = { incoming = Nothing, outgoing = Nothing }, callMode = Connected }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
+            case D.decodeValue callOutgoingDecoder ev of
+                Ok out ->
+                    ( { model | callUI = { incoming = Nothing, outgoing = Just { conversationId = out.convId, userId = 0, displayName = out.displayName, avatarUrl = out.avatarUrl }, active = model.callUI.active }, callMode = Ringing }, playOutgoingRingtone True )
+                Err _ ->
+                    ( { model | callUI = { incoming = Nothing, outgoing = model.callUI.outgoing, active = model.callUI.active }, callMode = Ringing }, playOutgoingRingtone True )
+        Ok ( "call_accepted", ev ) ->
+            case D.decodeValue callAcceptedDecoder ev of
+                Ok accepted ->
+                    let
+                        peer = { userId = accepted.userId, displayName = accepted.displayName, avatarUrl = accepted.avatarUrl, muted = False, deafened = False, connected = False }
+                        addPeer users =
+                            if List.any (\u -> u.userId == peer.userId) users then
+                                users
+                            else
+                                users ++ [ peer ]
+                        active =
+                            case model.callUI.active of
+                                Just a ->
+                                    Just { a | conversationId = if a.conversationId == 0 then accepted.convId else a.conversationId, users = addPeer a.users }
+                                Nothing ->
+                                    Just { conversationId = accepted.convId, users = [ peer ], startTime = model.serverTime, expanded = False }
+                    in
+                    ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = active }, callMode = Connected }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
+                Err _ ->
+                    ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = model.callUI.active }, callMode = Connected }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
         Ok ( "call_declined", _ ) ->
-            ( { model | callUI = { incoming = Nothing, outgoing = Nothing }, callMode = Idle }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
+            ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }, callMode = Idle }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
         Ok ( "call_cancelled", _ ) ->
-            ( { model | callUI = { incoming = Nothing, outgoing = Nothing }, callMode = Idle }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
-        Ok ( "call_ended", _ ) ->
-            ( { model | callUI = { incoming = Nothing, outgoing = Nothing }, callMode = Idle, voice = clearVoice model.voice }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
-        Ok ( "call_state", ev ) -> ( model, Cmd.none )
-        Ok ( "call_peer_joined", ev ) -> ( model, Cmd.none )
-        Ok ( "call_peer_left", ev ) -> ( model, Cmd.none )
+            ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }, callMode = Idle }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
+        Ok ( "call_ended", ev ) ->
+            case D.decodeValue (D.field "reason" D.string) ev of
+                Ok "accepted" ->
+                    ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = model.callUI.active } }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
+                _ ->
+                    let cid = case D.decodeValue (D.field "conversation_id" D.int) ev of
+                            Ok id -> id
+                            Err _ -> 0
+                        joinedCall = isJoinedCall cid model
+                    in if joinedCall then
+                        ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = model.callUI.active } }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
+                       else
+                        ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }, callMode = Idle, voice = clearVoice model.voice }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
+        Ok ( "call_state", ev ) ->
+            case D.decodeValue callStateDecoder ev of
+                Ok ( cid, users ) ->
+                    let currentCid = case model.callUI.active of
+                            Just a -> a.conversationId
+                            Nothing -> 0
+                        isCurrentCall = cid == currentCid || currentCid == 0
+                    in if isCurrentCall then
+                        let existing = Maybe.andThen (\a -> if a.conversationId == cid then Just a else Nothing) model.callUI.active
+                            safeUsers =
+                                if List.isEmpty users && isJoinedCall cid model then
+                                    Maybe.withDefault [] (Maybe.map .users existing)
+                                else
+                                    users
+                            active = { conversationId = cid, users = safeUsers
+                                , startTime = Maybe.withDefault model.serverTime (Maybe.map .startTime existing)
+                                , expanded = Maybe.withDefault False (Maybe.map .expanded existing)
+                                }
+                        in ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Just active } }, Cmd.none )
+                       else
+                        ( model, Cmd.none )
+                Err _ -> ( model, Cmd.none )
+        Ok ( "call_peer_joined", ev ) ->
+            case D.decodeValue callPeerJoinedDecoder ev of
+                Ok peer ->
+                    let addUser users =
+                            if List.any (\u -> u.userId == peer.userId) users then
+                                users
+                            else
+                                users ++ [ peer ]
+                        updateActive a = { a | users = addUser a.users }
+                    in ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Maybe.map updateActive model.callUI.active } }, Cmd.none )
+                Err _ -> ( model, Cmd.none )
+        Ok ( "call_peer_left", ev ) ->
+            case D.decodeValue (D.field "user_id" D.int) ev of
+                Ok uid ->
+                    let removeUser users = List.filter (\u -> u.userId /= uid) users
+                        updateActive a = { a | users = removeUser a.users }
+                    in ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Maybe.map updateActive model.callUI.active } }, Cmd.none )
+                Err _ -> ( model, Cmd.none )
         Ok ( "call_signal", ev ) -> ( model, Cmd.none )
         Ok ( "voice_state", ev ) -> ( model, Cmd.none )
         Ok ( "voice_user_joined", ev ) -> ( model, Cmd.none )
         Ok ( "voice_user_left", ev ) -> ( model, Cmd.none )
         Ok ( "voice_signal", ev ) -> ( model, Cmd.none )
+        Ok ( "presence_state", ev ) ->
+            case D.decodeValue (D.field "statuses" (D.dict D.string)) ev of
+                Ok statuses -> ( { model | userStatuses = statuses }, Cmd.none )
+                Err _ ->
+                    case D.decodeValue (D.field "online" (D.list D.int)) ev of
+                        Ok ids -> ( { model | userStatuses = Dict.fromList (List.map (\id -> ( String.fromInt id, "online" )) ids) }, Cmd.none )
+                        Err _ -> ( model, Cmd.none )
+        Ok ( "presence_online", ev ) ->
+            case D.decodeValue (D.map2 (\uid s -> ( uid, s )) (D.field "user_id" D.int) (D.field "status" D.string |> D.maybe |> D.map (Maybe.withDefault "online"))) ev of
+                Ok ( uid, status ) -> ( { model | userStatuses = Dict.insert (String.fromInt uid) status model.userStatuses }, Cmd.none )
+                Err _ -> ( model, Cmd.none )
+        Ok ( "presence_offline", ev ) ->
+            case D.decodeValue (D.field "user_id" D.int) ev of
+                Ok uid -> ( { model | userStatuses = Dict.remove (String.fromInt uid) model.userStatuses }, Cmd.none )
+                Err _ -> ( model, Cmd.none )
         Ok ( "error", ev ) ->
             ( model
             , bridgeSend (E.object
@@ -828,7 +1107,7 @@ handleCallIncoming ev model =
             ( { model | callUI =
                 { incoming = Just { conversationId = convId, userId = userId
                                   , displayName = displayName, avatarUrl = avatarUrl }
-                , outgoing = Nothing }
+                , outgoing = Nothing, active = Nothing }
               , callMode = Ringing
               }
             , bridgeSend (E.object
@@ -842,9 +1121,40 @@ callIncomingDecoder : Decoder { convId : Int, userId : Int, displayName : String
 callIncomingDecoder =
     D.map4 (\c u d a -> { convId = c, userId = u, displayName = d, avatarUrl = a })
         (D.field "conversation_id" D.int)
+        (D.field "from_user_id" D.int)
+        (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "Unknown" ])
+        (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
+
+callOutgoingDecoder : Decoder { convId : Int, displayName : String, avatarUrl : String }
+callOutgoingDecoder =
+    D.map3 (\c d a -> { convId = c, displayName = d, avatarUrl = a })
+        (D.field "conversation_id" D.int)
+        (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "Unknown" ])
+        (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
+
+callAcceptedDecoder : Decoder { convId : Int, userId : Int, displayName : String, avatarUrl : String }
+callAcceptedDecoder =
+    D.map4 (\c u d a -> { convId = c, userId = u, displayName = d, avatarUrl = a })
+        (D.field "conversation_id" D.int)
         (D.field "user_id" D.int)
-        (D.oneOf [ D.field "display_name" D.string, D.succeed "Unknown" ])
-        (D.oneOf [ D.field "avatar_url" D.string, D.succeed "" ])
+        (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "Unknown" ])
+        (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
+
+callStateDecoder : Decoder ( Int, List CallUser )
+callStateDecoder =
+    D.map2 Tuple.pair
+        (D.field "conversation_id" D.int)
+        (D.field "users" (D.list decodeCallUser))
+
+callPeerJoinedDecoder : Decoder CallUser
+callPeerJoinedDecoder =
+    D.map6 CallUser
+        (D.field "user_id" D.int)
+        (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "Unknown" ])
+        (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
+        (D.succeed False)
+        (D.succeed False)
+        (D.succeed False)
 
 
 -- VIEW
@@ -904,6 +1214,15 @@ modalContent kind model =
             ]
         , modalActions "Create thread"
         ]
+    else if kind == "new_forum" then
+        [ modalHead "Create community" "Make a public r/community for focused discussions."
+        , div [ class "modal-body" ]
+            [ div [ class "field" ] [ label [] [ text "Community name" ], input [ value model.modalTitle, placeholder "Gaming, News, Art...", onInput ModalTitle ] [] ]
+            , div [ class "field" ] [ label [] [ text "r/ slug" ], input [ value model.modalUserIds, placeholder "gaming", onInput ModalUserIds ] [] ]
+            , div [ class "field" ] [ label [] [ text "Description" ], textarea [ value model.modalBody, placeholder "What should people post here?", onInput ModalBody ] [] ]
+            ]
+        , modalActions "Create community"
+        ]
     else if kind == "new_dm" then
         [ modalHead "New message" "Start a DM or group chat." 
         , div [ class "modal-body" ]
@@ -934,6 +1253,14 @@ modalContent kind model =
             ]
         , modalActions "Create channel"
         ]
+    else if kind == "join_invite" then
+        [ modalHead "Join a Server" "Enter an invite code to join."
+        , div [ class "modal-body" ]
+            [ div [ class "field" ] [ label [] [ text "Invite code" ], input [ value model.modalUserIds, placeholder "e.g. abc123", onInput ModalUserIds ] [] ]
+            ]
+        , modalActions "Join"
+        ]
+
     else if String.startsWith "invite:" kind then
         [ modalHead "Create invite" "Copy a join link for this server."
         , div [ class "modal-body" ]
@@ -952,6 +1279,31 @@ modalContent kind model =
             ]
         , modalActions "Save server"
         ]
+    else if String.startsWith "invite_result:" kind then
+        let rest = String.dropLeft 14 kind
+            parts = String.split ":" rest
+            url = Maybe.withDefault "" (listAt 1 parts)
+            displayLink = url
+        in if String.startsWith "error" rest then
+            [ modalHead "Invite failed" "Could not create invite."
+            , div [ class "modal-actions" ] [ button [ class "btn", onClick CloseModal ] [ text "Close" ] ]
+            ]
+           else
+            [ modalHead "Invite created" "Share this link with friends."
+            , div [ class "modal-body" ]
+                [ div [ class "field" ]
+                    [ label [] [ text "Invite link" ]
+                    , div [ class "invite-code-box" ]
+                        [ input [ class "invite-code-input", readonly True, value displayLink ] []
+                        , button [ class "btn", onClick (CopyText displayLink) ] [ text "Copy" ]
+                        ]
+                    ]
+                , p [ class "muted modal-hint" ] [ text "Anyone with this link can join the server." ]
+                ]
+            , div [ class "modal-actions" ]
+                [ button [ class "btn", onClick CloseModal ] [ text "Done" ]
+                ]
+            ]
     else
         []
 
@@ -1019,17 +1371,30 @@ stopClick : Attribute Msg
 stopClick =
     custom "click" (D.succeed { message = NoOp, stopPropagation = True, preventDefault = False })
 
+onClickStop : Msg -> Attribute Msg
+onClickStop msg =
+    custom "click" (D.succeed { message = msg, stopPropagation = True, preventDefault = True })
+
 renderCallLayer : Model -> Html Msg
 renderCallLayer model =
-    let popups = List.filterMap identity
+    let inCall = model.callMode == Connected || model.callMode == InCall || model.callMode == Ringing
+        showInCall = inCall || model.voice.mode == Just "call" || model.voice.mode == Just "voice"
+        popups = List.filterMap identity
             [ Maybe.map (\i -> renderCallPopup "incoming" i model) model.callUI.incoming
             , Maybe.map (\o -> renderCallPopup "outgoing" o model) model.callUI.outgoing
             ]
-        activeDock = case model.callMode of
-            Connected -> [ renderActiveCallDock model ]
-            InCall -> [ renderActiveCallDock model ]
+        activeOverlay = case ( showInCall, model.callUI.active ) of
+            ( True, Just active ) ->
+                let joinedCall = isJoinedCall active.conversationId model
+                in if not joinedCall && List.isEmpty active.users then
+                    []
+                else if active.expanded then
+                    [ renderExpandedCallOverlay active model ]
+                else
+                    [ renderCompactCallBar active model ]
             _ -> []
-    in div [ class "call-layer" ] (popups ++ activeDock)
+    in if List.isEmpty popups && List.isEmpty activeOverlay then text ""
+       else div [ class "call-layer" ] (popups ++ activeOverlay)
 
 renderCallPopup : String -> CallPopup -> Model -> Html Msg
 renderCallPopup kind popup model =
@@ -1044,7 +1409,7 @@ renderCallPopup kind popup model =
                     ]
             "outgoing" ->
                 div [ class "call-popup-actions" ]
-                    [ button [ class "btn call-decline", onClick (DeclineCall popup.conversationId) ] [ text "Cancel" ]
+                    [ button [ class "btn call-decline", onClick (BridgeEvent "cancel_call" (E.int popup.conversationId)) ] [ text "Cancel" ]
                     ]
             _ -> text ""
     in div [ class ("call-popup " ++ kind) ]
@@ -1059,24 +1424,81 @@ renderCallPopup kind popup model =
         , actions
         ]
 
-renderActiveCallDock : Model -> Html Msg
-renderActiveCallDock model =
-    div [ class "call-popup active-call" ]
-        [ div [ class "call-popup-head" ]
-            [ div [ class "call-avatar-wrap" ]
-                [ div [ class "avatar big" ] [ text "♪" ]
-                , span [ class "call-status-dot live" ] []
-                ]
-            , div []
-                [ p [ class "call-popup-title" ] [ text "Voice connected" ]
-                , p [ class "call-popup-sub" ] [ text (if model.voice.deafened then "Deafened" else if model.voice.muted then "Muted" else "Live audio") ]
-                , div [ class "call-wave" ] [ span [] [], span [] [], span [] [], span [] [], span [] [] ]
-                ]
+renderCompactCallBar : ActiveCall -> Model -> Html Msg
+renderCompactCallBar active model =
+    let count = List.length active.users
+        countText = if count == 0 then "Connecting..." else String.fromInt count ++ " participant" ++ (if count /= 1 then "s" else "")
+        userAvatars = List.take 3 active.users
+            |> List.map (\u -> avatarImg u.avatarUrl u.displayName "small")
+        overflow = count - 3
+    in div [ class "call-bar compact", onClick ToggleCallOverlay ]
+        [ div [ class "call-bar-icon" ] [ text "♪" ]
+        , div [ class "call-bar-info" ]
+            [ span [ class "call-bar-title" ] [ text "In Call" ]
+            , span [ class "call-bar-sub" ] [ text countText ]
             ]
-        , div [ class "call-popup-controls" ]
-            [ button [ class "btn secondary", onClick (BridgeEvent "toggle_mute" E.null) ] [ text (if model.voice.muted then "Unmute" else "Mute") ]
-            , button [ class "btn secondary", onClick (BridgeEvent "toggle_deafen" E.null) ] [ text (if model.voice.deafened then "Undeafen" else "Deafen") ]
-            , button [ class "btn call-decline", onClick EndCall ] [ text "Disconnect" ]
+        , div [ class "call-bar-avatars" ] (userAvatars ++
+            (if overflow > 0 then [ div [ class "avatar small" ] [ text ("+" ++ String.fromInt overflow) ] ] else [])
+          )
+        , div [ class "call-bar-controls" ]
+            [ button [ class ("btn icon-btn" ++ if model.voice.muted then " call-muted" else ""), title "Toggle mute", onClick (BridgeEvent "toggle_mute" E.null) ]
+                [ text (if model.voice.muted then "🔇" else "🎤") ]
+            , button [ class ("btn icon-btn" ++ if model.voice.deafened then " call-muted" else ""), title "Toggle deafen", onClick (BridgeEvent "toggle_deafen" E.null) ]
+                [ text (if model.voice.deafened then "🔇" else "🔊") ]
+            , button [ class "btn icon-btn call-decline", title "Leave call", onClick EndCall ]
+                [ text "✕" ]
+            ]
+        ]
+
+renderExpandedCallOverlay : ActiveCall -> Model -> Html Msg
+renderExpandedCallOverlay active model =
+    let duration = floor (toFloat (model.serverTime - active.startTime) / 1000)
+        minutes = String.fromInt (duration // 60)
+        seconds = String.fromInt (modBy 60 duration) |> String.padLeft 2 '0'
+        timerText = minutes ++ ":" ++ seconds
+    in div [ class "call-overlay expanded" ]
+        [ div [ class "call-overlay-header" ]
+            [ div [ class "call-overlay-title" ]
+                [ span [ class "call-overlay-icon" ] [ text "♪" ]
+                , span [] [ text "In Call" ]
+                , span [ class "call-overlay-timer" ] [ text timerText ]
+                ]
+            , button [ class "btn icon-btn", title "Minimize", onClick ToggleCallOverlay ] [ text "─" ]
+            ]
+        , div [ class "call-overlay-users" ]
+            (if List.isEmpty active.users then
+                [ div [ class "call-empty" ] [ text "Connecting audio..." ] ]
+             else
+                List.map renderCallUser active.users)
+        , div [ class "call-overlay-controls" ]
+            [ button [ class ("btn" ++ if model.voice.muted then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_mute" E.null) ]
+                [ text (if model.voice.muted then "🔇 Unmute" else "🎤 Mute") ]
+            , button [ class ("btn" ++ if model.voice.deafened then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_deafen" E.null) ]
+                [ text (if model.voice.deafened then "🔇 Undeafen" else "🔊 Deafen") ]
+            , button [ class "btn secondary", onClick (BridgeEvent "toggle_speaker" E.null) ] [ text "🔈 Speaker" ]
+            , button [ class "btn call-decline", onClick EndCall ] [ text "✕" ]
+            ]
+        ]
+
+renderCallUser : CallUser -> Html Msg
+renderCallUser u =
+    let
+        avatarClass = "small" ++ if u.connected && not u.muted then " live" else ""
+        statusText =
+            if u.muted then
+                "Muted"
+            else if u.deafened then
+                "Deafened"
+            else if u.connected then
+                "Connected"
+            else
+                "Connecting"
+    in div [ class "call-user-row" ]
+        [ avatarImg u.avatarUrl u.displayName avatarClass
+        , div [ class "call-user-info" ]
+            [ span [ class "call-user-name" ] [ text u.displayName ]
+            , span [ class ("call-user-status" ++ if u.muted then " muted" else if u.deafened then " deafened" else "") ]
+                [ text statusText ]
             ]
         ]
 
@@ -1153,8 +1575,44 @@ renderApp model =
               , onClick CloseSidebar
               ] []
         , renderMobileNav model
+        , renderServersSheet model
         , renderContextMenu model
         , renderModal model
+        ]
+
+renderServersSheet : Model -> Html Msg
+renderServersSheet model =
+    if not model.sidebarOpen then text "" else
+    div [ class "servers-sheet", onClick CloseSidebar ]
+        [ div [ class "servers-sheet-card", stopClick ]
+            [ h3 [] [ text "Servers" ]
+            , if List.isEmpty model.servers then
+                p [ class "muted" ] [ text "No servers yet." ]
+              else
+                div [] (List.map (\s -> serverSheetRow s model) model.servers)
+            , div [ style "margin-top" "12px", class "nav-actions" ]
+                [ button [ class "btn", onClick (Go "#new-server") ] [ text "New Server" ]
+                , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Use Invite" ]
+                ]
+            , button [ class "btn secondary", style "margin-top" "8px", onClick CloseSidebar ] [ text "Close" ]
+            ]
+        ]
+
+serverSheetRow : Server -> Model -> Html Msg
+serverSheetRow s model =
+    let isActive = case model.active of
+            ServerView id -> id == s.id
+            ChannelView _ -> Maybe.map (.id << .server) model.currentServer == Just s.id
+            VoiceChannelView _ -> Maybe.map (.id << .server) model.currentServer == Just s.id
+            _ -> False
+    in div [ class ("server-sheet-row" ++ if isActive then " active" else "")
+           , onClick (Go ("#server/" ++ String.fromInt s.id))
+           ]
+        [ serverIcon s
+        , div [ class "grow" ]
+            [ b [] [ text s.name ]
+            , small [] [ text (s.role ++ " · " ++ String.fromInt s.memberCount ++ " members") ]
+            ]
         ]
 
 
@@ -1205,7 +1663,7 @@ serverIcon s =
     if String.isEmpty s.iconUrl then
         div [ class "server-icon" ] [ text (String.left 1 (String.toUpper s.name)) ]
     else
-        img [ class "server-icon", src s.iconUrl, alt "" ] []
+        div [ class "server-icon" ] [ img [ src s.iconUrl, alt s.name ] [] ]
 
 
 renderSide : Model -> Html Msg
@@ -1247,19 +1705,28 @@ renderServerSide model data =
         , userPanel model
         ]
 
+statusClass : Dict String String -> Int -> String
+statusClass userStatuses uid =
+    case Dict.get (String.fromInt uid) userStatuses of
+        Just "busy" -> "busy"
+        Just "away" -> "away"
+        Just "invisible" -> "invisible"
+        Just _ -> "online"
+        Nothing -> "offline"
+
 renderRightPanel : Model -> Html Msg
 renderRightPanel model =
     case ( model.active, model.currentServer ) of
-        ( ServerView _, Just data ) -> renderMembersPanel data.members
-        ( ChannelView _, Just data ) -> renderMembersPanel data.members
-        ( VoiceChannelView _, Just data ) -> renderMembersPanel data.members
+        ( ServerView _, Just data ) -> renderMembersPanel model.userStatuses data.members
+        ( ChannelView _, Just data ) -> renderMembersPanel model.userStatuses data.members
+        ( VoiceChannelView _, Just data ) -> renderMembersPanel model.userStatuses data.members
         _ -> text ""
 
-renderMembersPanel : List ServerMember -> Html Msg
-renderMembersPanel members =
+renderMembersPanel : Dict String String -> List ServerMember -> Html Msg
+renderMembersPanel userStatuses members =
     aside [ class "right members-panel" ]
         [ h3 [] [ text "Members" ]
-        , div [ class "list" ] (List.map memberRow members)
+        , div [ class "list" ] (List.map (\m -> memberRow userStatuses m) members)
         ]
 
 sideHead : Model -> Html Msg
@@ -1269,7 +1736,7 @@ sideHead model =
         , small [] [ text "Chat app" ]
         , div [ class "nav-actions" ]
             [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "New server" ]
-            , button [ class "btn secondary", onClick JoinInvite ] [ text "Use invite" ]
+            , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Use invite" ]
             ]
         ]
 
@@ -1385,10 +1852,19 @@ renderMobileNav : Model -> Html Msg
 renderMobileNav model =
     nav [ class "mobile-nav" ]
         [ mobileBtn "⌂" "Home" (model.active == Home) (Go "#")
-        , mobileBtn "#" "Forums" (model.active == Forums) (Go "#forums")
+        , mobileBtn "r/" "Forums" (model.active == Forums) (Go "#forums")
         , mobileBtn "D" "DMs" (isDmActive model) (Go "#dms")
         , mobileBtn "+" "Friends" (model.active == Friends) (Go "#friends")
+        , mobileBtn "≡" "Servers" False (ToggleSidebar)
         , mobileBtn "⚙" "You" (model.active == Settings) (Go "#settings")
+        , if List.isEmpty model.servers then text "" else
+            div [ class "mobile-server-dots" ]
+                (List.map (\s ->
+                    span [ class ("mobile-server-dot" ++ if serverIsActive s model then " active" else "")
+                         , onClick (Go ("#server/" ++ String.fromInt s.id))
+                         , title s.name
+                         ] [ text (String.left 1 s.name) ]
+                ) (List.take 4 model.servers))
         ]
 
 mobileBtn : String -> String -> Bool -> Msg -> Html Msg
@@ -1443,7 +1919,7 @@ renderPage model = case model.active of
     ServerView id -> renderServerPage model
     ChannelView id -> renderMessagePage ("channel:" ++ String.fromInt id) "Message channel" model
     VoiceChannelView id -> renderVoicePage id model
-    InviteView code -> renderInvitePage model
+    InviteView _ -> renderInvitePage model
     Notifications -> renderNotificationsPage model
     SearchView q -> renderSearchPage q model
 
@@ -1503,61 +1979,146 @@ statCard label value sub msg =
 
 renderForumsPage : Model -> Html Msg
 renderForumsPage model =
-    div [ class "forum-page" ]
-        [ div [ class "section-head" ]
-            [ div [] [ h2 [] [ text "Threads" ], p [ class "muted" ] [ text "Longer conversations by topic." ] ]
-            , button [ class "btn", onClick (NewThreadModal Nothing) ] [ text "New thread" ]
+    let
+        filtered =
+            if String.isEmpty (String.trim model.searchQuery) then
+                model.forums
+            else
+                let q = String.toLower (String.trim model.searchQuery)
+                in List.filter (\f ->
+                    String.contains q (String.toLower f.name)
+                    || String.contains q (String.toLower f.description)
+                ) model.forums
+        myForums = List.filter .joined filtered
+        otherForums = List.filter (\f -> not f.joined) filtered
+    in div [ class "forum-page" ]
+        [ div [ class "forum-header-bar" ]
+            [ div [ class "forum-header-title" ]
+                [ h2 [] [ text "Communities" ]
+                , p [ class "muted" ] [ text "r/ — public forums for any topic" ]
+                ]
+            , div [ class "forum-header-actions" ]
+                [ button [ class "btn", onClick NewForumModal ] [ text "Create Community" ]
+                ]
             ]
-        , div [ class "grid" ] (List.map forumCard model.forums)
+        , div [ class "forum-search" ]
+            [ input
+                [ class "forum-search-input"
+                , value model.searchQuery
+                , placeholder "Search communities..."
+                , onInput SearchQuery
+                , on "keydown" (D.andThen (\k ->
+                    if k == "Enter" then D.succeed DoSearch else D.fail "no")
+                    (D.field "key" D.string))
+                ] []
+            , span [ class "forum-search-icon" ] [ text "🔍" ]
+            ]
+        , if List.isEmpty filtered then
+            div [ class "empty" ] [ text (if String.isEmpty model.searchQuery then "No communities yet." else "No communities match your search.") ]
+          else
+            div []
+                [ if not (List.isEmpty myForums) then
+                    div []
+                        [ h3 [ class "forum-section-title" ] [ text "My Communities" ]
+                        , div [ class "forum-grid" ] (List.map forumCard myForums)
+                        ]
+                  else
+                    text ""
+                , if not (List.isEmpty otherForums) then
+                    div []
+                        [ h3 [ class "forum-section-title" ] [ text "Discover" ]
+                        , div [ class "forum-grid" ] (List.map forumCard otherForums)
+                        ]
+                  else
+                    text ""
+                ]
         ]
 
 forumCard : Forum -> Html Msg
 forumCard f =
-    div [ class "card pad", onClick (Go ("#forum/" ++ String.fromInt f.id)) ]
-        [ div [ class "forum-card-head" ]
-            [ span [ class "forum-glyph" ] [ text "r/" ]
-            , h2 [] [ text f.name ]
+    let
+        memberText = String.fromInt f.memberCount ++ " member" ++ (if f.memberCount /= 1 then "s" else "")
+        threadText = String.fromInt f.threadCount ++ " thread" ++ (if f.threadCount /= 1 then "s" else "")
+    in
+    div [ class "forum-card" ]
+        [ div [ class "forum-card-top", onClick (Go ("#forum/" ++ String.fromInt f.id)) ]
+            [ span [ class "forum-card-icon" ] [ text "r/" ]
+            , div [ class "forum-card-info" ]
+                [ h3 [ class "forum-card-name" ] [ text f.name ]
+                , p [ class "forum-card-desc" ] [ text (ellipsize 120 f.description) ]
+                ]
             ]
-        , p [ class "muted" ] [ text f.description ]
-        , div [ class "forum-stats" ]
-            [ span [ class "pill" ] [ text (String.fromInt f.threadCount ++ " threads") ]
-            , span [ class "pill" ] [ text (String.fromInt f.replyCount ++ " replies") ]
-            , span [ class "pill" ] [ text ("last " ++ Maybe.withDefault "never" (Maybe.map ago f.lastAt)) ]
+        , div [ class "forum-card-stats" ]
+            [ span [ class "forum-stat" ] [ text memberText ]
+            , span [ class "forum-stat" ] [ text threadText ]
+            , span [ class "forum-stat" ] [ text ("last " ++ Maybe.withDefault "never" (Maybe.map ago f.lastAt)) ]
+            ]
+        , div [ class "forum-card-footer" ]
+            [ if f.joined then
+                button [ class "btn forum-joined-btn", onClick (LeaveForum f.id) ] [ text "Joined" ]
+              else
+                button [ class "btn forum-join-btn", onClick (JoinForum f.id) ] [ text "Join" ]
+            , a [ class "forum-card-link", href ("#forum/" ++ String.fromInt f.id) ] [ text "View →" ]
             ]
         ]
 
 renderForumPage : Int -> Model -> Html Msg
 renderForumPage id model =
+    let
+        forum = List.filter (\f -> f.id == id) model.forums |> List.head
+    in
     div [ class "forum-page" ]
-        [ div [ class "section-head" ]
-            [ div [] [ h2 [] [ text "Threads" ], p [ class "muted" ] [ text "Pick a topic and jump in." ] ]
-            , button [ class "btn", onClick (NewThreadModal (Just id)) ] [ text "New thread" ]
-            ]
+        [ case forum of
+            Just f ->
+                div [ class "forum-view-header" ]
+                    [ div [ class "forum-view-title" ]
+                        [ span [ class "forum-card-icon large" ] [ text "r/" ]
+                        , div []
+                            [ h2 [] [ text f.name ]
+                            , p [ class "muted" ] [ text f.description ]
+                            , div [ class "forum-view-stats" ]
+                                [ span [ class "forum-stat" ] [ text (String.fromInt f.memberCount ++ " members") ]
+                                , span [ class "forum-stat" ] [ text (String.fromInt f.threadCount ++ " threads") ]
+                                ]
+                            ]
+                        ]
+                    , div [ class "forum-view-actions" ]
+                        [ if f.joined then
+                            button [ class "btn forum-joined-btn", onClick (LeaveForum f.id) ] [ text "Joined" ]
+                          else
+                            button [ class "btn forum-join-btn", onClick (JoinForum f.id) ] [ text "Join" ]
+                        , button [ class "btn", onClick (NewThreadModal (Just id)) ] [ text "New Thread" ]
+                        ]
+                    ]
+            Nothing ->
+                div [ class "forum-view-header" ]
+                    [ h2 [] [ text "Community" ] ]
         , div [ class "thread-listing" ]
             (List.map threadRow model.threads
-                |> (\l -> if List.isEmpty l then [ div [ class "empty" ] [ text "No threads yet." ] ] else l)
+                |> (\l -> if List.isEmpty l then [ div [ class "empty" ] [ text "No threads yet. Be the first to post!" ] ] else l)
             )
         ]
 
 threadRow : ForumThread -> Html Msg
 threadRow t =
     div [ class "reddit-thread", onClick (Go ("#thread/" ++ String.fromInt t.id)) ]
-        [ div [ class "vote-column" ]
-            [ button [ class "vote-btn up" ] [ text "▲" ]
-            , span [ class "vote-count" ] [ text (String.fromInt t.replyCount) ]
-            , button [ class "vote-btn down" ] [ text "▼" ]
-            ]
+        [ voteColumn t
         , div [ class "thread-content" ]
             [ h3 [ class "thread-title" ]
                 ((if t.pinned then [ span [ class "pill pin" ] [ text "pinned" ], text " " ] else [])
-                 ++ (if t.replyCount > 10 then [ span [ class "pill hot" ] [ text "hot" ], text " " ] else [])
+                 ++ (if t.score >= 5 || t.replyCount > 10 then [ span [ class "pill hot" ] [ text "hot" ], text " " ] else [])
                  ++ [ text t.title ])
             , div [ class "thread-meta" ]
                 [ span [] [ text t.displayName ]
+                , span [] [ text (String.fromInt t.score ++ " points") ]
                 , span [] [ text (String.fromInt t.replyCount ++ " replies") ]
                 , span [] [ text (String.fromInt t.views ++ " views") ]
                 , span [] [ text (ago t.updatedAt) ]
                 ]
+            , if String.isEmpty (String.trim t.body) then
+                text ""
+              else
+                p [ class "thread-excerpt" ] [ text (ellipsize 180 t.body) ]
             ]
         ]
 
@@ -1567,33 +2128,55 @@ renderThreadPage threadId model =
         Just t ->
             div []
                 [ div [ class "post card reddit-post" ]
-                    [ div [ class "vote-column" ]
-                        [ button [ class "vote-btn up" ] [ text "▲" ]
-                        , span [ class "vote-count" ] [ text (String.fromInt t.replyCount) ]
-                        , button [ class "vote-btn down" ] [ text "▼" ]
-                        ]
+                    [ voteColumn t
                     , div [ class "post-body" ]
                         [ h1 [ class "thread-title" ] [ text t.title ]
                         , div [ class "post-meta" ]
                             [ avatarImg "" t.displayName ""
                             , b [] [ text t.displayName ]
+                            , span [ class "muted" ] [ text (String.fromInt t.score ++ " points") ]
                             , span [ class "muted" ] [ text (ago t.createdAt ++ " ago") ]
+                            , span [ class "muted" ] [ text (String.fromInt t.views ++ " views") ]
                             ]
                         , div [ class "msg-body" ] [ text t.body ]
                         ]
                     ]
-                , div [ id "replies" ] (List.map replyView model.replies)
-                , composerView ("thread:" ++ String.fromInt threadId) "Reply to thread" model
+                , div [ class "replies-head" ]
+                    [ h2 [] [ text "Replies" ]
+                    , span [ class "pill" ] [ text (String.fromInt (List.length model.replies) ++ " total") ]
+                    ]
+                , div [ id "replies", class "reply-stack" ]
+                    (if List.isEmpty model.replies then
+                        [ div [ class "empty" ] [ text "No replies yet. Be the first to add one." ] ]
+                     else
+                        List.indexedMap replyView model.replies)
+                , if t.locked then
+                    div [ class "locked-banner" ] [ text "This thread is locked. New replies are disabled." ]
+                  else
+                    composerView ("thread:" ++ String.fromInt threadId) "Reply to thread" model
                 ]
         Nothing -> div [ class "empty" ] [ text "Loading thread..." ]
 
-replyView : Reply -> Html Msg
-replyView r =
+voteColumn : ForumThread -> Html Msg
+voteColumn t =
+    let
+        upValue = if t.userVote == 1 then 0 else 1
+        downValue = if t.userVote == -1 then 0 else -1
+    in
+    div [ class "vote-column" ]
+        [ button [ class ("vote-btn up" ++ if t.userVote == 1 then " active" else ""), title "Upvote", onClickStop (VoteThread t.id upValue) ] [ text "▲" ]
+        , span [ class "vote-count" ] [ text (String.fromInt t.score) ]
+        , button [ class ("vote-btn down" ++ if t.userVote == -1 then " active" else ""), title "Downvote", onClickStop (VoteThread t.id downValue) ] [ text "▼" ]
+        ]
+
+replyView : Int -> Reply -> Html Msg
+replyView idx r =
     div [ class "post card" ]
         [ div [ class "post-meta" ]
             [ avatarImg r.avatarUrl r.displayName ""
             , b [] [ text r.displayName ]
             , span [ class "muted" ] [ text (ago r.createdAt ++ " ago") ]
+            , span [ class "muted" ] [ text ("#" ++ String.fromInt (idx + 1)) ]
             ]
         , div [ class "msg-body" ] [ text r.body ]
         ]
@@ -1628,12 +2211,12 @@ renderFriendsPage model =
             (if List.isEmpty model.friends then
                 [ div [ class "empty" ] [ text "No friends yet." ] ]
              else
-                List.map friendRow model.friends
+                 List.map (\f -> friendRow model.userStatuses f) model.friends
             )
         ]
 
-friendRow : Friend -> Html Msg
-friendRow f =
+friendRow : Dict String String -> Friend -> Html Msg
+friendRow userStatuses f =
     let statusText = f.status ++ if f.incoming then " · incoming" else ""
     in div [ class "row friend-row" ]
         [ div [ class "clickable-user", onClick (ShowUserPopup f.user.id) ]
@@ -1641,6 +2224,7 @@ friendRow f =
         , div [ class "grow clickable-user", onClick (ShowUserPopup f.user.id) ]
             [ b [] [ text f.user.displayName ]
             , small [ class "muted" ] [ text ("@" ++ f.user.username ++ " · " ++ statusText) ]
+            , span [ class ("status-dot " ++ statusClass userStatuses f.user.id) ] []
             ]
         , div [ class "friend-actions" ]
             [ if f.incoming then button [ class "btn", onClick (BridgeEvent "accept_friend" (E.int f.user.id)) ] [ text "Accept" ] else text ""
@@ -1669,7 +2253,7 @@ renderServerPage model =
                 , h3 [ class "server-section-title" ] [ text "Channels" ]
                 , div [ class "card" ] (List.map channelRow data.channels)
                 , h3 [ class "server-section-title" ] [ text "Members" ]
-                , div [ class "card" ] (List.map memberRow data.members)
+                , div [ class "card" ] (List.map (\m -> memberRow model.userStatuses m) data.members)
                 ]
         Nothing -> div [ class "empty" ] [ text "Loading server..." ]
 
@@ -1682,24 +2266,33 @@ channelRow c =
         , div [ class "grow" ] [ b [] [ text c.name ], small [ class "muted" ] [ text c.kind ] ]
         ]
 
-memberRow : ServerMember -> Html Msg
-memberRow m =
+memberRow : Dict String String -> ServerMember -> Html Msg
+memberRow userStatuses m =
     div [ class "row member-row clickable-user", onClick (ShowUserPopup m.user.id) ]
         [ avatarImg m.user.avatarUrl m.user.displayName ""
         , div [ class "grow" ]
             [ b [] [ text m.user.displayName ]
             , small [ class "muted" ] [ text ("@" ++ m.user.username ++ " · " ++ m.role) ]
             ]
-        , span [ class ("status-dot " ++ statusToString m.user.status) ] []
+        , span [ class ("status-dot " ++ statusClass userStatuses m.user.id) ] []
         ]
 
 renderVoicePage : Int -> Model -> Html Msg
 renderVoicePage channelId model =
+    let joined = model.voice.mode == Just "voice" && model.voice.id == Just channelId
+    in
     div []
         [ div [ class "card pad" ]
             [ h2 [] [ text "Voice channel" ]
             , p [ class "muted" ] [ text "Join when you want to talk." ]
-            , button [ class "btn", onClick (BridgeEvent "join_voice" (E.int channelId)) ] [ text "Join voice" ]
+            , div [ class "voice-actions" ]
+                [ if joined then
+                    button [ class "btn call-decline", onClick EndCall ] [ text "Leave" ]
+                  else
+                    button [ class "btn", onClick (BridgeEvent "join_voice" (E.int channelId)) ] [ text "Join" ]
+                , button [ class ("btn" ++ if model.voice.muted then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_mute" E.null) ] [ text (if model.voice.muted then "Unmute" else "Mute") ]
+                , button [ class ("btn" ++ if model.voice.deafened then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_deafen" E.null) ] [ text (if model.voice.deafened then "Undeafen" else "Deafen") ]
+                ]
             ]
         ]
 
@@ -1732,14 +2325,14 @@ renderSettingsPage model =
         Just u ->
             div [ class "settings-page" ]
                 [ aside [ class "settings-sidebar" ]
-                    [ a [ class ("settings-tab" ++ if model.settingsTab == "profile" then " active" else ""), onClick (SetSettingsTab "profile") ] [ text "My Profile" ]
-                    , a [ class ("settings-tab" ++ if model.settingsTab == "sound" then " active" else ""), onClick (SetSettingsTab "sound") ] [ text "Notifications" ]
-                    , a [ class ("settings-tab" ++ if model.settingsTab == "account" then " active" else ""), onClick (SetSettingsTab "account") ] [ text "Account" ]
+                    [ a [ class ("settings-tab" ++ if model.settingsTab == "profile" then " active" else ""), onClick (SetSettingsTab "profile") ] [ text "👤 Profile" ]
+                    , a [ class ("settings-tab" ++ if model.settingsTab == "sound" then " active" else ""), onClick (SetSettingsTab "sound") ] [ text "🔔 Notifications" ]
+                    , a [ class ("settings-tab" ++ if model.settingsTab == "account" then " active" else ""), onClick (SetSettingsTab "account") ] [ text "⚙ Account" ]
                     ]
                 , div [ class "settings-content" ]
                     [ case model.settingsTab of
-                        "sound" -> div [ class "settings-card" ] [ h2 [] [ text "Notifications" ], button [ class "btn", onClick ToggleSound ] [ text (if model.soundEnabled then "Sound: on" else "Sound: off") ] ]
-                        "account" -> div [ class "settings-card" ] [ h2 [] [ text "Account" ], button [ class "btn danger", onClick Logout ] [ text "Logout" ] ]
+                        "sound" -> div [ class "settings-card" ] [ h2 [] [ text "Notifications" ], p [] [ text "Configure how you receive alerts and sounds." ], div [ class "field" ] [ label [] [ text "Sound effects" ], div [ class "toggle-row" ] [ span [ class "muted" ] [ text "Play sounds for messages and calls" ], button [ class ("btn toggle" ++ if model.soundEnabled then " active" else ""), onClick ToggleSound ] [ text (if model.soundEnabled then "On" else "Off") ] ] ] ]
+                        "account" -> div [ class "settings-card" ] [ h2 [] [ text "Account" ], p [] [ text ("Logged in as @" ++ u.username) ], p [ class "muted" ] [ text ("User ID: " ++ String.fromInt u.id) ], div [ class "nav-actions" ] [ button [ class "btn danger", onClick Logout ] [ text "Logout" ] ] ]
                         _ -> renderProfileSettings u model
                     ]
                 ]
@@ -1767,10 +2360,18 @@ renderProfileSettings u model =
         , div [ class "field" ]
             [ label [] [ text "Avatar URL" ]
             , input [ value model.profileAvatarUrl, placeholder "https://...", onInput ProfileAvatarUrl ] []
+            , div [ class "file-upload-row" ]
+                [ input [ id "profileAvatarFile", type_ "file", accept "image/*" ] []
+                , button [ class "btn secondary", onClick (ReadFile "profileAvatarFile") ] [ text "Use file" ]
+                ]
             ]
         , div [ class "field" ]
             [ label [] [ text "Banner URL" ]
             , input [ value model.profileBannerUrl, placeholder "https://...", onInput ProfileBannerUrl ] []
+            , div [ class "file-upload-row" ]
+                [ input [ id "profileBannerFile", type_ "file", accept "image/*" ] []
+                , button [ class "btn secondary", onClick (ReadFile "profileBannerFile") ] [ text "Use file" ]
+                ]
             ]
         , div [ class "field" ]
             [ label [] [ text "Status" ]
@@ -1819,16 +2420,25 @@ renderInvitePage model =
 
 renderMessagePage : String -> String -> Model -> Html Msg
 renderMessagePage draftKey placeholderText model =
-    div [ class "chat-surface" ]
-        [ renderChatHeader model
-        , div [ class "messages", id "messages" ]
-            (if List.isEmpty model.msg then
-                [ div [ class "empty chat-empty" ] [ h2 [] [ text "Start the conversation" ], p [ class "muted" ] [ text "Messages appear here instantly when people post." ] ] ]
-             else
-                groupedMessageViews model model.msg
-            )
-        , composerView draftKey placeholderText model
-        ]
+    let callBar = case ( model.active, model.callUI.active ) of
+            ( DmView convId, Just active ) ->
+                if active.conversationId == convId then
+                    [ renderDmCallBar active model ]
+                else
+                    []
+            _ -> []
+    in div [ class "chat-surface" ]
+        ( callBar
+            ++ [ renderChatHeader model
+               , div [ class "messages", id "messages" ]
+                    (if List.isEmpty model.msg then
+                        [ div [ class "empty chat-empty" ] [ h2 [] [ text "Start the conversation" ], p [ class "muted" ] [ text "Messages appear here instantly when people post." ] ] ]
+                     else
+                        groupedMessageViews model model.msg
+                    )
+               , composerView draftKey placeholderText model
+               ]
+        )
 
 renderChatHeader : Model -> Html Msg
 renderChatHeader model =
@@ -1836,17 +2446,65 @@ renderChatHeader model =
         DmView id ->
             case List.filter (\c -> c.id == id) model.convs of
                 c :: _ ->
-                    div [ class "chat-header" ]
+                    let hasCall = case model.callUI.active of
+                            Just a -> a.conversationId == id
+                            Nothing -> False
+                        joinedCall = isJoinedCall id model
+                    in div [ class "chat-header" ]
                         [ convAvatar c
                         , div [ class "grow" ]
                             [ h2 [] [ text (convName c) ]
                             , small [ class "muted" ] [ text (if c.memberCount > 2 then String.fromInt c.memberCount ++ " people" else "Direct message") ]
                             ]
-                        , button [ class "btn secondary", onClick (AddPeopleModal c.id) ] [ text "Add" ]
+                        , if joinedCall then
+                            button [ class "btn call-decline", onClick EndCall ] [ text "Leave Call" ]
+                          else if hasCall then
+                            button [ class "btn call-accept", onClick (JoinCall id) ] [ text "Join Call" ]
+                          else
+                            button [ class "btn", onClick (BridgeEvent "start_call" (E.int id)) ] [ text "Call" ]
                         ]
                 [] -> chatOnlineHeader
         ChannelView _ -> chatOnlineHeader
         _ -> chatOnlineHeader
+
+isJoinedCall : Int -> Model -> Bool
+isJoinedCall conversationId model =
+    model.voice.mode == Just "call" && model.voice.id == Just conversationId
+
+renderDmCallBar : ActiveCall -> Model -> Html Msg
+renderDmCallBar active model =
+    let count = List.length active.users
+        joinedCall = isJoinedCall active.conversationId model
+        countText =
+            if count == 0 then
+                "No one connected"
+            else
+                String.fromInt count ++ " participant" ++ (if count /= 1 then "s" else "")
+        duration = floor (toFloat (model.serverTime - active.startTime) / 1000)
+        minutes = String.fromInt (duration // 60)
+        seconds = String.fromInt (modBy 60 duration) |> String.padLeft 2 '0'
+    in div [ class "dm-call-bar" ]
+        [ div [ class "dm-call-bar-main" ]
+            [ span [ class "dm-call-bar-icon" ] [ text "♪" ]
+            , span [ class "dm-call-bar-title" ] [ text (if joinedCall then "In Call" else "Call active") ]
+            , span [ class "dm-call-bar-timer" ] [ text (if joinedCall then minutes ++ ":" ++ seconds else "Ready to join") ]
+            , span [ class "dm-call-bar-count" ] [ text countText ]
+            ]
+        , div [ class "dm-call-bar-controls" ]
+            (if joinedCall then
+                [ button [ class ("btn icon-btn" ++ if model.voice.muted then " call-muted" else ""), onClick (BridgeEvent "toggle_mute" E.null) ]
+                    [ text (if model.voice.muted then "🔇" else "🎤") ]
+                , button [ class ("btn icon-btn" ++ if model.voice.deafened then " call-muted" else ""), onClick (BridgeEvent "toggle_deafen" E.null) ]
+                    [ text (if model.voice.deafened then "🔇" else "🔊") ]
+                , button [ class "btn icon-btn", onClick (BridgeEvent "toggle_speaker" E.null) ]
+                    [ text "🔈" ]
+                , button [ class "btn call-decline", onClick EndCall ]
+                    [ text "✕ Leave" ]
+                ]
+             else
+                [ button [ class "btn call-accept", onClick (JoinCall active.conversationId) ] [ text "Join Call" ] ]
+            )
+        ]
 
 chatOnlineHeader : Html Msg
 chatOnlineHeader =
@@ -2019,8 +2677,9 @@ searchThreadView t =
 -- HELPERS
 
 parseRoute : String -> ActiveRoute
-parseRoute s =
-    if s == "" || s == "home" then Home
+parseRoute raw =
+    let s = if String.startsWith "/" raw then String.dropLeft 1 raw else raw
+    in if s == "" || s == "home" then Home
     else if s == "forums" then Forums
     else if s == "dms" then Dms
     else if s == "friends" then Friends
@@ -2099,23 +2758,32 @@ decodeApi : E.Value -> Msg
 decodeApi val =
     case D.decodeValue apiDecoder val of
         Ok msg -> msg
-        Err _ -> ApiError "" "request_failed"
+        Err _ -> ApiError "" "" "request_failed"
 
 apiDecoder : Decoder Msg
 apiDecoder =
-    D.map4 apiMsg
+    D.map5 apiMsg
         (D.field "path" D.string)
+        (D.field "method" D.string |> defaultValue "GET")
         (D.field "ok" D.bool)
         (D.oneOf [ D.field "data" D.value, D.succeed E.null ])
         (D.oneOf [ D.field "error" D.string, D.succeed "request_failed" ])
 
-apiMsg : String -> Bool -> E.Value -> String -> Msg
-apiMsg path ok data err =
-    if ok then ApiSuccess path data else ApiError path err
+apiMsg : String -> String -> Bool -> E.Value -> String -> Msg
+apiMsg path method ok data err =
+    if ok then ApiSuccess path method data else ApiError path method err
 
 ago : Int -> String
 ago t =
     agoAt 0 t
+
+ellipsize : Int -> String -> String
+ellipsize maxLen value =
+    let trimmed = String.trim value
+    in if String.length trimmed <= maxLen then
+        trimmed
+    else
+        String.left maxLen trimmed ++ "..."
 
 agoAt : Int -> Int -> String
 agoAt now t =
@@ -2199,6 +2867,7 @@ subscriptions model =
         , apiReceive decodeApi
         , wsReceive WsEvent
         , bridgeReceive decodeBridge
+        , fileInput decodeFileInput
         , Browser.Events.onVisibilityChange (\_ -> NoOp)
         , Time.every 3000 Tick
         ]

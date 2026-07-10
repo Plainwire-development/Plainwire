@@ -7,7 +7,7 @@ init(Req0, _State) ->
         undefined -> {ok, cowboy_req:reply(401, #{}, <<"not authenticated">>, Req0), #{}};
         Token ->
             case pw_db:session(Token) of
-                {ok, Session} -> {cowboy_websocket, Req0, #{session=>Session, uid=>maps:get(id,maps:get(user,Session)), subs=>[], voice=>undefined, call=>undefined}};
+                {ok, Session} -> {cowboy_websocket, Req0, #{session=>Session, uid=>maps:get(id,maps:get(user,Session)), subs=>[], voice=>undefined, call=>undefined, status=><<"online">>}};
                 _ -> {ok, cowboy_req:reply(401, #{}, <<"not authenticated">>, Req0), #{}}
             end
     end.
@@ -51,12 +51,15 @@ handle_msg(#{<<"type">> := <<"voice_signal">>, <<"to_user_id">> := To0, <<"signa
 handle_msg(#{<<"type">> := <<"call_ring">>, <<"conversation_id">> := Cid0}, State=#{uid:=Uid, session:=Session}) ->
     Cid = pw_util:int(Cid0),
     case pw_db:conversation_peer_ids(Uid, Cid) of
-        {ok, Targets} when Targets =/= [] ->
-            S1 = maybe_leave_call(State),
-            pw_hub:call_ring(Cid, Uid, self(), maps:get(user, Session), Targets),
-            {ok, S1#{call => Cid}};
-        {ok, []} ->
-            reply_error(State, no_peers);
+        {ok, Targets0} ->
+            case lists:filter(fun(T) -> T =/= Uid end, Targets0) of
+                [] ->
+                    reply_error(State, no_peers);
+                Targets ->
+                    S1 = maybe_leave_call(State),
+                    pw_hub:call_ring(Cid, Uid, self(), maps:get(user, Session), Targets),
+                    {ok, S1#{call => Cid}}
+            end;
         false ->
             reply_error(State, forbidden);
         {error, _} ->
@@ -95,6 +98,9 @@ handle_msg(#{<<"type">> := <<"call_signal">>, <<"to_user_id">> := To0, <<"signal
         To when is_integer(To), To > 0 -> pw_hub:call_signal(Cid, Uid, To, Sig), {ok, State};
         _ -> {ok, State}
     end;
+handle_msg(#{<<"type">> := <<"presence_update">>, <<"status">> := Status}, #{uid:=Uid}=State) ->
+    pw_hub:status_update(Uid, Status),
+    {ok, State#{status => Status}};
 handle_msg(_, State) -> {ok, State}.
 
 websocket_info({hub_json, Event}, State) -> {reply, {text, pw_util:json(Event)}, State};

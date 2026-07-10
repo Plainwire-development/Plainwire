@@ -1,13 +1,14 @@
 module Types exposing
     ( User, Conversation, Message, Forum, ForumThread, Reply
     , Server, Channel, ServerMember, ServerData, InvitePreview, Friend, Notification
-    , VoiceState, CallUI, CallPopup, CallMode(..)
+    , VoiceState, CallUI, CallPopup, CallUser, ActiveCall, CallMode(..)
     , ActiveRoute(..), Route(..), Model, PageState
     , Status(..), Relationship(..), ContextMenu, CtxItem, Msg(..)
     , decodeUser, decodeConversation, decodeMessage, decodeForum
     , decodeThread, decodeReply, decodeServer, decodeChannel
     , decodeServerMember, decodeFriend, decodeNotification
-    , decodeSyncData, encodeMessage, defaultMsg, statusToString
+    , decodeSyncData, decodeCallUser, encodeMessage, defaultMsg, statusToString
+    , defaultValue
     )
 
 import Json.Decode as D
@@ -66,13 +67,14 @@ type alias ReplyPreview =
 type alias Forum =
     { id : Int, slug : String, name : String, description : String
     , position : Int, threadCount : Int, replyCount : Int, lastAt : Maybe Int
+    , memberCount : Int, joined : Bool
     }
 
 type alias ForumThread =
     { id : Int, forumId : Int, forumName : String, userId : Int
     , username : String, displayName : String, title : String, body : String
     , createdAt : Int, updatedAt : Int, replyCount : Int, views : Int
-    , locked : Bool, pinned : Bool
+    , locked : Bool, pinned : Bool, score : Int, userVote : Int
     }
 
 type alias Reply =
@@ -114,8 +116,20 @@ type alias VoiceState =
 
 type alias VoiceUser = { userId : Int, muted : Bool, deafened : Bool }
 
+type alias CallUser =
+    { userId : Int, displayName : String, avatarUrl : String
+    , muted : Bool, deafened : Bool, connected : Bool
+    }
+
+type alias ActiveCall =
+    { conversationId : Int, users : List CallUser, startTime : Int
+    , expanded : Bool
+    }
+
 type alias CallUI =
-    { incoming : Maybe CallPopup, outgoing : Maybe CallPopup }
+    { incoming : Maybe CallPopup, outgoing : Maybe CallPopup
+    , active : Maybe ActiveCall
+    }
 
 type alias CallPopup =
     { conversationId : Int, userId : Int, displayName : String
@@ -174,6 +188,7 @@ type alias Model =
     , serverName : String, serverDescription : String
     , modalTitle : String, modalBody : String, modalUserIds : String
     , booting : Bool
+    , userStatuses : Dict String String
     }
 
 type alias InvitePreview =
@@ -202,8 +217,8 @@ type Msg
     | AuthDisplayName String
     | AuthPassword String
     | DoAuth
-    | ApiSuccess String E.Value
-    | ApiError String String
+    | ApiSuccess String String E.Value
+    | ApiError String String String
     | WsEvent E.Value
     | BridgeEvent String E.Value
     | Subscribe String
@@ -237,11 +252,15 @@ type Msg
     | EditServerModal Server
     | EditConversationModal Conversation
     | NewThreadModal (Maybe Int)
+    | NewForumModal
     | ModalTitle String
     | ModalBody String
     | ModalUserIds String
     | SubmitModal
     | CreateThread Int String String
+    | JoinForum Int
+    | LeaveForum Int
+    | VoteThread Int Int
     | CreateServer String String
     | CreateChannel Int String String
     | ProfileDisplayName String
@@ -274,6 +293,13 @@ type Msg
     | DeclineCall Int
     | EndCall
     | CallSignal Int String
+    | ToggleCallOverlay
+    | SetCallPeerConnected Int Bool
+    | PresenceState E.Value
+    | PresenceOnline Int String
+    | PresenceOffline Int
+    | PresenceStatus Int String
+    | SetMyStatus String
 
 
 -- DECODERS
@@ -338,12 +364,16 @@ decodeReplyPreview = D.map4 ReplyPreview
     (D.field "display_name" D.string) (D.field "body" D.string)
 
 decodeForum : D.Decoder Forum
-decodeForum = D.map8 Forum
+decodeForum = D.map8 (\id slug name description position threadCount replyCount lastAt ->
+        \memberCount joined -> Forum id slug name description position threadCount replyCount lastAt memberCount joined
+    )
     (D.field "id" D.int) (D.field "slug" D.string)
     (D.field "name" D.string) (D.field "description" D.string)
     (D.field "position" D.int) (D.field "thread_count" D.int |> defaultValue 0)
     (D.field "reply_count" D.int |> defaultValue 0)
     (D.field "last_at" (D.nullable D.int))
+    |> andMap (D.field "member_count" D.int |> defaultValue 0)
+    |> andMap (D.field "joined" D.bool |> defaultValue False)
 
 decodeThread : D.Decoder ForumThread
 decodeThread = D.succeed ForumThread
@@ -361,6 +391,8 @@ decodeThread = D.succeed ForumThread
     |> andMap (D.field "views" D.int |> defaultValue 0)
     |> andMap (D.field "locked" D.bool |> defaultValue False)
     |> andMap (D.field "pinned" D.bool |> defaultValue False)
+    |> andMap (D.field "score" D.int |> defaultValue 0)
+    |> andMap (D.field "user_vote" D.int |> defaultValue 0)
 
 decodeReply : D.Decoder Reply
 decodeReply = D.succeed Reply
@@ -425,6 +457,16 @@ defaultMsg = Message 0 "" 0 0 "" "" "" "" Nothing Nothing 0 Nothing Nothing
 
 
 -- HELPERS
+
+decodeCallUser : D.Decoder CallUser
+decodeCallUser =
+    D.map6 CallUser
+        (D.field "user_id" D.int)
+        (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "Unknown" ])
+        (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
+        (D.field "muted" D.bool |> defaultValue False)
+        (D.field "deafened" D.bool |> defaultValue False)
+        (D.field "connected" D.bool |> defaultValue False)
 
 encodeMessage : { body : String, replyToId : Maybe Int } -> E.Value
 encodeMessage m =
