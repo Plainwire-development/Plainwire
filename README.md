@@ -10,6 +10,8 @@ Plainwire is designed to run on our servers. Users are not expected to clone the
 
 This release removes generated demo content. There are no fake users, bots, seeded messages, or sample threads. On first boot, Plainwire only creates the default empty forum categories.
 
+> Link to the old [Plainwire Forums Concept](https://github.com/RobertFlexx/Plainwire-Forum)
+
 ## Features
 
 * Account registration and login
