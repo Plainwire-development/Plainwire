@@ -53,15 +53,15 @@ Message encryption is encryption at rest, not end-to-end encryption. The server 
 
 ## Stack
 
-* Erlang/OTP
-* Cowboy
-* PostgreSQL
-* epgsql
-* Elm
-* SCSS
+* [Erlang/OTP](https://github.com/erlang/otp)
+* [Cowboy](https://github.com/ninenines/cowboy)
+* [PostgreSQL](https://github.com/postgres/postgres)
+* [epgsql](https://github.com/epgsql/epgsql)
+* [Elm](https://github.com/elm/compiler)
+* [SCSS](https://github.com/sass/sass)
 * WebSocket
-* WebRTC
-* rebar3
+* [WebRTC](https://github.com/webrtc)
+* [rebar3](https://github.com/erlang/rebar3)
 
 # Below is information on how to host (If you want to be a hosting candidate)
 
