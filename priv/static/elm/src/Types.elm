@@ -190,6 +190,9 @@ type alias Model =
     , friendsTab : String, friendQuery : String
     , booting : Bool
     , userStatuses : Dict String String
+    , failedMsgIds : Set Int
+    , currentProfileRelationship : String
+    , pendingMessages : Dict Int String
     }
 
 type alias InvitePreview =
@@ -241,6 +244,9 @@ type Msg
     | SendMessage
     | DeleteMessage Int
     | LeaveConversation Int
+    | CloseConversation Int
+    | RetryMessage Int
+    | DismissFailedMessage Int
     | MarkConvRead Int
     | OpenMessageCtx Message Int Int
     | OpenConvCtx Conversation Int Int

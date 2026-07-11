@@ -41,6 +41,7 @@ handle(<<"POST">>, [<<"register">>], Req0, _) ->
                     {ok, #{token:=Token}=Data} -> pw_util:ok_json(pw_util:set_cookie(Req, <<"pw_session">>, Token), #{ok=>true,data=>maps:remove(token,Data)});
                     {error, username_taken} -> pw_util:err_json(Req, 409, <<"username_taken">>);
                     {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+                    {error, database_busy} -> pw_util:err_json(Req, 503, <<"database_busy">>);
                     {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
                     {error,E} -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8))
                 end
@@ -56,6 +57,7 @@ handle(<<"POST">>, [<<"login">>], Req0, _) ->
                 case pw_db:login(U, maps:get(<<"password">>,M,<<>>)) of
                     {ok, #{token:=Token}=Data} -> pw_util:ok_json(pw_util:set_cookie(Req, <<"pw_session">>, Token), #{ok=>true,data=>maps:remove(token,Data)});
                     {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+                    {error, database_busy} -> pw_util:err_json(Req, 503, <<"database_busy">>);
                     {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
                     {error,E} -> pw_util:err_json(Req, 401, atom_to_binary(E, utf8))
                 end
@@ -63,7 +65,11 @@ handle(<<"POST">>, [<<"login">>], Req0, _) ->
     end);
 handle(<<"GET">>, [<<"health">>], Req0, _) ->
     case pw_db:health() of
-        {ok, Data} -> pw_util:ok_json(Req0, #{ok=>true,data=>Data#{app => ok}});
+        {ok, Data} -> pw_util:ok_json(Req0, #{ok=>true,data=>Data#{app => ok,
+            schedulers => erlang:system_info(schedulers_online),
+            processes => erlang:system_info(process_count),
+            process_limit => erlang:system_info(process_limit),
+            rate_limiter => pw_rate:stats()}});
         {error, _} -> pw_util:err_json(Req0, 503, <<"unhealthy">>)
     end;
 handle(Method, Path, Req0, State) ->
@@ -79,6 +85,7 @@ handle(Method, Path, Req0, State) ->
                     end
             end;
         {error, database_unavailable} -> pw_util:err_json(Req0, 503, <<"database_unavailable">>);
+        {error, database_busy} -> pw_util:err_json(Req0, 503, <<"database_busy">>);
         {error, timeout} -> pw_util:err_json(Req0, 503, <<"database_timeout">>);
         {error,_} -> pw_util:err_json(Req0, 401, <<"not_authenticated">>)
     end.
@@ -86,7 +93,11 @@ handle(Method, Path, Req0, State) ->
 auth(Req) ->
     case pw_util:cookie_value(Req, <<"pw_session">>) of
         undefined -> {error, no_session};
-        Token -> pw_db:session(Token)
+        Token ->
+            case pw_db:session_fast(Token) of
+                {ok, Session} -> {ok, Session};
+                _ -> pw_db:session(Token)
+            end
     end.
 uid(Session) -> maps:get(id, maps:get(user, Session)).
 
@@ -145,6 +156,7 @@ authed(<<"POST">>, [<<"conversation">>, Id, <<"members">>], Req0, Session, _) ->
 authed(<<"POST">>, [<<"conversation">>, Id, <<"read">>], Req, Session, _) -> result(Req, pw_db:mark_conversation_read(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"messages">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:post_direct_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
 authed(<<"POST">>, [<<"conversation">>, Id, <<"leave">>], Req, Session, _) -> result(Req, pw_db:leave_conversation(uid(Session), Id));
+authed(<<"POST">>, [<<"conversation">>, Id, <<"close">>], Req, Session, _) -> result(Req, pw_db:close_conversation(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"request">>, <<"accept">>], Req, Session, _) -> result(Req, pw_db:accept_message_request(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"request">>, <<"deny">>], Req, Session, _) -> result(Req, pw_db:deny_message_request(uid(Session), Id));
 authed(<<"GET">>, [<<"notifications">>], Req, Session, _) -> result(Req, pw_db:notifications(uid(Session)));
@@ -169,6 +181,7 @@ with_json_large(Req0, Fun) ->
 result(Req, {ok, Data}) -> pw_util:ok_json(Req, #{ok=>true,data=>Data});
 result(Req, ok) -> pw_util:ok_json(Req, #{ok=>true});
 result(Req, {error, database_unavailable}) -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+result(Req, {error, database_busy}) -> pw_util:err_json(Req, 503, <<"database_busy">>);
 result(Req, {error, timeout}) -> pw_util:err_json(Req, 503, <<"database_timeout">>);
 result(Req, {error, forbidden}) -> pw_util:err_json(Req, 403, <<"forbidden">>);
 result(Req, {error, not_found}) -> pw_util:err_json(Req, 404, <<"not_found">>);

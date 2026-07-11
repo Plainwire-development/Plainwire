@@ -5,6 +5,9 @@
 
 -define(SERVER, ?MODULE).
 -define(CACHE, pw_media_cache).
+-define(INFLIGHT, pw_media_inflight).
+-define(RESULTS, pw_media_results).
+-define(LIMITS, pw_media_limits).
 -define(MAX_BYTES, 26214400).
 -define(MAX_SERVE_BYTES, 15728640).
 -define(TTL_MS, 3600000).
@@ -56,7 +59,11 @@ fetch(Uid, Token) ->
     end.
 
 init([]) ->
-    _ = ets:new(?CACHE, [named_table, public, set, {read_concurrency, true}]),
+    _ = ets:new(?CACHE, [named_table, public, set, {read_concurrency, true}, {write_concurrency, true}]),
+    _ = ets:new(?INFLIGHT, [named_table, public, set, {write_concurrency, true}]),
+    _ = ets:new(?RESULTS, [named_table, public, set, {read_concurrency, true}, {write_concurrency, true}]),
+    _ = ets:new(?LIMITS, [named_table, public, set, {write_concurrency, true}]),
+    ets:insert(?LIMITS, {active_fetches, 0}),
     {ok, #{}}.
 
 handle_call({fetch, Uid, Token}, _From, St) ->
@@ -78,7 +85,9 @@ resolve_fetch(_Uid, Token) ->
     Url = decode_token(Token),
     Key = cache_key(Url),
     Now = pw_util:now_ms(),
-    case ets:lookup(?CACHE, Key) of
+    case cache_lookup(Key) of
+        [{Key, <<"error">>, <<"error">>, Expires}] when Expires > Now ->
+            {error, upstream_error};
         [{Key, Body, Type, Expires}] when Expires > Now, byte_size(Body) =< ?MAX_SERVE_BYTES ->
             {ok, Body, Type};
         [{Key, _, _, Expires}] when Expires > Now ->
@@ -87,12 +96,15 @@ resolve_fetch(_Uid, Token) ->
             resolve_fetch_url(Url, Key, Now)
     end.
 
+cache_lookup(Key) ->
+    try ets:lookup(?CACHE, Key) catch error:badarg -> [] end.
+
 resolve_fetch_url(<<"data-proxy:", _/binary>>, _Key, _Now) ->
     {error, not_found};
 resolve_fetch_url(Url, Key, Now) ->
     case validate_url(Url) of
         ok ->
-            case http_get(Url) of
+            case coalesced_http_get(Url, Key) of
                 {ok, Body, Type} ->
                     case byte_size(Body) =< ?MAX_SERVE_BYTES of
                         true ->
@@ -103,10 +115,70 @@ resolve_fetch_url(Url, Key, Now) ->
                             {error, too_large}
                     end;
                 Err ->
+                    ets:insert(?CACHE, {Key, <<"error">>, <<"error">>, Now + 60000}),
                     Err
             end;
         Err ->
             Err
+    end.
+
+%% A popular uncached GIF can be requested by hundreds of page renders at the
+%% same instant. Only one process downloads a URL; followers wait for its
+%% short-lived result. A global semaphore also caps distinct upstream fetches.
+coalesced_http_get(Url, Key) ->
+    Now = erlang:monotonic_time(millisecond),
+    case ets:lookup(?RESULTS, Key) of
+        [{Key, Result, Expires}] when Expires > Now -> Result;
+        _ ->
+            Lock = {Key, self(), Now},
+            case ets:insert_new(?INFLIGHT, Lock) of
+                true ->
+                    try
+                        Result = bounded_http_get(Url),
+                        ets:insert(?RESULTS, {Key, Result, erlang:monotonic_time(millisecond) + 5000}),
+                        Result
+                    after ets:delete_object(?INFLIGHT, Lock)
+                    end;
+                false ->
+                    await_fetch(Key, Url, Now + 17000)
+            end
+    end.
+
+await_fetch(Key, Url, Deadline) ->
+    Now = erlang:monotonic_time(millisecond),
+    case ets:lookup(?RESULTS, Key) of
+        [{Key, Result, Expires}] when Expires > Now -> Result;
+        _ when Now >= Deadline -> {error, timeout};
+        _ ->
+            case ets:lookup(?INFLIGHT, Key) of
+                [{Key, Owner, Started}] when is_pid(Owner) ->
+                    case is_process_alive(Owner) andalso Now - Started < 20000 of
+                        true -> receive after 25 -> await_fetch(Key, Url, Deadline) end;
+                        false ->
+                            ets:delete_object(?INFLIGHT, {Key, Owner, Started}),
+                            coalesced_http_get(Url, Key)
+                    end;
+                _ -> coalesced_http_get(Url, Key)
+            end
+    end.
+
+bounded_http_get(Url) ->
+    Max = max(1, pw_util:env_int("PLAINWIRE_MEDIA_FETCH_CONCURRENCY", 24)),
+    acquire_fetch_slot(Max, erlang:monotonic_time(millisecond) + 10000),
+    try http_get(Url)
+    after ets:update_counter(?LIMITS, active_fetches, {2, -1}, {active_fetches, 1})
+    end.
+
+acquire_fetch_slot(Max, Deadline) ->
+    Active = ets:update_counter(?LIMITS, active_fetches, {2, 1}, {active_fetches, 0}),
+    case Active =< Max of
+        true -> ok;
+        false ->
+            _ = ets:update_counter(?LIMITS, active_fetches, {2, -1}),
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> erlang:error(media_overloaded);
+                false -> receive after 20 -> acquire_fetch_slot(Max, Deadline) end
+            end
     end.
 
 decode_token(Token) ->
@@ -248,16 +320,17 @@ prune_cache(Now) ->
             ExpiredSpec = [{{'$1', '_', '_', '$3'}, [{'<', '$3', Now}], ['$1']}],
             Expired = ets:select(?CACHE, ExpiredSpec),
             [ets:delete(?CACHE, K) || K <- Expired],
-            case ets:info(?CACHE, size) > ?MAX_CACHE_ENTRIES of
-                true ->
-                    OldestSpec = [{{'$1', '_', '_', '$3'}, [], ['$$']}],
-                    All = ets:select(?CACHE, OldestSpec),
-                    Sorted = lists:keysort(3, All),
-                    ToDrop = length(Sorted) - ?MAX_CACHE_ENTRIES,
-                    [ets:delete(?CACHE, element(1, E)) || E <- lists:sublist(Sorted, max(0, ToDrop))];
-                false ->
-                    ok
-            end;
+            Sorted = lists:keysort(4, ets:tab2list(?CACHE)),
+            drop_oldest_until_within(Sorted);
         false ->
             ok
+    end.
+
+drop_oldest_until_within([]) -> ok;
+drop_oldest_until_within([{Key, _, _, _} | Rest]) ->
+    Size = ets:info(?CACHE, size),
+    MemBytes = ets:info(?CACHE, memory) * erlang:system_info(wordsize),
+    case Size > ?MAX_CACHE_ENTRIES orelse MemBytes > ?MAX_CACHE_MEM of
+        true -> ets:delete(?CACHE, Key), drop_oldest_until_within(Rest);
+        false -> ok
     end.

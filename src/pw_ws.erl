@@ -13,12 +13,12 @@ init(Req0, _State) ->
                     logger:warning("[plainwire:ws] connection_rejected reason=unauthenticated"),
                     {ok, cowboy_req:reply(401, #{}, <<"not authenticated">>, Req0), #{}};
                 Token ->
-                        case pw_db:session(Token) of
+                        case cached_session(Token) of
                         {ok, Session} ->
                             User = maps:get(user, Session),
                             Status = maps:get(status, User, <<"online">>),
                             CleanSession = strip_session_urls(Session),
-                            WsOpts = #{idle_timeout => 300000, max_frame_size => 65536},
+                            WsOpts = #{idle_timeout => 300000, max_frame_size => 65536, compress => true},
                             {cowboy_websocket, Req0, #{session=>CleanSession, token=>Token,
                                 last_auth_check=>erlang:monotonic_time(millisecond),
                                 uid=>maps:get(id,User), subs=>[], voice=>undefined, call=>undefined, status=>Status}, WsOpts};
@@ -28,6 +28,7 @@ init(Req0, _State) ->
     end.
 
 websocket_init(State=#{uid:=Uid, status:=Status}) ->
+    process_flag(message_queue_data, off_heap),
     debug(info, "connected", #{uid => Uid, status => Status}),
     pw_hub:connect(Uid, self(), Status),
     Session = strip_session_urls(maps:get(session, State)),
@@ -67,6 +68,10 @@ handle_msg(#{<<"type">> := <<"subscribe">>, <<"key">> := Key0}, State=#{uid:=Uid
 handle_msg(#{<<"type">> := <<"unsubscribe_all">>}, State) ->
     pw_hub:unsubscribe_all(self()),
     {ok, State#{subs=>[]}};
+handle_msg(#{<<"type">> := <<"presence_watch">>, <<"user_ids">> := Uids0}, State) when is_list(Uids0) ->
+    Uids = lists:sublist(lists:usort([U || U0 <- Uids0, U <- [pw_util:int(U0)], is_integer(U), U > 0]), 2000),
+    pw_hub:watch_presence(self(), Uids),
+    {ok, State};
 handle_msg(#{<<"type">> := <<"voice_join">>, <<"channel_id">> := Cid0}, State=#{uid:=Uid, session:=Session}) ->
     Cid = pw_util:int(Cid0),
     case pw_db:member_of_channel(Uid, Cid) of
@@ -149,9 +154,28 @@ handle_msg(#{<<"type">> := <<"presence_update">>, <<"status">> := Status0}, #{ui
 handle_msg(_, State) -> {ok, State}.
 
 websocket_info({hub_json, Event}, State=#{uid:=Uid}) ->
-    debug(debug_level(Event), "sent", #{uid => Uid, type => event_type(Event), room => room_summary(State)}),
-    {reply, {text, pw_util:json(Event)}, State};
+    deliver_hub_payload(pw_util:json(Event), event_type(Event), Uid, State);
+websocket_info({hub_text, Payload, Type}, State=#{uid:=Uid}) ->
+    deliver_hub_payload(Payload, Type, Uid, State);
 websocket_info(_, State) -> {ok, State}.
+
+deliver_hub_payload(Payload, Type, Uid, State) ->
+    QueueLen = case process_info(self(), message_queue_len) of {message_queue_len, N} -> N; _ -> 0 end,
+    Soft = pw_util:env_int("PLAINWIRE_WS_SOFT_QUEUE", 500),
+    Hard = pw_util:env_int("PLAINWIRE_WS_HARD_QUEUE", 2000),
+    case QueueLen >= Hard of
+        true ->
+            logger:warning("[plainwire:ws] slow_client_disconnected uid=~p queue=~p", [Uid, QueueLen]),
+            {stop, State};
+        false when QueueLen >= Soft ->
+            case droppable_event(Type) of
+                true -> {ok, State};
+                false -> {reply, {text, Payload}, State}
+            end;
+        false ->
+            logger:debug("[plainwire:ws] sent ~p", [#{uid => Uid, type => Type, room => room_summary(State)}]),
+            {reply, {text, Payload}, State}
+    end.
 
 terminate(Reason, _, State=#{uid:=Uid}) ->
     debug(info, "disconnected", #{uid => Uid, reason => Reason, room => room_summary(State)}),
@@ -207,14 +231,23 @@ revalidate_session(State=#{last_auth_check := Last, token := Token, uid := Uid})
     case Now - Last < 60000 of
         true -> {ok, State};
         false ->
-            case pw_db:session(Token) of
+            case pw_db:session_fast(Token) of
                 {ok, Session} ->
                     User = maps:get(user, Session),
                     case maps:get(id, User) of
                         Uid -> {ok, State#{session=>Session, last_auth_check=>Now}};
                         _ -> {error, expired}
                     end;
-                _ -> {error, expired}
+                _ ->
+                    case pw_db:session(Token) of
+                        {ok, Session2} ->
+                            User2 = maps:get(user, Session2),
+                            case maps:get(id, User2) of
+                                Uid -> {ok, State#{session=>Session2, last_auth_check=>Now}};
+                                _ -> {error, expired}
+                            end;
+                        _ -> {error, expired}
+                    end
             end
     end.
 
@@ -246,6 +279,12 @@ parse_host_header(Host, Scheme) ->
 default_port("https") -> 443;
 default_port(_) -> 80.
 
+cached_session(Token) ->
+    case pw_db:session_fast(Token) of
+        {ok, Session} -> {ok, Session};
+        _ -> pw_db:session(Token)
+    end.
+
 safe_json_decode(Data) ->
     try jsx:decode(Data, [return_maps]) catch _:_ -> error end.
 
@@ -263,8 +302,16 @@ debug_level(Map) ->
         <<"call_signal">> -> debug;
         voice_signal -> debug;
         call_signal -> debug;
-        _ -> info
+        _ -> debug
     end.
+
+droppable_event(presence_state) -> true;
+droppable_event(presence_online) -> true;
+droppable_event(presence_offline) -> true;
+droppable_event(presence_status) -> true;
+droppable_event(voice_state) -> true;
+droppable_event(call_state) -> true;
+droppable_event(_) -> false.
 
 room_summary(State) ->
     #{voice => maps:get(voice, State, undefined), call => maps:get(call, State, undefined)}.

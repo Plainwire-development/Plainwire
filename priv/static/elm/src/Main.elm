@@ -11,6 +11,7 @@ import Json.Encode as E
 import Dict exposing (Dict)
 import Set exposing (Set)
 import Task
+import Process
 import Time
 import Url exposing (Url)
 import Ports exposing (..)
@@ -108,6 +109,8 @@ init _ url _ =
       , threadReply = "", searchQuery = ""
       , authMode = "login", authUsername = "", authBusy = False, authDisplayName = ""
       , authPassword = "", serverName = "", serverDescription = "", booting = True, userStatuses = Dict.empty
+      , failedMsgIds = Set.empty, currentProfileRelationship = "none"
+      , pendingMessages = Dict.empty
       , profileDisplayName = "", profileBio = ""
       , profileAvatarUrl = "", profileBannerUrl = ""
       , profileStatus = "online", profileTheme = "system"
@@ -249,7 +252,13 @@ update msg model =
             else if err == "not_authenticated" && model.me == Nothing then
                 ( { model | booting = False }, Cmd.none )
             else
-                ( { model | booting = False, authBusy = False, toast = Just (fmtErr err) }, Cmd.none )
+                let pendingPairs = Dict.toList model.pendingMessages
+                    failedPairs = List.filter (\(_, path) -> path == tag) pendingPairs
+                    model2 = case failedPairs of
+                        (msgId, _) :: _ ->
+                            { model | failedMsgIds = Set.insert msgId model.failedMsgIds, pendingMessages = Dict.remove msgId model.pendingMessages }
+                        [] -> model
+                in ( { model2 | booting = False, authBusy = False, toast = Just (fmtErr err) }, Cmd.none )
 
         WsEvent val -> handleWsEvent val model
 
@@ -258,7 +267,7 @@ update msg model =
         ToggleSidebar -> ( { model | sidebarOpen = not model.sidebarOpen }, Cmd.none )
         CloseSidebar -> ( { model | sidebarOpen = False }, Cmd.none )
 
-        Toast s -> ( { model | toast = Just s }, Cmd.none )
+        Toast s -> ( { model | toast = Just s }, Process.sleep 4000 |> Task.perform (\_ -> DismissToast) )
         DismissToast -> ( { model | toast = Nothing }, Cmd.none )
         GotTimeZone zone -> ( { model | timeZone = zone }, Cmd.none )
         ToggleTimestampMode -> ( { model | absoluteTimestamps = not model.absoluteTimestamps }, Cmd.none )
@@ -282,6 +291,28 @@ update msg model =
 
         LeaveConversation cid ->
             ( { model | ctxMenu = Nothing }, Cmd.batch [ apiSend (encodeApiRequest (ApiPost ("/conversation/" ++ String.fromInt cid ++ "/leave") (Just (E.object [])))), setHash "#dms" ] )
+
+        CloseConversation cid ->
+            ( { model | ctxMenu = Nothing }, Cmd.batch [ apiSend (encodeApiRequest (ApiPost ("/conversation/" ++ String.fromInt cid ++ "/close") (Just (E.object [])))), setHash "#dms" ] )
+
+        RetryMessage msgId ->
+            case findMessage msgId model.msg of
+                Just m ->
+                    let path = case m.scope of
+                            "direct" -> "/conversation/" ++ String.fromInt m.scopeId ++ "/messages"
+                            "channel" -> "/channels/" ++ String.fromInt m.scopeId ++ "/messages"
+                            _ -> ""
+                        payload = encodeMessage { body = m.body, replyToId = m.replyToId }
+                    in
+                    if String.isEmpty path then ( model, Cmd.none )
+                    else
+                        ( { model | failedMsgIds = Set.remove msgId model.failedMsgIds, pendingMessages = Dict.insert msgId path model.pendingMessages }
+                        , apiSend (encodeApiRequest (ApiPost path (Just payload)))
+                        )
+                Nothing -> ( model, Cmd.none )
+
+        DismissFailedMessage msgId ->
+            ( { model | failedMsgIds = Set.remove msgId model.failedMsgIds, msg = List.filter (\m -> m.id /= msgId) model.msg }, Cmd.none )
 
         MarkConvRead cid -> ( model, apiSend (encodeApiRequest (ApiPost ("/conversation/" ++ String.fromInt cid ++ "/read") (Just (E.object [])))) )
         OpenMessageCtx m x y -> ( { model | ctxMenu = Just (messageContext model.me m x y) }, Cmd.none )
@@ -628,7 +659,7 @@ handleMessages val model =
                         if String.isEmpty model.csrf then Cmd.none
                         else apiSend (encodeApiRequest (ApiPost ("/conversation/" ++ String.fromInt id ++ "/read") (Just (E.object []))))
                     _ -> Cmd.none
-                incoming = List.reverse items
+                incoming = List.filter (\m -> m.deletedAt == Nothing) (List.reverse items)
                 applies = List.all (messageApplies model.active) incoming
                 incomingIds = Set.fromList (List.map .id incoming)
                 preserved = List.filter (\m -> messageApplies model.active m && not (Set.member m.id incomingIds)) model.msg
@@ -653,7 +684,11 @@ handleMessageSent : E.Value -> Model -> ( Model, Cmd Msg )
 handleMessageSent val model =
     case D.decodeValue decodeMessage val of
         Ok message ->
-            ( { model | msg = List.filter (\m -> m.id > 0) model.msg ++ [ message ], inputText = "", replyTo = Nothing }
+            let newMsgs = List.filter (\m -> m.id > 0 && m.id /= message.id) model.msg ++ [ message ]
+                negIds = List.map .id (List.filter (\m -> m.id < 0) model.msg)
+                cleanedPending = List.foldl (\id acc -> Dict.remove id acc) model.pendingMessages negIds
+            in
+            ( { model | msg = newMsgs, inputText = "", replyTo = Nothing, pendingMessages = cleanedPending }
             , apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
             )
         Err err ->
@@ -861,8 +896,13 @@ serverDataDecoder =
 
 handleProfile : E.Value -> Model -> ( Model, Cmd Msg )
 handleProfile val model =
-    case D.decodeValue (D.field "user" decodeUser) val of
-        Ok user -> ( { model | currentProfile = Just user }, bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string user.theme)]) )
+    let userResult = D.decodeValue (D.field "user" decodeUser) val
+        relResult = D.decodeValue (D.field "relationship" (D.field "status" D.string)) val
+        rel = case relResult of
+            Ok r -> r
+            Err _ -> "none"
+    in case userResult of
+        Ok user -> ( { model | currentProfile = Just user, currentProfileRelationship = rel }, bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string user.theme)]) )
         Err _ -> ( model, Cmd.none )
 
 
@@ -971,12 +1011,24 @@ sendMessage model =
     else
         case model.active of
             DmView id ->
-                ( appendOptimisticMessage "direct" id body model
-                , apiSend (encodeApiRequest (ApiPost ("/conversation/" ++ String.fromInt id ++ "/messages") (Just payload)))
+                let path = "/conversation/" ++ String.fromInt id ++ "/messages"
+                    model2 = appendOptimisticMessage "direct" id body model
+                    lastMsgId = case List.reverse model2.msg of
+                        m :: _ -> m.id
+                        [] -> -1
+                in
+                ( { model2 | pendingMessages = Dict.insert lastMsgId path model.pendingMessages, failedMsgIds = Set.remove lastMsgId model.failedMsgIds }
+                , apiSend (encodeApiRequest (ApiPost path (Just payload)))
                 )
             ChannelView id ->
-                ( appendOptimisticMessage "channel" id body model
-                , apiSend (encodeApiRequest (ApiPost ("/channels/" ++ String.fromInt id ++ "/messages") (Just payload)))
+                let path = "/channels/" ++ String.fromInt id ++ "/messages"
+                    model2 = appendOptimisticMessage "channel" id body model
+                    lastMsgId = case List.reverse model2.msg of
+                        m :: _ -> m.id
+                        [] -> -1
+                in
+                ( { model2 | pendingMessages = Dict.insert lastMsgId path model.pendingMessages, failedMsgIds = Set.remove lastMsgId model.failedMsgIds }
+                , apiSend (encodeApiRequest (ApiPost path (Just payload)))
                 )
             ThreadView id ->
                 ( model, apiSend (encodeApiRequest (ApiPost ("/thread/" ++ String.fromInt id ++ "/replies") (Just (E.object [("body", E.string body)])))) )
@@ -1004,6 +1056,13 @@ appendOptimisticMessage scope scopeId body model =
             in { model | msg = model.msg ++ [ optimistic ], inputText = "", replyTo = Nothing }
         Nothing ->
             model
+
+
+findMessage : Int -> List Message -> Maybe Message
+findMessage msgId msgs =
+    case msgs of
+        [] -> Nothing
+        m :: rest -> if m.id == msgId then Just m else findMessage msgId rest
 
 
 handleWsEvent : E.Value -> Model -> ( Model, Cmd Msg )
@@ -1079,20 +1138,26 @@ handleWsEvent val model =
                             Just a -> a.conversationId
                             Nothing -> 0
                         isCurrentCall = cid == currentCid || currentCid == 0
-                    in if isCurrentCall then
+                    in if not isCurrentCall then
+                        ( model, Cmd.none )
+                       else
                         let existing = Maybe.andThen (\a -> if a.conversationId == cid then Just a else Nothing) model.callUI.active
+                            existingUsers = Maybe.withDefault [] (Maybe.map .users existing)
+                            myId = Maybe.withDefault 0 (Maybe.map .id model.me)
+                            mergeConnected u =
+                                let wasConnected = List.any (\e -> e.userId == u.userId && e.connected) existingUsers
+                                    isSelf = u.userId == myId
+                                in { u | connected = wasConnected || isSelf }
                             safeUsers =
                                 if List.isEmpty users && isJoinedCall cid model then
                                     Maybe.withDefault [] (Maybe.map .users existing)
                                 else
-                                    users
+                                    List.map mergeConnected users
                             active = { conversationId = cid, users = safeUsers
                                 , startTime = Maybe.withDefault model.serverTime (Maybe.map .startTime existing)
                                 , expanded = Maybe.withDefault False (Maybe.map .expanded existing)
                                 }
                         in ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Just active } }, Cmd.none )
-                       else
-                        ( model, Cmd.none )
                 Err _ -> ( model, Cmd.none )
         Ok ( "call_peer_joined", ev ) ->
             case D.decodeValue callPeerJoinedDecoder ev of
@@ -1446,7 +1511,7 @@ conversationContext c x y =
             if c.memberCount > 2 then
                 { label = "Leave group", icon = Just "×", danger = True, sep = True, msg = LeaveConversation c.id }
             else
-                { label = "Close", icon = Just "×", danger = False, sep = True, msg = Go "#dms" }
+                { label = "Close", icon = Just "×", danger = False, sep = True, msg = CloseConversation c.id }
     in
     { items =
         [ { label = "Open", icon = Just "→", danger = False, sep = False, msg = Go ("#dm/" ++ String.fromInt c.id) }
@@ -2650,6 +2715,11 @@ renderProfilePage model =
                         , div [ class "nav-actions" ]
                             [ button [ class "btn secondary", onClick (BridgeEvent "call_user" (E.int u.id)) ] [ text "Call" ]
                             , button [ class "btn secondary", onClick (BridgeEvent "dm_user" (E.int u.id)) ] [ text "Message" ]
+                            , if model.currentProfileRelationship == "blocked" then
+                                button [ class "btn danger", onClick (BridgeEvent "unblock_user" (E.int u.id)) ] [ text "Unblock" ]
+                              else if model.currentProfileRelationship == "none" || model.currentProfileRelationship == "" then
+                                button [ class "btn danger", onClick (BridgeEvent "block_user" (E.int u.id)) ] [ text "Block" ]
+                              else text ""
                             ]
                         ]
                     ]
@@ -2962,7 +3032,8 @@ messageView model grouped m =
     let mine = case model.me of
             Just user -> user.id == m.userId
             Nothing -> False
-    in div [ class ("msg" ++ (if mine then " mine" else "") ++ (if grouped then " compact" else "") ++ (if m.id < 0 then " pending" else "")), attribute "data-mid" (String.fromInt m.id), onContextMenu (OpenMessageCtx m) ]
+        failed = Set.member m.id model.failedMsgIds
+    in div [ class ("msg" ++ (if mine then " mine" else "") ++ (if grouped then " compact" else "") ++ (if m.id < 0 then " pending" else "") ++ (if failed then " failed" else "")), attribute "data-mid" (String.fromInt m.id), onContextMenu (OpenMessageCtx m) ]
         [ if grouped then div [ class "avatar avatar-spacer" ] [] else avatarImg m.avatarUrl m.displayName ""
         , div [ class "msg-main" ]
             [ if grouped then
@@ -2976,7 +3047,14 @@ messageView model grouped m =
             , case m.replyTo of
                 Just r -> div [ class "reply-preview" ] [ span [ class "reply-line" ] [], span [ class "reply-author" ] [ text r.displayName ], span [] [ text r.body ] ]
                 Nothing -> text ""
-            , div [ class "msg-body" ] [ text m.body ]
+            , div [ class "msg-body" ] (renderMessageBody m.body)
+            , if failed then
+                div [ class "msg-failed-bar" ]
+                    [ span [ class "msg-failed-text" ] [ text "Failed to send" ]
+                    , button [ class "msg-action", onClick (RetryMessage m.id) ] [ text "Retry" ]
+                    , button [ class "msg-action danger", onClick (DismissFailedMessage m.id) ] [ text "Dismiss" ]
+                    ]
+              else text ""
             , div [ class "msg-actions" ]
                 [ button [ class "msg-action", onClick (SetReplyTo m) ] [ text "Reply" ]
                 , button [ class "msg-action", onClick (CopyText m.body) ] [ text "Copy" ]
@@ -3017,10 +3095,47 @@ composerView key placeholderText model =
             Nothing -> text ""
         , textarea [ id "compose", placeholder placeholderText, value model.inputText, onInput InputText, onComposerKeyDown ] []
         , div [ class "composer-footer" ]
-            [ small [ class "muted" ] [ text "Write a message." ]
+            [ button [ class "btn secondary attach-btn", type_ "button", title "Attach files or images", onClick (BridgeEvent "pick_attachments" E.null) ] [ text "＋ Attach" ]
+            , small [ class "muted" ] [ text "Paste images or attach files up to 250 MB." ]
             , button [ class "btn", disabled (String.isEmpty (String.trim model.inputText)), onClick SendMessage ] [ text "Send" ]
             ]
         ]
+
+renderMessageBody : String -> List (Html Msg)
+renderMessageBody body =
+    let lines = String.lines body
+    in lines
+        |> List.indexedMap (\index line ->
+            case attachmentMarkup line of
+                Just ( True, name, url ) ->
+                    a [ class "message-image-link", href url, target "_blank", rel "noopener" ]
+                        [ img [ class "message-image", src url, alt name, attribute "loading" "lazy" ] [] ]
+                Just ( False, name, url ) ->
+                    a [ class "message-file", href url, target "_blank", rel "noopener" ]
+                        [ span [ class "message-file-icon" ] [ text "↧" ], span [] [ text name ] ]
+                Nothing ->
+                    if String.startsWith "https://" line || String.startsWith "http://" line then
+                        a [ class "message-link", href line, target "_blank", rel "noopener noreferrer" ] [ text line ]
+                    else
+                        span [] [ text line, if index < List.length lines - 1 then br [] [] else text "" ]
+        )
+
+attachmentMarkup : String -> Maybe ( Bool, String, String )
+attachmentMarkup line =
+    let
+        parse image prefix =
+            if String.startsWith prefix line && String.endsWith ")" line then
+                case String.split "](/api/files/" line of
+                    [ left, idPart ] ->
+                        let name = String.dropLeft (String.length prefix) left
+                            ident = String.dropRight 1 idPart
+                        in if String.isEmpty name || String.isEmpty ident || String.contains "/" ident then Nothing
+                           else Just ( image, name, "/api/files/" ++ ident )
+                    _ -> Nothing
+            else Nothing
+    in case parse True "![" of
+        Just value -> Just value
+        Nothing -> parse False "["
 
 onComposerKeyDown : Attribute Msg
 onComposerKeyDown =

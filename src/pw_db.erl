@@ -12,9 +12,10 @@
     messages/5, post_channel_message/4, delete_message/2,
     conversations/1, create_conversation/3, update_conversation/4,
     add_conversation_members/3, conversation/2, post_direct_message/4,
-    leave_conversation/2, accept_message_request/2, deny_message_request/2,
+    close_conversation/2, leave_conversation/2, accept_message_request/2, deny_message_request/2,
     mark_conversation_read/2, notifications/1, mark_notifications_seen/1, mark_url_seen/2,
-    member_of_channel/2, member_of_conversation/2, member_of_server/2, conversation_peer_ids/2
+    member_of_channel/2, member_of_conversation/2, member_of_server/2, conversation_peer_ids/2,
+    begin_upload/6, finish_upload/3, abort_upload/2, get_upload/2, stale_uploads/2, delete_upload/1
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -22,6 +23,8 @@
 -record(pool, {conns, size, counter}).
 -define(SERVER, ?MODULE).
 -define(POOL_KEY, pw_db_pool).
+-define(POOL_CONNS, pw_db_connections).
+-define(POOL_LOAD, pw_db_connection_load).
 -define(MAX_BODY, 12000).
 -define(MAX_MSG, 5000).
 
@@ -31,10 +34,12 @@ start_link() -> gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 health() ->
     try
-        #pool{conns = Conns} = persistent_term:get(?POOL_KEY),
-        Conn = element(1, Conns),
+        #pool{conns = Conns, size = Size} = persistent_term:get(?POOL_KEY),
+        Conn = pool_conn(1, Conns),
         case rows(Conn, "SELECT 1", []) of
-            {ok, _} -> ok;
+            {ok, _} ->
+                Queues = [connection_load(I, pool_conn(I, Conns)) || I <- lists:seq(1, Size)],
+                {ok, #{database => ok, pool_size => Size, max_connection_queue => lists:max(Queues)}};
             _ -> {error, database_unavailable}
         end
     catch
@@ -49,25 +54,45 @@ session_fast(Token) ->
             H = pw_util:sha256_hex(Token),
             Now = pw_util:now_ms(),
             case ets:lookup(?SESSION_CACHE, H) of
-                [{H, Uid, Expires}] when Expires > Now ->
-                    case ets:lookup(?SESSION_CACHE, {user, Uid}) of
-                        [{_, Session}] -> {ok, Session};
-                        _ -> {error, no_session}
-                    end;
+                [{H, Session, Expires}] when Expires > Now -> {ok, Session};
                 _ -> {error, no_session}
             end
     end.
 
 call(Msg) ->
-    #pool{conns = Conns, size = Size, counter = Counter} = persistent_term:get(?POOL_KEY),
-    Idx = atomics:add_get(Counter, 1, 1) rem Size + 1,
-    Conn = element(Idx, Conns),
-    try route_with_reconnect(Msg, Conn) of
-        {Reply, Conn} ->
-            Reply;
-        {Reply, Conn1} ->
-            update_pool_conn(Idx, Conn1),
-            Reply
+    try persistent_term:get(?POOL_KEY) of
+        Pool = #pool{} -> call_with_pool(Msg, Pool)
+    catch
+        error:badarg -> {error, database_unavailable};
+        error:{badmatch, _} -> {error, database_unavailable}
+    end.
+
+call_with_pool(Msg, #pool{conns = Conns, size = Size, counter = Counter}) ->
+    case pick_connection(Conns, Size, Counter) of
+        overloaded ->
+            logger:warning("[plainwire:db] pool_overloaded operation=~p", [element(1, Msg)]),
+            {error, database_busy};
+        {Idx, Conn, QueueLen} ->
+            Started = erlang:monotonic_time(millisecond),
+            _ = ets:update_counter(?POOL_LOAD, Idx, {2, 1}, {Idx, 0}),
+            try run_connection_locked(Idx, Msg, Conn, Started, QueueLen)
+            after ets:update_counter(?POOL_LOAD, Idx, {2, -1}, {Idx, 1}) end
+    end.
+
+run_connection_locked(Idx, Msg, Conn, Started, QueueLen) ->
+    %% epgsql serializes individual queries, not an entire BEGIN..COMMIT
+    %% sequence. Lock the complete route per physical connection so unrelated
+    %% requests can never execute inside another request's transaction.
+    LockId = {{?MODULE, connection, Idx}, self()},
+    try global:trans(LockId, fun() ->
+        CurrentConn = case ets:lookup(?POOL_CONNS, Idx) of [{Idx, C}] -> C; [] -> Conn end,
+        case route_with_reconnect(Msg, CurrentConn) of
+            {Reply, CurrentConn} -> Reply;
+            {Reply, Conn1} -> update_pool_conn(Idx, Conn1), Reply
+        end
+    end, [node()], infinity) of
+        aborted -> {error, database_busy};
+        Reply -> log_db_latency(Msg, Started, QueueLen), Reply
     catch
         exit:{timeout, _} -> {error, timeout};
         exit:{noproc, _} -> {error, database_unavailable};
@@ -77,10 +102,47 @@ call(Msg) ->
             {error, database_unavailable}
     end.
 
+%% "Power of two choices" avoids blindly piling requests onto a busy epgsql
+%% process while keeping selection O(1), even with a large connection pool.
+pick_connection(Conns, Size, Counter) ->
+    A = atomics:add_get(Counter, 1, 1) rem Size + 1,
+    B = case Size of 1 -> A; _ -> atomics:add_get(Counter, 1, 1) rem Size + 1 end,
+    ConnA = pool_conn(A, Conns),
+    ConnB = pool_conn(B, Conns),
+    QA = connection_load(A, ConnA),
+    QB = connection_load(B, ConnB),
+    {Idx, Conn, Q} = case QA =< QB of true -> {A, ConnA, QA}; false -> {B, ConnB, QB} end,
+    MaxQueue = max(10, pw_util:env_int("PLAINWIRE_DB_MAX_QUEUE", 250)),
+    case Q >= MaxQueue of true -> overloaded; false -> {Idx, Conn, Q} end.
+
+connection_queue_len(Pid) when is_pid(Pid) ->
+    case process_info(Pid, message_queue_len) of
+        {message_queue_len, N} -> N;
+        _ -> 1000000
+    end;
+connection_queue_len(_) -> 1000000.
+
+connection_load(Idx, Conn) ->
+    Waiting = case ets:lookup(?POOL_LOAD, Idx) of [{Idx, N}] -> N; [] -> 0 end,
+    max(Waiting, connection_queue_len(Conn)).
+
+log_db_latency(Msg, Started, QueueLen) ->
+    Elapsed = erlang:monotonic_time(millisecond) - Started,
+    SlowMs = pw_util:env_int("PLAINWIRE_DB_SLOW_MS", 250),
+    case Elapsed >= SlowMs of
+        true -> logger:warning("[plainwire:db] slow operation=~p duration_ms=~p initial_queue=~p", [element(1, Msg), Elapsed, QueueLen]);
+        false -> ok
+    end.
+
 update_pool_conn(Idx, NewConn) ->
-    Pool = persistent_term:get(?POOL_KEY),
-    NewConns = setelement(Idx, Pool#pool.conns, NewConn),
-    persistent_term:put(?POOL_KEY, Pool#pool{conns = NewConns}).
+    ets:insert(?POOL_CONNS, {Idx, NewConn}),
+    ok.
+
+pool_conn(Idx, FallbackConns) ->
+    case ets:lookup(?POOL_CONNS, Idx) of
+        [{Idx, Conn}] -> Conn;
+        [] -> element(Idx, FallbackConns)
+    end.
 
 register(U, D, P) -> call({register, U, D, P}).
 login(U, P) -> call({login, U, P}).
@@ -121,6 +183,7 @@ create_conversation(Uid, Name, UserIds) -> call({create_conversation, Uid, Name,
 update_conversation(Uid, Cid, Name, Patch) -> call({update_conversation, Uid, Cid, Name, Patch}).
 add_conversation_members(Uid, Cid, UserIds) -> call({add_conversation_members, Uid, Cid, UserIds}).
 conversation(Uid, Cid) -> call({conversation, Uid, Cid}).
+close_conversation(Uid, Cid) -> call({close_conversation, Uid, Cid}).
 leave_conversation(Uid, Cid) -> call({leave_conversation, Uid, Cid}).
 accept_message_request(Uid, Cid) -> call({accept_message_request, Uid, Cid}).
 deny_message_request(Uid, Cid) -> call({deny_message_request, Uid, Cid}).
@@ -133,10 +196,18 @@ member_of_channel(Uid, ChannelId) -> call({member_of_channel, Uid, ChannelId}).
 member_of_conversation(Uid, Cid) -> call({member_of_conversation, Uid, Cid}).
 member_of_server(Uid, Sid) -> call({member_of_server, Uid, Sid}).
 conversation_peer_ids(Uid, Cid) -> call({conversation_peer_ids, Uid, Cid}).
+begin_upload(Uid, Id, Name, Type, Size, Path) -> call({begin_upload, Uid, Id, Name, Type, Size, Path}).
+finish_upload(Uid, Id, Hash) -> call({finish_upload, Uid, Id, Hash}).
+abort_upload(Uid, Id) -> call({abort_upload, Uid, Id}).
+get_upload(Uid, Id) -> call({get_upload, Uid, Id}).
+stale_uploads(PendingBefore, ReadyBefore) -> call({stale_uploads, PendingBefore, ReadyBefore}).
+delete_upload(Id) -> call({delete_upload, Id}).
 
 init([]) ->
     application:ensure_all_started(inets),
     _ = ets:new(?SESSION_CACHE, [named_table, public, set, {read_concurrency, true}]),
+    _ = ets:new(?POOL_CONNS, [named_table, public, set, {read_concurrency, true}, {write_concurrency, true}]),
+    _ = ets:new(?POOL_LOAD, [named_table, public, set, {read_concurrency, true}, {write_concurrency, true}]),
     {ok, MigConn} = connect_with_retry(10, 500),
     ok = migrate(MigConn),
     try epgsql:close(MigConn) catch _:_ -> ok end,
@@ -148,6 +219,7 @@ init([]) ->
         end || _ <- lists:seq(1, PoolSize)
     ]),
     Counter = atomics:new(1, [{signed, false}]),
+    [begin ets:insert(?POOL_CONNS, {I, element(I, Conns)}), ets:insert(?POOL_LOAD, {I, 0}) end || I <- lists:seq(1, PoolSize)],
     persistent_term:put(?POOL_KEY, #pool{conns = Conns, size = PoolSize, counter = Counter}),
     {ok, #st{}}.
 
@@ -158,7 +230,7 @@ handle_info(_, St) -> {noreply, St}.
 terminate(_, _) ->
     try
         #pool{conns = Conns, size = Size} = persistent_term:get(?POOL_KEY),
-        [try epgsql:close(element(I, Conns)) catch _:_ -> ok end || I <- lists:seq(1, Size)],
+        [try epgsql:close(pool_conn(I, Conns)) catch _:_ -> ok end || I <- lists:seq(1, Size)],
         persistent_term:erase(?POOL_KEY)
     catch _:_ -> ok end,
     ok.
@@ -236,6 +308,7 @@ read_msg({delete_message, _, _}) -> false;
 read_msg({create_conversation, _, _, _}) -> false;
 read_msg({update_conversation, _, _, _, _}) -> false;
 read_msg({add_conversation_members, _, _, _}) -> false;
+read_msg({close_conversation, _, _}) -> false;
 read_msg({leave_conversation, _, _}) -> false;
 read_msg({accept_message_request, _, _}) -> false;
 read_msg({deny_message_request, _, _}) -> false;
@@ -243,6 +316,10 @@ read_msg({mark_conversation_read, _, _}) -> false;
 read_msg({post_direct_message, _, _, _, _}) -> false;
 read_msg({mark_notifications_seen, _}) -> false;
 read_msg({mark_url_seen, _, _}) -> false;
+read_msg({begin_upload, _, _, _, _, _, _}) -> false;
+read_msg({finish_upload, _, _, _}) -> false;
+read_msg({abort_upload, _, _}) -> false;
+read_msg({delete_upload, _}) -> false;
 read_msg(_) -> true.
 
 safe_log_msg({register, _, _, _}) -> {register, redacted};
@@ -358,7 +435,7 @@ route({session, Token}, Conn) ->
                     _ = exec(Conn, "UPDATE users SET last_seen = $1 WHERE id = $2 AND last_seen < $3", [Now, Uid, Cutoff]),
                     Session = #{user => user_map_full([Uid, Un, Dn, Bio, Av, Ban, St, Th, Cr, Ls]),
                            csrf => Csrf, server_time => Now},
-                    ets:insert(?SESSION_CACHE, [{H, Uid, Now + 300000}, {{user, Uid}, Session}]),
+                    ets:insert(?SESSION_CACHE, {H, Session, Now + 300000}),
                     {ok, Session};
                 _ ->
                     {error, no_session}
@@ -824,9 +901,9 @@ route({conversations, Uid}, Conn) ->
     Sql = "SELECT dt.id, dt.name, dt.avatar_url, dt.owner_id, dt.created_at, dt.updated_at, "
           "dm.last_read_message_id, dm.muted, dm.request_state, "
           "(SELECT count(*) FROM direct_members WHERE thread_id = dt.id), "
-          "(SELECT body FROM messages WHERE scope = 'direct' AND scope_id = dt.id ORDER BY id DESC LIMIT 1), "
-          "(SELECT id FROM messages WHERE scope = 'direct' AND scope_id = dt.id ORDER BY id DESC LIMIT 1), "
-          "(SELECT count(*) FROM messages WHERE scope = 'direct' AND scope_id = dt.id "
+          "(SELECT body FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL ORDER BY id DESC LIMIT 1), "
+          "(SELECT id FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL ORDER BY id DESC LIMIT 1), "
+          "(SELECT count(*) FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL "
           "AND id > dm.last_read_message_id AND user_id <> $1), "
           "COALESCE((SELECT u.display_name FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
           "WHERE dm2.thread_id = dt.id AND dm2.user_id <> $1 ORDER BY u.display_name ASC LIMIT 1), ''), "
@@ -835,6 +912,7 @@ route({conversations, Uid}, Conn) ->
           "COALESCE((SELECT u.username FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
           "WHERE dm2.thread_id = dt.id AND dm2.user_id <> $1 ORDER BY u.display_name ASC LIMIT 1), '') "
           "FROM direct_threads dt JOIN direct_members dm ON dm.thread_id = dt.id AND dm.user_id = $1 "
+          "WHERE dm.hidden = false "
           "ORDER BY dt.updated_at DESC",
     {ok, Rows} = rows(Conn, Sql, [Uid]),
     {ok, [conversation_row_map(R) || R <- Rows]};
@@ -896,6 +974,15 @@ route({add_conversation_members, Uid, Cid0, UserIds0}, Conn) ->
             {ok, #{added => length(UserIds)}};
         {false, _, _, _, _} ->
             {error, forbidden}
+    end;
+route({close_conversation, Uid, Cid0}, Conn) ->
+    Cid = pw_util:int(Cid0),
+    case is_conversation_member(Conn, Uid, Cid) of
+        true ->
+            ok = exec(Conn, "UPDATE direct_members SET hidden = true WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]),
+            {ok, #{closed => true}};
+        false ->
+            {error, not_found}
     end;
 route({leave_conversation, Uid, Cid0}, Conn) ->
     Cid = pw_util:int(Cid0),
@@ -969,6 +1056,7 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
                 [<<"direct">>, Cid, Uid, Body, ReplyTo, Now]),
             ok = exec(Conn, "UPDATE direct_threads SET updated_at = $1 WHERE id = $2", [Now, Cid]),
             ok = exec(Conn, "UPDATE direct_members SET last_read_message_id = $1 WHERE thread_id = $2 AND user_id = $3", [Mid, Cid, Uid]),
+            ok = exec(Conn, "UPDATE direct_members SET hidden = false WHERE thread_id = $1 AND user_id <> $2", [Cid, Uid]),
             {ok, Row} = one(Conn, message_select() ++ " WHERE m.id = $1", [Mid]),
             Msg = message_map(Conn, Row),
             pw_hub:broadcast({direct, Cid}, #{type => message_created, scope => direct, scope_id => Cid, message => Msg}),
@@ -986,6 +1074,39 @@ route({mark_notifications_seen, Uid}, Conn) ->
 route({mark_url_seen, Uid, Url}, Conn) ->
     mark_url_seen0(Conn, Uid, pw_util:clean_text(Url, 240)),
     {ok, #{seen => true}};
+route({begin_upload, Uid, Id, Name, Type, Size, Path}, Conn) ->
+    Now = pw_util:now_ms(),
+    WindowStart = Now - 10800000,
+    Quota = min(1073741824, max(262144000, pw_util:env_int("PLAINWIRE_UPLOAD_QUOTA_BYTES", 1073741824))),
+    with_tx(Conn, fun() ->
+        _ = rows(Conn, "SELECT pg_advisory_xact_lock($1)", [Uid]),
+        {ok, [UsedRaw]} = one(Conn,
+            "SELECT COALESCE(sum(size), 0) FROM uploads WHERE user_id = $1 AND created_at >= $2 AND status IN ('pending','ready')",
+            [Uid, WindowStart]),
+        Used = pw_util:int(UsedRaw),
+        case Used + Size =< Quota of
+            true ->
+                ok = exec(Conn,
+                    "INSERT INTO uploads(id,user_id,name,content_type,size,path,status,created_at) VALUES($1,$2,$3,$4,$5,$6,'pending',$7)",
+                    [Id, Uid, Name, Type, Size, Path, Now]),
+                {ok, reserved};
+            false -> {error, quota_exceeded}
+        end
+    end);
+route({finish_upload, Uid, Id, Hash}, Conn) ->
+    exec(Conn, "UPDATE uploads SET status = 'ready', sha256 = $1 WHERE id = $2 AND user_id = $3 AND status = 'pending'", [Hash, Id, Uid]);
+route({abort_upload, Uid, Id}, Conn) ->
+    exec(Conn, "DELETE FROM uploads WHERE id = $1 AND user_id = $2 AND status = 'pending'", [Id, Uid]);
+route({get_upload, _Uid, Id}, Conn) ->
+    case one(Conn, "SELECT name,content_type,size,path,sha256 FROM uploads WHERE id = $1 AND status = 'ready'", [Id]) of
+        {ok, [Name, Type, Size, Path, Hash]} -> {ok, #{name => Name, content_type => Type, size => Size, path => Path, sha256 => Hash}};
+        _ -> {error, not_found}
+    end;
+route({stale_uploads, PendingBefore, ReadyBefore}, Conn) ->
+    {ok, Rows} = rows(Conn, "SELECT id,path FROM uploads WHERE (status = 'pending' AND created_at < $1) OR (status = 'ready' AND created_at < $2) LIMIT 500", [PendingBefore, ReadyBefore]),
+    {ok, [#{id => Id, path => Path} || [Id, Path] <- Rows]};
+route({delete_upload, Id}, Conn) ->
+    exec(Conn, "DELETE FROM uploads WHERE id = $1", [Id]);
 route({member_of_channel, Uid, Cid0}, Conn) ->
     case channel_server_member(Conn, Uid, pw_util:int(Cid0)) of
         {ok, _} -> true;
@@ -1015,7 +1136,7 @@ make_session(Conn, Uid) ->
         [H, Uid, Csrf, Now, Expires, Now]),
     {ok, User} = route({me, Uid}, Conn),
     Session = #{token => Token, csrf => Csrf, user => User, server_time => Now},
-    ets:insert(?SESSION_CACHE, [{H, Uid, Now + 300000}, {{user, Uid}, Session}]),
+    ets:insert(?SESSION_CACHE, {H, maps:remove(token, Session), Now + 300000}),
     Session.
 
 migrate(Conn) ->
@@ -1123,6 +1244,16 @@ migrations() -> [
         "CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_id) WHERE reply_to_id IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_channels_server ON channels(server_id, position ASC, id ASC)"
+    ]},
+    {7, [
+        "CREATE TABLE IF NOT EXISTS uploads(id text PRIMARY KEY, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+        "name text NOT NULL, content_type text NOT NULL, size bigint NOT NULL CHECK(size > 0 AND size <= 262144000), "
+        "path text NOT NULL, status text NOT NULL CHECK(status IN ('pending','ready')), sha256 text NOT NULL DEFAULT '', created_at bigint NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_uploads_user_created ON uploads(user_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_uploads_pending ON uploads(created_at) WHERE status = 'pending'"
+    ]},
+    {8, [
+        "ALTER TABLE direct_members ADD COLUMN IF NOT EXISTS hidden boolean NOT NULL DEFAULT false"
     ]}
 ].
 
@@ -1432,7 +1563,7 @@ message_map_with_replies(Row = [_,_,_,_,_,_,_,_,ReplyTo|_], ReplyMap) ->
     end.
 
 replied_message(Conn, ReplyTo, Scope, ScopeId) ->
-    Sql = "SELECT body, user_id, display_name FROM messages JOIN users ON users.id = messages.user_id WHERE messages.id = $1 AND scope = $2 AND scope_id = $3",
+    Sql = "SELECT body, user_id, display_name FROM messages JOIN users ON users.id = messages.user_id WHERE messages.id = $1 AND scope = $2 AND scope_id = $3 AND messages.deleted_at IS NULL",
     case one(Conn, Sql, [ReplyTo, Scope, ScopeId]) of
         {ok, [Body, RUid, RName]} ->
             #{id => ReplyTo, user_id => RUid, display_name => RName, body => load_message(Body)};
@@ -1450,7 +1581,7 @@ batch_replied_messages(Conn, Ids, Scope, ScopeId) ->
             Placeholders = string:join(["$" ++ integer_to_list(I) || I <- lists:seq(1, N)], ","),
             Sql = "SELECT m.id, m.body, m.user_id, u.display_name FROM messages m JOIN users u ON u.id = m.user_id "
                   "WHERE m.id IN (" ++ Placeholders ++ ") AND m.scope = $" ++ integer_to_list(N + 1) ++
-                  " AND m.scope_id = $" ++ integer_to_list(N + 2),
+                  " AND m.scope_id = $" ++ integer_to_list(N + 2) ++ " AND m.deleted_at IS NULL",
             case rows(Conn, Sql, Params) of
                 {ok, Rows} ->
                     maps:from_list([{Id, #{id => Id, user_id => Uid, display_name => D, body => load_message(Body)}}
@@ -1499,11 +1630,11 @@ message_select() ->
     "m.body, m.reply_to_id, m.created_at, m.edited_at, m.deleted_at FROM messages m JOIN users u ON u.id = m.user_id".
 
 message_sql(Scope, Id, undefined, undefined) ->
-    {message_select() ++ " WHERE m.scope = $1 AND m.scope_id = $2 ORDER BY m.id DESC LIMIT 80", [Scope, Id]};
+    {message_select() ++ " WHERE m.scope = $1 AND m.scope_id = $2 AND m.deleted_at IS NULL ORDER BY m.id DESC LIMIT 80", [Scope, Id]};
 message_sql(Scope, Id, Before, undefined) ->
-    {message_select() ++ " WHERE m.scope = $1 AND m.scope_id = $2 AND m.id < $3 ORDER BY m.id DESC LIMIT 80", [Scope, Id, Before]};
+    {message_select() ++ " WHERE m.scope = $1 AND m.scope_id = $2 AND m.deleted_at IS NULL AND m.id < $3 ORDER BY m.id DESC LIMIT 80", [Scope, Id, Before]};
 message_sql(Scope, Id, _, After) ->
-    {message_select() ++ " WHERE m.scope = $1 AND m.scope_id = $2 AND m.id > $3 ORDER BY m.id ASC LIMIT 250", [Scope, Id, After]}.
+    {message_select() ++ " WHERE m.scope = $1 AND m.scope_id = $2 AND m.deleted_at IS NULL AND m.id > $3 ORDER BY m.id ASC LIMIT 250", [Scope, Id, After]}.
 
 validate_thread(Conn, F, T, B) ->
     case {F, byte_size(T) >= 3, byte_size(B) > 0, one(Conn, "SELECT id FROM forums WHERE id = $1", [F])} of
@@ -1574,7 +1705,17 @@ is_conversation_member(Conn, Uid, Cid) ->
 
 conversation_can_send(Conn, Uid, Cid) ->
     case one(Conn, "SELECT request_state FROM direct_members WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]) of
-        {ok, [<<"accepted">>]} -> true;
+        {ok, [<<"accepted">>]} ->
+            not is_blocked_in_conversation(Conn, Uid, Cid);
+        _ -> false
+    end.
+
+is_blocked_in_conversation(Conn, Uid, Cid) ->
+    case one(Conn, "SELECT dm2.user_id FROM direct_members dm1 "
+                   "JOIN direct_members dm2 ON dm2.thread_id = dm1.thread_id AND dm2.user_id <> dm1.user_id "
+                   "JOIN friendships f ON (f.user_low = LEAST(dm1.user_id, dm2.user_id) AND f.user_high = GREATEST(dm1.user_id, dm2.user_id)) "
+                   "WHERE dm1.thread_id = $1 AND dm1.user_id = $2 AND f.status = 'blocked'", [Cid, Uid]) of
+        {ok, [_]} -> true;
         _ -> false
     end.
 

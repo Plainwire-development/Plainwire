@@ -1,7 +1,7 @@
 -module(pw_hub).
 -behaviour(gen_server).
 -export([
-    start_link/0, connect/2, connect/3, disconnect/1, subscribe/2, unsubscribe_all/1,
+    start_link/0, connect/2, connect/3, disconnect/1, subscribe/2, unsubscribe_all/1, watch_presence/2,
     notify_user/2, broadcast/2, status_update/2,
     voice_join/4, voice_leave/2, voice_state/4, voice_signal/4,
     call_ring/5, call_decline/2, call_cancel/2, call_accept/4,
@@ -11,7 +11,7 @@
 
 -define(RING_MS, 45000).
 
--record(st, {users = #{}, pids = #{}, subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}}).
+-record(st, {users = #{}, pids = #{}, subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}, watches = #{}, watchers = #{}}).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 connect(Uid, Pid) -> connect(Uid, Pid, <<"online">>).
@@ -19,6 +19,7 @@ connect(Uid, Pid, Status) -> gen_server:cast(?MODULE, {connect, Uid, Pid, Status
 disconnect(Pid) -> gen_server:cast(?MODULE, {disconnect, Pid}).
 subscribe(Pid, Key) -> gen_server:cast(?MODULE, {subscribe, Pid, Key}).
 unsubscribe_all(Pid) -> gen_server:cast(?MODULE, {unsubscribe_all, Pid}).
+watch_presence(Pid, Uids) -> gen_server:cast(?MODULE, {watch_presence, Pid, Uids}).
 notify_user(Uid, Event) -> gen_server:cast(?MODULE, {notify_user, Uid, Event}).
 broadcast(Key, Event) -> gen_server:cast(?MODULE, {broadcast, Key, Event}).
 status_update(Uid, Status) -> gen_server:cast(?MODULE, {status_update, Uid, Status}).
@@ -49,7 +50,7 @@ handle_cast({connect, Uid, Pid, Status0}, St) ->
         true ->
             case visible_status(Status) of
                 true ->
-                    send_to_others(Pids, #{type => presence_online, user_id => Uid, status => Status}, Pid),
+                    send_presence_watchers(St#st.watchers, Uid, #{type => presence_online, user_id => Uid, status => Status}, Pid),
                     maps:put(Uid, Status, St#st.online);
                 false ->
                     St#st.online
@@ -57,8 +58,7 @@ handle_cast({connect, Uid, Pid, Status0}, St) ->
         false ->
             St#st.online
     end,
-    Pid ! {hub_json, #{type => presence_state, online => maps:keys(Online),
-        statuses => maps:from_list([{U, S} || {U, S} <- maps:to_list(Online)])}},
+    Pid ! {hub_json, #{type => presence_state, online => [], statuses => #{}}},
     log("client_connected", #{uid => Uid, sessions => length(maps:get(Uid, Users, [])), online_users => map_size(Online)}),
     {noreply, St#st{users = Users, pids = Pids, online = Online}};
 handle_cast({disconnect, Pid}, St) ->
@@ -66,6 +66,15 @@ handle_cast({disconnect, Pid}, St) ->
     {noreply, remove_pid(Pid, St)};
 handle_cast({unsubscribe_all, Pid}, St) -> {noreply, St#st{subs = remove_from_all(Pid, St#st.subs)}};
 handle_cast({subscribe, Pid, Key}, St) -> {noreply, St#st{subs = add_to_set(Key, Pid, St#st.subs)}};
+handle_cast({watch_presence, Pid, Uids0}, St0) ->
+    Uids = lists:usort([U || U <- Uids0, is_integer(U), U > 0]),
+    Old = maps:get(Pid, St0#st.watches, []),
+    Watchers0 = lists:foldl(fun(U, Acc) -> update_set(U, Pid, Acc) end, St0#st.watchers, Old),
+    Watchers = lists:foldl(fun(U, Acc) -> add_to_set(U, Pid, Acc) end, Watchers0, Uids),
+    Watches = case Uids of [] -> maps:remove(Pid, St0#st.watches); _ -> maps:put(Pid, Uids, St0#st.watches) end,
+    Statuses = maps:from_list([{U, S} || U <- Uids, {ok, S} <- [maps:find(U, St0#st.online)]]),
+    Pid ! {hub_json, #{type => presence_state, online => maps:keys(Statuses), statuses => Statuses}},
+    {noreply, St0#st{watches = Watches, watchers = Watchers}};
 handle_cast({notify_user, Uid, Event}, St) ->
     Payload = case maps:get(type, Event, undefined) of
         call_incoming -> Event;
@@ -204,13 +213,13 @@ handle_cast({status_update, Uid, Status0}, St) ->
         {false, _, _} ->
             {noreply, St};
         {true, true, false} ->
-            send_to_others(St#st.pids, #{type => presence_offline, user_id => Uid, status => Status}, undefined),
+            send_presence_watchers(St#st.watchers, Uid, #{type => presence_offline, user_id => Uid, status => Status}, undefined),
             {noreply, St#st{online = maps:remove(Uid, Online0)}};
         {true, false, true} ->
-            send_to_others(St#st.pids, #{type => presence_online, user_id => Uid, status => Status}, undefined),
+            send_presence_watchers(St#st.watchers, Uid, #{type => presence_online, user_id => Uid, status => Status}, undefined),
             {noreply, St#st{online = maps:put(Uid, Status, Online0)}};
         {true, true, true} ->
-            send_to_others(St#st.pids, #{type => presence_status, user_id => Uid, status => Status}, undefined),
+            send_presence_watchers(St#st.watchers, Uid, #{type => presence_status, user_id => Uid, status => Status}, undefined),
             {noreply, St#st{online = maps:put(Uid, Status, Online0)}};
         {true, false, false} ->
             {noreply, St}
@@ -266,18 +275,32 @@ relay_signal(Room, From, To, Event) ->
     end,
     ok.
 
-send_many(Pids, Event) -> [Pid ! {hub_json, Event} || Pid <- Pids, is_pid(Pid)], ok.
-send_to_others(Pids, Event, Skip) -> [Pid ! {hub_json, Event} || Pid <- maps:keys(Pids), Pid =/= Skip, is_pid(Pid)], ok.
+send_many([], _Event) -> ok;
+send_many(Pids, Event) ->
+    %% Encode a broadcast once instead of making every recipient encode the
+    %% same message independently (a major reduction for large channels).
+    Payload = pw_util:json(Event),
+    Type = maps:get(type, Event, unknown),
+    [Pid ! {hub_text, Payload, Type} || Pid <- Pids, is_pid(Pid)],
+    ok.
+send_presence_watchers(Watchers, Uid, Event, Skip) ->
+    send_many([Pid || Pid <- maps:get(Uid, Watchers, []), Pid =/= Skip], Event).
 
 signal_kind(Signal) when is_map(Signal) -> maps:get(<<"kind">>, Signal, unknown);
 signal_kind(_) -> unknown.
 
 log(Event, Data) -> logger:notice("[plainwire:hub] ~s ~p", [Event, Data]).
 add_to_set(Key, Pid, Map) -> maps:put(Key, lists:usort([Pid | maps:get(Key, Map, [])]), Map).
-remove_from_all(Pid, Map) -> maps:map(fun(_, L) -> lists:delete(Pid, L) end, Map).
+remove_from_all(Pid, Map) ->
+    maps:fold(fun(Key, List, Acc) ->
+        case lists:delete(Pid, List) of
+            [] -> Acc;
+            Remaining -> maps:put(Key, Remaining, Acc)
+        end
+    end, #{}, Map).
 put_or_remove(Key, Room, Map) when map_size(Room) =:= 0 -> maps:remove(Key, Map);
 put_or_remove(Key, Room, Map) -> maps:put(Key, Room, Map).
-room_users(Room) -> [#{user_id => Uid, muted => maps:get(muted, Info, false), deafened => maps:get(deafened, Info, false)} || {Uid, Info} <- maps:to_list(Room)].
+room_users(Room) -> [#{user_id => Uid, muted => maps:get(muted, Info, false), deafened => maps:get(deafened, Info, false), profile => strip_profile(maps:get(profile, Info, #{}))} || {Uid, Info} <- maps:to_list(Room)].
 
 strip_profile(Info) when is_map(Info) ->
     maps:remove(avatar_source_url, maps:remove(banner_source_url, Info));
@@ -302,7 +325,7 @@ remove_pid(Pid, St0) ->
                 error -> % no longer any PIDs for this user
                     case maps:find(Uid, St0#st.online) of
                         {ok, PrevStatus} ->
-                            send_to_others(Pids, #{type => presence_offline, user_id => Uid, status => PrevStatus}, Pid);
+                            send_presence_watchers(St0#st.watchers, Uid, #{type => presence_offline, user_id => Uid, status => PrevStatus}, Pid);
                         error ->
                             ok
                     end,
@@ -314,7 +337,10 @@ remove_pid(Pid, St0) ->
     Voices = drop_pid_from_rooms(Pid, St0#st.voices, voice),
     Calls = drop_pid_from_rooms(Pid, St0#st.calls, call),
     Rings = drop_caller_rings(Pid, St0#st.rings, St0#st.users),
-    St0#st{users = Users, pids = Pids, online = Online, subs = Subs, voices = Voices, calls = Calls, rings = Rings}.
+    OldWatches = maps:get(Pid, St0#st.watches, []),
+    Watchers = lists:foldl(fun(WatchedUid, Acc) -> update_set(WatchedUid, Pid, Acc) end, St0#st.watchers, OldWatches),
+    Watches = maps:remove(Pid, St0#st.watches),
+    St0#st{users = Users, pids = Pids, online = Online, subs = Subs, voices = Voices, calls = Calls, rings = Rings, watches = Watches, watchers = Watchers}.
 
 update_set(Key, Pid, Map) ->
     L = lists:delete(Pid, maps:get(Key, Map, [])),

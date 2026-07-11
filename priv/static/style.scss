@@ -777,6 +777,14 @@ button, a { touch-action: manipulation; }
   }
 }
 
+.attach-btn { white-space: nowrap; }
+.message-image-link { display: block; margin-top: .45rem; width: fit-content; max-width: min(100%, 720px); }
+.message-image { display: block; max-width: 100%; max-height: 520px; border-radius: 10px; object-fit: contain; background: rgba(0,0,0,.18); }
+.message-file { display: inline-flex; align-items: center; gap: .55rem; margin-top: .4rem; padding: .65rem .8rem; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); color: var(--text); text-decoration: none; }
+.message-file:hover { border-color: var(--accent); }
+.message-file-icon { font-size: 1.15rem; color: var(--accent); }
+.message-link { color: var(--accent); overflow-wrap: anywhere; }
+
 .profile .banner {
   height: 120px;
   background: var(--bg);

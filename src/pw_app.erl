@@ -6,20 +6,32 @@ start(_Type, _Args) ->
     ensure_secure_config(),
     {ok, Sup} = pw_sup:start_link(),
     Port = pw_util:env_int("PORT", 8080),
+    Acceptors = pw_util:env_int("PLAINWIRE_HTTP_ACCEPTORS", 100),
+    MaxConnections = pw_util:env_int("PLAINWIRE_HTTP_MAX_CONNECTIONS", 100000),
     Dispatch = cowboy_router:compile([
         {'_', [
             {"/ws", pw_ws, []},
+            {"/api/uploads", pw_upload_hdl, []},
+            {"/api/files/[...]", pw_file_hdl, []},
             {"/api/media/[...]", pw_media_hdl, []},
             {"/api/[...]", pw_api, []},
             {"/assets/[...]", cowboy_static, {priv_dir, plainwire_relay, "static"}},
             {"/[...]", pw_page, []}
         ]}
     ]),
-    {ok, _} = cowboy:start_clear(plainwire_http, [{port, Port}], #{
+    TransportOpts = #{
+        num_acceptors => Acceptors,
+        max_connections => MaxConnections,
+        socket_opts => [{port, Port}, {backlog, 4096}, {nodelay, true}, {keepalive, true}, {reuseaddr, true}]
+    },
+    {ok, _} = cowboy:start_clear(plainwire_http, TransportOpts, #{
         env => #{dispatch => Dispatch},
+        idle_timeout => pw_util:env_int("PLAINWIRE_HTTP_IDLE_TIMEOUT_MS", 60000),
+        request_timeout => pw_util:env_int("PLAINWIRE_HTTP_REQUEST_TIMEOUT_MS", 30000),
+        max_keepalive => pw_util:env_int("PLAINWIRE_HTTP_MAX_KEEPALIVE", 1000),
         stream_handlers => [cowboy_stream_h]
     }),
-    io:format("Plainwire Relay listening on http://0.0.0.0:~p~n", [Port]),
+    logger:notice("[plainwire] listening port=~p acceptors=~p max_connections=~p schedulers=~p", [Port, Acceptors, MaxConnections, erlang:system_info(schedulers_online)]),
     {ok, Sup}.
 
 stop(_State) ->
@@ -28,6 +40,7 @@ stop(_State) ->
 
 ensure_secure_config() ->
     Production = production_env(),
+    ensure_upload_config(Production),
     case Production of
         false ->
             ensure_rtc_config(Production);
@@ -95,4 +108,18 @@ password_cost_configured() ->
     case pw_util:env_int("PLAINWIRE_PBKDF2_ITERS", 160000) of
         N when N >= 100000 -> true;
         _ -> erlang:error({insecure_production_config, password_hash_cost})
+    end.
+
+ensure_upload_config(Production) ->
+    DirBin = pw_util:env_str("PLAINWIRE_UPLOAD_DIR", <<"data/uploads/">>),
+    Dir = binary_to_list(DirBin),
+    case Production andalso not (filename:pathtype(Dir) =:= absolute) of
+        true -> erlang:error({insecure_production_config, upload_dir_must_be_absolute});
+        false -> ok
+    end,
+    Probe = filename:join(Dir, ".plainwire-write-test"),
+    ok = filelib:ensure_dir(Probe),
+    case file:write_file(Probe, <<>>, [write, raw]) of
+        ok -> file:delete(Probe), ok;
+        {error, Reason} -> erlang:error({upload_storage_unavailable, Reason})
     end.

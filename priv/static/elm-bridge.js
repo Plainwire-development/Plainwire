@@ -25,6 +25,8 @@
   let rtcConfig = window.PLAINWIRE_RTC_CONFIG || defaultRtcConfig;
   let rtcConfigRequest = null;
   let rtcConfigFetchedAt = 0;
+  const presenceWatch = new Set();
+  let presenceWatchTimer = null;
   let vad = null;
   const debugEnabled = window.PLAINWIRE_DEBUG !== false && localStorage.getItem('plainwire_debug') !== 'false';
   const startedAt = performance.now();
@@ -211,6 +213,7 @@
       debug('API', 'response', { method, path, status: res.status, ok: !!json.ok, duration_ms: Math.round(performance.now() - requestStarted), error: json.error });
       if (json.ok && json.data && json.data.csrf) csrf = json.data.csrf;
       if (json.ok && json.data && json.data.user && json.data.user.id) meId = json.data.user.id;
+      if (json.ok && json.data) updatePresenceWatch(json.data);
       send(app.ports.apiReceive, {
         path,
         method,
@@ -225,6 +228,70 @@
       return null;
     }
   };
+
+  const appendToComposer = (text) => {
+    const composer = document.getElementById('compose');
+    if (!composer) return;
+    composer.value += composer.value && !composer.value.endsWith('\n') ? '\n' + text : text;
+    composer.dispatchEvent(new Event('input', { bubbles: true }));
+    composer.focus();
+  };
+
+  const uploadOne = (file) => new Promise((resolve, reject) => {
+    if (!file || file.size <= 0) return reject(new Error('empty_file'));
+    if (file.size > 250 * 1024 * 1024) return reject(new Error('file_too_large'));
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/uploads');
+    xhr.responseType = 'json';
+    xhr.setRequestHeader('x-csrf-token', csrf);
+    xhr.setRequestHeader('x-file-name', encodeURIComponent(file.name || 'pasted-image'));
+    xhr.setRequestHeader('content-type', file.type || 'application/octet-stream');
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) send(app.ports.bridgeReceive, { tag: 'toast', data: `Uploading ${file.name || 'image'}… ${Math.round(event.loaded * 100 / event.total)}%` });
+    };
+    xhr.onload = () => {
+      const json = xhr.response;
+      if (xhr.status >= 200 && xhr.status < 300 && json?.ok && json.data) resolve(json.data);
+      else reject(new Error(json?.error || 'upload_failed'));
+    };
+    xhr.onerror = () => reject(new Error('network_error'));
+    xhr.onabort = () => reject(new Error('upload_cancelled'));
+    xhr.send(file);
+  });
+
+  const uploadFiles = async (files) => {
+    for (const file of Array.from(files || []).slice(0, 10)) {
+      try {
+        const uploaded = await uploadOne(file);
+        const safeName = String(uploaded.name || 'file').replace(/[\]()[\r\n]/g, '_');
+        const markup = String(uploaded.content_type || '').startsWith('image/')
+          ? `![${safeName}](${uploaded.url})` : `[${safeName}](${uploaded.url})`;
+        appendToComposer(markup);
+        send(app.ports.bridgeReceive, { tag: 'toast', data: `${safeName} ready to send` });
+      } catch (error) {
+        const messages = { file_too_large: 'Files can be up to 250 MB.', upload_quota_exceeded: 'Upload limit reached: 1 GB every 3 hours.', network_error: 'Upload connection interrupted.' };
+        send(app.ports.bridgeReceive, { tag: 'toast', data: messages[error.message] || 'File upload failed. Please try again.' });
+      }
+    }
+  };
+
+  const attachmentInput = document.createElement('input');
+  attachmentInput.type = 'file';
+  attachmentInput.multiple = true;
+  attachmentInput.hidden = true;
+  attachmentInput.addEventListener('change', () => { uploadFiles(attachmentInput.files); attachmentInput.value = ''; });
+  document.body.appendChild(attachmentInput);
+  document.addEventListener('paste', (event) => {
+    if (document.activeElement?.id !== 'compose') return;
+    const files = Array.from(event.clipboardData?.files || []);
+    if (files.length) { event.preventDefault(); uploadFiles(files); }
+  });
+  document.addEventListener('dragover', (event) => { if (document.getElementById('compose')) event.preventDefault(); });
+  document.addEventListener('drop', (event) => {
+    if (!document.getElementById('compose')) return;
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (files.length) { event.preventDefault(); uploadFiles(files); }
+  });
 
   const connectWs = () => {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
@@ -272,6 +339,26 @@
       wsQueue.push(value);
       debug('WS', 'queued', { type: value?.type, queue_length: wsQueue.length }, 'warn');
     }
+  };
+
+  const updatePresenceWatch = (data) => {
+    const before = presenceWatch.size;
+    const visit = (value, depth = 0) => {
+      if (!value || typeof value !== 'object' || depth > 6 || presenceWatch.size >= 2000) return;
+      if (Number.isInteger(value.id) && value.id > 0 && (typeof value.username === 'string' || typeof value.display_name === 'string')) {
+        if (value.id !== meId) presenceWatch.add(value.id);
+      }
+      if (Array.isArray(value)) value.forEach((item) => visit(item, depth + 1));
+      else Object.values(value).forEach((item) => visit(item, depth + 1));
+    };
+    visit(data);
+    if (presenceWatch.size === before) return;
+    if (presenceWatchTimer) clearTimeout(presenceWatchTimer);
+    presenceWatchTimer = setTimeout(() => {
+      presenceWatchTimer = null;
+      sendWs({ type: 'presence_watch', user_ids: Array.from(presenceWatch) });
+      debug('PRESENCE', 'watch_updated', { users: presenceWatch.size });
+    }, 100);
   };
 
   const ask = (message, fallback = '') => {
@@ -546,10 +633,10 @@
           const stream = audio && audio.srcObject;
           const hasLiveAudio = stream instanceof MediaStream && stream.getAudioTracks().some((track) => track.readyState === 'live');
           if (!hasLiveAudio) {
-            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Connected, but no audio track arrived—renegotiating…' });
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Establishing audio stream…' });
             makeOffer(uid, pc).catch(() => {});
           }
-        }, 4000);
+        }, 6000);
       }
       if (pc.connectionState === 'disconnected' && reconnectAttempts < 3) {
         reconnectAttempts++;
@@ -578,21 +665,21 @@
       pc._connectTimer = setTimeout(() => {
         if (pc.connectionState === 'connected' || pc.connectionState === 'closed') return;
         pc._connectAttempts++;
-        if (pc._connectAttempts <= 2) {
+        if (pc._connectAttempts <= 4) {
           if (pc.signalingState === 'stable') {
             makeOffer(uid, pc, { iceRestart: true }).catch(() => {});
           } else if (typeof pc.restartIce === 'function') {
             pc.restartIce();
           }
-          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Still connecting audio—retrying…' });
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Reconnecting audio…' });
           checkConnection();
         } else {
           const failedKind = room ? room.kind : 'call';
           closePeer(uid);
           send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: failedKind });
-          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Voice connection failed. Check TURN configuration or try rejoining.' });
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call connection timed out. Try rejoining.' });
         }
-      }, 12000);
+      }, 20000);
     };
     checkConnection();
     return pc;
@@ -795,6 +882,9 @@
       case 'toast':
         send(app.ports.bridgeReceive, { tag: 'toast', data });
         break;
+      case 'pick_attachments':
+        attachmentInput.click();
+        break;
       case 'play_ringtone':
         stopRingtones();
         ringtoneTimer = setInterval(() => playTone({ freq: 740, dur: 180 }), 700);
@@ -811,6 +901,16 @@
         break;
       case 'remove_friend':
         api({ method: 'POST', path: '/friends/remove', body: { user_id: data } }).then(() => {
+          api({ method: 'GET', path: '/sync?since=0' });
+        });
+        break;
+      case 'block_user':
+        api({ method: 'POST', path: '/friends/block', body: { user_id: data } }).then(() => {
+          api({ method: 'GET', path: '/sync?since=0' });
+        });
+        break;
+      case 'unblock_user':
+        api({ method: 'POST', path: '/friends/block', body: { user_id: data } }).then(() => {
           api({ method: 'GET', path: '/sync?since=0' });
         });
         break;

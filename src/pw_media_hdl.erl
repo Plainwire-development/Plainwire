@@ -7,16 +7,18 @@ init(Req0, _) ->
         {ok, Uid} ->
             Path = cowboy_req:path(Req0),
             Token = extract_token(Path),
+            ETag = <<"\"", (pw_util:sha256_hex(Token))/binary, "\"">>,
             case pw_rate:allow({media, pw_util:ip(Req0), Uid}, 300, 60000) of
                 false ->
                     pw_util:err_json(Req0, 429, <<"rate_limited">>);
                 true ->
-            case pw_media:fetch(Uid, Token) of
+            case cowboy_req:header(<<"if-none-match">>, Req0, <<>>) =:= ETag of
+                true ->
+                    Req = cowboy_req:reply(304, media_headers(<<"application/octet-stream">>, ETag), <<>>, Req0),
+                    {ok, Req, undefined};
+                false -> case pw_media:fetch(Uid, Token) of
                 {ok, Body, Type} ->
-                    Headers = maps:merge(pw_util:security_headers(), #{
-                        <<"content-type">> => Type,
-                        <<"cache-control">> => <<"private, max-age=86400, immutable">>
-                    }),
+                    Headers = media_headers(Type, ETag),
                     Req = cowboy_req:reply(200, Headers, Body, Req0),
                     {ok, Req, undefined};
                 {error, blocked_url} ->
@@ -25,6 +27,7 @@ init(Req0, _) ->
                     pw_util:err_json(Req0, 400, <<"invalid_url">>);
                 {error, _} ->
                     pw_util:err_json(Req0, 502, <<"fetch_failed">>)
+            end
             end
             end;
         {error, _} ->
@@ -37,7 +40,14 @@ auth(Req) ->
         Token ->
             case pw_db:session_fast(Token) of
                 {ok, Session} -> {ok, maps:get(id, maps:get(user, Session))};
-                _ -> {error, no_session}
+                %% The ETS session cache is deliberately short lived. Media
+                %% requests must still accept a valid persistent session after
+                %% that cache expires (notably pages with many animated GIFs).
+                _ ->
+                    case pw_db:session(Token) of
+                        {ok, Session} -> {ok, maps:get(id, maps:get(user, Session))};
+                        Error -> Error
+                    end
             end
     end.
 
@@ -47,3 +57,11 @@ extract_token(Path) ->
         [Token | _] -> Token;
         _ -> <<>>
     end.
+
+media_headers(Type, ETag) ->
+    maps:merge(pw_util:security_headers(), #{
+        <<"content-type">> => Type,
+        <<"cache-control">> => <<"public, max-age=31536000, immutable, stale-while-revalidate=86400">>,
+        <<"etag">> => ETag,
+        <<"x-content-type-options">> => <<"nosniff">>
+    }).

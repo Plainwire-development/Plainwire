@@ -30,6 +30,8 @@ This release removes generated demo content. There are no fake users, bots, seed
 * Compact message grouping
 * Link embeds using Open Graph metadata
 * External image proxying
+* Streamed picture and file attachments up to 250 MB
+* Clipboard image paste, drag-and-drop uploads, inline image embeds, and file downloads
 * WebSocket live updates
 * Multi-tab WebSocket coordination
 * Silent sync fallback
@@ -74,6 +76,19 @@ and connection state. Logging is enabled by default; use
 `PlainwireDebug.setEnabled(false)` (or `true`) to persist the setting and reload.
 Voice activity transitions and room/connection lifecycle events are also printed
 by the Erlang backend when the server is running. No audio is sent to the backend.
+
+## Production capacity
+
+The relay uses concurrent PostgreSQL connections, ETS-based rate limiting and
+session caches, bounded/deduplicated media fetching, selective presence watches,
+WebSocket slow-client backpressure, and Ranch connection tuning. See
+`.env.example` for capacity controls. The health endpoint reports scheduler,
+process, database-pool queue, and rate-limiter data.
+
+Capacity is deployment-specific: benchmark with realistic message fan-out,
+animated avatars, TLS termination, PostgreSQL latency, and WebRTC signaling.
+Put `/api/media/*` behind a CDN, enforce OS file-descriptor limits, monitor BEAM
+mailboxes/memory, and scale relay nodes horizontally before sustained saturation.
 
 # Below is information on how to host (If you want to be a hosting candidate)
 
@@ -166,6 +181,12 @@ http://localhost:8080
 | `PLAINWIRE_ALLOWED_ORIGINS` | public URL | Comma-separated WebSocket origins                           |
 | `PLAINWIRE_TRUST_PROXY`    |     `false` | Trust the first `X-Forwarded-For` address for rate limiting    |
 | `PLAINWIRE_MEDIA_ALLOWED_HOSTS` | unset | Trusted hosts allowed for remote images and embeds          |
+| `PLAINWIRE_UPLOAD_DIR` | `data/uploads/` | Durable local or mounted volume for message attachments |
+| `PLAINWIRE_UPLOAD_MAX_BYTES` | `262144000` | Maximum attachment size (250 MB hard ceiling) |
+| `PLAINWIRE_UPLOAD_QUOTA_BYTES` | `1073741824` | Per-user upload allowance in each rolling three-hour window |
+| `PLAINWIRE_UPLOAD_RETENTION_DAYS` | `90` | Attachment retention period before automatic cleanup |
+| `PLAINWIRE_UPLOAD_CONCURRENCY` | `64` | Maximum simultaneous uploads across one relay node |
+| `PLAINWIRE_UPLOAD_USER_CONCURRENCY` | `4` | Maximum simultaneous uploads from one user |
 | `PLAINWIRE_ALLOW_ARBITRARY_MEDIA` | `false` | Explicitly allow unrestricted hosts (not recommended)   |
 | `PLAINWIRE_STUN_URLS`    | Google STUN | Comma-separated STUN server URLs                              |
 | `PLAINWIRE_TURN_URLS`    |       unset | Comma-separated TURN URLs (`turn:` or `turns:`)               |
@@ -224,6 +245,8 @@ For public hosting:
 * Set `PLAINWIRE_ENC_KEY`
 * Back up PostgreSQL regularly
 * Keep dependencies updated
+* Mount `PLAINWIRE_UPLOAD_DIR` on durable storage, back it up, and monitor free space
+* Allow request bodies of at least 250 MB on `/api/uploads` in the reverse proxy; keep smaller limits on other routes
 * Restrict outbound traffic and keep `PLAINWIRE_MEDIA_ALLOWED_HOSTS` narrow
 * Set `PLAINWIRE_TRUST_PROXY=true` only when the app port is reachable solely by your proxy
 

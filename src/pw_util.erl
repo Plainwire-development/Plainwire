@@ -4,7 +4,7 @@
     base64url/1, base64url_decode/1, pbkdf2/2, verify_password/3,
     normalize_username/1, clean_text/2, int/1, bool/1, bin/1, json/1,
     read_json/1, read_json/2, ok_json/2, err_json/3, set_cookie/3, clear_cookie/1, cookie_value/2,
-    require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1
+    require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1, hex_binary/1
 ]).
 
 env_int(Name, Default) ->
@@ -77,6 +77,8 @@ constant_time([A|As], [B|Bs], Acc) -> constant_time(As, Bs, Acc bor (A bxor B)).
 hex(Bin) -> << <<(hex_char((X bsr 4) band 15)), (hex_char(X band 15))>> || <<X>> <= Bin >>.
 hex_char(N) when N < 10 -> $0 + N;
 hex_char(N) -> $a + N - 10.
+
+hex_binary(Bin) -> hex(Bin).
 
 bin(undefined) -> <<>>;
 bin(null) -> <<>>;
