@@ -13,7 +13,10 @@ init(Req0, State) ->
 allowed(Req, Method, Path) ->
     Ip = pw_util:ip(Req),
     Limit = case Method of <<"GET">> -> 900; _ -> 180 end,
-    pw_rate:allow({Ip, Method, Path}, Limit, 60000).
+    pw_rate:allow({api, Ip, Method, route_bucket(Path)}, Limit, 60000).
+
+route_bucket([]) -> root;
+route_bucket([First | _]) -> First.
 
 api_path(Path) ->
     Segs = [S || S <- binary:split(Path, <<"/">>, [global]), S =/= <<>>],
@@ -66,9 +69,14 @@ handle(<<"GET">>, [<<"health">>], Req0, _) ->
 handle(Method, Path, Req0, State) ->
     case auth(Req0) of
         {ok, Session} ->
-            case Method =:= <<"GET">> orelse pw_util:require_csrf(Req0, Session) of
-                true -> authed(Method, Path, Req0, Session, State);
-                false -> pw_util:err_json(Req0, 403, <<"bad_csrf">>)
+            UserLimit = case Method of <<"GET">> -> 1200; _ -> 240 end,
+            case pw_rate:allow({api_user, uid(Session), Method}, UserLimit, 60000) of
+                false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+                true ->
+                    case Method =:= <<"GET">> orelse pw_util:require_csrf(Req0, Session) of
+                        true -> authed(Method, Path, Req0, Session, State);
+                        false -> pw_util:err_json(Req0, 403, <<"bad_csrf">>)
+                    end
             end;
         {error, database_unavailable} -> pw_util:err_json(Req0, 503, <<"database_unavailable">>);
         {error, timeout} -> pw_util:err_json(Req0, 503, <<"database_timeout">>);
@@ -83,12 +91,14 @@ auth(Req) ->
 uid(Session) -> maps:get(id, maps:get(user, Session)).
 
 authed(<<"GET">>, [<<"me">>], Req, Session, _) -> pw_util:ok_json(Req, #{ok=>true,data=>Session});
+authed(<<"GET">>, [<<"rtc-config">>], Req, Session, _) ->
+    pw_util:ok_json(Req, #{ok=>true,data=>pw_rtc_config:get(uid(Session))});
 authed(<<"POST">>, [<<"logout">>], Req0, _, _) ->
     Token = pw_util:cookie_value(Req0, <<"pw_session">>),
     _ = case Token of undefined -> ok; _ -> pw_db:logout(Token) end,
     pw_util:ok_json(pw_util:clear_cookie(Req0), #{ok=>true});
 authed(<<"GET">>, [<<"sync">>], Req, Session, _) -> result(Req, pw_db:sync(uid(Session), qs(Req, <<"since">>)));
-authed(<<"POST">>, [<<"profile">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_profile(uid(Session), maps:get(<<"display_name">>, M, maps:get(display_name, maps:get(user,Session))), M)) end);
+authed(<<"POST">>, [<<"profile">>], Req0, Session, _) -> with_json_large(Req0, fun(M, Req) -> result(Req, pw_db:update_profile(uid(Session), maps:get(<<"display_name">>, M, maps:get(display_name, maps:get(user,Session))), M)) end);
 authed(<<"GET">>, [<<"forums">>], Req, Session, _) -> result(Req, pw_db:forums(uid(Session)));
 authed(<<"POST">>, [<<"forums">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_forum(uid(Session), maps:get(<<"name">>,M,<<>>), maps:get(<<"slug">>,M,<<>>), maps:get(<<"description">>,M,<<>>))) end);
 authed(<<"POST">>, [<<"forum">>, Id, <<"join">>], Req, Session, _) -> result(Req, pw_db:join_forum(uid(Session), Id));
@@ -135,6 +145,8 @@ authed(<<"POST">>, [<<"conversation">>, Id, <<"members">>], Req0, Session, _) ->
 authed(<<"POST">>, [<<"conversation">>, Id, <<"read">>], Req, Session, _) -> result(Req, pw_db:mark_conversation_read(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"messages">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:post_direct_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
 authed(<<"POST">>, [<<"conversation">>, Id, <<"leave">>], Req, Session, _) -> result(Req, pw_db:leave_conversation(uid(Session), Id));
+authed(<<"POST">>, [<<"conversation">>, Id, <<"request">>, <<"accept">>], Req, Session, _) -> result(Req, pw_db:accept_message_request(uid(Session), Id));
+authed(<<"POST">>, [<<"conversation">>, Id, <<"request">>, <<"deny">>], Req, Session, _) -> result(Req, pw_db:deny_message_request(uid(Session), Id));
 authed(<<"GET">>, [<<"notifications">>], Req, Session, _) -> result(Req, pw_db:notifications(uid(Session)));
 authed(<<"POST">>, [<<"notifications">>, <<"seen">>], Req, Session, _) -> result(Req, pw_db:mark_notifications_seen(uid(Session)));
 authed(_, _, Req, _, _) -> pw_util:err_json(Req, 404, <<"not_found">>).
@@ -146,6 +158,13 @@ with_json_public(Req0, Fun) ->
         {error, _, Req} -> pw_util:err_json(Req, 400, <<"invalid_json">>)
     end.
 with_json(Req0, Fun) -> with_json_public(Req0, Fun).
+
+with_json_large(Req0, Fun) ->
+    case pw_util:read_json(Req0, 20971520) of
+        {ok, M, Req} -> Fun(M, Req);
+        {error, too_large, Req} -> pw_util:err_json(Req, 413, <<"profile_images_too_large">>);
+        {error, _, Req} -> pw_util:err_json(Req, 400, <<"invalid_json">>)
+    end.
 
 result(Req, {ok, Data}) -> pw_util:ok_json(Req, #{ok=>true,data=>Data});
 result(Req, ok) -> pw_util:ok_json(Req, #{ok=>true});

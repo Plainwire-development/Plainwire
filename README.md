@@ -63,6 +63,18 @@ Message encryption is encryption at rest, not end-to-end encryption. The server 
 * [WebRTC](https://github.com/webrtc)
 * [rebar3](https://github.com/erlang/rebar3)
 
+## Debug logging
+
+The browser bridge logs API timing, WebSocket lifecycle and messages, microphone
+tracks, voice activity, WebRTC signaling/state changes, Elm commands, network
+changes, and uncaught errors. Sensitive fields and message bodies are redacted.
+
+In the browser console, run `PlainwireDebug.snapshot()` for the current voice
+and connection state. Logging is enabled by default; use
+`PlainwireDebug.setEnabled(false)` (or `true`) to persist the setting and reload.
+Voice activity transitions and room/connection lifecycle events are also printed
+by the Erlang backend when the server is running. No audio is sent to the backend.
+
 # Below is information on how to host (If you want to be a hosting candidate)
 
 > Or you're a contributor and want to code, test, build, and push. either goes.
@@ -112,7 +124,7 @@ Build Elm:
 
 ```sh
 cd priv/static/elm
-elm make src/Main.elm --output=../../app.js --optimize
+elm make src/Main.elm --output=../app.js --optimize
 ```
 
 Build SCSS:
@@ -147,8 +159,22 @@ http://localhost:8080
 | `PLAINWIRE_DB_NAME`      | `plainwire` | PostgreSQL database                                           |
 | `PLAINWIRE_DB_SSL`       |     `false` | Enable SSL for PostgreSQL                                     |
 | `PLAINWIRE_ENC_KEY`      |       unset | Base64-encoded 32-byte AES key for message encryption at rest |
+| `PLAINWIRE_MEDIA_SIGNING_KEY` | ENC key | Optional separate base64 32-byte media-token signing key      |
 | `PLAINWIRE_PBKDF2_ITERS` |    `160000` | Password hash iteration count                                 |
 | `COOKIE_SECURE`          |     `false` | Set to `true` when running behind HTTPS                       |
+| `PLAINWIRE_PUBLIC_URL`   |       unset | Canonical HTTPS origin; required in production                 |
+| `PLAINWIRE_ALLOWED_ORIGINS` | public URL | Comma-separated WebSocket origins                           |
+| `PLAINWIRE_TRUST_PROXY`    |     `false` | Trust the first `X-Forwarded-For` address for rate limiting    |
+| `PLAINWIRE_MEDIA_ALLOWED_HOSTS` | unset | Trusted hosts allowed for remote images and embeds          |
+| `PLAINWIRE_ALLOW_ARBITRARY_MEDIA` | `false` | Explicitly allow unrestricted hosts (not recommended)   |
+| `PLAINWIRE_STUN_URLS`    | Google STUN | Comma-separated STUN server URLs                              |
+| `PLAINWIRE_TURN_URLS`    |       unset | Comma-separated TURN URLs (`turn:` or `turns:`)               |
+| `PLAINWIRE_TURN_SECRET`  |       unset | Coturn REST shared secret (32+ random bytes recommended)       |
+| `PLAINWIRE_TURN_USERNAME`| `plainwire` | Label used in temporary TURN usernames                        |
+| `PLAINWIRE_TURN_TTL_SECONDS` |    `3600` | Temporary TURN credential lifetime (300–86400)             |
+| `PLAINWIRE_REQUIRE_TURN` | prod: `true` | Fail startup when TURN is missing                             |
+| `PLAINWIRE_ALLOW_STATIC_TURN_CREDENTIALS` | `false` | Permit long-lived TURN credentials in prod      |
+| `PLAINWIRE_ICE_TRANSPORT_POLICY` | `all` | Set to `relay` to force all calls through TURN             |
 
 Generate an encryption key:
 
@@ -160,11 +186,18 @@ Example production-style configuration:
 
 ```sh
 COOKIE_SECURE=true
+PLAINWIRE_ENV=production
+PLAINWIRE_PUBLIC_URL=https://chat.example.com
 PLAINWIRE_ENC_KEY=your-base64-key-here
 PLAINWIRE_DB_HOST=localhost
 PLAINWIRE_DB_USER=plainwire
 PLAINWIRE_DB_PASS=plainwire
 PLAINWIRE_DB_NAME=plainwire
+PLAINWIRE_DB_SSL=true
+PLAINWIRE_MEDIA_ALLOWED_HOSTS=cdn.example.com,images.example.net
+PLAINWIRE_TURN_URLS=turn:turn.example.com:3478,turns:turn.example.com:5349
+PLAINWIRE_TURN_USERNAME=plainwire
+PLAINWIRE_TURN_SECRET=replace-with-at-least-32-random-bytes
 ```
 
 ## Persistence and upgrades
@@ -187,12 +220,26 @@ For public hosting:
 * Use HTTPS
 * Set `COOKIE_SECURE=true`
 * Keep PostgreSQL private
-* Expose only the reverse proxy publicly
+* Expose only the reverse proxy publicly; firewall the Erlang listener
 * Set `PLAINWIRE_ENC_KEY`
 * Back up PostgreSQL regularly
 * Keep dependencies updated
+* Restrict outbound traffic and keep `PLAINWIRE_MEDIA_ALLOWED_HOSTS` narrow
+* Set `PLAINWIRE_TRUST_PROXY=true` only when the app port is reachable solely by your proxy
 
-WebRTC voice uses STUN for peer-to-peer connections. Some networks may require TURN support later.
+WebRTC voice uses STUN for direct peer-to-peer connections and automatically falls back to the
+configured TURN server when a direct connection is blocked by NAT or a firewall. With
+`PLAINWIRE_TURN_SECRET`, the authenticated RTC endpoint creates a user-scoped, short-lived HMAC-SHA1
+credential compatible with coturn's `use-auth-secret`/`static-auth-secret` mechanism. The browser
+refreshes configuration periodically. Configure the exact same secret in coturn, set its realm,
+disable anonymous access, cap allocations/quotas, and expose UDP/TCP 3478 plus TLS 5349. Include
+both `turn:` and `turns:` URLs so restrictive networks have a TLS fallback.
+
+Production startup deliberately fails without HTTPS public-origin configuration, secure cookies,
+database TLS, a non-default database password, encryption, an adequate password-hash cost, and TURN
+(unless `PLAINWIRE_REQUIRE_TURN=false` is explicitly set). Remote media and embed fetching is denied
+in production unless its host is allowlisted or unrestricted fetching is explicitly enabled. Keep
+network-level egress rules as a second SSRF boundary even when using the allowlist.
 
 ## Development notes
 
@@ -221,4 +268,3 @@ The AGPL is used because Plainwire is a hosted web application. It allows people
 This helps keep improvements open while still allowing others to run and contribute to the project.
 
 The Plainwire name, logo, and branding are not included in this license unless stated otherwise.
-

@@ -46,7 +46,7 @@ type alias User =
 type alias Conversation =
     { id : Int, name : String, avatarUrl : String, ownerId : Int
     , createdAt : Int, updatedAt : Int, lastReadMessageId : Int
-    , muted : Bool, memberCount : Int, lastBody : Maybe String
+    , muted : Bool, requestState : String, memberCount : Int, lastBody : Maybe String
     , lastMessageId : Maybe Int, unread : Int, members : List MemberUser
     , peerName : String, peerAvatarUrl : String, peerUsername : String
     }
@@ -187,6 +187,7 @@ type alias Model =
     , profileStatus : String, profileTheme : String
     , serverName : String, serverDescription : String
     , modalTitle : String, modalBody : String, modalUserIds : String
+    , friendsTab : String, friendQuery : String
     , booting : Bool
     , userStatuses : Dict String String
     }
@@ -282,6 +283,9 @@ type Msg
     | FileUpload String (Maybe String)
     | ReadFile String
     | SetSettingsTab String
+    | SetFriendsTab String
+    | FriendQuery String
+    | FindFriends
     | ClearNotifs
     | SearchQuery String
     | DoSearch
@@ -328,6 +332,7 @@ decodeConversation = D.succeed Conversation
     |> andMap (D.field "updated_at" D.int)
     |> andMap (D.field "last_read_message_id" D.int |> defaultValue 0)
     |> andMap (D.field "muted" D.bool |> defaultValue False)
+    |> andMap (D.field "request_state" D.string |> defaultValue "accepted")
     |> andMap (D.field "member_count" D.int |> defaultValue 1)
     |> andMap (D.field "last_body" (D.nullable D.string))
     |> andMap (D.field "last_message_id" (D.nullable D.int))

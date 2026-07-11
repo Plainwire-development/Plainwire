@@ -5,35 +5,51 @@
 init(Req0, _State) ->
     case origin_allowed(Req0) of
         false ->
+            logger:warning("[plainwire:ws] connection_rejected reason=origin host=~p origin=~p", [cowboy_req:header(<<"host">>, Req0), cowboy_req:header(<<"origin">>, Req0)]),
             {ok, cowboy_req:reply(403, #{}, <<"forbidden origin">>, Req0), #{}};
         true ->
             case pw_util:cookie_value(Req0, <<"pw_session">>) of
-                undefined -> {ok, cowboy_req:reply(401, #{}, <<"not authenticated">>, Req0), #{}};
+                undefined ->
+                    logger:warning("[plainwire:ws] connection_rejected reason=unauthenticated"),
+                    {ok, cowboy_req:reply(401, #{}, <<"not authenticated">>, Req0), #{}};
                 Token ->
-                    case pw_db:session(Token) of
+                        case pw_db:session(Token) of
                         {ok, Session} ->
                             User = maps:get(user, Session),
                             Status = maps:get(status, User, <<"online">>),
-                            WsOpts = #{idle_timeout => 60000, max_frame_size => 65536},
-                            {cowboy_websocket, Req0, #{session=>Session, uid=>maps:get(id,User), subs=>[], voice=>undefined, call=>undefined, status=>Status}, WsOpts};
+                            CleanSession = strip_session_urls(Session),
+                            WsOpts = #{idle_timeout => 300000, max_frame_size => 65536},
+                            {cowboy_websocket, Req0, #{session=>CleanSession, token=>Token,
+                                last_auth_check=>erlang:monotonic_time(millisecond),
+                                uid=>maps:get(id,User), subs=>[], voice=>undefined, call=>undefined, status=>Status}, WsOpts};
                         _ -> {ok, cowboy_req:reply(401, #{}, <<"not authenticated">>, Req0), #{}}
                     end
             end
     end.
 
 websocket_init(State=#{uid:=Uid, status:=Status}) ->
+    debug(info, "connected", #{uid => Uid, status => Status}),
     pw_hub:connect(Uid, self(), Status),
-    {reply, {text, pw_util:json(#{type=>hello, session=>maps:get(session,State)})}, State}.
+    Session = strip_session_urls(maps:get(session, State)),
+    {reply, {text, pw_util:json(#{type=>hello, session=>Session})}, State}.
 
 websocket_handle({text, Data}, State0=#{uid:=Uid}) ->
-    case byte_size(Data) =< 65536 andalso pw_rate:allow({ws, Uid}, 240, 60000) of
-        true ->
-            case safe_json_decode(Data) of
-                M when is_map(M) -> handle_msg(M, State0);
-                _ -> {ok, State0}
-            end;
-        false ->
-            reply_error(State0, rate_limited)
+    case revalidate_session(State0) of
+        {error, expired} -> {stop, State0};
+        {ok, State} ->
+            case byte_size(Data) =< 65536 andalso pw_rate:allow({ws, Uid}, 240, 60000) of
+                true ->
+                    case safe_json_decode(Data) of
+                        M when is_map(M) ->
+                            debug(debug_level(M), "received", #{uid => Uid, type => event_type(M), bytes => byte_size(Data), room => room_summary(State)}),
+                            handle_msg(M, State);
+                        _ ->
+                            debug(warning, "invalid_json", #{uid => Uid, bytes => byte_size(Data)}),
+                            {ok, State}
+                    end;
+                false ->
+                    reply_error(State, rate_limited)
+            end
     end;
 websocket_handle(_Frame, State) -> {ok, State}.
 
@@ -120,16 +136,25 @@ handle_msg(#{<<"type">> := <<"call_signal">>, <<"to_user_id">> := To0, <<"signal
         {To, true} when is_integer(To), To > 0 -> pw_hub:call_signal(Cid, Uid, To, Sig), {ok, State};
         _ -> {ok, State}
     end;
+handle_msg(#{<<"type">> := <<"voice_activity">>, <<"active">> := Active0}=Msg, State=#{uid:=Uid}) ->
+    Active = pw_util:bool(Active0),
+    Level = clamp_level(pw_util:int(maps:get(<<"level_db">>, Msg, -100))),
+    debug(info, case Active of true -> "voice_detected"; false -> "voice_stopped" end,
+        #{uid => Uid, active => Active, level_db => Level, room => room_summary(State)}),
+    {ok, State};
 handle_msg(#{<<"type">> := <<"presence_update">>, <<"status">> := Status0}, #{uid:=Uid}=State) ->
     Status = clean_status(Status0),
     pw_hub:status_update(Uid, Status),
     {ok, State#{status => Status}};
 handle_msg(_, State) -> {ok, State}.
 
-websocket_info({hub_json, Event}, State) -> {reply, {text, pw_util:json(Event)}, State};
+websocket_info({hub_json, Event}, State=#{uid:=Uid}) ->
+    debug(debug_level(Event), "sent", #{uid => Uid, type => event_type(Event), room => room_summary(State)}),
+    {reply, {text, pw_util:json(Event)}, State};
 websocket_info(_, State) -> {ok, State}.
 
-terminate(_, _, State) ->
+terminate(Reason, _, State=#{uid:=Uid}) ->
+    debug(info, "disconnected", #{uid => Uid, reason => Reason, room => room_summary(State)}),
     maybe_leave_voice(State), maybe_leave_call(State), pw_hub:disconnect(self()), ok.
 
 parse_key(Bin) when is_binary(Bin) ->
@@ -164,13 +189,39 @@ clean_status(_) -> <<"online">>.
 
 origin_allowed(Req) ->
     case cowboy_req:header(<<"origin">>, Req, <<>>) of
-        <<>> -> true;
+        <<>> -> not production_env();
         Origin ->
-            Allowed = pw_util:env_str("PLAINWIRE_ALLOWED_ORIGINS", <<>>),
+            Allowed = configured_origins(),
             case Allowed of
                 <<>> -> same_origin(Origin, cowboy_req:header(<<"host">>, Req, <<>>));
                 _ -> lists:member(Origin, [string:trim(O) || O <- binary:split(Allowed, <<",">>, [global])])
             end
+    end.
+
+production_env() ->
+    lists:member(os:getenv("PLAINWIRE_ENV"), ["prod", "production"]) orelse
+        lists:member(os:getenv("NODE_ENV"), ["prod", "production"]).
+
+revalidate_session(State=#{last_auth_check := Last, token := Token, uid := Uid}) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Now - Last < 60000 of
+        true -> {ok, State};
+        false ->
+            case pw_db:session(Token) of
+                {ok, Session} ->
+                    User = maps:get(user, Session),
+                    case maps:get(id, User) of
+                        Uid -> {ok, State#{session=>Session, last_auth_check=>Now}};
+                        _ -> {error, expired}
+                    end;
+                _ -> {error, expired}
+            end
+    end.
+
+configured_origins() ->
+    case pw_util:env_str("PLAINWIRE_ALLOWED_ORIGINS", <<>>) of
+        <<>> -> pw_util:env_str("PLAINWIRE_PUBLIC_URL", <<>>);
+        Origins -> Origins
     end.
 
 same_origin(Origin, Host) ->
@@ -203,3 +254,30 @@ maybe_leave_voice(State=#{uid:=Uid, voice:=Cid}) when is_integer(Cid) -> pw_hub:
 maybe_leave_voice(State) -> State.
 maybe_leave_call(State=#{uid:=Uid, call:=Cid}) when is_integer(Cid) -> pw_hub:call_leave(Cid, Uid), State;
 maybe_leave_call(State) -> State.
+
+event_type(Map) -> maps:get(<<"type">>, Map, maps:get(type, Map, unknown)).
+
+debug_level(Map) ->
+    case event_type(Map) of
+        <<"voice_signal">> -> debug;
+        <<"call_signal">> -> debug;
+        voice_signal -> debug;
+        call_signal -> debug;
+        _ -> info
+    end.
+
+room_summary(State) ->
+    #{voice => maps:get(voice, State, undefined), call => maps:get(call, State, undefined)}.
+
+clamp_level(undefined) -> -100;
+clamp_level(N) when N < -100 -> -100;
+clamp_level(N) when N > 0 -> 0;
+clamp_level(N) -> N.
+
+debug(debug, Event, Data) -> logger:debug("[plainwire:ws] ~s ~p", [Event, Data]);
+debug(info, Event, Data) -> logger:notice("[plainwire:ws] ~s ~p", [Event, Data]);
+debug(warning, Event, Data) -> logger:warning("[plainwire:ws] ~s ~p", [Event, Data]).
+
+strip_session_urls(Session = #{user := User}) ->
+    Session#{user => maps:remove(avatar_source_url, maps:remove(banner_source_url, User))};
+strip_session_urls(Session) -> Session.

@@ -1,12 +1,15 @@
 -module(pw_media).
 -behaviour(gen_server).
--export([start_link/0, proxy_url/1, fetch/2, validate_url/1]).
+-export([start_link/0, proxy_url/1, fetch/2, validate_url/1, cache_data_url/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
 -define(CACHE, pw_media_cache).
--define(MAX_BYTES, 524288).
+-define(MAX_BYTES, 26214400).
+-define(MAX_SERVE_BYTES, 15728640).
 -define(TTL_MS, 3600000).
+-define(MAX_CACHE_ENTRIES, 500).
+-define(MAX_CACHE_MEM, 104857600).
 
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
@@ -14,8 +17,43 @@ start_link() ->
 proxy_url(Url) when is_binary(Url) ->
     <<"/api/media/", (pw_crypto:proxy_token(Url))/binary>>.
 
+cache_data_url(<<"data:", Rest/binary>> = DataUrl) ->
+    case safe_data_url_parse(Rest) of
+        {ok, ContentType, Body} ->
+            Now = pw_util:now_ms(),
+            SynthUrl = <<"data-proxy:", (pw_util:sha256_hex(DataUrl))/binary>>,
+            Key = cache_key(SynthUrl),
+            ets:insert(?CACHE, {Key, Body, ContentType, Now + ?TTL_MS}),
+            proxy_url(SynthUrl);
+        error ->
+            DataUrl
+    end;
+cache_data_url(Url) -> Url.
+
+safe_data_url_parse(Rest) ->
+    case binary:split(Rest, <<",">>) of
+        [Meta, BodyB64] ->
+            ContentType = case binary:split(Meta, <<";">>) of
+                [CT | _] -> CT;
+                _ -> Meta
+            end,
+            try base64:decode(BodyB64) of
+                Body when byte_size(Body) =< ?MAX_SERVE_BYTES ->
+                    {ok, ContentType, Body};
+                _ -> error
+            catch _:_ -> error
+            end;
+        _ -> error
+    end.
+
 fetch(Uid, Token) ->
-    gen_server:call(?SERVER, {fetch, Uid, Token}, 15000).
+    %% Remote requests must not run inside the gen_server: one slow avatar used
+    %% to block every other image request behind it.
+    try resolve_fetch(Uid, Token)
+    catch C:R:S ->
+        error_logger:error_msg("media fetch failed ~p:~p ~p~n", [C, R, S]),
+        {error, fetch_failed}
+    end.
 
 init([]) ->
     _ = ets:new(?CACHE, [named_table, public, set, {read_concurrency, true}]),
@@ -38,22 +76,34 @@ code_change(_, St, _) -> {ok, St}.
 
 resolve_fetch(_Uid, Token) ->
     Url = decode_token(Token),
+    Key = cache_key(Url),
+    Now = pw_util:now_ms(),
+    case ets:lookup(?CACHE, Key) of
+        [{Key, Body, Type, Expires}] when Expires > Now, byte_size(Body) =< ?MAX_SERVE_BYTES ->
+            {ok, Body, Type};
+        [{Key, _, _, Expires}] when Expires > Now ->
+            {error, too_large};
+        _ ->
+            resolve_fetch_url(Url, Key, Now)
+    end.
+
+resolve_fetch_url(<<"data-proxy:", _/binary>>, _Key, _Now) ->
+    {error, not_found};
+resolve_fetch_url(Url, Key, Now) ->
     case validate_url(Url) of
         ok ->
-            Key = cache_key(Url),
-            Now = pw_util:now_ms(),
-            case ets:lookup(?CACHE, Key) of
-                [{Key, Body, Type, Expires}] when Expires > Now ->
-                    {ok, Body, Type};
-                _ ->
-                    case http_get(Url) of
-                        {ok, Body, Type} ->
+            case http_get(Url) of
+                {ok, Body, Type} ->
+                    case byte_size(Body) =< ?MAX_SERVE_BYTES of
+                        true ->
                             ets:insert(?CACHE, {Key, Body, Type, Now + ?TTL_MS}),
                             prune_cache(Now),
                             {ok, Body, Type};
-                        Err ->
-                            Err
-                    end
+                        false ->
+                            {error, too_large}
+                    end;
+                Err ->
+                    Err
             end;
         Err ->
             Err
@@ -68,12 +118,15 @@ decode_token(Token) ->
                 true when byte_size(Url) > 0 -> Url;
                 _ -> erlang:error(invalid_token)
             end;
-        _ ->
-            Url = pw_util:base64url_decode(Token),
+        [Legacy] ->
+            %% Compatibility for URLs issued before signed proxy tokens. The
+            %% decoded URL still passes DNS/IP and production allowlist checks.
+            Url = pw_util:base64url_decode(Legacy),
             case byte_size(Url) > 0 of
                 true -> Url;
                 false -> erlang:error(invalid_token)
-            end
+            end;
+        _ -> erlang:error(invalid_token)
     end.
 
 cache_key(Url) -> pw_util:sha256_hex(Url).
@@ -81,13 +134,30 @@ cache_key(Url) -> pw_util:sha256_hex(Url).
 validate_url(Url) ->
     case uri_string:parse(binary_to_list(Url)) of
         #{scheme := Scheme, host := Host} when Scheme =:= "http"; Scheme =:= "https" ->
-            case blocked_host_or_addr(string:lowercase(Host)) of
+            LowerHost = string:lowercase(Host),
+            case blocked_host_or_addr(LowerHost) orelse not host_allowed(LowerHost) of
                 true -> {error, blocked_url};
                 false -> ok
             end;
         _ ->
             {error, invalid_url}
     end.
+
+host_allowed(Host) ->
+    case pw_util:env_str("PLAINWIRE_MEDIA_ALLOWED_HOSTS", <<>>) of
+        <<>> ->
+            not production_env() orelse pw_util:env_bool("PLAINWIRE_ALLOW_ARBITRARY_MEDIA", false);
+        Csv ->
+            Hosts = [string:lowercase(binary_to_list(string:trim(H))) ||
+                H <- binary:split(Csv, <<",">>, [global]), H =/= <<>>],
+            lists:any(fun(Allowed) ->
+                Host =:= Allowed orelse lists:suffix("." ++ Allowed, Host)
+            end, Hosts)
+    end.
+
+production_env() ->
+    lists:member(os:getenv("PLAINWIRE_ENV"), ["prod", "production"]) orelse
+        lists:member(os:getenv("NODE_ENV"), ["prod", "production"]).
 
 blocked_host(H) ->
     lists:any(fun(Prefix) -> string:prefix(H, Prefix) =:= Prefix end,
@@ -134,22 +204,16 @@ blocked_addr({_,_,_,_,_,_,_,_}) -> false;
 blocked_addr(_) -> true.
 
 http_get(Url) ->
-    Headers = [{"user-agent", "PlainwireRelay/1.1"}],
-    case httpc:request(get, {binary_to_list(Url), Headers}, [{timeout, 8000}, {autoredirect, false}], [{body_format, binary}]) of
-        {ok, {{_, Code, _}, RespHeaders, Body}} when Code >= 200, Code < 300 ->
-            case content_length_ok(RespHeaders) andalso byte_size(Body) =< ?MAX_BYTES of
-                true ->
-                    Type = content_type(RespHeaders),
-                    case allowed_type(Type) of
-                        true -> {ok, Body, Type};
-                        false -> {error, unsupported_type}
-                    end;
-                false ->
-                    {error, too_large}
+    case pw_http_fetch:get(Url, ?MAX_BYTES) of
+        {ok, Code, RespHeaders, Body} when Code >= 200, Code < 300 ->
+            Type = content_type(RespHeaders),
+            case allowed_type(Type) of
+                true -> {ok, Body, Type};
+                false -> {error, unsupported_type}
             end;
-        {ok, {{_, Code, _}, _, _}} when Code >= 300, Code < 400 ->
+        {ok, Code, _, _} when Code >= 300, Code < 400 ->
             {error, blocked_url};
-        {ok, {{_, Code, _}, _, _}} ->
+        {ok, Code, _, _} ->
             {error, {http, Code}};
         {error, Reason} ->
             {error, Reason}
@@ -161,15 +225,6 @@ content_type(Headers) ->
         CT -> pw_util:bin(string:trim(hd(string:split(CT, ";"))))
     end.
 
-content_length_ok(Headers) ->
-    case header_value("content-length", Headers) of
-        undefined -> false;
-        Len -> case safe_list_to_integer(string:trim(Len)) of
-            N when is_integer(N), N =< ?MAX_BYTES -> true;
-            _ -> false
-        end
-    end.
-
 header_value(Name, Headers) ->
     Lower = string:lowercase(Name),
     case [V || {K, V} <- Headers, string:lowercase(K) =:= Lower] of
@@ -177,18 +232,32 @@ header_value(Name, Headers) ->
         [] -> undefined
     end.
 
-safe_list_to_integer(V) ->
-    try list_to_integer(V) catch _:_ -> undefined end.
-
-allowed_type(<<"image/", _/binary>>) -> true;
+allowed_type(<<"image/jpeg">>) -> true;
+allowed_type(<<"image/png">>) -> true;
+allowed_type(<<"image/gif">>) -> true;
+allowed_type(<<"image/webp">>) -> true;
+allowed_type(<<"image/avif">>) -> true;
 allowed_type(_) -> false.
 
 prune_cache(Now) ->
-    case ets:info(?CACHE, size) of
-        N when N > 500 ->
-            Expired = [K || {K, _, _, Exp} <- ets:tab2list(?CACHE), Exp =< Now],
+    Size = ets:info(?CACHE, size),
+    MemBytes = ets:info(?CACHE, memory) * erlang:system_info(wordsize),
+    NeedsPrune = Size > ?MAX_CACHE_ENTRIES orelse MemBytes > ?MAX_CACHE_MEM,
+    case NeedsPrune of
+        true ->
+            ExpiredSpec = [{{'$1', '_', '_', '$3'}, [{'<', '$3', Now}], ['$1']}],
+            Expired = ets:select(?CACHE, ExpiredSpec),
             [ets:delete(?CACHE, K) || K <- Expired],
-            ok;
-        _ ->
+            case ets:info(?CACHE, size) > ?MAX_CACHE_ENTRIES of
+                true ->
+                    OldestSpec = [{{'$1', '_', '_', '$3'}, [], ['$$']}],
+                    All = ets:select(?CACHE, OldestSpec),
+                    Sorted = lists:keysort(3, All),
+                    ToDrop = length(Sorted) - ?MAX_CACHE_ENTRIES,
+                    [ets:delete(?CACHE, element(1, E)) || E <- lists:sublist(Sorted, max(0, ToDrop))];
+                false ->
+                    ok
+            end;
+        false ->
             ok
     end.

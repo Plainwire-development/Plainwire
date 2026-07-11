@@ -3,8 +3,8 @@
     env_int/2, env_bool/2, env_str/2, now_ms/0, random_token/1, sha256_hex/1,
     base64url/1, base64url_decode/1, pbkdf2/2, verify_password/3,
     normalize_username/1, clean_text/2, int/1, bool/1, bin/1, json/1,
-    read_json/1, ok_json/2, err_json/3, set_cookie/3, clear_cookie/1, cookie_value/2,
-    require_csrf/2, ip/1, security_headers/0, proxied_image/1
+    read_json/1, read_json/2, ok_json/2, err_json/3, set_cookie/3, clear_cookie/1, cookie_value/2,
+    require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1
 ]).
 
 env_int(Name, Default) ->
@@ -138,6 +138,9 @@ key(K) -> bin(K).
 read_json(Req0) ->
     read_json_body(Req0, <<>>, 1048576).
 
+read_json(Req0, MaxBytes) when is_integer(MaxBytes), MaxBytes >= 1024, MaxBytes =< 41943040 ->
+    read_json_body(Req0, <<>>, MaxBytes).
+
 read_json_body(Req0, Acc, Remaining) when Remaining > 0 ->
     case cowboy_req:read_body(Req0, #{length => Remaining, period => 5000}) of
         {ok, Body, Req1} ->
@@ -189,21 +192,31 @@ security_headers() -> #{
     <<"x-frame-options">> => <<"SAMEORIGIN">>,
     <<"cross-origin-resource-policy">> => <<"same-origin">>,
     <<"referrer-policy">> => <<"same-origin">>,
+    <<"cross-origin-opener-policy">> => <<"same-origin">>,
+    <<"x-permitted-cross-domain-policies">> => <<"none">>,
     <<"strict-transport-security">> => <<"max-age=31536000; includeSubDomains">>,
     <<"content-security-policy">> => <<"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'">>,
-    <<"permissions-policy">> => <<"camera=(), microphone=(self), geolocation=()">>
+    <<"permissions-policy">> => <<"camera=(), microphone=(self), geolocation=(), payment=(), usb=(), browsing-topics=()">>
 }.
 
 proxied_image(Url0) ->
     Url = bin(Url0),
     case Url of
         <<>> -> <<>>;
-        <<"data:", _/binary>> -> <<>>;
+        <<"data:", _/binary>> -> pw_media:cache_data_url(Url);
         <<"/api/media/", _/binary>> -> Url;
         <<"http://", _/binary>> -> pw_media:proxy_url(Url);
         <<"https://", _/binary>> -> pw_media:proxy_url(Url);
         _ -> Url
     end.
+
+safe_image_data_url(Url) when is_binary(Url), byte_size(Url) =< 17825792 ->
+    lists:any(fun(Prefix) -> binary:match(Url, Prefix) =:= {0, byte_size(Prefix)} end, [
+        <<"data:image/jpeg;base64,">>, <<"data:image/png;base64,">>,
+        <<"data:image/gif;base64,">>, <<"data:image/webp;base64,">>,
+        <<"data:image/avif;base64,">>
+    ]);
+safe_image_data_url(_) -> false.
 
 set_cookie(Req, Name, Value) ->
     Secure = cookie_secure_default(),
@@ -239,6 +252,20 @@ require_csrf(Req, Session) ->
     Csrf =/= <<>> andalso Header =:= Csrf.
 
 ip(Req) ->
+    case env_bool("PLAINWIRE_TRUST_PROXY", false) of
+        true -> forwarded_ip(Req);
+        false -> peer_ip(Req)
+    end.
+
+forwarded_ip(Req) ->
+    Header = cowboy_req:header(<<"x-forwarded-for">>, Req, <<>>),
+    First = hd(binary:split(Header, <<",">>, [global]) ++ [<<>>]),
+    case inet:parse_address(binary_to_list(string:trim(First))) of
+        {ok, Addr} -> Addr;
+        _ -> peer_ip(Req)
+    end.
+
+peer_ip(Req) ->
     case cowboy_req:peer(Req) of
         {{A,B,C,D}, _} -> {A,B,C,D};
         {Addr, _} -> Addr;

@@ -27,15 +27,24 @@ stop(_State) ->
     ok.
 
 ensure_secure_config() ->
-    case production_env() of
+    Production = production_env(),
+    case Production of
         false ->
-            ok;
+            ensure_rtc_config(Production);
         true ->
             true = pw_crypto:enabled(),
             true = secure_cookie_configured(),
             true = db_password_configured(),
             true = db_ssl_configured(),
-            ok
+            true = public_url_configured(),
+            true = password_cost_configured(),
+            ensure_rtc_config(Production)
+    end.
+
+ensure_rtc_config(Production) ->
+    case pw_rtc_config:validate(Production) of
+        ok -> ok;
+        {error, Reason} -> erlang:error({insecure_production_config, Reason})
     end.
 
 production_env() ->
@@ -74,4 +83,16 @@ db_ssl_configured() ->
         {_, "TRUE"} -> true;
         {_, "yes"} -> true;
         _ -> erlang:error({insecure_production_config, db_ssl})
+    end.
+
+public_url_configured() ->
+    case os:getenv("PLAINWIRE_PUBLIC_URL") of
+        "https://" ++ Host when Host =/= [] -> true;
+        _ -> erlang:error({insecure_production_config, public_https_url})
+    end.
+
+password_cost_configured() ->
+    case pw_util:env_int("PLAINWIRE_PBKDF2_ITERS", 160000) of
+        N when N >= 100000 -> true;
+        _ -> erlang:error({insecure_production_config, password_hash_cost})
     end.

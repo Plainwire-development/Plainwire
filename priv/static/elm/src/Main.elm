@@ -112,6 +112,7 @@ init _ url _ =
       , profileAvatarUrl = "", profileBannerUrl = ""
       , profileStatus = "online", profileTheme = "system"
       , modalTitle = "", modalBody = "", modalUserIds = ""
+      , friendsTab = "online", friendQuery = ""
       }
     , Cmd.batch
         [ apiSend (encodeApiRequest (ApiGet "/me"))
@@ -139,10 +140,16 @@ update msg model =
                     case active of
                         ThreadView _ -> Nothing
                         _ -> model.currentThread
+                clearMessages = case ( model.active, active ) of
+                    ( DmView a, DmView b ) -> a /= b
+                    ( ChannelView a, ChannelView b ) -> a /= b
+                    ( _, _ ) -> model.active /= active
             in ( { model | active = active
-                  , msg = [], sidebarOpen = False
+                  , msg = if clearMessages then [] else model.msg
+                  , sidebarOpen = False
                   , invitePreview = clearedInvite
                   , currentThread = clearedThread
+                  , nextBefore = Nothing
                   }
                , Cmd.batch
                     [ bridgeSend (E.object
@@ -287,15 +294,11 @@ update msg model =
             )
 
         Tick now ->
-            ( { model | serverTime = Time.posixToMillis now }
-            , if model.me == Nothing then
-                Cmd.none
-              else
-                Cmd.batch
-                    [ apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
-                    , routeCmd model.active
-                    ]
-            )
+            let elapsed = Time.posixToMillis now - model.serverTime
+                shouldSync = model.me /= Nothing && elapsed > 15000
+            in ( { model | serverTime = Time.posixToMillis now }
+               , if shouldSync then apiSend (encodeApiRequest (ApiGet "/sync?since=0")) else Cmd.none
+               )
 
         ToggleSound -> ( { model | soundEnabled = not model.soundEnabled }
                        , if not model.soundEnabled then playNotification True else Cmd.none )
@@ -303,6 +306,18 @@ update msg model =
         Logout -> ( model, apiSend (encodeApiRequest (ApiPost "/logout" (Just (E.object [])))) )
 
         SetSettingsTab t -> ( { model | settingsTab = t }, Cmd.none )
+
+        SetFriendsTab tab ->
+            ( { model | friendsTab = tab, friendQuery = if tab == "add" then model.friendQuery else "", searchUsers = if tab == "add" then model.searchUsers else [] }, Cmd.none )
+
+        FriendQuery query -> ( { model | friendQuery = query }, Cmd.none )
+
+        FindFriends ->
+            let query = String.trim model.friendQuery
+            in if String.length query < 2 then
+                ( { model | toast = Just "Enter at least 2 characters." }, Cmd.none )
+               else
+                ( { model | searchUsers = [] }, apiSend (encodeApiRequest (ApiGet ("/users?q=" ++ Url.percentEncode query))) )
 
         ProfileDisplayName s -> ( { model | profileDisplayName = s }, Cmd.none )
         ProfileBio s -> ( { model | profileBio = s }, Cmd.none )
@@ -531,21 +546,35 @@ update msg model =
         RtcJoinFailed _ ->
             ( { model | voice = clearVoice model.voice, callMode = Idle, callUI = { incoming = model.callUI.incoming, outgoing = Nothing, active = Nothing } }, Cmd.none )
 
+        LoadMoreMessages ->
+            case ( model.active, model.msg ) of
+                ( DmView id, firstMsg :: _ ) ->
+                    ( model, apiSend (encodeApiRequest (ApiGet ("/messages?scope=direct&scope_id=" ++ String.fromInt id ++ "&before=" ++ String.fromInt firstMsg.id))) )
+                ( ChannelView id, firstMsg :: _ ) ->
+                    ( model, apiSend (encodeApiRequest (ApiGet ("/messages?scope=channel&scope_id=" ++ String.fromInt id ++ "&before=" ++ String.fromInt firstMsg.id))) )
+                _ -> ( model, Cmd.none )
+
         _ -> ( model, Cmd.none )
 
 
 handleMe : E.Value -> Model -> ( Model, Cmd Msg )
 handleMe val model =
     case D.decodeValue decodeUser (fromApiField "user" val) of
-                    Ok user -> ( { model | me = Just user
+                    Ok user ->
+                        let
+                            userValue = fromApiField "user" val
+                            avatarSource = D.decodeValue (D.field "avatar_source_url" D.string) userValue |> Result.withDefault user.avatarUrl
+                            bannerSource = D.decodeValue (D.field "banner_source_url" D.string) userValue |> Result.withDefault user.bannerUrl
+                        in
+                                ( { model | me = Just user
                                     , csrf = fromApiFieldStr "csrf" val
                                     , serverTime = fromApiFieldInt "server_time" val
                                     , booting = False
                                     , authBusy = False
                                     , profileDisplayName = user.displayName
                                     , profileBio = user.bio
-                                    , profileAvatarUrl = user.avatarUrl
-                                    , profileBannerUrl = user.bannerUrl
+                                    , profileAvatarUrl = avatarSource
+                                    , profileBannerUrl = bannerSource
                                     , profileStatus = statusPreference (statusToString user.status)
                                     , profileTheme = user.theme
                                     }
@@ -563,15 +592,23 @@ handleSync : E.Value -> Model -> ( Model, Cmd Msg )
 handleSync val model =
     case D.decodeValue decodeSyncData val of
         Ok data ->
-            ( { model
-                | notifs = data.notifications
-                , convs = sortConvs data.conversations
-                , servers = data.servers
-                , friends = data.friends
-                , serverTime = data.now
-              }
-            , Cmd.none
-            )
+            let
+                activeConversationGone =
+                    case model.active of
+                        DmView id -> not (List.any (\c -> c.id == id) data.conversations)
+                        _ -> False
+                nextModel =
+                    { model
+                        | notifs = data.notifications
+                        , convs = sortConvs data.conversations
+                        , servers = data.servers
+                        , friends = data.friends
+                        , serverTime = data.now
+                    }
+            in if activeConversationGone then
+                ( { nextModel | msg = [] }, setHash "#dms" )
+            else
+                ( nextModel, Cmd.none )
         Err _ -> ( model, Cmd.none )
 
 
@@ -591,7 +628,16 @@ handleMessages val model =
                         if String.isEmpty model.csrf then Cmd.none
                         else apiSend (encodeApiRequest (ApiPost ("/conversation/" ++ String.fromInt id ++ "/read") (Just (E.object []))))
                     _ -> Cmd.none
-            in ( { model | msg = List.reverse items }, cmd )
+                incoming = List.reverse items
+                applies = List.all (messageApplies model.active) incoming
+                incomingIds = Set.fromList (List.map .id incoming)
+                preserved = List.filter (\m -> messageApplies model.active m && not (Set.member m.id incomingIds)) model.msg
+                merged = List.sortBy .createdAt (incoming ++ preserved)
+            in
+            if applies then
+                ( { model | msg = merged }, cmd )
+            else
+                ( model, Cmd.none )
         Err err ->
             ( { model | toast = Just ("Could not load messages: " ++ D.errorToString err) }, Cmd.none )
 
@@ -608,7 +654,7 @@ handleMessageSent val model =
     case D.decodeValue decodeMessage val of
         Ok message ->
             ( { model | msg = List.filter (\m -> m.id > 0) model.msg ++ [ message ], inputText = "", replyTo = Nothing }
-            , Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), routeCmd model.active ]
+            , apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
             )
         Err err ->
             ( { model | inputText = "", replyTo = Nothing, toast = Just ("Message sent, but could not display it yet: " ++ D.errorToString err) }, routeCmd model.active )
@@ -1123,7 +1169,7 @@ handleMessageCreated ev model =
     case D.decodeValue (D.field "message" decodeMessage) ev of
         Ok message ->
             if messageApplies model.active message then
-                ( { model | msg = model.msg ++ [ message ] }, playNotification model.soundEnabled )
+                ( { model | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ] }, playNotification model.soundEnabled )
             else
                 ( model, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), playNotification model.soundEnabled ] )
         Err _ -> ( model, Cmd.none )
@@ -1529,6 +1575,7 @@ renderExpandedCallOverlay active model =
                 [ text (if model.voice.muted then "🔇 Unmute" else "🎤 Mute") ]
             , button [ class ("btn" ++ if model.voice.deafened then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_deafen" E.null) ]
                 [ text (if model.voice.deafened then "🔇 Undeafen" else "🔊 Deafen") ]
+            , button [ class "btn secondary", onClick (BridgeEvent "unlock_audio" E.null) ] [ text "Enable audio" ]
             , button [ class "btn secondary", onClick (BridgeEvent "toggle_speaker" E.null) ] [ text "🔈 Speaker" ]
             , button [ class "btn call-decline", onClick EndCall ] [ text "✕" ]
             ]
@@ -1570,11 +1617,11 @@ avatarImg url name cls =
 
 renderAuth : Model -> Html Msg
 renderAuth model =
-    div [ class "layout" ]
+    div [ class "layout auth-layout" ]
         [ div [] []
         , main_ [ class "main" ]
             [ div [ class "content" ]
-                [ div [ class "card pad", style "max-width" "520px", style "margin" "8vh auto" ]
+                [ div [ class "card pad auth-card" ]
                     [ h1 [] [ text "Plainwire" ]
                     , p [ class "muted" ] [ text "Chat with your friends and communities." ]
                     , div [ class "tabs" ]
@@ -1730,7 +1777,9 @@ renderSide model =
              , friendsRow model
              ] ++ List.map (\s -> serverRow s model) model.servers
              ++ [ dmHeader model ]
-             ++ List.map (\c -> convRow c model) model.convs)
+             ++ (let requestCount = List.length (List.filter (\c -> c.requestState == "pending") model.convs)
+                 in if requestCount == 0 then [] else [ messageRequestsNav requestCount ])
+             ++ List.map (\c -> convRow c model) (List.filter (\c -> c.requestState /= "pending") model.convs))
         , userPanel model
         ]
 
@@ -1755,9 +1804,18 @@ renderServerSide model data =
                 , button [ class "btn secondary", onClick (EditServerModal data.server) ] [ text "Edit" ]
                 ]
             ]
-        , div [ class "list" ] (List.map channelRow data.channels)
+        , div [ class "list server-channel-list" ]
+            (channelGroup "Text channels" (List.filter (\c -> c.kind /= "voice") data.channels)
+             ++ channelGroup "Voice channels" (List.filter (\c -> c.kind == "voice") data.channels))
         , userPanel model
         ]
+
+channelGroup : String -> List Channel -> List (Html Msg)
+channelGroup heading channels =
+    if List.isEmpty channels then
+        []
+    else
+        div [ class "channel-group-title" ] [ text heading ] :: List.map channelRow channels
 
 statusClass : Dict String String -> Int -> String
 statusClass userStatuses uid =
@@ -1771,6 +1829,7 @@ statusClass userStatuses uid =
 statusPreference : String -> String
 statusPreference status =
     case status of
+        "away" -> "away"
         "busy" -> "busy"
         "invisible" -> "invisible"
         _ -> "online"
@@ -1825,11 +1884,13 @@ notifRow model =
         ]
 
 friendsRow : Model -> Html Msg
-friendsRow _ =
-    a [ class "row", onClick (Go "#friends") ]
-        [ span [ class "server-icon" ] [ text "+" ]
+friendsRow model =
+    let pending = List.length (List.filter (\f -> f.incoming) model.friends)
+    in a [ class "row", onClick (Go "#friends") ]
+        [ span [ class "server-icon" ] [ text "☻" ]
         , div [ class "grow" ]
             [ b [] [ text "Friends" ], small [ class "muted" ] [ text "requests and contacts" ] ]
+        , if pending > 0 then span [ class "badge" ] [ text (String.fromInt pending) ] else text ""
         ]
 
 serverRow : Server -> Model -> Html Msg
@@ -1855,6 +1916,14 @@ dmHeader model =
             , small [ class "muted" ] [ text "private and group chats" ]
             ]
         , button [ class "btn secondary", onClick NewDmModal ] [ text "New" ]
+        ]
+
+messageRequestsNav : Int -> Html Msg
+messageRequestsNav count =
+    a [ class "row message-requests-nav", onClick (Go "#dms") ]
+        [ span [ class "server-icon" ] [ text "?" ]
+        , div [ class "grow" ] [ b [] [ text "Message Requests" ], small [ class "muted" ] [ text "Review before replying" ] ]
+        , span [ class "badge" ] [ text (String.fromInt count) ]
         ]
 
 convRow : Conversation -> Model -> Html Msg
@@ -2053,10 +2122,11 @@ renderForumsPage model =
         myForums = List.filter .joined filtered
         otherForums = List.filter (\f -> not f.joined) filtered
     in div [ class "forum-page" ]
-        [ div [ class "forum-header-bar" ]
+        [ div [ class "forum-header-bar forum-directory-hero" ]
             [ div [ class "forum-header-title" ]
-                [ h2 [] [ text "Communities" ]
-                , p [ class "muted" ] [ text "r/ — public forums for any topic" ]
+                [ span [ class "eyebrow" ] [ text "Plainwire Forums" ]
+                , h2 [] [ text "Find your community" ]
+                , p [ class "muted" ] [ text (String.fromInt (List.length model.forums) ++ " communities for questions, ideas, and conversation") ]
                 ]
             , div [ class "forum-header-actions" ]
                 [ button [ class "btn", onClick NewForumModal ] [ text "Create Community" ]
@@ -2081,38 +2151,39 @@ renderForumsPage model =
                 [ if not (List.isEmpty myForums) then
                     div []
                         [ h3 [ class "forum-section-title" ] [ text "My Communities" ]
-                        , div [ class "forum-grid" ] (List.map forumCard myForums)
+                        , div [ class "forum-grid" ] (List.map (forumCard model) myForums)
                         ]
                   else
                     text ""
                 , if not (List.isEmpty otherForums) then
                     div []
-                        [ h3 [ class "forum-section-title" ] [ text "Discover" ]
-                        , div [ class "forum-grid" ] (List.map forumCard otherForums)
+                        [ h3 [ class "forum-section-title" ] [ text "Other Communities" ]
+                        , div [ class "forum-grid" ] (List.map (forumCard model) otherForums)
                         ]
                   else
                     text ""
                 ]
         ]
 
-forumCard : Forum -> Html Msg
-forumCard f =
+forumCard : Model -> Forum -> Html Msg
+forumCard model f =
     let
         memberText = String.fromInt f.memberCount ++ " member" ++ (if f.memberCount /= 1 then "s" else "")
         threadText = String.fromInt f.threadCount ++ " thread" ++ (if f.threadCount /= 1 then "s" else "")
     in
     div [ class "forum-card" ]
         [ div [ class "forum-card-top", onClick (Go ("#forum/" ++ String.fromInt f.id)) ]
-            [ span [ class "forum-card-icon" ] [ text "r/" ]
+            [ span [ class "forum-card-icon" ] [ text (String.left 1 (String.toUpper f.name)) ]
             , div [ class "forum-card-info" ]
-                [ h3 [ class "forum-card-name" ] [ text f.name ]
+                [ span [ class "forum-card-kicker" ] [ text ("r/" ++ f.slug) ]
+                , h3 [ class "forum-card-name" ] [ text f.name ]
                 , p [ class "forum-card-desc" ] [ text (ellipsize 120 f.description) ]
                 ]
             ]
         , div [ class "forum-card-stats" ]
             [ span [ class "forum-stat" ] [ text memberText ]
             , span [ class "forum-stat" ] [ text threadText ]
-            , span [ class "forum-stat" ] [ text ("last " ++ Maybe.withDefault "never" (Maybe.map ago f.lastAt)) ]
+            , span [ class "forum-stat" ] [ text ("last " ++ Maybe.withDefault "never" (Maybe.map (ago model.serverTime) f.lastAt)) ]
             ]
         , div [ class "forum-card-footer" ]
             [ if f.joined then
@@ -2133,9 +2204,10 @@ renderForumPage id model =
             Just f ->
                 div [ class "forum-view-header" ]
                     [ div [ class "forum-view-title" ]
-                        [ span [ class "forum-card-icon large" ] [ text "r/" ]
+                        [ span [ class "forum-card-icon large" ] [ text (String.left 1 (String.toUpper f.name)) ]
                         , div []
-                            [ h2 [] [ text f.name ]
+                            [ span [ class "forum-card-kicker" ] [ text ("r/" ++ f.slug) ]
+                            , h2 [] [ text f.name ]
                             , p [ class "muted" ] [ text f.description ]
                             , div [ class "forum-view-stats" ]
                                 [ span [ class "forum-stat" ] [ text (String.fromInt f.memberCount ++ " members") ]
@@ -2155,13 +2227,13 @@ renderForumPage id model =
                 div [ class "forum-view-header" ]
                     [ h2 [] [ text "Community" ] ]
         , div [ class "thread-listing" ]
-            (List.map threadRow model.threads
+            (List.map (threadRow model) model.threads
                 |> (\l -> if List.isEmpty l then [ div [ class "empty" ] [ text "No threads yet. Be the first to post!" ] ] else l)
             )
         ]
 
-threadRow : ForumThread -> Html Msg
-threadRow t =
+threadRow : Model -> ForumThread -> Html Msg
+threadRow model t =
     div [ class "reddit-thread", onClick (Go ("#thread/" ++ String.fromInt t.id)) ]
         [ voteColumn t
         , div [ class "thread-content" ]
@@ -2171,16 +2243,18 @@ threadRow t =
                  ++ [ text t.title ])
             , div [ class "thread-meta" ]
                 [ avatarImg t.avatarUrl t.displayName "tiny"
-                , span [] [ text t.displayName ]
-                , span [] [ text (String.fromInt t.score ++ " points") ]
-                , span [] [ text (String.fromInt t.replyCount ++ " replies") ]
-                , span [] [ text (String.fromInt t.views ++ " views") ]
-                , span [] [ text (ago t.updatedAt) ]
+                , span [ class "thread-author" ] [ text t.displayName ]
+                , span [] [ text ("posted " ++ ago model.serverTime t.createdAt ++ " ago") ]
                 ]
             , if String.isEmpty (String.trim t.body) then
                 text ""
               else
-                p [ class "thread-excerpt" ] [ text (ellipsize 180 t.body) ]
+                p [ class "thread-excerpt" ] [ text (ellipsize 240 t.body) ]
+            , div [ class "thread-actions" ]
+                [ span [ class "thread-action primary" ] [ text ("▣  " ++ String.fromInt t.replyCount ++ " replies") ]
+                , span [ class "thread-action" ] [ text ("◉  " ++ String.fromInt t.views ++ " views") ]
+                , span [ class "thread-action" ] [ text ("updated " ++ ago model.serverTime t.updatedAt ++ " ago") ]
+                ]
             ]
         ]
 
@@ -2188,19 +2262,29 @@ renderThreadPage : Int -> Model -> Html Msg
 renderThreadPage threadId model =
     case model.currentThread of
         Just t ->
-            div []
-                [ div [ class "post card reddit-post" ]
+            div [ class "thread-page" ]
+                [ div [ class "thread-breadcrumb" ]
+                    [ a [ href ("#forum/" ++ String.fromInt t.forumId) ] [ text ("r/" ++ t.forumName) ]
+                    , span [] [ text "›" ]
+                    , span [] [ text "Discussion" ]
+                    ]
+                , div [ class "post card reddit-post" ]
                     [ voteColumn t
                     , div [ class "post-body" ]
                         [ h1 [ class "thread-title" ] [ text t.title ]
                         , div [ class "post-meta" ]
                             [ avatarImg t.avatarUrl t.displayName ""
-                            , b [] [ text t.displayName ]
-                            , span [ class "muted" ] [ text (String.fromInt t.score ++ " points") ]
-                            , span [ class "muted" ] [ text (ago t.createdAt ++ " ago") ]
-                            , span [ class "muted" ] [ text (String.fromInt t.views ++ " views") ]
+                            , div [ class "post-author-block" ]
+                                [ b [] [ text t.displayName ]
+                                , span [ class "muted" ] [ text ("@" ++ t.username ++ " · " ++ ago model.serverTime t.createdAt ++ " ago") ]
+                                ]
                             ]
-                        , div [ class "msg-body" ] [ text t.body ]
+                        , div [ class "thread-post-body" ] [ text t.body ]
+                        , div [ class "thread-post-footer" ]
+                            [ span [] [ text (String.fromInt t.score ++ " points") ]
+                            , span [] [ text (String.fromInt t.views ++ " views") ]
+                            , span [] [ text (String.fromInt t.replyCount ++ " replies") ]
+                            ]
                         ]
                     ]
                 , div [ class "replies-head" ]
@@ -2211,7 +2295,7 @@ renderThreadPage threadId model =
                     (if List.isEmpty model.replies then
                         [ div [ class "empty" ] [ text "No replies yet. Be the first to add one." ] ]
                      else
-                        List.indexedMap replyView model.replies)
+                        List.indexedMap (replyView model) model.replies)
                 , if t.locked then
                     div [ class "locked-banner" ] [ text "This thread is locked. New replies are disabled." ]
                   else
@@ -2231,21 +2315,30 @@ voteColumn t =
         , button [ class ("vote-btn down" ++ if t.userVote == -1 then " active" else ""), title "Downvote", onClickStop (VoteThread t.id downValue) ] [ text "▼" ]
         ]
 
-replyView : Int -> Reply -> Html Msg
-replyView idx r =
-    div [ class "post card" ]
-        [ div [ class "post-meta" ]
+replyView : Model -> Int -> Reply -> Html Msg
+replyView model idx r =
+    div [ class "post card forum-reply" ]
+        [ div [ class "reply-rail" ]
             [ avatarImg r.avatarUrl r.displayName ""
-            , b [] [ text r.displayName ]
-            , span [ class "muted" ] [ text (ago r.createdAt ++ " ago") ]
-            , span [ class "muted" ] [ text ("#" ++ String.fromInt (idx + 1)) ]
+            , span [ class "reply-rail-line" ] []
             ]
-        , div [ class "msg-body" ] [ text r.body ]
+        , div [ class "reply-content" ]
+            [ div [ class "post-meta reply-meta" ]
+                [ b [] [ text r.displayName ]
+                , span [ class "reply-username" ] [ text ("@" ++ r.username) ]
+                , span [ class "muted" ] [ text (ago model.serverTime r.createdAt ++ " ago") ]
+                , span [ class "reply-number" ] [ text ("#" ++ String.fromInt (idx + 1)) ]
+                ]
+            , div [ class "reply-body" ] [ text r.body ]
+            ]
         ]
 
 renderDmsPage : Model -> Html Msg
 renderDmsPage model =
-    div [ class "dm-inbox" ]
+    let
+        requests = List.filter (\c -> c.requestState == "pending") model.convs
+        conversations = List.filter (\c -> c.requestState /= "pending") model.convs
+    in div [ class "dm-inbox" ]
         [ div [ class "section-head" ]
             [ div []
                 [ h2 [] [ text "Direct Messages" ]
@@ -2253,33 +2346,157 @@ renderDmsPage model =
                 ]
             , button [ class "btn", onClick NewDmModal ] [ text "New DM" ]
             ]
+        , if List.isEmpty requests then text "" else
+            div [ class "dm-request-section" ]
+                [ h3 [ class "list-section-title" ] [ text ("Message requests · " ++ String.fromInt (List.length requests)) ]
+                , div [ class "card dm-list-card" ] (List.map messageRequestRow requests)
+                ]
+        , h3 [ class "list-section-title" ] [ text "Messages" ]
         , div [ class "card dm-list-card" ]
-            (if List.isEmpty model.convs then
+            (if List.isEmpty conversations then
                 [ div [ class "empty dm-empty" ]
                     [ h2 [] [ text "No messages yet" ]
                     , p [] [ text "Start a conversation from Friends or New DM." ]
                     ]
                 ]
              else
-                List.map (\c -> convRow c model) model.convs
+                List.map (\c -> convRow c model) conversations
             )
+        ]
+
+messageRequestRow : Conversation -> Html Msg
+messageRequestRow conversation =
+    div [ class "row dm-row message-request-row" ]
+        [ convAvatar conversation
+        , div [ class "grow" ]
+            [ b [] [ text (convName conversation) ]
+            , small [ class "muted dm-preview" ] [ text (Maybe.withDefault "Wants to message you" conversation.lastBody) ]
+            ]
+        , div [ class "request-actions" ]
+            [ button [ class "btn", onClick (BridgeEvent "accept_message_request" (E.int conversation.id)) ] [ text "Accept" ]
+            , button [ class "btn secondary", onClick (BridgeEvent "deny_message_request" (E.int conversation.id)) ] [ text "Delete" ]
+            ]
         ]
 
 renderFriendsPage : Model -> Html Msg
 renderFriendsPage model =
-    div []
-        [ button [ class "btn", onClick SearchUsersModal ] [ text "Find user" ]
-        , div [ class "card" ]
-            (if List.isEmpty model.friends then
-                [ div [ class "empty" ] [ text "No friends yet." ] ]
-             else
-                 List.map (\f -> friendRow model.userStatuses f) model.friends
-            )
+    let
+        incoming = List.filter .incoming model.friends
+        outgoing = List.filter .outgoing model.friends
+        accepted = List.filter (\f -> f.status == "accepted") model.friends
+        blocked = List.filter (\f -> f.status == "blocked") model.friends
+        online = List.filter (\f -> Dict.get (String.fromInt f.user.id) model.userStatuses /= Nothing) accepted
+        pendingCount = List.length incoming + List.length outgoing
+        visible = if model.friendsTab == "online" then online else accepted
+        listTitle = if model.friendsTab == "online" then "Online" else "All friends"
+    in div [ class "friends-page" ]
+        [ div [ class "friends-toolbar" ]
+            [ h2 [] [ text "Friends" ]
+            , nav [ class "friends-tabs", attribute "aria-label" "Friends sections" ]
+                [ friendTab model.friendsTab "online" "Online" 0
+                , friendTab model.friendsTab "all" "All" 0
+                , friendTab model.friendsTab "pending" "Pending" pendingCount
+                , friendTab model.friendsTab "blocked" "Blocked" 0
+                , friendTab model.friendsTab "add" "Add Friend" 0
+                ]
+            ]
+        , div [ class "friends-content" ]
+            [ if model.friendsTab == "pending" then
+                div []
+                    [ friendSection "Incoming" incoming model.userStatuses
+                    , friendSection "Outgoing" outgoing model.userStatuses
+                    , if pendingCount == 0 then friendEmpty "You're all caught up" "Incoming and outgoing requests will appear here." else text ""
+                    ]
+              else if model.friendsTab == "blocked" then
+                friendList "Blocked" "Blocked people can't message you or send friend requests." blocked model.userStatuses
+              else if model.friendsTab == "add" then
+                addFriendPanel model
+              else
+                friendList listTitle (if model.friendsTab == "online" then "Friends who are online right now." else "Everyone you've added as a friend.") visible model.userStatuses
+            ]
         ]
+
+friendTab : String -> String -> String -> Int -> Html Msg
+friendTab active key label count =
+    button
+        [ class ("friends-tab" ++ if active == key then " active" else "")
+        , onClick (SetFriendsTab key)
+        , attribute "aria-pressed" (if active == key then "true" else "false")
+        ]
+        [ text label
+        , if count > 0 then span [ class "tab-count" ] [ text (String.fromInt count) ] else text ""
+        ]
+
+friendList : String -> String -> List Friend -> Dict String String -> Html Msg
+friendList heading description friends statuses =
+    div []
+        [ div [ class "friend-list-head" ]
+            [ div [] [ h3 [] [ text (heading ++ " — " ++ String.fromInt (List.length friends)) ], p [ class "muted" ] [ text description ] ] ]
+        , div [ class "card friends-list" ]
+            (if List.isEmpty friends then
+                [ friendEmpty (if heading == "Online" then "It's quiet for now" else "Nothing here yet") (if heading == "Online" then "Offline friends will still be waiting in All." else description) ]
+             else List.map (friendRow statuses) friends)
+        ]
+
+friendEmpty : String -> String -> Html Msg
+friendEmpty title body =
+    div [ class "empty friend-empty" ] [ b [] [ text title ], p [ class "muted" ] [ text body ] ]
+
+addFriendPanel : Model -> Html Msg
+addFriendPanel model =
+    div [ class "add-friend-panel" ]
+        [ div [ class "add-friend-intro" ]
+            [ span [ class "add-friend-icon" ] [ text "+" ]
+            , div []
+                [ h3 [] [ text "Add Friend" ]
+                , p [ class "muted" ] [ text "Find someone by their username or display name." ]
+                ]
+            ]
+        , Html.form [ class "add-friend-form", onSubmit FindFriends ]
+            [ span [ class "add-friend-search-icon", attribute "aria-hidden" "true" ] [ text "⌕" ]
+            , input [ value model.friendQuery, onInput FriendQuery, placeholder "Search for a friend", attribute "aria-label" "Friend username", attribute "autocomplete" "off" ] []
+            , button [ class "btn add-friend-submit", type_ "submit", disabled (String.length (String.trim model.friendQuery) < 2) ] [ text "Send Search" ]
+            ]
+        , if String.isEmpty (String.trim model.friendQuery) then
+            div [ class "friend-discovery-hint" ]
+                [ span [ class "discovery-art", attribute "aria-hidden" "true" ] [ text "☺" ]
+                , b [] [ text "Friends make everything better" ]
+                , p [] [ text "Search above to find people. You can use only part of their display name." ]
+                ]
+          else if List.isEmpty model.searchUsers then
+            div [ class "friend-discovery-hint compact" ] [ b [] [ text "Ready to search" ], p [] [ text "Results will appear here after you press Send Search." ] ]
+          else
+            div [ class "card friends-list friend-results" ]
+                (model.searchUsers
+                    |> List.filter (\user -> Just user.id /= Maybe.map .id model.me)
+                    |> List.map (friendCandidateRow model.friends))
+        ]
+
+friendCandidateRow : List Friend -> User -> Html Msg
+friendCandidateRow relationships user =
+    let relationship = List.filter (\f -> f.user.id == user.id) relationships |> List.head
+    in div [ class "row friend-row" ]
+        [ div [ class "clickable-user", onClick (ShowUserPopup user.id) ] [ avatarImg user.avatarUrl user.displayName "" ]
+        , div [ class "grow clickable-user", onClick (ShowUserPopup user.id) ]
+            [ b [] [ text user.displayName ], small [ class "muted" ] [ text ("@" ++ user.username) ] ]
+        , case relationship of
+            Just f -> span [ class "relationship-label" ] [ text (if f.status == "accepted" then "Already friends" else if f.outgoing then "Request sent" else if f.incoming then "Request received" else "Blocked") ]
+            Nothing -> button [ class "btn", onClick (BridgeEvent "friend_user" (E.int user.id)) ] [ text "Send Friend Request" ]
+        ]
+
+friendSection : String -> List Friend -> Dict String String -> Html Msg
+friendSection heading friends statuses =
+    if List.isEmpty friends then
+        text ""
+    else
+        div [ class "friend-request-section" ]
+            [ h3 [ class "list-section-title" ] [ text (heading ++ " · " ++ String.fromInt (List.length friends)) ]
+            , div [ class "card friends-list" ] (List.map (\friend -> friendRow statuses friend) friends)
+            ]
 
 friendRow : Dict String String -> Friend -> Html Msg
 friendRow userStatuses f =
-    let statusText = f.status ++ if f.incoming then " · incoming" else ""
+    let statusText = if f.status == "accepted" then statusLabel userStatuses f.user.id else if f.incoming then "Incoming friend request" else if f.outgoing then "Outgoing friend request" else "Blocked"
     in div [ class "row friend-row" ]
         [ div [ class "clickable-user", onClick (ShowUserPopup f.user.id) ]
             [ avatarImg f.user.avatarUrl f.user.displayName "" ]
@@ -2290,10 +2507,21 @@ friendRow userStatuses f =
             ]
         , div [ class "friend-actions" ]
             [ if f.incoming then button [ class "btn", onClick (BridgeEvent "accept_friend" (E.int f.user.id)) ] [ text "Accept" ] else text ""
-            , button [ class "btn secondary", onClick (BridgeEvent "call_user" (E.int f.user.id)) ] [ text "Call" ]
-            , button [ class "btn secondary", onClick (BridgeEvent "dm_user" (E.int f.user.id)) ] [ text "Message" ]
+            , if f.incoming then button [ class "btn secondary", onClick (BridgeEvent "remove_friend" (E.int f.user.id)) ] [ text "Decline" ] else text ""
+            , if f.outgoing then button [ class "btn secondary", onClick (BridgeEvent "remove_friend" (E.int f.user.id)) ] [ text "Cancel" ] else text ""
+            , if f.status == "accepted" then button [ class "btn secondary", onClick (BridgeEvent "call_user" (E.int f.user.id)) ] [ text "Call" ] else text ""
+            , if f.status == "accepted" then button [ class "btn secondary", onClick (BridgeEvent "dm_user" (E.int f.user.id)) ] [ text "Message" ] else text ""
+            , if f.status == "blocked" then button [ class "btn secondary", onClick (BridgeEvent "remove_friend" (E.int f.user.id)) ] [ text "Unblock" ] else text ""
             ]
         ]
+
+statusLabel : Dict String String -> Int -> String
+statusLabel statuses userId =
+    case Dict.get (String.fromInt userId) statuses of
+        Just "busy" -> "Do Not Disturb"
+        Just "away" -> "Idle"
+        Just _ -> "Online"
+        Nothing -> "Offline"
 
 renderServerPage : Model -> Html Msg
 renderServerPage model =
@@ -2305,7 +2533,7 @@ renderServerPage model =
                     , div []
                         [ h2 [] [ text data.server.name ]
                         , p [ class "muted" ] [ text (if String.isEmpty data.server.description then "No description yet." else data.server.description) ]
-                        , div [ class "nav-actions" ]
+                , div [ class "nav-actions server-hero-actions" ]
                             [ button [ class "btn", onClick (InviteModal data.server.id) ] [ text "Invite people" ]
                             , button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Add channel" ]
                             , button [ class "btn secondary", onClick (EditServerModal data.server) ] [ text "Customize" ]
@@ -2313,7 +2541,9 @@ renderServerPage model =
                         ]
                     ]
                 , h3 [ class "server-section-title" ] [ text "Channels" ]
-                , div [ class "card" ] (List.map channelRow data.channels)
+                , div [ class "card server-channel-card" ]
+                    (channelGroup "Text channels" (List.filter (\c -> c.kind /= "voice") data.channels)
+                     ++ channelGroup "Voice channels" (List.filter (\c -> c.kind == "voice") data.channels))
                 , h3 [ class "server-section-title" ] [ text "Members" ]
                 , div [ class "card" ] (List.map (\m -> memberRow model.userStatuses m) data.members)
                 ]
@@ -2392,18 +2622,33 @@ renderProfilePage : Model -> Html Msg
 renderProfilePage model =
     case model.currentProfile of
         Just u ->
-            div [ class "card profile" ]
+            let
+                liveStatus = Dict.get (String.fromInt u.id) model.userStatuses
+                presence = Maybe.withDefault "offline" liveStatus
+                activityText =
+                    case liveStatus of
+                        Just "away" -> "Away"
+                        Just "busy" -> "Busy"
+                        Just _ -> "Online"
+                        Nothing ->
+                            let elapsed = agoAt model.serverTime u.lastSeen
+                            in if elapsed == "never" then "Offline"
+                               else if elapsed == "now" || elapsed == "1s" then "Last seen just now"
+                               else "Last seen " ++ elapsed ++ " ago"
+            in div [ class "card profile" ]
                 [ div [ class "banner", style "background-image" (if String.isEmpty u.bannerUrl then "none" else "url('" ++ u.bannerUrl ++ "')") ] []
                 , div [ class "profile-body" ]
                     [ avatarImg u.avatarUrl u.displayName "big"
                     , div []
                         [ h1 [] [ text u.displayName ]
-                        , p [ class "muted" ] [ text ("@" ++ u.username ++ " · seen " ++ ago u.lastSeen ++ " ago") ]
+                        , p [ class "muted profile-identity" ]
+                            [ text ("@" ++ u.username ++ " · ")
+                            , span [ class ("presence-text " ++ presence) ] [ text activityText ]
+                            ]
                         , p [] [ text (if String.isEmpty u.bio then "No bio set." else u.bio) ]
-                        , p [] [ span [ class "pill" ] [ text (statusToString u.status) ] ]
+                        , p [] [ span [ class ("pill presence-pill " ++ presence) ] [ span [ class ("status-dot " ++ presence) ] [], text activityText ] ]
                         , div [ class "nav-actions" ]
-                            [ button [ class "btn", onClick (BridgeEvent "friend_user" (E.int u.id)) ] [ text "Friend" ]
-                            , button [ class "btn secondary", onClick (BridgeEvent "call_user" (E.int u.id)) ] [ text "Call" ]
+                            [ button [ class "btn secondary", onClick (BridgeEvent "call_user" (E.int u.id)) ] [ text "Call" ]
                             , button [ class "btn secondary", onClick (BridgeEvent "dm_user" (E.int u.id)) ] [ text "Message" ]
                             ]
                         ]
@@ -2417,18 +2662,100 @@ renderSettingsPage model =
         Just u ->
             div [ class "settings-page" ]
                 [ aside [ class "settings-sidebar" ]
-                    [ a [ class ("settings-tab" ++ if model.settingsTab == "profile" then " active" else ""), onClick (SetSettingsTab "profile") ] [ text "👤 Profile" ]
-                    , a [ class ("settings-tab" ++ if model.settingsTab == "sound" then " active" else ""), onClick (SetSettingsTab "sound") ] [ text "🔔 Notifications" ]
-                    , a [ class ("settings-tab" ++ if model.settingsTab == "account" then " active" else ""), onClick (SetSettingsTab "account") ] [ text "⚙ Account" ]
+                    [ div [ class "settings-nav-label" ] [ text "User settings" ]
+                    , a [ class ("settings-tab" ++ if model.settingsTab == "profile" then " active" else ""), onClick (SetSettingsTab "profile") ] [ span [ class "settings-tab-icon" ] [ text "●" ], text "Profile" ]
+                    , a [ class ("settings-tab" ++ if model.settingsTab == "appearance" then " active" else ""), onClick (SetSettingsTab "appearance") ] [ span [ class "settings-tab-icon" ] [ text "◐" ], text "Appearance" ]
+                    , a [ class ("settings-tab" ++ if model.settingsTab == "sound" then " active" else ""), onClick (SetSettingsTab "sound") ] [ span [ class "settings-tab-icon" ] [ text "◖" ], text "Notifications" ]
+                    , div [ class "settings-nav-separator" ] []
+                    , a [ class ("settings-tab" ++ if model.settingsTab == "account" then " active" else ""), onClick (SetSettingsTab "account") ] [ span [ class "settings-tab-icon" ] [ text "⚙" ], text "Account" ]
                     ]
                 , div [ class "settings-content" ]
-                    [ case model.settingsTab of
-                        "sound" -> div [ class "settings-card" ] [ h2 [] [ text "Notifications" ], p [] [ text "Configure how you receive alerts and sounds." ], div [ class "field" ] [ label [] [ text "Sound effects" ], div [ class "toggle-row" ] [ span [ class "muted" ] [ text "Play sounds for messages and calls" ], button [ class ("btn toggle" ++ if model.soundEnabled then " active" else ""), onClick ToggleSound ] [ text (if model.soundEnabled then "On" else "Off") ] ] ] ]
-                        "account" -> div [ class "settings-card" ] [ h2 [] [ text "Account" ], p [] [ text ("Logged in as @" ++ u.username) ], p [ class "muted" ] [ text ("User ID: " ++ String.fromInt u.id) ], div [ class "nav-actions" ] [ button [ class "btn danger", onClick Logout ] [ text "Logout" ] ] ]
-                        _ -> renderProfileSettings u model
+                    [ div [ class "settings-content-top" ]
+                        [ div [] [ span [ class "eyebrow" ] [ text "Personal settings" ], h1 [] [ text (settingsTitle model.settingsTab) ] ]
+                        , span [ class "settings-user-chip" ] [ avatarImg u.avatarUrl u.displayName "small", text ("@" ++ u.username) ]
+                        ]
+                    , div [ class "settings-content-inner" ]
+                        [ case model.settingsTab of
+                            "appearance" -> renderAppearanceSettings model
+                            "sound" -> renderNotificationSettings model
+                            "account" -> renderAccountSettings u
+                            _ -> renderProfileSettings u model
+                        ]
                     ]
                 ]
         Nothing -> text ""
+
+settingsTitle : String -> String
+settingsTitle tab =
+    case tab of
+        "appearance" -> "Appearance"
+        "sound" -> "Notifications"
+        "account" -> "Account"
+        _ -> "My Profile"
+
+renderAccountSettings : User -> Html Msg
+renderAccountSettings user =
+    div [ class "settings-card settings-panel" ]
+        [ div [ class "settings-card-head" ]
+            [ h2 [] [ text "Account" ]
+            , p [ class "muted" ] [ text "Your Plainwire identity and session." ]
+            ]
+        , div [ class "setting-row" ]
+            [ div []
+                [ b [] [ text ("@" ++ user.username) ]
+                , small [ class "muted" ] [ text ("User ID " ++ String.fromInt user.id) ]
+                ]
+            , span [ class "pill" ] [ text "Signed in" ]
+            ]
+        , div [ class "danger-zone" ]
+            [ div []
+                [ b [] [ text "Log out" ]
+                , p [ class "muted" ] [ text "End this browser session." ]
+                ]
+            , button [ class "btn danger", onClick Logout ] [ text "Log out" ]
+            ]
+        ]
+
+renderAppearanceSettings : Model -> Html Msg
+renderAppearanceSettings model =
+    div [ class "settings-card settings-panel" ]
+        [ div [ class "settings-card-head" ] [ h2 [] [ text "Appearance" ], p [ class "muted" ] [ text "Make Plainwire feel comfortable on this device." ] ]
+        , div [ class "setting-row setting-row-stack" ]
+            [ div [] [ b [] [ text "Theme" ], small [ class "muted" ] [ text "Use your system colors or choose a theme." ] ]
+            , select [ value model.profileTheme, onInput ProfileTheme ] [ option [ value "system" ] [ text "System" ], option [ value "light" ] [ text "Light" ], option [ value "dark" ] [ text "Dark" ] ]
+            ]
+        , div [ class "setting-row setting-row-stack" ]
+            [ div [] [ b [] [ text "Interface density" ], small [ class "muted" ] [ text "Compact mode fits more channels and messages on screen." ] ]
+            , div [ class "segmented-control" ]
+                [ button [ class "btn secondary", onClick (BridgeEvent "ui_density" (E.string "comfortable")) ] [ text "Comfortable" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "ui_density" (E.string "compact")) ] [ text "Compact" ]
+                ]
+            ]
+        , div [ class "setting-row setting-row-stack" ]
+            [ div [] [ b [] [ text "Motion" ], small [ class "muted" ] [ text "Reduce interface animation when you prefer less movement." ] ]
+            , div [ class "segmented-control" ]
+                [ button [ class "btn secondary", onClick (BridgeEvent "reduce_motion" (E.bool False)) ] [ text "Standard" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "reduce_motion" (E.bool True)) ] [ text "Reduced" ]
+                ]
+            ]
+        ]
+
+renderNotificationSettings : Model -> Html Msg
+renderNotificationSettings model =
+    div [ class "settings-card settings-panel" ]
+        [ div [ class "settings-card-head" ] [ h2 [] [ text "Notifications" ], p [ class "muted" ] [ text "Control alerts on this device." ] ]
+        , div [ class "setting-row" ]
+            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "♫" ], div [] [ b [] [ text "Sound effects" ], small [ class "muted" ] [ text "Play sounds for messages, calls, and important activity." ] ] ]
+            , button
+                [ class ("settings-switch" ++ if model.soundEnabled then " active" else "")
+                , onClick ToggleSound, attribute "role" "switch", attribute "aria-checked" (if model.soundEnabled then "true" else "false"), title "Toggle sound effects"
+                ] [ span [ class "settings-switch-knob" ] [] ]
+            ]
+        , div [ class "setting-row" ]
+            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "◉" ], div [] [ b [] [ text "Desktop notifications" ], small [ class "muted" ] [ text "Get alerts while Plainwire is open in the background." ] ] ]
+            , button [ class "btn secondary settings-action", onClick (BridgeEvent "request_notifications" E.null) ] [ text "Review permission" ]
+            ]
+        ]
 
 renderProfileSettings : User -> Model -> Html Msg
 renderProfileSettings u model =
@@ -2469,10 +2796,11 @@ renderProfileSettings u model =
             [ label [] [ text "Status" ]
             , select [ value model.profileStatus, onInput ProfileStatus ]
                 [ option [ value "online" ] [ text "Online (auto idle)" ]
+                , option [ value "away" ] [ text "Away" ]
                 , option [ value "busy" ] [ text "Busy" ]
                 , option [ value "invisible" ] [ text "Invisible" ]
                 ]
-            , small [ class "muted" ] [ text "Online turns to idle automatically when you stop using Plainwire. Invisible shows you as offline." ]
+            , small [ class "muted" ] [ text "Online turns to away automatically when you stop using Plainwire. Invisible shows you as offline." ]
             ]
         , div [ class "field" ]
             [ label [] [ text "Theme" ]
@@ -2710,25 +3038,35 @@ onComposerKeyDown =
 
 renderNotificationsPage : Model -> Html Msg
 renderNotificationsPage model =
-    div []
-        [ button [ class "btn secondary", onClick ClearNotifs ] [ text "Mark seen" ]
-        , div [ class "card" ]
+    div [ class "notifications-page" ]
+        [ div [ class "section-head notifications-head" ]
+            [ div [] [ h2 [] [ text "Notifications" ], p [ class "muted" ] [ text "Mentions, replies, requests, and messages." ] ]
+            , button [ class "btn secondary", onClick ClearNotifs ] [ text "Mark all read" ]
+            ]
+        , div [ class "card notifications-list" ]
             (if List.isEmpty model.notifs then
                 [ div [ class "empty" ] [ text "No notifications." ] ]
              else
-                List.map notificationView model.notifs
+                List.map (notificationView model.serverTime) model.notifs
             )
         ]
 
-notificationView : Notification -> Html Msg
-notificationView n =
+notificationView : Int -> Notification -> Html Msg
+notificationView now n =
     a [ class ("row notif" ++ if n.seen then "" else " unseen"), onClick (Go n.url) ]
         [ div [ class "grow" ]
             [ b [] [ text n.kind ]
             , small [] [ text n.body ]
             ]
-        , span [ class "muted" ] [ text (ago n.createdAt ++ " ago") ]
+        , span [ class "muted notif-time" ] [ text (relativeTime now n.createdAt) ]
         ]
+
+relativeTime : Int -> Int -> String
+relativeTime now timestamp =
+    let elapsed = agoAt now timestamp
+    in if elapsed == "now" || elapsed == "1s" then "just now"
+       else if elapsed == "never" then ""
+       else elapsed ++ " ago"
 
 renderSearchPage : String -> Model -> Html Msg
 renderSearchPage q model =
@@ -2755,7 +3093,6 @@ searchUserView u =
         [ avatarImg u.avatarUrl u.displayName ""
         , div [ class "grow clickable-user", onClick (Go ("#profile/" ++ String.fromInt u.id)) ]
             [ b [] [ text u.displayName ], small [ class "muted" ] [ text ("@" ++ u.username) ] ]
-        , button [ class "btn secondary", onClick (BridgeEvent "friend_user" (E.int u.id)) ] [ text "Add" ]
         , button [ class "btn", onClick (BridgeEvent "dm_user" (E.int u.id)) ] [ text "Message" ]
         ]
 
@@ -2867,9 +3204,9 @@ apiMsg : String -> String -> Bool -> E.Value -> String -> Msg
 apiMsg path method ok data err =
     if ok then ApiSuccess path method data else ApiError path method err
 
-ago : Int -> String
-ago t =
-    agoAt 0 t
+ago : Int -> Int -> String
+ago now t =
+    agoAt now t
 
 ellipsize : Int -> String -> String
 ellipsize maxLen value =

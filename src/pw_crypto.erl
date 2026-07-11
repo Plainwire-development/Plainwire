@@ -47,17 +47,18 @@ decrypt(X) -> decrypt(pw_util:bin(X)).
 
 %% Signed opaque tokens for proxied media URLs (no raw URL in client requests).
 proxy_token(Url) ->
-    case key() of
+    case signing_key() of
         {ok, Key} ->
-            Nonce = crypto:strong_rand_bytes(8),
+            %% Keep media URLs stable across API refreshes. Random tokens caused
+            %% browsers to reload every avatar on each sync even when unchanged.
+            <<Nonce:8/binary, _/binary>> = crypto:mac(hmac, sha256, Key, <<"media:", Url/binary>>),
             Mac = crypto:mac(hmac, sha256, Key, <<Nonce/binary, Url/binary>>),
             <<$p, $1, $:, (pw_util:base64url(<<Nonce/binary, Mac:16/binary>>))/binary, $., (pw_util:base64url(Url))/binary>>;
-        _ ->
-            pw_util:base64url(Url)
+        _ -> erlang:error(media_signing_key_not_configured)
     end.
 
 verify_proxy_token(Token, Url) ->
-    case key() of
+    case signing_key() of
         {ok, Key} ->
             case Token of
                 <<$p, $1, $:, Rest/binary>> ->
@@ -76,12 +77,34 @@ verify_proxy_token(Token, Url) ->
                 _ ->
                     false
             end;
+        _ -> false
+    end.
+
+signing_key() ->
+    case env_key("PLAINWIRE_MEDIA_SIGNING_KEY") of
+        {ok, _} = Found -> Found;
         _ ->
-            pw_util:base64url_decode(Token) =:= Url
+            case key() of
+                {ok, _} = Found -> Found;
+                _ -> ephemeral_signing_key()
+            end
+    end.
+
+ephemeral_signing_key() ->
+    Key = {?MODULE, media_signing_key},
+    case persistent_term:get(Key, undefined) of
+        undefined ->
+            Generated = crypto:strong_rand_bytes(32),
+            persistent_term:put(Key, Generated),
+            {ok, Generated};
+        Existing -> {ok, Existing}
     end.
 
 key() ->
-    case os:getenv("PLAINWIRE_ENC_KEY") of
+    env_key("PLAINWIRE_ENC_KEY").
+
+env_key(Name) ->
+    case os:getenv(Name) of
         false ->
             {error, no_key};
         V ->

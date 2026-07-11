@@ -23,6 +23,6 @@ handle_info(_, State) -> {noreply, State}.
 terminate(_, _) -> ok.
 code_change(_, State, _) -> {ok, State}.
 
-maybe_gc(State, Now) when map_size(State) > 20000 ->
+maybe_gc(State, Now) when map_size(State) > 10000 ->
     maps:filter(fun(_, {Start, _}) -> Now - Start < 300000 end, State);
 maybe_gc(State, _) -> State.

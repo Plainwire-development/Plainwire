@@ -3,7 +3,7 @@
 -export([
     start_link/0,
     health/0,
-    register/3, login/2, session/1, logout/1, me/1, update_profile/3,
+    register/3, login/2, session/1, session_fast/1, logout/1, me/1, update_profile/3,
     sync/2, users/1, profile/2,
     friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friends/1,
     forums/1, create_forum/4, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, reply_thread/3, vote_thread/3,
@@ -12,29 +12,75 @@
     messages/5, post_channel_message/4, delete_message/2,
     conversations/1, create_conversation/3, update_conversation/4,
     add_conversation_members/3, conversation/2, post_direct_message/4,
-    leave_conversation/2, mark_conversation_read/2, notifications/1, mark_notifications_seen/1, mark_url_seen/2,
+    leave_conversation/2, accept_message_request/2, deny_message_request/2,
+    mark_conversation_read/2, notifications/1, mark_notifications_seen/1, mark_url_seen/2,
     member_of_channel/2, member_of_conversation/2, member_of_server/2, conversation_peer_ids/2
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--record(st, {conn}).
+-record(st, {}).
+-record(pool, {conns, size, counter}).
 -define(SERVER, ?MODULE).
+-define(POOL_KEY, pw_db_pool).
 -define(MAX_BODY, 12000).
 -define(MAX_MSG, 5000).
 
+-define(SESSION_CACHE, pw_session_cache).
+
 start_link() -> gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
-health() -> call(health).
+
+health() ->
+    try
+        #pool{conns = Conns} = persistent_term:get(?POOL_KEY),
+        Conn = element(1, Conns),
+        case rows(Conn, "SELECT 1", []) of
+            {ok, _} -> ok;
+            _ -> {error, database_unavailable}
+        end
+    catch
+        _:_ -> {error, database_unavailable}
+    end.
+
+session_fast(Token) ->
+    case Token of
+        undefined -> {error, no_session};
+        <<>> -> {error, no_session};
+        _ ->
+            H = pw_util:sha256_hex(Token),
+            Now = pw_util:now_ms(),
+            case ets:lookup(?SESSION_CACHE, H) of
+                [{H, Uid, Expires}] when Expires > Now ->
+                    case ets:lookup(?SESSION_CACHE, {user, Uid}) of
+                        [{_, Session}] -> {ok, Session};
+                        _ -> {error, no_session}
+                    end;
+                _ -> {error, no_session}
+            end
+    end.
+
 call(Msg) ->
-    try gen_server:call(?SERVER, Msg, 30000) of
-        Reply -> Reply
+    #pool{conns = Conns, size = Size, counter = Counter} = persistent_term:get(?POOL_KEY),
+    Idx = atomics:add_get(Counter, 1, 1) rem Size + 1,
+    Conn = element(Idx, Conns),
+    try route_with_reconnect(Msg, Conn) of
+        {Reply, Conn} ->
+            Reply;
+        {Reply, Conn1} ->
+            update_pool_conn(Idx, Conn1),
+            Reply
     catch
         exit:{timeout, _} -> {error, timeout};
         exit:{noproc, _} -> {error, database_unavailable};
         exit:{normal, _} -> {error, database_unavailable};
         exit:Reason ->
-            error_logger:error_msg("DB call exit ~p for ~p~n", [Reason, Msg]),
+            error_logger:error_msg("DB call exit ~p for ~p~n", [Reason, safe_log_msg(Msg)]),
             {error, database_unavailable}
     end.
+
+update_pool_conn(Idx, NewConn) ->
+    Pool = persistent_term:get(?POOL_KEY),
+    NewConns = setelement(Idx, Pool#pool.conns, NewConn),
+    persistent_term:put(?POOL_KEY, Pool#pool{conns = NewConns}).
 
 register(U, D, P) -> call({register, U, D, P}).
 login(U, P) -> call({login, U, P}).
@@ -76,6 +122,8 @@ update_conversation(Uid, Cid, Name, Patch) -> call({update_conversation, Uid, Ci
 add_conversation_members(Uid, Cid, UserIds) -> call({add_conversation_members, Uid, Cid, UserIds}).
 conversation(Uid, Cid) -> call({conversation, Uid, Cid}).
 leave_conversation(Uid, Cid) -> call({leave_conversation, Uid, Cid}).
+accept_message_request(Uid, Cid) -> call({accept_message_request, Uid, Cid}).
+deny_message_request(Uid, Cid) -> call({deny_message_request, Uid, Cid}).
 mark_conversation_read(Uid, Cid) -> call({mark_conversation_read, Uid, Cid}).
 post_direct_message(Uid, Cid, Body, ReplyTo) -> call({post_direct_message, Uid, Cid, Body, ReplyTo}).
 notifications(Uid) -> call({notifications, Uid}).
@@ -87,23 +135,33 @@ member_of_server(Uid, Sid) -> call({member_of_server, Uid, Sid}).
 conversation_peer_ids(Uid, Cid) -> call({conversation_peer_ids, Uid, Cid}).
 
 init([]) ->
-    process_flag(trap_exit, true),
     application:ensure_all_started(inets),
-    {ok, Conn} = connect_with_retry(10, 500),
-    ok = migrate(Conn),
-    {ok, #st{conn = Conn}}.
+    _ = ets:new(?SESSION_CACHE, [named_table, public, set, {read_concurrency, true}]),
+    {ok, MigConn} = connect_with_retry(10, 500),
+    ok = migrate(MigConn),
+    try epgsql:close(MigConn) catch _:_ -> ok end,
+    PoolSize = pw_util:env_int("PLAINWIRE_DB_POOL_SIZE", 10),
+    Conns = list_to_tuple([
+        begin
+            {ok, C} = connect_with_retry(5, 500),
+            C
+        end || _ <- lists:seq(1, PoolSize)
+    ]),
+    Counter = atomics:new(1, [{signed, false}]),
+    persistent_term:put(?POOL_KEY, #pool{conns = Conns, size = PoolSize, counter = Counter}),
+    {ok, #st{}}.
 
-handle_call(Msg, _From, #st{conn = Conn} = St) ->
-    {Reply, Conn1} = route_with_reconnect(Msg, Conn),
-    {reply, Reply, St#st{conn = Conn1}};
 handle_call(_, _From, St) -> {reply, {error, unknown}, St}.
 
 handle_cast(_, St) -> {noreply, St}.
-handle_info({'EXIT', Conn, Reason}, #st{conn = Conn} = St) ->
-    error_logger:error_msg("DB connection exited: ~p~n", [Reason]),
-    {noreply, St#st{conn = reconnect_or_keep(Conn)}};
 handle_info(_, St) -> {noreply, St}.
-terminate(_, #st{conn = Conn}) -> try epgsql:close(Conn) catch _:_ -> ok end, ok.
+terminate(_, _) ->
+    try
+        #pool{conns = Conns, size = Size} = persistent_term:get(?POOL_KEY),
+        [try epgsql:close(element(I, Conns)) catch _:_ -> ok end || I <- lists:seq(1, Size)],
+        persistent_term:erase(?POOL_KEY)
+    catch _:_ -> ok end,
+    ok.
 code_change(_, St, _) -> {ok, St}.
 
 route_with_reconnect(Msg, Conn) ->
@@ -111,7 +169,7 @@ route_with_reconnect(Msg, Conn) ->
         Reply -> {Reply, Conn}
     catch
         C:R:S ->
-            error_logger:error_msg("DB route failed ~p:~p ~p for ~p~n", [C, R, S, Msg]),
+            error_logger:error_msg("DB route failed ~p:~p ~p for ~p~n", [C, R, S, safe_log_msg(Msg)]),
             case db_error(R) of
                 true ->
                     case reconnect(Conn) of
@@ -132,7 +190,7 @@ maybe_retry_read(Msg, Conn, FirstReason) ->
                 Reply -> {Reply, Conn}
             catch
                 C:R:S ->
-                    error_logger:error_msg("DB retry failed after ~p: ~p:~p ~p for ~p~n", [FirstReason, C, R, S, Msg]),
+                    error_logger:error_msg("DB retry failed after ~p: ~p:~p ~p for ~p~n", [FirstReason, C, R, S, safe_log_msg(Msg)]),
                     {{error, database_unavailable}, Conn}
             end;
         false ->
@@ -179,17 +237,25 @@ read_msg({create_conversation, _, _, _}) -> false;
 read_msg({update_conversation, _, _, _, _}) -> false;
 read_msg({add_conversation_members, _, _, _}) -> false;
 read_msg({leave_conversation, _, _}) -> false;
+read_msg({accept_message_request, _, _}) -> false;
+read_msg({deny_message_request, _, _}) -> false;
 read_msg({mark_conversation_read, _, _}) -> false;
 read_msg({post_direct_message, _, _, _, _}) -> false;
 read_msg({mark_notifications_seen, _}) -> false;
 read_msg({mark_url_seen, _, _}) -> false;
 read_msg(_) -> true.
 
-reconnect_or_keep(Conn) ->
-    case reconnect(Conn) of
-        {ok, Conn1} -> Conn1;
-        {error, _} -> Conn
-    end.
+safe_log_msg({register, _, _, _}) -> {register, redacted};
+safe_log_msg({login, _, _}) -> {login, redacted};
+safe_log_msg({session, _}) -> {session, redacted};
+safe_log_msg({logout, _}) -> {logout, redacted};
+safe_log_msg({post_channel_message, Uid, ChannelId, _, ReplyTo}) ->
+    {post_channel_message, Uid, ChannelId, redacted, ReplyTo};
+safe_log_msg({post_direct_message, Uid, Cid, _, ReplyTo}) ->
+    {post_direct_message, Uid, Cid, redacted, ReplyTo};
+safe_log_msg({create_thread, Uid, ForumId, _, _}) -> {create_thread, Uid, ForumId, redacted};
+safe_log_msg({reply_thread, Uid, ThreadId, _}) -> {reply_thread, Uid, ThreadId, redacted};
+safe_log_msg(Msg) -> Msg.
 
 reconnect(Conn) ->
     try epgsql:close(Conn) catch _:_ -> ok end,
@@ -287,22 +353,27 @@ route({session, Token}, Conn) ->
                   "WHERE s.token_hash = $1 AND s.expires_at > $2",
             case one(Conn, Sql, [H, Now]) of
                 {ok, [Uid, Csrf, Un, Dn, Bio, Av, Ban, St, Th, Cr, Ls]} ->
-                    _ = exec(Conn, "UPDATE sessions SET last_seen = $1 WHERE token_hash = $2", [Now, H]),
-                    _ = exec(Conn, "UPDATE users SET last_seen = $1 WHERE id = $2", [Now, Uid]),
-                    {ok, #{user => user_map([Uid, Un, Dn, Bio, Av, Ban, St, Th, Cr, Ls]),
-                           csrf => Csrf, server_time => Now}};
+                    Cutoff = Now - 60000,
+                    _ = exec(Conn, "UPDATE sessions SET last_seen = $1 WHERE token_hash = $2 AND last_seen < $3", [Now, H, Cutoff]),
+                    _ = exec(Conn, "UPDATE users SET last_seen = $1 WHERE id = $2 AND last_seen < $3", [Now, Uid, Cutoff]),
+                    Session = #{user => user_map_full([Uid, Un, Dn, Bio, Av, Ban, St, Th, Cr, Ls]),
+                           csrf => Csrf, server_time => Now},
+                    ets:insert(?SESSION_CACHE, [{H, Uid, Now + 300000}, {{user, Uid}, Session}]),
+                    {ok, Session};
                 _ ->
                     {error, no_session}
             end
     end;
 route({logout, Token}, Conn) ->
-    _ = exec(Conn, "DELETE FROM sessions WHERE token_hash = $1", [pw_util:sha256_hex(Token)]),
+    H = pw_util:sha256_hex(Token),
+    _ = exec(Conn, "DELETE FROM sessions WHERE token_hash = $1", [H]),
+    ets:delete(?SESSION_CACHE, H),
     ok;
 route({me, Uid}, Conn) ->
     case one(Conn,
         "SELECT id, username, display_name, bio, avatar_url, banner_url, status, theme, created_at, last_seen "
         "FROM users WHERE id = $1", [Uid]) of
-        {ok, Row} when is_list(Row) -> {ok, user_map(Row)};
+        {ok, Row} when is_list(Row) -> {ok, user_map_full(Row)};
         _ -> {error, not_found}
     end;
 route({update_profile, Uid, Display0, Patch}, Conn) ->
@@ -320,12 +391,19 @@ route({update_profile, Uid, Display0, Patch}, Conn) ->
     {ok, #{updated => true}};
 route({sync, Uid, Since0}, Conn) ->
     Since = case pw_util:int(Since0) of undefined -> 0; I -> I end,
-    {ok, Notifs} = route({notifications, Uid}, Conn),
+    Notifs = case Since > 0 of
+        true ->
+            {ok, Rows} = rows(Conn, "SELECT id, kind, body, url, seen, created_at FROM notifications WHERE user_id = $1 AND created_at > $2 ORDER BY id DESC LIMIT 120", [Uid, Since]),
+            {ok, [notification_map(R) || R <- Rows]};
+        false ->
+            route({notifications, Uid}, Conn)
+    end,
     {ok, Convs} = route({conversations, Uid}, Conn),
     {ok, Servers} = route({servers, Uid}, Conn),
     {ok, Friends} = route({friends, Uid}, Conn),
     {ok, #{now => pw_util:now_ms(), since => Since,
-          notifications => Notifs, conversations => Convs,
+          notifications => case Notifs of {ok, N} -> N; _ -> [] end,
+          conversations => Convs,
           servers => Servers, friends => Friends}};
 route({users, Q0}, Conn) ->
     Q = pw_util:clean_text(Q0, 80),
@@ -384,6 +462,11 @@ route({friend_accept, Uid, Target0}, Conn) ->
             case one(Conn, "SELECT status, requester_id, addressee_id FROM friendships WHERE user_low = $1 AND user_high = $2", [A, B]) of
                 {ok, [<<"pending">>, Target, Uid]} ->
                     ok = exec(Conn, "UPDATE friendships SET status = 'accepted', updated_at = $1 WHERE user_low = $2 AND user_high = $3", [Now, A, B]),
+                    ok = exec(Conn,
+                        "UPDATE direct_members SET request_state = 'accepted' WHERE user_id = $1 AND request_state = 'pending' "
+                        "AND thread_id IN (SELECT dm1.thread_id FROM direct_members dm1 JOIN direct_members dm2 ON dm2.thread_id = dm1.thread_id "
+                        "WHERE dm1.user_id = $1 AND dm2.user_id = $2 AND (SELECT count(*) FROM direct_members dmc WHERE dmc.thread_id = dm1.thread_id) = 2)",
+                        [Uid, Target]),
                     create_notification(Conn, Target, <<"friend_accept">>, <<"Friend request accepted">>, <<"#/friends">>, Now),
                     pw_hub:notify_user(Target, #{type => friend_accept, user_id => Uid}),
                     {ok, #{status => accepted}};
@@ -699,7 +782,9 @@ route({messages, Uid, Scope0, ScopeId0, Before0, After0}, Conn) ->
         true ->
             {Sql, Params} = message_sql(Scope, ScopeId, Before, After),
             {ok, Rows} = rows(Conn, Sql, Params),
-            {ok, [message_map(Conn, R) || R <- Rows]};
+            ReplyIds = [R || [_,_,_,_,_,_,_,_,R,_] <- Rows, R =/= null, is_integer(R)],
+            ReplyMap = batch_replied_messages(Conn, ReplyIds, Scope, ScopeId),
+            {ok, [message_map_with_replies(R, ReplyMap) || R <- Rows]};
         false ->
             {error, forbidden}
     end;
@@ -737,7 +822,7 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
     end;
 route({conversations, Uid}, Conn) ->
     Sql = "SELECT dt.id, dt.name, dt.avatar_url, dt.owner_id, dt.created_at, dt.updated_at, "
-          "dm.last_read_message_id, dm.muted, "
+          "dm.last_read_message_id, dm.muted, dm.request_state, "
           "(SELECT count(*) FROM direct_members WHERE thread_id = dt.id), "
           "(SELECT body FROM messages WHERE scope = 'direct' AND scope_id = dt.id ORDER BY id DESC LIMIT 1), "
           "(SELECT id FROM messages WHERE scope = 'direct' AND scope_id = dt.id ORDER BY id DESC LIMIT 1), "
@@ -826,6 +911,28 @@ route({leave_conversation, Uid, Cid0}, Conn) ->
         false ->
             {error, not_found}
     end;
+route({accept_message_request, Uid, Cid0}, Conn) ->
+    Cid = pw_util:int(Cid0),
+    case one(Conn, "SELECT request_state FROM direct_members WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]) of
+        {ok, [<<"pending">>]} ->
+            Now = pw_util:now_ms(),
+            ok = exec(Conn, "UPDATE direct_members SET request_state = 'accepted' WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]),
+            notify_direct_members(Conn, Cid, Uid, #{type => message_request_accepted, conversation_id => Cid}, Now),
+            {ok, #{accepted => true, conversation_id => Cid}};
+        {ok, [<<"accepted">>]} -> {ok, #{accepted => true, conversation_id => Cid}};
+        _ -> {error, no_message_request}
+    end;
+route({deny_message_request, Uid, Cid0}, Conn) ->
+    Cid = pw_util:int(Cid0),
+    case one(Conn, "SELECT request_state FROM direct_members WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]) of
+        {ok, [<<"pending">>]} ->
+            Now = pw_util:now_ms(),
+            notify_direct_members(Conn, Cid, Uid, #{type => conversation_closed, conversation_id => Cid, reason => request_denied}, Now),
+            ok = exec(Conn, "DELETE FROM messages WHERE scope = 'direct' AND scope_id = $1", [Cid]),
+            ok = exec(Conn, "DELETE FROM direct_threads WHERE id = $1", [Cid]),
+            {ok, #{denied => true, conversation_id => Cid}};
+        _ -> {error, no_message_request}
+    end;
 route({mark_conversation_read, Uid, Cid0}, Conn) ->
     Cid = pw_util:int(Cid0),
     case is_conversation_member(Conn, Uid, Cid) of
@@ -854,7 +961,7 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
     Cid = pw_util:int(Cid0),
     Body = store_message(pw_util:clean_text(Body0, ?MAX_MSG)),
     ReplyTo = pw_util:int(ReplyTo0),
-    case {byte_size(Body) > 0, is_conversation_member(Conn, Uid, Cid), valid_reply_to(Conn, <<"direct">>, Cid, ReplyTo)} of
+    case {byte_size(Body) > 0, conversation_can_send(Conn, Uid, Cid), valid_reply_to(Conn, <<"direct">>, Cid, ReplyTo)} of
         {true, true, true} ->
             Now = pw_util:now_ms(),
             {ok, Mid} = insert_returning(Conn,
@@ -885,14 +992,14 @@ route({member_of_channel, Uid, Cid0}, Conn) ->
         _ -> false
     end;
 route({member_of_conversation, Uid, Cid0}, Conn) ->
-    is_conversation_member(Conn, Uid, pw_util:int(Cid0));
+    conversation_can_send(Conn, Uid, pw_util:int(Cid0));
 route({member_of_server, Uid, Sid0}, Conn) ->
     is_member(Conn, Uid, pw_util:int(Sid0));
 route({conversation_peer_ids, Uid, Cid0}, Conn) ->
     Cid = pw_util:int(Cid0),
-    case is_conversation_member(Conn, Uid, Cid) of
+    case conversation_can_send(Conn, Uid, Cid) of
         true ->
-            {ok, Rows} = rows(Conn, "SELECT user_id FROM direct_members WHERE thread_id = $1 AND user_id <> $2", [Cid, Uid]),
+            {ok, Rows} = rows(Conn, "SELECT user_id FROM direct_members WHERE thread_id = $1 AND user_id <> $2 AND request_state = 'accepted'", [Cid, Uid]),
             {ok, [only_id(R) || R <- Rows]};
         false ->
             {error, forbidden}
@@ -907,7 +1014,9 @@ make_session(Conn, Uid) ->
     ok = exec(Conn, "INSERT INTO sessions(token_hash, user_id, csrf, created_at, expires_at, last_seen) VALUES($1,$2,$3,$4,$5,$6)",
         [H, Uid, Csrf, Now, Expires, Now]),
     {ok, User} = route({me, Uid}, Conn),
-    #{token => Token, csrf => Csrf, user => User, server_time => Now}.
+    Session = #{token => Token, csrf => Csrf, user => User, server_time => Now},
+    ets:insert(?SESSION_CACHE, [{H, Uid, Now + 300000}, {{user, Uid}, Session}]),
+    Session.
 
 migrate(Conn) ->
     ensure_schema_table(Conn),
@@ -1003,6 +1112,17 @@ migrations() -> [
         "CREATE TABLE IF NOT EXISTS forum_members(forum_id integer NOT NULL REFERENCES forums(id) ON DELETE CASCADE, "
         "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, joined_at bigint NOT NULL, PRIMARY KEY(forum_id, user_id))",
         "CREATE INDEX IF NOT EXISTS idx_forum_members_user ON forum_members(user_id, forum_id)"
+    ]},
+    {5, [
+        "ALTER TABLE direct_members ADD COLUMN IF NOT EXISTS request_state text NOT NULL DEFAULT 'accepted'",
+        "ALTER TABLE direct_members DROP CONSTRAINT IF EXISTS direct_members_request_state_check",
+        "ALTER TABLE direct_members ADD CONSTRAINT direct_members_request_state_check CHECK(request_state IN ('pending','accepted'))",
+        "CREATE INDEX IF NOT EXISTS idx_direct_members_requests ON direct_members(user_id, request_state, joined_at DESC)"
+    ]},
+    {6, [
+        "CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_id) WHERE reply_to_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_channels_server ON channels(server_id, position ASC, id ASC)"
     ]}
 ].
 
@@ -1095,9 +1215,14 @@ load_message(null) -> <<>>;
 load_message(Body) -> pw_crypto:decrypt(Body).
 
 store_image_url(Url0) ->
-    Url = pw_util:clean_text(Url0, 260000),
+    Url = pw_util:clean_text(Url0, 17825792),
     case Url of
         <<>> -> <<>>;
+        <<"data:", _/binary>> ->
+            case pw_util:safe_image_data_url(Url) of
+                true -> pw_media:cache_data_url(Url);
+                false -> <<>>
+            end;
         <<"/api/media/", _/binary>> -> Url;
         <<"http://", _/binary>> -> Url;
         <<"https://", _/binary>> -> Url;
@@ -1134,28 +1259,39 @@ ensure_list(_) -> [].
 
 users_exist(_Conn, []) -> true;
 users_exist(Conn, UserIds) ->
-    lists:all(fun(UserId) ->
-        case one(Conn, "SELECT id FROM users WHERE id = $1", [UserId]) of
-            {ok, [_]} -> true;
-            _ -> false
-        end
-    end, UserIds).
+    UniqueIds = lists:usort([pw_util:int(U) || U <- UserIds, is_integer(pw_util:int(U))]),
+    case UniqueIds of
+        [] -> true;
+        _ ->
+            N = length(UniqueIds),
+            Placeholders = string:join(["$" ++ integer_to_list(I) || I <- lists:seq(1, N)], ","),
+            Sql = "SELECT id FROM users WHERE id IN (" ++ Placeholders ++ ")",
+            case rows(Conn, Sql, UniqueIds) of
+                {ok, FoundIds} -> length(FoundIds) =:= length(UniqueIds);
+                _ -> false
+            end
+    end.
 
 users_not_blocked(_Conn, _Uid, []) -> true;
 users_not_blocked(Conn, Uid, UserIds) ->
-    lists:all(fun(UserId) -> not blocked_pair(Conn, Uid, UserId) end, UserIds).
-
-blocked_pair(_Conn, Uid, Uid) -> true;
-blocked_pair(Conn, A0, B0) ->
-    case {pw_util:int(A0), pw_util:int(B0)} of
-        {A, B} when is_integer(A), is_integer(B) ->
-            {L, H} = pair(A, B),
-            case one(Conn, "SELECT status FROM friendships WHERE user_low = $1 AND user_high = $2", [L, H]) of
-                {ok, [<<"blocked">>]} -> true;
-                _ -> false
-            end;
+    UniqueIds = lists:usort([pw_util:int(U) || U <- UserIds, is_integer(pw_util:int(U)), pw_util:int(U) =/= Uid]),
+    case UniqueIds of
+        [] -> true;
         _ ->
-            true
+            Pairs = [{min(Uid, U), max(Uid, U)} || U <- UniqueIds],
+            case length(Pairs) > 0 of
+                true ->
+                    N = length(Pairs),
+                    Params = lists:flatten([[L, H] || {L, H} <- Pairs]),
+                    PairsSql = string:join(["($" ++ integer_to_list(I*2-1) ++ ",$" ++ integer_to_list(I*2) ++ ")" || I <- lists:seq(1, N)], ","),
+                    Sql = "SELECT user_low, user_high FROM friendships WHERE (user_low, user_high) IN (" ++ PairsSql ++ ") AND status = 'blocked'",
+                    case rows(Conn, Sql, Params) of
+                        {ok, []} -> true;
+                        {ok, _} -> false;
+                        _ -> true
+                    end;
+                false -> true
+            end
     end.
 
 duplicate_server_name(_Conn, _Uid, _Sid, <<>>) -> false;
@@ -1199,11 +1335,19 @@ create_conversation0(Conn, Uid, Name, UserIds) ->
     {ok, Tid} = insert_returning(Conn,
         "INSERT INTO direct_threads(name, avatar_url, owner_id, created_at, updated_at) VALUES($1,$2,$3,$4,$5) RETURNING id",
         [Name, <<>>, Uid, Now, Now]),
-    [exec(Conn,
-        "INSERT INTO direct_members(thread_id, user_id, last_read_message_id, muted, nickname, joined_at) "
-        "VALUES($1,$2,0,false,$3,$4) ON CONFLICT (thread_id, user_id) DO NOTHING",
-        [Tid, U, <<>>, Now]) || U <- [Uid | UserIds]],
-    notify_direct_members(Conn, Tid, Uid, #{type => conversation_created, conversation_id => Tid}, Now),
+    IsRequest = case UserIds of [OnlyPeer] -> not is_friend(Conn, Uid, OnlyPeer); _ -> false end,
+    [begin
+        RequestState = case U =:= Uid orelse not IsRequest of true -> <<"accepted">>; false -> <<"pending">> end,
+        exec(Conn,
+            "INSERT INTO direct_members(thread_id, user_id, last_read_message_id, muted, nickname, joined_at, request_state) "
+            "VALUES($1,$2,0,false,$3,$4,$5) ON CONFLICT (thread_id, user_id) DO NOTHING",
+            [Tid, U, <<>>, Now, RequestState])
+     end || U <- [Uid | UserIds]],
+    CreatedEvent = case IsRequest of
+        true -> #{type => message_request, conversation_id => Tid};
+        false -> #{type => conversation_created, conversation_id => Tid}
+    end,
+    notify_direct_members(Conn, Tid, Uid, CreatedEvent, Now),
     {ok, #{id => Tid}}.
 
 pair(A, B) when A < B -> {A, B};
@@ -1217,6 +1361,10 @@ user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen]) ->
       avatar_url => pw_util:proxied_image(Avatar),
       banner_url => pw_util:proxied_image(Banner),
       status => Status, theme => Theme, created_at => Created, last_seen => LastSeen}.
+
+user_map_full([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen]) ->
+    (user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen])) #{
+      avatar_source_url => Avatar, banner_source_url => Banner}.
 
 forum_map([Id, Slug, Name, Desc, Pos, Tc, Rc, Last, Members, Joined]) ->
     #{id => pw_util:int(Id), slug => Slug, name => Name, description => Desc, position => pw_util:int(Pos),
@@ -1273,6 +1421,16 @@ message_map(Conn, Row = [_,Scope,ScopeId,_,_,_,_,_,ReplyTo|_]) ->
         null -> M;
         _ -> M#{reply_to => replied_message(Conn, ReplyTo, Scope, ScopeId)}
     end.
+message_map_with_replies(Row = [_,_,_,_,_,_,_,_,ReplyTo|_], ReplyMap) ->
+    M = message_map(Row),
+    case ReplyTo of
+        null -> M;
+        _ -> case maps:find(ReplyTo, ReplyMap) of
+            {ok, ReplyInfo} -> M#{reply_to => ReplyInfo};
+            error -> M
+        end
+    end.
+
 replied_message(Conn, ReplyTo, Scope, ScopeId) ->
     Sql = "SELECT body, user_id, display_name FROM messages JOIN users ON users.id = messages.user_id WHERE messages.id = $1 AND scope = $2 AND scope_id = $3",
     case one(Conn, Sql, [ReplyTo, Scope, ScopeId]) of
@@ -1281,9 +1439,29 @@ replied_message(Conn, ReplyTo, Scope, ScopeId) ->
         _ -> undefined
     end.
 
-conversation_row_map([Id, Name, Avatar, Owner, Created, Updated, LastRead, Muted, Count, LastBody, LastMsg, Unread, PeerName, PeerAvatar, PeerUsername]) ->
+batch_replied_messages(_Conn, [], _Scope, _ScopeId) -> #{};
+batch_replied_messages(Conn, Ids, Scope, ScopeId) ->
+    UniqueIds = lists:usort(Ids),
+    case UniqueIds of
+        [] -> #{};
+        _ ->
+            N = length(UniqueIds),
+            Params = UniqueIds ++ [Scope, ScopeId],
+            Placeholders = string:join(["$" ++ integer_to_list(I) || I <- lists:seq(1, N)], ","),
+            Sql = "SELECT m.id, m.body, m.user_id, u.display_name FROM messages m JOIN users u ON u.id = m.user_id "
+                  "WHERE m.id IN (" ++ Placeholders ++ ") AND m.scope = $" ++ integer_to_list(N + 1) ++
+                  " AND m.scope_id = $" ++ integer_to_list(N + 2),
+            case rows(Conn, Sql, Params) of
+                {ok, Rows} ->
+                    maps:from_list([{Id, #{id => Id, user_id => Uid, display_name => D, body => load_message(Body)}}
+                                    || [Id, Body, Uid, D] <- Rows]);
+                _ -> #{}
+            end
+    end.
+
+conversation_row_map([Id, Name, Avatar, Owner, Created, Updated, LastRead, Muted, RequestState, Count, LastBody, LastMsg, Unread, PeerName, PeerAvatar, PeerUsername]) ->
     #{id => Id, name => Name, avatar_url => pw_util:proxied_image(Avatar), owner_id => Owner,
-      created_at => Created, updated_at => Updated, last_read_message_id => LastRead, muted => Muted,
+      created_at => Created, updated_at => Updated, last_read_message_id => LastRead, muted => Muted, request_state => RequestState,
       member_count => Count, last_body => load_message(LastBody), last_message_id => LastMsg, unread => Unread,
       peer_name => PeerName, peer_avatar_url => pw_util:proxied_image(PeerAvatar), peer_username => PeerUsername}.
 
@@ -1343,6 +1521,13 @@ friendship_status(Conn, A, B) ->
             #{status => none}
     end.
 
+is_friend(Conn, A, B) ->
+    {L, H} = pair(A, B),
+    case one(Conn, "SELECT status FROM friendships WHERE user_low = $1 AND user_high = $2", [L, H]) of
+        {ok, [<<"accepted">>]} -> true;
+        _ -> false
+    end.
+
 is_member(Conn, Uid, Sid) ->
     case one(Conn, "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2", [Sid, Uid]) of
         {ok, [_]} -> true;
@@ -1387,6 +1572,12 @@ is_conversation_member(Conn, Uid, Cid) ->
         _ -> false
     end.
 
+conversation_can_send(Conn, Uid, Cid) ->
+    case one(Conn, "SELECT request_state FROM direct_members WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]) of
+        {ok, [<<"accepted">>]} -> true;
+        _ -> false
+    end.
+
 is_conversation_owner(Conn, Uid, Cid) ->
     case one(Conn, "SELECT owner_id FROM direct_threads WHERE id = $1 AND owner_id = $2", [Cid, Uid]) of
         {ok, [_]} -> true;
@@ -1417,11 +1608,24 @@ notify_channel_members(Conn, Sid, Sender, Cid, Msg, Now) ->
     ok.
 
 notify_direct_members(Conn, Cid, Sender, Event, Now) ->
-    {ok, Rows} = rows(Conn, "SELECT user_id FROM direct_members WHERE thread_id = $1 AND user_id <> $2 AND muted = false", [Cid, Sender]),
+    {ok, Rows} = rows(Conn, "SELECT user_id, request_state FROM direct_members WHERE thread_id = $1 AND user_id <> $2 AND muted = false", [Cid, Sender]),
     [begin
-         U = only_id(R),
-         create_notification(Conn, U, <<"direct_message">>, <<"New direct message">>,
-             <<"#/dm/", (integer_to_binary(Cid))/binary>>, Now),
+         [U, RequestState] = R,
+         EventType = maps:get(type, Event, direct_message),
+         {Kind, Body, Url} = case {EventType, RequestState} of
+             {direct_message, <<"pending">>} -> {<<"message_request">>, <<"New message request">>, <<"#/dms">>};
+             _ -> case EventType of
+             message_request_accepted -> {<<"message_request_accepted">>, <<"Message request accepted">>, <<"#/dm/", (integer_to_binary(Cid))/binary>>};
+             conversation_closed -> {<<"conversation_closed">>, <<"Message request declined">>, <<"#/dms">>};
+             message_request -> {<<"message_request">>, <<"New message request">>, <<"#/dms">>};
+             conversation_created -> {<<"conversation_created">>, <<"New conversation">>, <<"#/dm/", (integer_to_binary(Cid))/binary>>};
+             _ -> {<<"direct_message">>, <<"New direct message">>, <<"#/dm/", (integer_to_binary(Cid))/binary>>}
+             end
+         end,
+         case Kind of
+             <<"message_request">> -> create_notification_once(Conn, U, Kind, Body, Url, Now);
+             _ -> create_notification(Conn, U, Kind, Body, Url, Now)
+         end,
          pw_hub:notify_user(U, Event)
      end || R <- Rows],
     ok.
@@ -1429,6 +1633,12 @@ notify_direct_members(Conn, Cid, Sender, Event, Now) ->
 create_notification(Conn, U, K, B, Url, Now) ->
     ok = exec(Conn, "INSERT INTO notifications(user_id, kind, body, url, seen, created_at) VALUES($1,$2,$3,$4,false,$5)",
         [U, K, pw_util:clean_text(B, 180), Url, Now]).
+
+create_notification_once(Conn, U, K, B, Url, Now) ->
+    case one(Conn, "SELECT id FROM notifications WHERE user_id = $1 AND kind = $2 AND url = $3 AND seen = false LIMIT 1", [U, K, Url]) of
+        {ok, [_]} -> ok;
+        _ -> create_notification(Conn, U, K, B, Url, Now)
+    end.
 
 mark_url_seen0(Conn, Uid, Url) ->
     _ = exec(Conn, "UPDATE notifications SET seen = true WHERE user_id = $1 AND url = $2", [Uid, Url]),

@@ -17,11 +17,19 @@ for path_part in "${path_parts[@]}"; do
 done
 export PATH="${clean_path}"
 
-elm_bin="$(command -v elm || true)"
+elm_bin="${ELM_BIN:-$(command -v elm || true)}"
 if [ -z "${elm_bin}" ]; then
-  printf '%s\n' "Elm compiler not found. Install Elm 0.19.2 on the server PATH, then rerun npm run build:elm." >&2
+  printf '%s\n' "Elm compiler not found. Install Elm 0.19.x on the server PATH, then rerun scripts/build-elm.sh." >&2
   exit 127
 fi
 
+resolved_elm="$(readlink -f "${elm_bin}" 2>/dev/null || printf '%s' "${elm_bin}")"
+case "${resolved_elm}" in
+  */node_modules/*)
+    printf '%s\n' "Refusing npm-installed Elm wrapper. Set ELM_BIN to a native Elm compiler." >&2
+    exit 127
+    ;;
+esac
+
 cd priv/static/elm
-exec "${elm_bin}" make src/Main.elm --output=../app.js --optimize
+exec "${resolved_elm}" make src/Main.elm --output=../app.js --optimize

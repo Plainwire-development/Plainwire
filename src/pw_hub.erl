@@ -59,8 +59,11 @@ handle_cast({connect, Uid, Pid, Status0}, St) ->
     end,
     Pid ! {hub_json, #{type => presence_state, online => maps:keys(Online),
         statuses => maps:from_list([{U, S} || {U, S} <- maps:to_list(Online)])}},
+    log("client_connected", #{uid => Uid, sessions => length(maps:get(Uid, Users, [])), online_users => map_size(Online)}),
     {noreply, St#st{users = Users, pids = Pids, online = Online}};
-handle_cast({disconnect, Pid}, St) -> {noreply, remove_pid(Pid, St)};
+handle_cast({disconnect, Pid}, St) ->
+    log("client_disconnected", #{uid => maps:get(Pid, St#st.pids, undefined)}),
+    {noreply, remove_pid(Pid, St)};
 handle_cast({unsubscribe_all, Pid}, St) -> {noreply, St#st{subs = remove_from_all(Pid, St#st.subs)}};
 handle_cast({subscribe, Pid, Key}, St) -> {noreply, St#st{subs = add_to_set(Key, Pid, St#st.subs)}};
 handle_cast({notify_user, Uid, Event}, St) ->
@@ -81,14 +84,16 @@ handle_cast({broadcast, Key, Event}, St) ->
 handle_cast({voice_join, ChannelId, Uid, Pid, Profile}, St0) ->
     Key = {voice, ChannelId},
     Room0 = maps:get(Key, St0#st.voices, #{}),
-    send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room0)], #{type => voice_peer_joined, channel_id => ChannelId, user_id => Uid, profile => Profile}),
+    send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room0)], #{type => voice_peer_joined, channel_id => ChannelId, user_id => Uid, profile => strip_profile(Profile)}),
     Room = maps:put(Uid, #{pid => Pid, profile => Profile, muted => false, deafened => false}, Room0),
+    log("voice_join", #{uid => Uid, channel_id => ChannelId, participants => map_size(Room)}),
     send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => voice_state, channel_id => ChannelId, users => room_users(Room)}),
     {noreply, St0#st{voices = maps:put(Key, Room, St0#st.voices)}};
 handle_cast({voice_leave, ChannelId, Uid}, St0) ->
     Key = {voice, ChannelId},
     Room0 = maps:get(Key, St0#st.voices, #{}),
     Room = maps:remove(Uid, Room0),
+    log("voice_leave", #{uid => Uid, channel_id => ChannelId, participants => map_size(Room)}),
     send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => voice_peer_left, channel_id => ChannelId, user_id => Uid}),
     Voices = put_or_remove(Key, Room, St0#st.voices),
     {noreply, St0#st{voices = Voices}};
@@ -98,11 +103,13 @@ handle_cast({voice_state, ChannelId, Uid, Patch, Profile}, St0) ->
     Info0 = maps:get(Uid, Room0, #{pid => undefined, profile => Profile}),
     Info = maps:merge(Info0, Patch#{profile => Profile}),
     Room = maps:put(Uid, Info, Room0),
+    log("voice_state", #{uid => Uid, channel_id => ChannelId, patch => Patch}),
     send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => voice_state, channel_id => ChannelId, users => room_users(Room)}),
     {noreply, St0#st{voices = maps:put(Key, Room, St0#st.voices)}};
 handle_cast({voice_signal, ChannelId, From, To, Signal}, St) ->
     Key = {voice, ChannelId},
     Room = maps:get(Key, St#st.voices, #{}),
+    logger:debug("[plainwire:hub] voice_signal ~p", [#{channel_id => ChannelId, from => From, to => To, kind => signal_kind(Signal)}]),
     relay_signal(Room, From, To, #{type => voice_signal, channel_id => ChannelId, from_user_id => From, signal => Signal}),
     {noreply, St};
 handle_cast({call_ring, Cid, Uid, Pid, Profile, Targets}, St0) ->
@@ -110,6 +117,7 @@ handle_cast({call_ring, Cid, Uid, Pid, Profile, Targets}, St0) ->
     St1 = end_ring(St0, Key, call_cancelled, missed),
     Ref = erlang:send_after(?RING_MS, self(), {ring_timeout, Cid, Uid}),
     Targets1 = lists:filter(fun(T) -> T =/= Uid end, Targets),
+    log("call_ring", #{uid => Uid, conversation_id => Cid, target_count => length(Targets1)}),
     Ring = #{
         caller_id => Uid,
         caller_pid => Pid,
@@ -119,8 +127,8 @@ handle_cast({call_ring, Cid, Uid, Pid, Profile, Targets}, St0) ->
         accepted => undefined,
         timer => Ref
     },
-    Pid ! {hub_json, #{type => call_ringing, conversation_id => Cid, targets => length(Targets1), profile => Profile}},
-    [notify_user(T, #{type => call_incoming, conversation_id => Cid, from_user_id => Uid, profile => Profile}) || T <- Targets1],
+    Pid ! {hub_json, #{type => call_ringing, conversation_id => Cid, targets => length(Targets1), profile => strip_profile(Profile)}},
+    [notify_user(T, #{type => call_incoming, conversation_id => Cid, from_user_id => Uid, profile => strip_profile(Profile)}) || T <- Targets1],
     {noreply, St1#st{rings = maps:put(Key, Ring, St1#st.rings)}};
 handle_cast({call_decline, Cid, Uid}, St0) ->
     Key = {ring, Cid},
@@ -154,8 +162,8 @@ handle_cast({call_accept, Cid, Uid, Pid, Profile}, St0) ->
         #{caller_id := Caller, caller_pid := CPid, caller_profile := CProfile, targets := Targets, timer := Ref} ->
             cancel_timer(Ref),
             notify_ring_parties(Targets, #{type => call_ended, conversation_id => Cid, reason => accepted}, Uid),
-            notify_user(Caller, #{type => call_accepted, conversation_id => Cid, user_id => Uid, profile => Profile}),
-            notify_user(Uid, #{type => call_accepted, conversation_id => Cid, user_id => Caller, profile => CProfile}),
+            notify_user(Caller, #{type => call_accepted, conversation_id => Cid, user_id => Uid, profile => strip_profile(Profile)}),
+            notify_user(Uid, #{type => call_accepted, conversation_id => Cid, user_id => Caller, profile => strip_profile(CProfile)}),
             St1 = St0#st{rings = maps:remove(Key, St0#st.rings)},
             St2 = do_call_join(Cid, Uid, Pid, Profile, St1),
             St3 = do_call_join(Cid, Caller, CPid, CProfile, St2),
@@ -169,6 +177,7 @@ handle_cast({call_leave, ConversationId, Uid}, St0) ->
     Key = {call, ConversationId},
     Room0 = maps:get(Key, St0#st.calls, #{}),
     Room = maps:remove(Uid, Room0),
+    log("call_leave", #{uid => Uid, conversation_id => ConversationId, participants => map_size(Room)}),
     send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => call_peer_left, conversation_id => ConversationId, user_id => Uid}),
     send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => call_state, conversation_id => ConversationId, users => room_users(Room)}),
     Calls = put_or_remove(Key, Room, St0#st.calls),
@@ -225,8 +234,9 @@ code_change(_, St, _) -> {ok, St}.
 do_call_join(ConversationId, Uid, Pid, Profile, St0) ->
     Key = {call, ConversationId},
     Room0 = maps:get(Key, St0#st.calls, #{}),
-    send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room0)], #{type => call_peer_joined, conversation_id => ConversationId, user_id => Uid, profile => Profile}),
+    send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room0)], #{type => call_peer_joined, conversation_id => ConversationId, user_id => Uid, profile => strip_profile(Profile)}),
     Room = maps:put(Uid, #{pid => Pid, profile => Profile, muted => false, deafened => false}, Room0),
+    log("call_join", #{uid => Uid, conversation_id => ConversationId, participants => map_size(Room)}),
     send_many([maps:get(pid, V) || {_K, V} <- maps:to_list(Room)], #{type => call_state, conversation_id => ConversationId, users => room_users(Room)}),
     St0#st{calls = maps:put(Key, Room, St0#st.calls)}.
 
@@ -258,11 +268,20 @@ relay_signal(Room, From, To, Event) ->
 
 send_many(Pids, Event) -> [Pid ! {hub_json, Event} || Pid <- Pids, is_pid(Pid)], ok.
 send_to_others(Pids, Event, Skip) -> [Pid ! {hub_json, Event} || Pid <- maps:keys(Pids), Pid =/= Skip, is_pid(Pid)], ok.
+
+signal_kind(Signal) when is_map(Signal) -> maps:get(<<"kind">>, Signal, unknown);
+signal_kind(_) -> unknown.
+
+log(Event, Data) -> logger:notice("[plainwire:hub] ~s ~p", [Event, Data]).
 add_to_set(Key, Pid, Map) -> maps:put(Key, lists:usort([Pid | maps:get(Key, Map, [])]), Map).
 remove_from_all(Pid, Map) -> maps:map(fun(_, L) -> lists:delete(Pid, L) end, Map).
 put_or_remove(Key, Room, Map) when map_size(Room) =:= 0 -> maps:remove(Key, Map);
 put_or_remove(Key, Room, Map) -> maps:put(Key, Room, Map).
-room_users(Room) -> [maps:merge(#{user_id => Uid}, maps:remove(pid, Info)) || {Uid, Info} <- maps:to_list(Room)].
+room_users(Room) -> [#{user_id => Uid, muted => maps:get(muted, Info, false), deafened => maps:get(deafened, Info, false)} || {Uid, Info} <- maps:to_list(Room)].
+
+strip_profile(Info) when is_map(Info) ->
+    maps:remove(avatar_source_url, maps:remove(banner_source_url, Info));
+strip_profile(Other) -> Other.
 
 normalize_status(<<"busy">>) -> <<"busy">>;
 normalize_status(<<"away">>) -> <<"away">>;

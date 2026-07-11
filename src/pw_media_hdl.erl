@@ -7,7 +7,7 @@ init(Req0, _) ->
         {ok, Uid} ->
             Path = cowboy_req:path(Req0),
             Token = extract_token(Path),
-            case pw_rate:allow({media, pw_util:ip(Req0), Uid}, 120, 60000) of
+            case pw_rate:allow({media, pw_util:ip(Req0), Uid}, 300, 60000) of
                 false ->
                     pw_util:err_json(Req0, 429, <<"rate_limited">>);
                 true ->
@@ -15,7 +15,7 @@ init(Req0, _) ->
                 {ok, Body, Type} ->
                     Headers = maps:merge(pw_util:security_headers(), #{
                         <<"content-type">> => Type,
-                        <<"cache-control">> => <<"private, max-age=3600">>
+                        <<"cache-control">> => <<"private, max-age=86400, immutable">>
                     }),
                     Req = cowboy_req:reply(200, Headers, Body, Req0),
                     {ok, Req, undefined};
@@ -35,7 +35,7 @@ auth(Req) ->
     case pw_util:cookie_value(Req, <<"pw_session">>) of
         undefined -> {error, no_session};
         Token ->
-            case pw_db:session(Token) of
+            case pw_db:session_fast(Token) of
                 {ok, Session} -> {ok, maps:get(id, maps:get(user, Session))};
                 _ -> {error, no_session}
             end
