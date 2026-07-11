@@ -47,37 +47,31 @@ decrypt(X) -> decrypt(pw_util:bin(X)).
 
 %% Signed opaque tokens for proxied media URLs (no raw URL in client requests).
 proxy_token(Url) ->
-    case signing_key() of
-        {ok, Key} ->
-            %% Keep media URLs stable across API refreshes. Random tokens caused
-            %% browsers to reload every avatar on each sync even when unchanged.
-            <<Nonce:8/binary, _/binary>> = crypto:mac(hmac, sha256, Key, <<"media:", Url/binary>>),
-            Mac = crypto:mac(hmac, sha256, Key, <<Nonce/binary, Url/binary>>),
-            <<$p, $1, $:, (pw_util:base64url(<<Nonce/binary, Mac:16/binary>>))/binary, $., (pw_util:base64url(Url))/binary>>;
-        _ -> erlang:error(media_signing_key_not_configured)
-    end.
+    {ok, Key} = signing_key(),
+    %% Keep media URLs stable across API refreshes. Random tokens caused
+    %% browsers to reload every avatar on each sync even when unchanged.
+    <<Nonce:8/binary, _/binary>> = crypto:mac(hmac, sha256, Key, <<"media:", Url/binary>>),
+    Mac = crypto:mac(hmac, sha256, Key, <<Nonce/binary, Url/binary>>),
+    <<$p, $1, $:, (pw_util:base64url(<<Nonce/binary, Mac:16/binary>>))/binary, $., (pw_util:base64url(Url))/binary>>.
 
 verify_proxy_token(Token, Url) ->
-    case signing_key() of
-        {ok, Key} ->
-            case Token of
-                <<$p, $1, $:, Rest/binary>> ->
-                    case binary:split(Rest, <<".">>, []) of
-                        [SigB64, UrlB64] ->
-                            case {pw_util:base64url_decode(SigB64), pw_util:base64url_decode(UrlB64)} of
-                                {<<Nonce:8/binary, Mac:16/binary>>, DecUrl} when DecUrl =:= Url ->
-                                    <<Expected:16/binary, _/binary>> = crypto:mac(hmac, sha256, Key, <<Nonce/binary, Url/binary>>),
-                                    constant_time(Mac, Expected);
-                                _ ->
-                                    false
-                            end;
+    {ok, Key} = signing_key(),
+    case Token of
+        <<$p, $1, $:, Rest/binary>> ->
+            case binary:split(Rest, <<".">>, []) of
+                [SigB64, UrlB64] ->
+                    case {pw_util:base64url_decode(SigB64), pw_util:base64url_decode(UrlB64)} of
+                        {<<Nonce:8/binary, Mac:16/binary>>, DecUrl} when DecUrl =:= Url ->
+                            <<Expected:16/binary, _/binary>> = crypto:mac(hmac, sha256, Key, <<Nonce/binary, Url/binary>>),
+                            constant_time(Mac, Expected);
                         _ ->
                             false
                     end;
                 _ ->
                     false
             end;
-        _ -> false
+        _ ->
+            false
     end.
 
 signing_key() ->

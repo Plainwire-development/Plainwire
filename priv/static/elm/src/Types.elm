@@ -23,6 +23,14 @@ defaultValue fallback decoder =
     D.oneOf [ decoder, D.succeed fallback ]
 
 
+resilientList : D.Decoder a -> D.Decoder (List a)
+resilientList decoder =
+    -- A single legacy or malformed row must not erase an entire navigation
+    -- collection. Keep valid records while the server-side row is repaired.
+    D.list (D.maybe decoder)
+        |> D.map (List.filterMap identity)
+
+
 andMap : D.Decoder a -> D.Decoder (a -> b) -> D.Decoder b
 andMap valueDecoder functionDecoder =
     D.map2 (\f value -> f value) functionDecoder valueDecoder
@@ -457,10 +465,10 @@ decodeSyncData : D.Decoder { notifications : List Notification, conversations : 
 decodeSyncData = D.map5 (\notifications conversations servers friends now ->
     { notifications = notifications, conversations = conversations, servers = servers, friends = friends, now = now }
     )
-    (D.field "notifications" (D.list decodeNotification) |> defaultValue [])
-    (D.field "conversations" (D.list decodeConversation) |> defaultValue [])
-    (D.field "servers" (D.list decodeServer) |> defaultValue [])
-    (D.field "friends" (D.list decodeFriend) |> defaultValue [])
+    (D.field "notifications" (resilientList decodeNotification) |> defaultValue [])
+    (D.field "conversations" (resilientList decodeConversation) |> defaultValue [])
+    (D.field "servers" (resilientList decodeServer) |> defaultValue [])
+    (D.field "friends" (resilientList decodeFriend) |> defaultValue [])
     (D.field "now" D.int)
 
 type alias SyncData r = { r | notifications : List Notification, conversations : List Conversation, servers : List Server, friends : List Friend, now : Int }

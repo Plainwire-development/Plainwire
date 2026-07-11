@@ -27,6 +27,7 @@
 -define(POOL_LOAD, pw_db_connection_load).
 -define(MAX_BODY, 12000).
 -define(MAX_MSG, 5000).
+-define(SESSION_GC_MS, 3600000).
 
 -define(SESSION_CACHE, pw_session_cache).
 
@@ -211,7 +212,9 @@ init([]) ->
     {ok, MigConn} = connect_with_retry(10, 500),
     ok = migrate(MigConn),
     try epgsql:close(MigConn) catch _:_ -> ok end,
-    PoolSize = pw_util:env_int("PLAINWIRE_DB_POOL_SIZE", 10),
+    %% Bound configuration before it reaches tuple indexing/modulo operations
+    %% or opens an unreasonable number of database connections.
+    PoolSize = min(128, max(1, pw_util:env_int("PLAINWIRE_DB_POOL_SIZE", 10))),
     Conns = list_to_tuple([
         begin
             {ok, C} = connect_with_retry(5, 500),
@@ -221,11 +224,20 @@ init([]) ->
     Counter = atomics:new(1, [{signed, false}]),
     [begin ets:insert(?POOL_CONNS, {I, element(I, Conns)}), ets:insert(?POOL_LOAD, {I, 0}) end || I <- lists:seq(1, PoolSize)],
     persistent_term:put(?POOL_KEY, #pool{conns = Conns, size = PoolSize, counter = Counter}),
+    erlang:send_after(?SESSION_GC_MS, self(), session_gc),
     {ok, #st{}}.
 
 handle_call(_, _From, St) -> {reply, {error, unknown}, St}.
 
 handle_cast(_, St) -> {noreply, St}.
+handle_info(session_gc, St) ->
+    Now = pw_util:now_ms(),
+    _ = ets:select_delete(?SESSION_CACHE,
+        [{{'_', '_', '$1'}, [{'<', '$1', Now}], [true]}]),
+    %% Delete in bounded batches so cleanup cannot create a long table lock.
+    _ = call({prune_sessions, Now}),
+    erlang:send_after(?SESSION_GC_MS, self(), session_gc),
+    {noreply, St};
 handle_info(_, St) -> {noreply, St}.
 terminate(_, _) ->
     try
@@ -320,6 +332,7 @@ read_msg({begin_upload, _, _, _, _, _, _}) -> false;
 read_msg({finish_upload, _, _, _}) -> false;
 read_msg({abort_upload, _, _}) -> false;
 read_msg({delete_upload, _}) -> false;
+read_msg({prune_sessions, _}) -> false;
 read_msg(_) -> true.
 
 safe_log_msg({register, _, _, _}) -> {register, redacted};
@@ -412,11 +425,12 @@ route({login, U0, P0}, Conn) ->
             _ = pw_util:pbkdf2(P, <<"plainwire-login-timing-pad">>),
             {error, bad_login}
     end;
-route(health, Conn) ->
-    case one(Conn, "SELECT 1", []) of
-        {ok, [1]} -> {ok, #{database => ok}};
-        _ -> {error, database_unavailable}
-    end;
+route({prune_sessions, Now}, Conn) ->
+    ok = exec(Conn,
+        "DELETE FROM sessions WHERE token_hash IN "
+        "(SELECT token_hash FROM sessions WHERE expires_at <= $1 LIMIT 10000)",
+        [Now]),
+    {ok, pruned};
 route({session, Token}, Conn) ->
     case Token of
         undefined -> {error, no_session};
@@ -495,7 +509,10 @@ route({profile, Viewer, UserId0}, Conn) ->
     case route({me, UserId}, Conn) of
         {ok, U} ->
             Rel = friendship_status(Conn, Viewer, UserId),
-            {ok, #{user => U, relationship => Rel}};
+            %% Source URLs are edit-state for the account owner, not public
+            %% profile data. In particular, an uploaded data URL can be large.
+            Public = maps:without([avatar_source_url, banner_source_url], U),
+            {ok, #{user => Public, relationship => Rel}};
         E ->
             E
     end;
@@ -931,7 +948,12 @@ route({create_conversation, Uid, Name0, UserIds0}, Conn) ->
             {error, forbidden};
         {[Peer], _, true, true} when Name =:= <<>> ->
             case existing_one_to_one(Conn, Uid, Peer) of
-                {ok, Tid} -> {ok, #{id => Tid, existing => true}};
+                {ok, Tid} ->
+                    %% "New DM" also acts as reopen. Previously it returned the
+                    %% old thread while leaving it hidden, so the user was sent
+                    %% to a conversation that remained absent from their list.
+                    ok = exec(Conn, "UPDATE direct_members SET hidden = false WHERE thread_id = $1 AND user_id = $2", [Tid, Uid]),
+                    {ok, #{id => Tid, existing => true}};
                 not_found -> create_conversation0(Conn, Uid, Name, UserIds)
             end;
         {_, _, true, true} ->
@@ -1329,9 +1351,7 @@ one(Conn, Sql, Params) ->
     end.
 
 insert_returning(Conn, Sql, Params) ->
-    R = if Params =:= [] -> epgsql:squery(Conn, Sql);
-           true -> epgsql:equery(Conn, Sql, Params)
-        end,
+    R = epgsql:equery(Conn, Sql, Params),
     case R of
         {ok, _, _, Rows} when is_list(Rows), Rows =/= [] -> {ok, hd(to_list(hd(Rows)))};
         {ok, _, _} -> {ok, 1};
@@ -1351,7 +1371,12 @@ store_image_url(Url0) ->
         <<>> -> <<>>;
         <<"data:", _/binary>> ->
             case pw_util:safe_image_data_url(Url) of
-                true -> pw_media:cache_data_url(Url);
+                %% Keep the source bytes in PostgreSQL. The media cache is ETS
+                %% backed and is intentionally disposable; persisting its
+                %% synthetic URL made uploaded avatars disappear after every
+                %% application restart. user_map/1 turns this durable source
+                %% into a short, signed media URL whenever it is returned.
+                true -> Url;
                 false -> <<>>
             end;
         <<"/api/media/", _/binary>> -> Url;
@@ -1573,21 +1598,17 @@ replied_message(Conn, ReplyTo, Scope, ScopeId) ->
 batch_replied_messages(_Conn, [], _Scope, _ScopeId) -> #{};
 batch_replied_messages(Conn, Ids, Scope, ScopeId) ->
     UniqueIds = lists:usort(Ids),
-    case UniqueIds of
-        [] -> #{};
-        _ ->
-            N = length(UniqueIds),
-            Params = UniqueIds ++ [Scope, ScopeId],
-            Placeholders = string:join(["$" ++ integer_to_list(I) || I <- lists:seq(1, N)], ","),
-            Sql = "SELECT m.id, m.body, m.user_id, u.display_name FROM messages m JOIN users u ON u.id = m.user_id "
-                  "WHERE m.id IN (" ++ Placeholders ++ ") AND m.scope = $" ++ integer_to_list(N + 1) ++
-                  " AND m.scope_id = $" ++ integer_to_list(N + 2) ++ " AND m.deleted_at IS NULL",
-            case rows(Conn, Sql, Params) of
-                {ok, Rows} ->
-                    maps:from_list([{Id, #{id => Id, user_id => Uid, display_name => D, body => load_message(Body)}}
-                                    || [Id, Body, Uid, D] <- Rows]);
-                _ -> #{}
-            end
+    N = length(UniqueIds),
+    Params = UniqueIds ++ [Scope, ScopeId],
+    Placeholders = string:join(["$" ++ integer_to_list(I) || I <- lists:seq(1, N)], ","),
+    Sql = "SELECT m.id, m.body, m.user_id, u.display_name FROM messages m JOIN users u ON u.id = m.user_id "
+          "WHERE m.id IN (" ++ Placeholders ++ ") AND m.scope = $" ++ integer_to_list(N + 1) ++
+          " AND m.scope_id = $" ++ integer_to_list(N + 2) ++ " AND m.deleted_at IS NULL",
+    case rows(Conn, Sql, Params) of
+        {ok, Rows} ->
+            maps:from_list([{Id, #{id => Id, user_id => Uid, display_name => D, body => load_message(Body)}}
+                            || [Id, Body, Uid, D] <- Rows]);
+        _ -> #{}
     end.
 
 conversation_row_map([Id, Name, Avatar, Owner, Created, Updated, LastRead, Muted, RequestState, Count, LastBody, LastMsg, Unread, PeerName, PeerAvatar, PeerUsername]) ->
@@ -1689,13 +1710,11 @@ can_read_messages(Conn, Uid, <<"direct">>, Id) -> is_conversation_member(Conn, U
 can_read_messages(_, _, _, _) -> false.
 
 valid_reply_to(_, _, _, undefined) -> true;
-valid_reply_to(_, _, _, null) -> true;
 valid_reply_to(Conn, Scope, ScopeId, ReplyTo) when is_integer(ReplyTo) ->
     case one(Conn, "SELECT id FROM messages WHERE id = $1 AND scope = $2 AND scope_id = $3 AND deleted_at IS NULL", [ReplyTo, Scope, ScopeId]) of
         {ok, [_]} -> true;
         _ -> false
-    end;
-valid_reply_to(_, _, _, _) -> false.
+    end.
 
 is_conversation_member(Conn, Uid, Cid) ->
     case one(Conn, "SELECT user_id FROM direct_members WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]) of

@@ -3,7 +3,10 @@
 
 get(Url, MaxBytes) when is_binary(Url), is_integer(MaxBytes), MaxBytes > 0 ->
     Headers = [{"user-agent", "PlainwireRelay/1.1"}, {"accept-encoding", "identity"}],
-    HttpOptions = [{timeout, 15000}, {connect_timeout, 5000}, {autoredirect, true}],
+    %% Redirects must never be followed here. Callers validate the requested
+    %% host against the SSRF policy, but an automatic redirect would bypass
+    %% that validation and could target a loopback or private address.
+    HttpOptions = [{timeout, 15000}, {connect_timeout, 5000}, {autoredirect, false}],
     Options = [{sync, false}, {stream, {self, once}}],
     case httpc:request(get, {binary_to_list(Url), Headers}, HttpOptions, Options) of
         {ok, RequestId} -> await_start(RequestId, MaxBytes);

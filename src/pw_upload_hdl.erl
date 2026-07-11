@@ -95,5 +95,21 @@ clean_filename(Name0) ->
     case pw_util:bin(Name2) of <<>> -> <<"file">>; Name -> Name end.
 
 clean_type(Type0) ->
-    Type = hd(binary:split(pw_util:clean_text(Type0, 120), <<";">>)),
-    case binary:match(Type, <<"/">>) of nomatch -> <<"application/octet-stream">>; _ -> Type end.
+    Type = string:lowercase(string:trim(hd(binary:split(pw_util:clean_text(Type0, 120), <<";">>)))),
+    case valid_media_type(Type) of
+        true -> Type;
+        false -> <<"application/octet-stream">>
+    end.
+
+valid_media_type(Type) when is_binary(Type), byte_size(Type) >= 3, byte_size(Type) =< 120 ->
+    case binary:split(Type, <<"/">>, [global]) of
+        [Major, Minor] when Major =/= <<>>, Minor =/= <<>> ->
+            lists:all(fun valid_type_char/1, binary_to_list(Major)) andalso
+                lists:all(fun valid_type_char/1, binary_to_list(Minor));
+        _ -> false
+    end;
+valid_media_type(_) -> false.
+
+valid_type_char(C) ->
+    (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse
+    lists:member(C, "!#$&^_.+-").

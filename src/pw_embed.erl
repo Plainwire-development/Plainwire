@@ -40,17 +40,19 @@ http_get(Url) ->
     end.
 
 parse_og(Html, Url) ->
-    Title = meta(Html, "og:title"),
-    Desc = meta(Html, "og:description"),
-    Image = meta(Html, "og:image"),
-    Site = meta(Html, "og:site_name"),
+    Title = bounded(meta(Html, <<"og:title">>), 300),
+    Desc = bounded(meta(Html, <<"og:description">>), 1000),
+    Image = bounded(meta(Html, <<"og:image">>), 2048),
+    Site = bounded(meta(Html, <<"og:site_name">>), 200),
     #{
         <<"url">> => Url,
-        <<"title">> => pick(Title, title_tag(Html), host_of(Url)),
-        <<"description">> => pick(Desc, meta(Html, "description"), <<>>),
+        <<"title">> => pick(Title, bounded(title_tag(Html), 300), host_of(Url)),
+        <<"description">> => pick(Desc, bounded(meta(Html, <<"description">>), 1000), <<>>),
         <<"image">> => absolutize(Image, Url),
         <<"site_name">> => pick(Site, host_of(Url), <<>>)
     }.
+
+bounded(Value, Max) -> pw_util:clean_text(Value, Max).
 
 meta(Html, Prop) ->
     Pats = [

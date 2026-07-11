@@ -64,8 +64,18 @@ verify_password(Pass, Salt, Stored) ->
     case Parts of
         [IterBin, Hex] ->
             Iter = int(IterBin),
-            Hash = crypto:pbkdf2_hmac(sha256, bin(Pass), bin(Salt), Iter, 32),
-            constant_time(hex(Hash), Hex);
+            %% Treat corrupt or maliciously modified hashes as invalid rather
+            %% than allowing an unbounded PBKDF2 cost to pin a scheduler.
+            %% Accept legacy/test hashes with a lower work factor; production
+            %% startup separately enforces a strong configured minimum.
+            case is_integer(Iter) andalso Iter >= 1 andalso Iter =< 2000000
+                 andalso byte_size(Hex) =:= 64 of
+                true ->
+                    Hash = crypto:pbkdf2_hmac(sha256, bin(Pass), bin(Salt), Iter, 32),
+                    constant_time(hex(Hash), Hex);
+                false ->
+                    false
+            end;
         _ -> false
     end.
 
@@ -150,9 +160,7 @@ read_json_body(Req0, Acc, Remaining) when Remaining > 0 ->
         {more, Body, Req1} when byte_size(Body) < Remaining ->
             read_json_body(Req1, <<Acc/binary, Body/binary>>, Remaining - byte_size(Body));
         {more, _, Req1} ->
-            {error, too_large, Req1};
-        Other ->
-            {error, Other, Req0}
+            {error, too_large, Req1}
     end;
 read_json_body(Req0, _Acc, _Remaining) ->
     {error, too_large, Req0}.
@@ -270,6 +278,5 @@ forwarded_ip(Req) ->
 peer_ip(Req) ->
     case cowboy_req:peer(Req) of
         {{A,B,C,D}, _} -> {A,B,C,D};
-        {Addr, _} -> Addr;
-        _ -> unknown
+        {Addr, _} -> Addr
     end.

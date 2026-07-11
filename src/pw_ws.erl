@@ -161,8 +161,8 @@ websocket_info(_, State) -> {ok, State}.
 
 deliver_hub_payload(Payload, Type, Uid, State) ->
     QueueLen = case process_info(self(), message_queue_len) of {message_queue_len, N} -> N; _ -> 0 end,
-    Soft = pw_util:env_int("PLAINWIRE_WS_SOFT_QUEUE", 500),
-    Hard = pw_util:env_int("PLAINWIRE_WS_HARD_QUEUE", 2000),
+    Soft = max(10, pw_util:env_int("PLAINWIRE_WS_SOFT_QUEUE", 500)),
+    Hard = max(Soft + 1, pw_util:env_int("PLAINWIRE_WS_HARD_QUEUE", 2000)),
     case QueueLen >= Hard of
         true ->
             logger:warning("[plainwire:ws] slow_client_disconnected uid=~p queue=~p", [Uid, QueueLen]),
@@ -200,8 +200,7 @@ can_subscribe(Uid, {channel, Id}) -> pw_db:member_of_channel(Uid, Id);
 can_subscribe(Uid, {direct, Id}) -> pw_db:member_of_conversation(Uid, Id);
 can_subscribe(Uid, {server, Id}) -> pw_db:member_of_server(Uid, Id);
 can_subscribe(_, {thread, _}) -> true;
-can_subscribe(_, {forum, _}) -> true;
-can_subscribe(_, _) -> false.
+can_subscribe(_, {forum, _}) -> true.
 
 signal_ok(Sig) when is_map(Sig) -> byte_size(pw_util:json(Sig)) =< 32768;
 signal_ok(_) -> false.

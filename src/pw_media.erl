@@ -21,15 +21,22 @@ proxy_url(Url) when is_binary(Url) ->
     <<"/api/media/", (pw_crypto:proxy_token(Url))/binary>>.
 
 cache_data_url(<<"data:", Rest/binary>> = DataUrl) ->
-    case safe_data_url_parse(Rest) of
-        {ok, ContentType, Body} ->
-            Now = pw_util:now_ms(),
-            SynthUrl = <<"data-proxy:", (pw_util:sha256_hex(DataUrl))/binary>>,
-            Key = cache_key(SynthUrl),
-            ets:insert(?CACHE, {Key, Body, ContentType, Now + ?TTL_MS}),
+    SynthUrl = <<"data-proxy:", (pw_util:sha256_hex(DataUrl))/binary>>,
+    Key = cache_key(SynthUrl),
+    Now = pw_util:now_ms(),
+    case cache_lookup(Key) of
+        [{Key, _Body, _ContentType, Expires}] when Expires > Now ->
+            %% Profile maps are built often; avoid repeatedly base64-decoding
+            %% the same multi-megabyte avatar while its cache entry is alive.
             proxy_url(SynthUrl);
-        error ->
-            DataUrl
+        _ ->
+            case safe_data_url_parse(Rest) of
+                {ok, ContentType, Body} ->
+                    ets:insert(?CACHE, {Key, Body, ContentType, Now + ?TTL_MS}),
+                    proxy_url(SynthUrl);
+                error ->
+                    DataUrl
+            end
     end;
 cache_data_url(Url) -> Url.
 

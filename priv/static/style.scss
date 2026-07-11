@@ -2080,8 +2080,13 @@ button, input, textarea, select, [role="button"] {
 input, textarea, select { min-width: 0; max-width: 100%; }
 img { max-width: 100%; }
 .image-failed {
-  color: transparent !important;
   background: linear-gradient(135deg, var(--hover), var(--bg3));
+}
+.avatar.image-failed {
+  color: var(--text) !important;
+  font-weight: 700;
+  line-height: normal;
+  text-align: center;
 }
 
 .content {

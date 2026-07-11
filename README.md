@@ -223,7 +223,8 @@ PLAINWIRE_TURN_SECRET=replace-with-at-least-32-random-bytes
 
 ## Persistence and upgrades
 
-Plainwire stores data in PostgreSQL. Data persists across application restarts and server reboots.
+Plainwire stores application data, including uploaded profile images, in PostgreSQL. Message
+attachments live in `PLAINWIRE_UPLOAD_DIR`. Both must be included in production backups.
 
 Schema changes are tracked in `schema_migrations`. Migrations are additive and run automatically on boot.
 

@@ -51,7 +51,23 @@ authenticated_uid(Req) ->
     end.
 
 disposition(Type, Name) ->
-    Kind = case Type of <<"image/", _/binary>> -> <<"inline">>; <<"video/", _/binary>> -> <<"inline">>; <<"audio/", _/binary>> -> <<"inline">>; _ -> <<"attachment">> end,
+    %% Only passive, browser-native formats are safe to render inline. In
+    %% particular, SVG/XML/HTML remain downloads even if a client supplied an
+    %% image-like Content-Type.
+    Kind = case inline_type(Type) of true -> <<"inline">>; false -> <<"attachment">> end,
     Safe0 = binary:replace(binary:replace(Name, <<"\"">>, <<>>, [global]), <<"\r">>, <<>>, [global]),
     Safe = binary:replace(Safe0, <<"\n">>, <<>>, [global]),
     <<Kind/binary, "; filename=\"", Safe/binary, "\"">>.
+
+inline_type(<<"image/jpeg">>) -> true;
+inline_type(<<"image/png">>) -> true;
+inline_type(<<"image/gif">>) -> true;
+inline_type(<<"image/webp">>) -> true;
+inline_type(<<"image/avif">>) -> true;
+inline_type(<<"video/mp4">>) -> true;
+inline_type(<<"video/webm">>) -> true;
+inline_type(<<"audio/mpeg">>) -> true;
+inline_type(<<"audio/ogg">>) -> true;
+inline_type(<<"audio/wav">>) -> true;
+inline_type(<<"audio/webm">>) -> true;
+inline_type(_) -> false.

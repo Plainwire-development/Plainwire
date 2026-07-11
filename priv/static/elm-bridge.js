@@ -1141,7 +1141,13 @@
     if (!(target instanceof HTMLImageElement)) return;
     target.removeAttribute('src');
     target.removeAttribute('srcset');
-    target.alt = '';
+    if (target.dataset.avatarFallback) {
+      target.alt = target.dataset.avatarFallback;
+      target.setAttribute('role', 'img');
+      target.setAttribute('aria-label', 'Avatar unavailable');
+    } else {
+      target.alt = '';
+    }
     target.classList.add('image-failed');
   }, true);
   window.addEventListener('pagehide', cleanupRtcMedia);

@@ -1675,7 +1675,14 @@ avatarImg url name cls =
         div [ class ("avatar " ++ cls) ]
             [ text (String.left 1 (String.toUpper name)) ]
     else
-        img [ class ("avatar " ++ cls), src url, alt "" ] []
+        img
+            [ class ("avatar " ++ cls)
+            , src url
+            , alt (name ++ " avatar")
+            , attribute "decoding" "async"
+            , attribute "data-avatar-fallback" (String.left 1 (String.toUpper name))
+            ]
+            []
 
 
 -- AUTH VIEW

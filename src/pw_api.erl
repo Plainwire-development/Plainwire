@@ -172,7 +172,9 @@ with_json_public(Req0, Fun) ->
 with_json(Req0, Fun) -> with_json_public(Req0, Fun).
 
 with_json_large(Req0, Fun) ->
-    case pw_util:read_json(Req0, 20971520) of
+    %% Two 8 MiB images expand to roughly 21.4 MiB as base64 data URLs.
+    %% Leave a small envelope for profile metadata while keeping a hard cap.
+    case pw_util:read_json(Req0, 25165824) of
         {ok, M, Req} -> Fun(M, Req);
         {error, too_large, Req} -> pw_util:err_json(Req, 413, <<"profile_images_too_large">>);
         {error, _, Req} -> pw_util:err_json(Req, 400, <<"invalid_json">>)
