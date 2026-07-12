@@ -22,8 +22,7 @@ erl_crash.dump
 tmp/
 temp/
 .tmp/
-scripts/install-openrc-release.sh
-scripts/update-openrc-release.sh
+
 .env
 .env.*
 !.env.example
