@@ -26,6 +26,7 @@
   let rtcConfigRequest = null;
   let rtcConfigFetchedAt = 0;
   const presenceWatch = new Set();
+  let messageScrollSnapshot = null;
   let presenceWatchTimer = null;
   let vad = null;
   const debugEnabled = window.PLAINWIRE_DEBUG !== false && localStorage.getItem('plainwire_debug') !== 'false';
@@ -169,6 +170,23 @@
     if (port && typeof port.subscribe === 'function') port.subscribe(fn);
   };
 
+  let historyObserver = null;
+  const observeMessageHistory = () => {
+    const list = document.getElementById('messages');
+    const sentinel = document.getElementById('message-history-sentinel');
+    if (!list || !sentinel || typeof IntersectionObserver === 'undefined') return;
+    if (historyObserver) historyObserver.disconnect();
+    historyObserver = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        send(app.ports.bridgeReceive, { tag: 'load_more_messages' });
+      }
+    }, { root: list, rootMargin: '320px 0px 0px', threshold: 0 });
+    historyObserver.observe(sentinel);
+  };
+
+  const messageDomObserver = new MutationObserver(() => requestAnimationFrame(observeMessageHistory));
+  messageDomObserver.observe(root, { childList: true, subtree: true });
+
   const audioContext = () => {
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return null;
@@ -229,8 +247,13 @@
     }
   };
 
+  const activeComposer = () => {
+    const composers = Array.from(document.querySelectorAll('#compose'));
+    return composers.reverse().find((element) => element.offsetParent !== null) || null;
+  };
+
   const appendToComposer = (text) => {
-    const composer = document.getElementById('compose');
+    const composer = activeComposer();
     if (!composer) return;
     composer.value += composer.value && !composer.value.endsWith('\n') ? '\n' + text : text;
     composer.dispatchEvent(new Event('input', { bubbles: true }));
@@ -282,13 +305,13 @@
   attachmentInput.addEventListener('change', () => { uploadFiles(attachmentInput.files); attachmentInput.value = ''; });
   document.body.appendChild(attachmentInput);
   document.addEventListener('paste', (event) => {
-    if (document.activeElement?.id !== 'compose') return;
+    if (document.activeElement !== activeComposer()) return;
     const files = Array.from(event.clipboardData?.files || []);
     if (files.length) { event.preventDefault(); uploadFiles(files); }
   });
-  document.addEventListener('dragover', (event) => { if (document.getElementById('compose')) event.preventDefault(); });
+  document.addEventListener('dragover', (event) => { if (activeComposer()) event.preventDefault(); });
   document.addEventListener('drop', (event) => {
-    if (!document.getElementById('compose')) return;
+    if (!activeComposer()) return;
     const files = Array.from(event.dataTransfer?.files || []);
     if (files.length) { event.preventDefault(); uploadFiles(files); }
   });
@@ -346,7 +369,9 @@
     const visit = (value, depth = 0) => {
       if (!value || typeof value !== 'object' || depth > 6 || presenceWatch.size >= 2000) return;
       if (Number.isInteger(value.id) && value.id > 0 && (typeof value.username === 'string' || typeof value.display_name === 'string')) {
-        if (value.id !== meId) presenceWatch.add(value.id);
+        // Include the signed-in user. Self presence is authoritative hub state
+        // too (including away/busy changes shared by multiple tabs).
+        presenceWatch.add(value.id);
       }
       if (Array.isArray(value)) value.forEach((item) => visit(item, depth + 1));
       else Object.values(value).forEach((item) => visit(item, depth + 1));
@@ -475,6 +500,7 @@
   };
 
   const playAllRemoteAudio = () => {
+    audioContext()?.resume?.();
     document.querySelectorAll('audio[id^="remote-audio-"]').forEach((audio) => {
       audio.play().then(() => { audioUnlockToastShown = false; }).catch(() => false);
     });
@@ -482,15 +508,21 @@
 
   const playRemoteAudio = (audio) => {
     audio.play().then(() => { audioUnlockToastShown = false; }).catch(() => {
-      if (!audioUnlockToastShown) {
-        audioUnlockToastShown = true;
-        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Tap Enable audio to hear the call.' });
-      }
+      audioContext()?.resume?.();
+      audio.play().catch(() => {
+        if (!audioUnlockToastShown) {
+          audioUnlockToastShown = true;
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Tap Enable audio to hear the call.' });
+        }
+      });
     });
     if (!remoteAudioUnlockInstalled) {
       remoteAudioUnlockInstalled = true;
-      ['click', 'touchend', 'keydown'].forEach((ev) => {
-        document.addEventListener(ev, playAllRemoteAudio, { passive: true });
+      ['click', 'touchend', 'keydown', 'pointerdown'].forEach((ev) => {
+        document.addEventListener(ev, () => {
+          audioContext()?.resume?.();
+          playAllRemoteAudio();
+        }, { passive: true });
       });
     }
   };
@@ -563,8 +595,15 @@
   const restartPeerIce = (uid, pc) => {
     if (!pc || pc.signalingState === 'closed') return;
     if (pc._restartTimer) clearTimeout(pc._restartTimer);
-    pc._restartTimer = setTimeout(() => {
-      makeOffer(uid, pc, { iceRestart: true }).catch(() => closePeer(uid));
+    pc._restartTimer = setTimeout(async () => {
+      try {
+        if (pc.signalingState !== 'stable') {
+          try { await pc.setLocalDescription({ type: 'rollback' }); } catch (_) {}
+        }
+        await makeOffer(uid, pc, { iceRestart: true });
+      } catch (e) {
+        debug('RTC', 'restart_peer_ice_failed', { peer_user_id: uid, error: e.message }, 'warn');
+      }
     }, 600);
   };
 
@@ -592,10 +631,10 @@
     pc._polite = polite;
     pc._makingOffer = false;
     pc._pendingCandidates = [];
-    pc._connectAttempts = 0;
+    pc._negotiated = false;
     stream.getTracks().forEach((track) => pc.addTrack(track, stream));
     pc.onnegotiationneeded = () => {
-      if (pc._polite) return;
+      if (pc._polite && !pc._negotiated) return;
       makeOffer(uid, pc).catch(() => closePeer(uid));
     };
     pc.onicecandidate = (ev) => {
@@ -624,6 +663,8 @@
       if (pc.connectionState === 'connected') {
         if (pc._connectTimer) clearTimeout(pc._connectTimer);
         reconnectAttempts = 0;
+        pc._negotiated = true;
+        audioContext()?.resume?.();
         send(app.ports.bridgeReceive, { tag: 'rtc_peer_connected', user_id: uid, connected: true });
         send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call audio connected' });
         playAllRemoteAudio();
@@ -636,14 +677,15 @@
             send(app.ports.bridgeReceive, { tag: 'toast', data: 'Establishing audio stream…' });
             makeOffer(uid, pc).catch(() => {});
           }
-        }, 6000);
+        }, 10000);
       }
-      if (pc.connectionState === 'disconnected' && reconnectAttempts < 3) {
+      if (pc.connectionState === 'disconnected' && reconnectAttempts < 6) {
         reconnectAttempts++;
-        setTimeout(() => { if (pc.connectionState === 'disconnected') restartPeerIce(uid, pc); }, 2000);
+        const delay = Math.min(2000 * Math.pow(1.5, reconnectAttempts - 1), 10000);
+        setTimeout(() => { if (pc.connectionState === 'disconnected') restartPeerIce(uid, pc); }, delay);
       }
       if (pc.connectionState === 'failed') {
-        if (reconnectAttempts < 2) {
+        if (reconnectAttempts < 6) {
           reconnectAttempts++;
           restartPeerIce(uid, pc);
         } else {
@@ -653,7 +695,7 @@
     };
     pc.oniceconnectionstatechange = () => {
       debug('RTC', 'ice_connection_state', { peer_user_id: uid, state: pc.iceConnectionState });
-      if (pc.iceConnectionState === 'failed' && reconnectAttempts < 3) {
+      if (pc.iceConnectionState === 'failed' && reconnectAttempts < 6) {
         reconnectAttempts++;
         restartPeerIce(uid, pc);
       }
@@ -662,26 +704,70 @@
     pc.onsignalingstatechange = () => debug('RTC', 'signaling_state', { peer_user_id: uid, state: pc.signalingState });
     peers.set(uid, pc);
     const checkConnection = () => {
-      pc._connectTimer = setTimeout(() => {
+      pc._connectTimer = setTimeout(async () => {
         if (pc.connectionState === 'connected' || pc.connectionState === 'closed') return;
-        pc._connectAttempts++;
-        if (pc._connectAttempts <= 4) {
-          if (pc.signalingState === 'stable') {
-            makeOffer(uid, pc, { iceRestart: true }).catch(() => {});
-          } else if (typeof pc.restartIce === 'function') {
-            pc.restartIce();
+
+        // Sync connection state to Elm in case events were missed
+        send(app.ports.bridgeReceive, { tag: 'rtc_peer_connected', user_id: uid, connected: false });
+
+        debug('RTC', 'check_connection', {
+          peer_user_id: uid,
+          connection: pc.connectionState,
+          signaling: pc.signalingState,
+          ice: pc.iceConnectionState,
+          reconnectAttempts
+        });
+
+        if (pc.signalingState === 'have-local-offer') {
+          // Stuck waiting for answer that never came — rollback and retry
+          try {
+            await pc.setLocalDescription({ type: 'rollback' });
+            debug('RTC', 'stuck_offer_rollback', { peer_user_id: uid });
+          } catch (e) {
+            debug('RTC', 'rollback_failed', { peer_user_id: uid, error: e.message }, 'warn');
           }
-          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Reconnecting audio…' });
-          checkConnection();
-        } else {
-          const failedKind = room ? room.kind : 'call';
-          closePeer(uid);
-          send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: failedKind });
-          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call connection timed out. Try rejoining.' });
+          makeOffer(uid, pc, { iceRestart: true }).catch(() => {});
+        } else if (pc.signalingState === 'have-remote-offer') {
+          // Stuck with unhandled remote offer — try to answer
+          try {
+            while (pc._pendingCandidates.length) {
+              await pc.addIceCandidate(pc._pendingCandidates.shift()).catch(() => {});
+            }
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            sendSignal(uid, { kind: 'answer', sdp: pc.localDescription });
+            debug('RTC', 'stuck_answer_sent', { peer_user_id: uid });
+          } catch (e) {
+            debug('RTC', 'answer_retry_failed', { peer_user_id: uid, error: e.message }, 'warn');
+          }
+        } else if (pc.signalingState === 'stable') {
+          // Stable but not connected — ICE is stuck, restart with new credentials
+          if (typeof pc.restartIce === 'function') pc.restartIce();
+          makeOffer(uid, pc, { iceRestart: true }).catch(() => {});
+        } else if (pc.signalingState === 'have-local-pranswer' || pc.signalingState === 'have-remote-pranswer') {
+          // Stuck in provisional answer state — rollback and start over
+          try {
+            await pc.setLocalDescription({ type: 'rollback' });
+          } catch (_) {}
+          makeOffer(uid, pc, { iceRestart: true }).catch(() => {});
         }
+
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Reconnecting audio…' });
+        checkConnection();
       }, 20000);
     };
     checkConnection();
+    // Polite peers skip onnegotiationneeded — give the impolite peer a short
+    // window to send its offer, then try to recover if nothing arrived.
+    if (polite) {
+      setTimeout(() => {
+        if (pc.connectionState === 'connected' || pc.connectionState === 'closed') return;
+        if (pc.signalingState === 'stable' && !pc._negotiated) {
+          debug('RTC', 'polite_peer_early_recovery', { peer_user_id: uid });
+          makeOffer(uid, pc, { iceRestart: true }).catch(() => {});
+        }
+      }, 5000);
+    }
     return pc;
   };
 
@@ -851,16 +937,25 @@
     if (!file) return send(app.ports.fileInput, { id, data: null });
     if (!/^image\/(jpeg|png|gif|webp|avif)$/i.test(file.type)) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Use a JPEG, PNG, GIF, WebP, or AVIF image.' });
+      send(app.ports.fileInput, { id, data: null });
       return;
     }
     if (file.size > 8 * 1024 * 1024) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Profile images and GIFs can be up to 8 MB.' });
+      send(app.ports.fileInput, { id, data: null });
       return;
     }
-    const reader = new FileReader();
-    reader.onload = () => send(app.ports.fileInput, { id, data: reader.result });
-    reader.onerror = () => send(app.ports.bridgeReceive, { tag: 'toast', data: 'The browser could not read that image.' });
-    reader.readAsDataURL(file);
+    send(app.ports.bridgeReceive, { tag: 'toast', data: `Uploading ${file.name || 'image'}…` });
+    uploadOne(file)
+      .then((uploaded) => {
+        send(app.ports.fileInput, { id, data: uploaded.url || null });
+        send(app.ports.bridgeReceive, { tag: 'toast', data: `${file.name || 'Image'} ready — save your profile` });
+      })
+      .catch((error) => {
+        debug('UPLOAD', 'profile_image_failed', { error: error.message }, 'error');
+        send(app.ports.fileInput, { id, data: null });
+        send(app.ports.bridgeReceive, { tag: 'toast', data: `Image upload failed: ${error.message}` });
+      });
   });
   recv(app.ports.requestNotifyPermission, () => {
     if ('Notification' in window && Notification.permission === 'default') {
@@ -870,6 +965,34 @@
   recv(app.ports.bridgeSend, ({ tag, data }) => {
     debug('ELM', 'command', { tag, data });
     switch (tag) {
+      case 'preserve_message_scroll': {
+        const list = document.getElementById('messages');
+        messageScrollSnapshot = list ? { height: list.scrollHeight, top: list.scrollTop } : null;
+        break;
+      }
+      case 'restore_message_scroll':
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          const list = document.getElementById('messages');
+          if (list && messageScrollSnapshot) {
+            list.scrollTop = messageScrollSnapshot.top + (list.scrollHeight - messageScrollSnapshot.height);
+          }
+          messageScrollSnapshot = null;
+          observeMessageHistory();
+        }));
+        break;
+      case 'scroll_messages_to_bottom':
+        [0, 60, 200, 600].forEach((delay) => setTimeout(() => {
+          const list = document.getElementById('messages');
+          if (!list) return;
+          list.scrollTop = list.scrollHeight;
+          if (delay === 0) {
+            list.querySelectorAll('img').forEach((img) => {
+              if (!img.complete) img.addEventListener('load', () => { list.scrollTop = list.scrollHeight; }, { once: true });
+            });
+          }
+          observeMessageHistory();
+        }, delay));
+        break;
       case 'connect_ws':
         connectWs();
         break;
@@ -905,12 +1028,13 @@
         });
         break;
       case 'block_user':
+        if (!window.confirm('Block this user? They will not be able to friend or directly message you.')) break;
         api({ method: 'POST', path: '/friends/block', body: { user_id: data } }).then(() => {
           api({ method: 'GET', path: '/sync?since=0' });
         });
         break;
       case 'unblock_user':
-        api({ method: 'POST', path: '/friends/block', body: { user_id: data } }).then(() => {
+        api({ method: 'POST', path: '/friends/unblock', body: { user_id: data } }).then(() => {
           api({ method: 'GET', path: '/sync?since=0' });
         });
         break;
@@ -1041,11 +1165,26 @@
         }
         break;
       }
+      case 'delete_forum':
+        if (window.confirm('Delete this community and every thread and reply inside it? This cannot be undone.')) {
+          api({ method: 'POST', path: '/forum/' + data + '/delete', body: {} }).then((res) => {
+            if (res && res.deleted) location.hash = '#forums';
+          });
+        }
+        break;
+      case 'delete_thread':
+        if (data?.id && window.confirm('Delete this thread and all of its replies? This cannot be undone.')) {
+          api({ method: 'POST', path: '/thread/' + data.id + '/delete', body: {} }).then((res) => {
+            if (res && res.deleted) location.hash = '#forum/' + (res.forum_id || data.forum_id);
+          });
+        }
+        break;
       case 'new_dm': {
-        const userIds = askCsvInts('User IDs, comma separated');
+        const usernames = ask('Usernames, comma separated')
+          .split(',').map((name) => name.trim().replace(/^@/, '').toLowerCase()).filter(Boolean);
         const name = ask('Conversation name', '');
-        if (userIds.length) {
-          api({ method: 'POST', path: '/conversations', body: { user_ids: userIds, name } }).then((res) => {
+        if (usernames.length) {
+          api({ method: 'POST', path: '/conversations', body: { usernames, name } }).then((res) => {
             if (res && res.id) location.hash = '#dm/' + res.id;
           });
         }
@@ -1092,8 +1231,9 @@
         break;
       }
       case 'add_people': {
-        const userIds = askCsvInts('User IDs to add, comma separated');
-        if (userIds.length) api({ method: 'POST', path: '/conversation/' + data + '/members', body: { user_ids: userIds } }).then(() => api({ method: 'GET', path: '/sync?since=0' }));
+        const usernames = ask('Usernames to add, comma separated')
+          .split(',').map((name) => name.trim().replace(/^@/, '').toLowerCase()).filter(Boolean);
+        if (usernames.length) api({ method: 'POST', path: '/conversation/' + data + '/members', body: { usernames } }).then(() => api({ method: 'GET', path: '/sync?since=0' }));
         break;
       }
       case 'set_theme':

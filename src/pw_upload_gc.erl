@@ -45,6 +45,8 @@ init([]) ->
 handle_info(sweep, State) ->
     Now = pw_util:now_ms(),
     RetentionDays = max(1, pw_util:env_int("PLAINWIRE_UPLOAD_RETENTION_DAYS", 90)),
+    %% Files referenced by profiles are durable assets, not expiring message
+    %% attachments. pw_db:stale_uploads excludes those references.
     case pw_db:stale_uploads(Now - 86400000, Now - RetentionDays * 86400000) of
         {ok, Items} ->
             lists:foreach(fun(#{id := Id, path := Path}) ->

@@ -12,7 +12,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-scripts/
+scripts/*
+!scripts/install-openrc-release.sh
+!scripts/update-openrc-release.sh
 erl_crash.dump
 *.crashdump
 *.dump

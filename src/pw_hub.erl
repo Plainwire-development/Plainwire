@@ -67,7 +67,14 @@ handle_cast({disconnect, Pid}, St) ->
 handle_cast({unsubscribe_all, Pid}, St) -> {noreply, St#st{subs = remove_from_all(Pid, St#st.subs)}};
 handle_cast({subscribe, Pid, Key}, St) -> {noreply, St#st{subs = add_to_set(Key, Pid, St#st.subs)}};
 handle_cast({watch_presence, Pid, Uids0}, St0) ->
-    Uids = lists:usort([U || U <- Uids0, is_integer(U), U > 0]),
+    Requested = [U || U <- Uids0, is_integer(U), U > 0],
+    %% Always include the authenticated socket's own account. Older clients
+    %% excluded it and therefore rendered themselves offline even though peers
+    %% received the correct presence broadcasts.
+    Uids = case maps:get(Pid, St0#st.pids, undefined) of
+        SelfUid when is_integer(SelfUid), SelfUid > 0 -> lists:usort([SelfUid | Requested]);
+        _ -> lists:usort(Requested)
+    end,
     Old = maps:get(Pid, St0#st.watches, []),
     Watchers0 = lists:foldl(fun(U, Acc) -> update_set(U, Pid, Acc) end, St0#st.watchers, Old),
     Watchers = lists:foldl(fun(U, Acc) -> add_to_set(U, Pid, Acc) end, Watchers0, Uids),

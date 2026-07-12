@@ -5,19 +5,22 @@
     health/0,
     register/3, login/2, session/1, session_fast/1, logout/1, me/1, update_profile/3,
     sync/2, users/1, profile/2,
-    friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friends/1,
-    forums/1, create_forum/4, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, reply_thread/3, vote_thread/3,
+    friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friend_unblock/2, friends/1,
+    forums/1, create_forum/4, delete_forum/2, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, delete_thread/2, reply_thread/3, vote_thread/3,
     servers/1, create_server/3, update_server/3, server/2, create_channel/4,
     create_invite/4, invite_preview/1, join_invite/2,
     messages/5, post_channel_message/4, delete_message/2,
-    conversations/1, create_conversation/3, update_conversation/4,
-    add_conversation_members/3, conversation/2, post_direct_message/4,
+    conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4,
+    add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4,
     close_conversation/2, leave_conversation/2, accept_message_request/2, deny_message_request/2,
-    mark_conversation_read/2, notifications/1, mark_notifications_seen/1, mark_url_seen/2,
+    mark_conversation_read/2, notifications/1, mark_notifications_seen/1, clear_notifications/1, mark_url_seen/2,
     member_of_channel/2, member_of_conversation/2, member_of_server/2, conversation_peer_ids/2,
     begin_upload/6, finish_upload/3, abort_upload/2, get_upload/2, stale_uploads/2, delete_upload/1
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-ifdef(TEST).
+-export([profile_file_signature/2]).
+-endif.
 
 -record(st, {}).
 -record(pool, {conns, size, counter}).
@@ -158,14 +161,17 @@ friend_request(Uid, Target) -> call({friend_request, Uid, Target}).
 friend_accept(Uid, Target) -> call({friend_accept, Uid, Target}).
 friend_remove(Uid, Target) -> call({friend_remove, Uid, Target}).
 friend_block(Uid, Target) -> call({friend_block, Uid, Target}).
+friend_unblock(Uid, Target) -> call({friend_unblock, Uid, Target}).
 friends(Uid) -> call({friends, Uid}).
 forums(Uid) -> call({forums, Uid}).
 create_forum(Uid, Name, Slug, Description) -> call({create_forum, Uid, Name, Slug, Description}).
+delete_forum(Uid, ForumId) -> call({delete_forum, Uid, ForumId}).
 join_forum(Uid, ForumId) -> call({join_forum, Uid, ForumId}).
 leave_forum(Uid, ForumId) -> call({leave_forum, Uid, ForumId}).
 threads(Uid, ForumId, Search) -> call({threads, Uid, ForumId, Search}).
 thread(Uid, ThreadId) -> call({thread, Uid, ThreadId}).
 create_thread(Uid, ForumId, Title, Body) -> call({create_thread, Uid, ForumId, Title, Body}).
+delete_thread(Uid, ThreadId) -> call({delete_thread, Uid, ThreadId}).
 reply_thread(Uid, ThreadId, Body) -> call({reply_thread, Uid, ThreadId, Body}).
 vote_thread(Uid, ThreadId, Value) -> call({vote_thread, Uid, ThreadId, Value}).
 servers(Uid) -> call({servers, Uid}).
@@ -181,8 +187,10 @@ post_channel_message(Uid, ChannelId, Body, ReplyTo) -> call({post_channel_messag
 delete_message(Uid, Mid) -> call({delete_message, Uid, Mid}).
 conversations(Uid) -> call({conversations, Uid}).
 create_conversation(Uid, Name, UserIds) -> call({create_conversation, Uid, Name, UserIds}).
+create_conversation_usernames(Uid, Name, Usernames) -> call({create_conversation_usernames, Uid, Name, Usernames}).
 update_conversation(Uid, Cid, Name, Patch) -> call({update_conversation, Uid, Cid, Name, Patch}).
 add_conversation_members(Uid, Cid, UserIds) -> call({add_conversation_members, Uid, Cid, UserIds}).
+add_conversation_members_usernames(Uid, Cid, Usernames) -> call({add_conversation_members_usernames, Uid, Cid, Usernames}).
 conversation(Uid, Cid) -> call({conversation, Uid, Cid}).
 close_conversation(Uid, Cid) -> call({close_conversation, Uid, Cid}).
 leave_conversation(Uid, Cid) -> call({leave_conversation, Uid, Cid}).
@@ -192,6 +200,7 @@ mark_conversation_read(Uid, Cid) -> call({mark_conversation_read, Uid, Cid}).
 post_direct_message(Uid, Cid, Body, ReplyTo) -> call({post_direct_message, Uid, Cid, Body, ReplyTo}).
 notifications(Uid) -> call({notifications, Uid}).
 mark_notifications_seen(Uid) -> call({mark_notifications_seen, Uid}).
+clear_notifications(Uid) -> call({clear_notifications, Uid}).
 mark_url_seen(Uid, Url) -> call({mark_url_seen, Uid, Url}).
 member_of_channel(Uid, ChannelId) -> call({member_of_channel, Uid, ChannelId}).
 member_of_conversation(Uid, Cid) -> call({member_of_conversation, Uid, Cid}).
@@ -308,7 +317,10 @@ read_msg({friend_request, _, _}) -> false;
 read_msg({friend_accept, _, _}) -> false;
 read_msg({friend_remove, _, _}) -> false;
 read_msg({friend_block, _, _}) -> false;
+read_msg({friend_unblock, _, _}) -> false;
 read_msg({create_thread, _, _, _, _}) -> false;
+read_msg({delete_thread, _, _}) -> false;
+read_msg({delete_forum, _, _}) -> false;
 read_msg({reply_thread, _, _, _}) -> false;
 read_msg({create_server, _, _, _}) -> false;
 read_msg({update_server, _, _, _}) -> false;
@@ -318,8 +330,10 @@ read_msg({join_invite, _, _}) -> false;
 read_msg({post_channel_message, _, _, _, _}) -> false;
 read_msg({delete_message, _, _}) -> false;
 read_msg({create_conversation, _, _, _}) -> false;
+read_msg({create_conversation_usernames, _, _, _}) -> false;
 read_msg({update_conversation, _, _, _, _}) -> false;
 read_msg({add_conversation_members, _, _, _}) -> false;
+read_msg({add_conversation_members_usernames, _, _, _}) -> false;
 read_msg({close_conversation, _, _}) -> false;
 read_msg({leave_conversation, _, _}) -> false;
 read_msg({accept_message_request, _, _}) -> false;
@@ -327,6 +341,7 @@ read_msg({deny_message_request, _, _}) -> false;
 read_msg({mark_conversation_read, _, _}) -> false;
 read_msg({post_direct_message, _, _, _, _}) -> false;
 read_msg({mark_notifications_seen, _}) -> false;
+read_msg({clear_notifications, _}) -> false;
 read_msg({mark_url_seen, _, _}) -> false;
 read_msg({begin_upload, _, _, _, _, _, _}) -> false;
 read_msg({finish_upload, _, _, _}) -> false;
@@ -470,8 +485,9 @@ route({me, Uid}, Conn) ->
 route({update_profile, Uid, Display0, Patch}, Conn) ->
     Display = pw_util:clean_text(Display0, 48),
     Bio = pw_util:clean_text(maps:get(<<"bio">>, Patch, <<>>), 600),
-    Avatar = store_image_url(maps:get(<<"avatar_url">>, Patch, <<>>)),
-    Banner = store_image_url(maps:get(<<"banner_url">>, Patch, <<>>)),
+    {CurrentAvatar, CurrentBanner} = current_profile_images(Conn, Uid),
+    Avatar = store_profile_image(maps:get(<<"avatar_url">>, Patch, <<>>), CurrentAvatar, Conn, Uid),
+    Banner = store_profile_image(maps:get(<<"banner_url">>, Patch, <<>>), CurrentBanner, Conn, Uid),
     Status = pw_util:clean_text(maps:get(<<"status">>, Patch, <<>>), 100),
     Theme = pw_util:clean_text(maps:get(<<"theme">>, Patch, <<"system">>), 32),
     Now = pw_util:now_ms(),
@@ -479,6 +495,7 @@ route({update_profile, Uid, Display0, Patch}, Conn) ->
         "UPDATE users SET display_name = $1, bio = $2, avatar_url = $3, banner_url = $4, "
         "status = $5, theme = $6, updated_at = $7 WHERE id = $8",
         [Display, Bio, Avatar, Banner, Status, Theme, Now, Uid]),
+    invalidate_session_cache(Uid),
     {ok, #{updated => true}};
 route({sync, Uid, Since0}, Conn) ->
     Since = case pw_util:int(Since0) of undefined -> 0; I -> I end,
@@ -595,6 +612,24 @@ route({friend_block, Uid, Target0}, Conn) ->
             ok = exec(Conn, Sql, [A, B, Uid, Target, <<"blocked">>, Now, Now]),
             {ok, #{status => blocked}}
     end;
+route({friend_unblock, Uid, Target0}, Conn) ->
+    Target = pw_util:int(Target0),
+    case Target of
+        undefined -> {error, invalid_user};
+        Uid -> {error, cannot_unblock_self};
+        _ ->
+            {A, B} = pair(Uid, Target),
+            %% Only the account that created the block may remove it. Without
+            %% this requester check, the blocked party could unblock itself.
+            case one(Conn,
+                "SELECT requester_id FROM friendships WHERE user_low = $1 AND user_high = $2 AND status = 'blocked'",
+                [A, B]) of
+                {ok, [Uid]} ->
+                    ok = exec(Conn, "DELETE FROM friendships WHERE user_low = $1 AND user_high = $2", [A, B]),
+                    {ok, #{status => none}};
+                _ -> {error, forbidden}
+            end
+    end;
 route({friends, Uid}, Conn) ->
     Sql = "SELECT fr.status, fr.requester_id, fr.addressee_id, u.id, u.username, u.display_name, "
           "u.bio, u.avatar_url, u.banner_url, u.status, u.theme, u.created_at, u.last_seen "
@@ -603,7 +638,7 @@ route({friends, Uid}, Conn) ->
     {ok, Rows} = rows(Conn, Sql, [Uid]),
     {ok, [friend_map(R, Uid) || R <- Rows]};
 route({forums, Uid}, Conn) ->
-    Sql = "SELECT f.id, f.slug, f.name, f.description, f.position, "
+    Sql = "SELECT f.id, f.slug, f.name, f.description, f.position, f.owner_id, "
            "(SELECT count(*) FROM threads t WHERE t.forum_id = f.id), "
            "(SELECT count(*) FROM replies r JOIN threads t2 ON t2.id = r.thread_id WHERE t2.forum_id = f.id), "
           "(SELECT max(updated_at) FROM threads t3 WHERE t3.forum_id = f.id), "
@@ -627,12 +662,27 @@ route({create_forum, Uid, Name0, Slug0, Desc0}, Conn) ->
                     Pos = forum_position(Conn),
                     Now = pw_util:now_ms(),
                     {ok, Fid} = insert_returning(Conn,
-                        "INSERT INTO forums(slug, name, description, position) VALUES($1,$2,$3,$4) RETURNING id",
-                        [Slug, Name, Desc, Pos]),
+                        "INSERT INTO forums(slug, name, description, position, owner_id) VALUES($1,$2,$3,$4,$5) RETURNING id",
+                        [Slug, Name, Desc, Pos, Uid]),
                     ok = exec(Conn, "INSERT INTO forum_members(forum_id, user_id, joined_at) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", [Fid, Uid, Now]),
                     {ok, #{id => Fid}}
             end
     end;
+route({delete_forum, Uid, ForumId0}, Conn) ->
+    ForumId = pw_util:int(ForumId0),
+    with_tx(Conn, fun() ->
+        case one(Conn, "SELECT owner_id FROM forums WHERE id = $1 FOR UPDATE", [ForumId]) of
+            {ok, [Uid]} ->
+                ok = exec(Conn,
+                    "DELETE FROM notifications WHERE url IN "
+                    "(SELECT '#/thread/' || id::text FROM threads WHERE forum_id = $1)", [ForumId]),
+                ok = exec(Conn, "DELETE FROM forums WHERE id = $1", [ForumId]),
+                pw_hub:broadcast({forum, ForumId}, #{type => forum_deleted, forum_id => ForumId}),
+                {ok, #{deleted => true, id => ForumId}};
+            {ok, [_]} -> {error, forbidden};
+            _ -> {error, not_found}
+        end
+    end);
 route({join_forum, Uid, ForumId0}, Conn) ->
     ForumId = pw_util:int(ForumId0),
     case one(Conn, "SELECT id FROM forums WHERE id = $1", [ForumId]) of
@@ -654,7 +704,7 @@ route({threads, Uid, ForumId0, Search0}, Conn) ->
     {ok, [thread_row_map(R) || R <- Rows]};
 route({thread, Uid, ThreadId0}, Conn) ->
     ThreadId = pw_util:int(ThreadId0),
-    _ = exec(Conn, "UPDATE threads SET views = views + 1 WHERE id = $1", [ThreadId]),
+    _ = record_thread_view(Conn, ThreadId, Uid),
     Sql1 = "SELECT t.id, t.forum_id, f.name, t.user_id, u.username, u.display_name, u.avatar_url, "
            "t.title, t.body, t.created_at, t.updated_at, t.reply_count, t.locked, t.pinned, t.views, "
            "COALESCE(t.score,0), COALESCE(tv.value,0) "
@@ -687,6 +737,21 @@ route({create_thread, Uid, ForumId0, Title0, Body0}, Conn) ->
         Err ->
             Err
     end;
+route({delete_thread, Uid, ThreadId0}, Conn) ->
+    ThreadId = pw_util:int(ThreadId0),
+    with_tx(Conn, fun() ->
+        case one(Conn,
+            "SELECT t.user_id,f.owner_id,t.forum_id FROM threads t "
+            "JOIN forums f ON f.id = t.forum_id WHERE t.id = $1 FOR UPDATE", [ThreadId]) of
+            {ok, [AuthorId, ForumOwnerId, ForumId]} when Uid =:= AuthorId; Uid =:= ForumOwnerId ->
+                ok = exec(Conn, "DELETE FROM notifications WHERE url = $1", [<<"#/thread/", (integer_to_binary(ThreadId))/binary>>]),
+                ok = exec(Conn, "DELETE FROM threads WHERE id = $1", [ThreadId]),
+                pw_hub:broadcast({forum, ForumId}, #{type => thread_deleted, forum_id => ForumId, thread_id => ThreadId}),
+                {ok, #{deleted => true, id => ThreadId, forum_id => ForumId}};
+            {ok, _} -> {error, forbidden};
+            _ -> {error, not_found}
+        end
+    end);
 route({reply_thread, Uid, ThreadId0, Body0}, Conn) ->
     ThreadId = pw_util:int(ThreadId0),
     Body = pw_util:clean_text(Body0, ?MAX_BODY),
@@ -922,6 +987,8 @@ route({conversations, Uid}, Conn) ->
           "(SELECT id FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL ORDER BY id DESC LIMIT 1), "
           "(SELECT count(*) FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL "
           "AND id > dm.last_read_message_id AND user_id <> $1), "
+          "COALESCE((SELECT u.id FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
+          "WHERE dm2.thread_id = dt.id AND dm2.user_id <> $1 ORDER BY u.display_name ASC LIMIT 1), 0), "
           "COALESCE((SELECT u.display_name FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
           "WHERE dm2.thread_id = dt.id AND dm2.user_id <> $1 ORDER BY u.display_name ASC LIMIT 1), ''), "
           "COALESCE((SELECT u.avatar_url FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
@@ -959,6 +1026,20 @@ route({create_conversation, Uid, Name0, UserIds0}, Conn) ->
         {_, _, true, true} ->
             create_conversation0(Conn, Uid, Name, UserIds)
     end;
+route({create_conversation_usernames, Uid, Name0, Usernames0}, Conn) ->
+    Usernames = lists:usort([Normalized
+        || Name <- ensure_list(Usernames0),
+           Normalized <- [pw_util:normalize_username(strip_username_prefix(pw_util:bin(Name)))],
+           Normalized =/= <<>>]),
+    case {Usernames, length(Usernames) =< 49} of
+        {[], _} -> {error, invalid_members};
+        {_, false} -> {error, too_many_members};
+        _ ->
+            case user_ids_for_usernames(Conn, Usernames) of
+                {ok, UserIds} -> route({create_conversation, Uid, Name0, UserIds}, Conn);
+                error -> {error, user_not_found}
+            end
+    end;
 route({update_conversation, Uid, Cid0, Name0, Patch}, Conn) ->
     Cid = pw_util:int(Cid0),
     Name = pw_util:clean_text(Name0, 80),
@@ -975,18 +1056,31 @@ route({update_conversation, Uid, Cid0, Name0, Patch}, Conn) ->
     end;
 route({add_conversation_members, Uid, Cid0, UserIds0}, Conn) ->
     Cid = pw_util:int(Cid0),
-    UserIds = lists:usort([X || X <- [pw_util:int(Y) || Y <- ensure_list(UserIds0)], is_integer(X), X =/= Uid]),
+    case Cid of
+        I when is_integer(I), I > 0 ->
+            with_tx(Conn, fun() ->
+                _ = rows(Conn, "SELECT pg_advisory_xact_lock($1)", [Cid]),
+                route({add_conversation_members_locked, Uid, Cid, UserIds0}, Conn)
+            end);
+        _ -> {error, invalid_conversation}
+    end;
+route({add_conversation_members_locked, Uid, Cid0, UserIds0}, Conn) ->
+    Cid = pw_util:int(Cid0),
+    RequestedIds = lists:usort([X || X <- [pw_util:int(Y) || Y <- ensure_list(UserIds0)], is_integer(X), X =/= Uid]),
+    UserIds = new_conversation_member_ids(Conn, Cid, RequestedIds),
     ExistingCount = conversation_member_count(Conn, Cid),
-    case {is_conversation_owner(Conn, Uid, Cid), UserIds, users_exist(Conn, UserIds), users_not_blocked(Conn, Uid, UserIds), ExistingCount + length(UserIds) =< 50} of
-        {true, [], _, _, _} ->
+    case {is_conversation_owner(Conn, Uid, Cid), RequestedIds, UserIds, users_exist(Conn, RequestedIds), users_not_blocked(Conn, Uid, RequestedIds), ExistingCount + length(UserIds) =< 50} of
+        {true, [], _, _, _, _} ->
             {error, invalid_members};
-        {true, _, false, _, _} ->
+        {true, _, _, false, _, _} ->
             {error, invalid_members};
-        {true, _, _, false, _} ->
+        {true, _, _, _, false, _} ->
             {error, forbidden};
-        {true, _, _, _, false} ->
+        {true, _, _, _, _, false} ->
             {error, too_many_members};
-        {true, _, true, true, true} ->
+        {true, _, [], true, true, true} ->
+            {ok, #{added => 0}};
+        {true, _, _, true, true, true} ->
             Now = pw_util:now_ms(),
             [exec(Conn,
                 "INSERT INTO direct_members(thread_id, user_id, last_read_message_id, muted, nickname, joined_at) "
@@ -994,8 +1088,19 @@ route({add_conversation_members, Uid, Cid0, UserIds0}, Conn) ->
                 [Cid, U, <<>>, Now]) || U <- UserIds],
             notify_direct_members(Conn, Cid, Uid, #{type => conversation_members_added, conversation_id => Cid}, Now),
             {ok, #{added => length(UserIds)}};
-        {false, _, _, _, _} ->
+        {false, _, _, _, _, _} ->
             {error, forbidden}
+    end;
+route({add_conversation_members_usernames, Uid, Cid, Usernames0}, Conn) ->
+    Usernames = lists:usort([Normalized
+        || Name <- ensure_list(Usernames0),
+           Normalized <- [pw_util:normalize_username(strip_username_prefix(pw_util:bin(Name)))],
+           Normalized =/= <<>>]),
+    case {Usernames, length(Usernames) =< 49, user_ids_for_usernames(Conn, Usernames)} of
+        {[], _, _} -> {error, invalid_members};
+        {_, false, _} -> {error, too_many_members};
+        {_, _, {ok, UserIds}} -> route({add_conversation_members, Uid, Cid, UserIds}, Conn);
+        _ -> {error, user_not_found}
     end;
 route({close_conversation, Uid, Cid0}, Conn) ->
     Cid = pw_util:int(Cid0),
@@ -1093,6 +1198,9 @@ route({notifications, Uid}, Conn) ->
 route({mark_notifications_seen, Uid}, Conn) ->
     ok = exec(Conn, "UPDATE notifications SET seen = true WHERE user_id = $1", [Uid]),
     {ok, #{seen => true}};
+route({clear_notifications, Uid}, Conn) ->
+    ok = exec(Conn, "DELETE FROM notifications WHERE user_id = $1", [Uid]),
+    {ok, #{cleared => true}};
 route({mark_url_seen, Uid, Url}, Conn) ->
     mark_url_seen0(Conn, Uid, pw_util:clean_text(Url, 240)),
     {ok, #{seen => true}};
@@ -1125,7 +1233,13 @@ route({get_upload, _Uid, Id}, Conn) ->
         _ -> {error, not_found}
     end;
 route({stale_uploads, PendingBefore, ReadyBefore}, Conn) ->
-    {ok, Rows} = rows(Conn, "SELECT id,path FROM uploads WHERE (status = 'pending' AND created_at < $1) OR (status = 'ready' AND created_at < $2) LIMIT 500", [PendingBefore, ReadyBefore]),
+    {ok, Rows} = rows(Conn,
+        "SELECT up.id,up.path FROM uploads up "
+        "WHERE ((up.status = 'pending' AND up.created_at < $1) OR "
+        "(up.status = 'ready' AND up.created_at < $2)) "
+        "AND NOT EXISTS (SELECT 1 FROM users u WHERE "
+        "u.avatar_url = '/api/files/' || up.id OR u.banner_url = '/api/files/' || up.id) "
+        "LIMIT 500", [PendingBefore, ReadyBefore]),
     {ok, [#{id => Id, path => Path} || [Id, Path] <- Rows]};
 route({delete_upload, Id}, Conn) ->
     exec(Conn, "DELETE FROM uploads WHERE id = $1", [Id]);
@@ -1147,6 +1261,15 @@ route({conversation_peer_ids, Uid, Cid0}, Conn) ->
         false ->
             {error, forbidden}
     end.
+
+invalidate_session_cache(Uid) ->
+    ets:foldl(fun({H, Session, _}, _) ->
+        case maps:get(user, Session, undefined) of
+            #{id := Uid} -> ets:delete(?SESSION_CACHE, H);
+            _ -> ok
+        end
+    end, ok, ?SESSION_CACHE),
+    ok.
 
 make_session(Conn, Uid) ->
     Token = pw_util:random_token(32),
@@ -1276,6 +1399,16 @@ migrations() -> [
     ]},
     {8, [
         "ALTER TABLE direct_members ADD COLUMN IF NOT EXISTS hidden boolean NOT NULL DEFAULT false"
+    ]},
+    {9, [
+        "ALTER TABLE forums ADD COLUMN IF NOT EXISTS owner_id integer REFERENCES users(id) ON DELETE SET NULL",
+        "UPDATE forums f SET owner_id = (SELECT fm.user_id FROM forum_members fm WHERE fm.forum_id = f.id ORDER BY fm.joined_at ASC LIMIT 1) "
+        "WHERE f.owner_id IS NULL AND f.slug NOT IN ('general','support','development','security')",
+        "CREATE TABLE IF NOT EXISTS thread_views(thread_id integer NOT NULL REFERENCES threads(id) ON DELETE CASCADE, "
+        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, first_viewed_at bigint NOT NULL, "
+        "PRIMARY KEY(thread_id,user_id))",
+        "CREATE INDEX IF NOT EXISTS idx_thread_views_user ON thread_views(user_id,thread_id)",
+        "UPDATE threads SET views = 0"
     ]}
 ].
 
@@ -1379,11 +1512,81 @@ store_image_url(Url0) ->
                 true -> Url;
                 false -> <<>>
             end;
-        <<"/api/media/", _/binary>> -> Url;
+        <<"/api/files/", Id/binary>> ->
+            case valid_file_id(Id) of true -> Url; false -> <<>> end;
+        %% Proxy URLs are derived response values, not durable image sources.
+        %% Saving one would discard an uploaded data URL and make the image
+        %% dependent on the current media-signing key and in-memory cache.
+        <<"/api/media/", _/binary>> -> <<>>;
         <<"http://", _/binary>> -> Url;
         <<"https://", _/binary>> -> Url;
         _ -> <<>>
     end.
+
+valid_file_id(Id) when byte_size(Id) >= 24, byte_size(Id) =< 64 ->
+    lists:all(fun(C) ->
+        (C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z) orelse
+        (C >= $0 andalso C =< $9) orelse C =:= $- orelse C =:= $_
+    end, binary_to_list(Id));
+valid_file_id(_) -> false.
+
+current_profile_images(Conn, Uid) ->
+    case one(Conn, "SELECT avatar_url, banner_url FROM users WHERE id = $1", [Uid]) of
+        {ok, [Avatar, Banner]} -> {pw_util:bin(Avatar), pw_util:bin(Banner)};
+        _ -> {<<>>, <<>>}
+    end.
+
+store_profile_image(Url0, Current, Conn, Uid) ->
+    Url = pw_util:clean_text(Url0, 17825792),
+    %% The profile editor is populated from API output, where durable sources
+    %% are represented by signed /api/media URLs. Preserve the source when the
+    %% client submits that unchanged derived value.
+    case Url =:= pw_util:proxied_image(Current) of
+        true -> Current;
+        false ->
+            case Url of
+                <<"/api/files/", Id/binary>> ->
+                    case profile_upload_allowed(Conn, Uid, Id) of
+                        true -> Url;
+                        false -> Current
+                    end;
+                _ -> store_image_url(Url)
+            end
+    end.
+
+profile_upload_allowed(Conn, Uid, Id) ->
+    case valid_file_id(Id) of
+        false -> false;
+        true ->
+            case one(Conn,
+                "SELECT content_type,size,path FROM uploads "
+                "WHERE id = $1 AND user_id = $2 AND status = 'ready'", [Id, Uid]) of
+                {ok, [Type, Size, Path]} when is_integer(Size), Size > 0, Size =< 8388608 ->
+                    safe_profile_file(Type, Path);
+                _ -> false
+            end
+    end.
+
+safe_profile_file(Type, Path) ->
+    case file:open(binary_to_list(Path), [read, raw, binary]) of
+        {ok, Io} ->
+            Result = case file:read(Io, 64) of
+                {ok, Header} -> profile_file_signature(Type, Header);
+                _ -> false
+            end,
+            _ = file:close(Io),
+            Result;
+        _ -> false
+    end.
+
+profile_file_signature(<<"image/jpeg">>, <<16#ff,16#d8,16#ff,_/binary>>) -> true;
+profile_file_signature(<<"image/png">>, <<16#89,"PNG",13,10,26,10,_/binary>>) -> true;
+profile_file_signature(<<"image/gif">>, <<"GIF87a",_/binary>>) -> true;
+profile_file_signature(<<"image/gif">>, <<"GIF89a",_/binary>>) -> true;
+profile_file_signature(<<"image/webp">>, <<"RIFF",_:4/binary,"WEBP",_/binary>>) -> true;
+profile_file_signature(<<"image/avif">>, <<_:4/binary,"ftyp",Brands/binary>>) ->
+    binary:match(Brands, <<"avif">>) =/= nomatch orelse binary:match(Brands, <<"avis">>) =/= nomatch;
+profile_file_signature(_, _) -> false.
 
 normalize_max_uses(undefined) -> 0;
 normalize_max_uses(I) when is_integer(I), I > 0, I =< 1000 -> I;
@@ -1412,6 +1615,29 @@ valid_invite_channel(Conn, Sid, ChannelId) ->
 
 ensure_list(L) when is_list(L) -> L;
 ensure_list(_) -> [].
+
+strip_username_prefix(<<$@, Rest/binary>>) -> Rest;
+strip_username_prefix(Name) -> Name.
+
+user_ids_for_usernames(_Conn, []) -> error;
+user_ids_for_usernames(Conn, Usernames) ->
+    N = length(Usernames),
+    Placeholders = string:join(["$" ++ integer_to_list(I) || I <- lists:seq(1, N)], ","),
+    Sql = "SELECT id,username FROM users WHERE username IN (" ++ Placeholders ++ ")",
+    case rows(Conn, Sql, Usernames) of
+        {ok, Found} when length(Found) =:= N -> {ok, [Id || [Id, _] <- Found]};
+        _ -> error
+    end.
+
+new_conversation_member_ids(_Conn, _Cid, []) -> [];
+new_conversation_member_ids(Conn, Cid, UserIds) ->
+    N = length(UserIds),
+    Placeholders = string:join(["$" ++ integer_to_list(I + 1) || I <- lists:seq(1, N)], ","),
+    Sql = "SELECT user_id FROM direct_members WHERE thread_id = $1 AND user_id IN (" ++ Placeholders ++ ")",
+    case rows(Conn, Sql, [Cid | UserIds]) of
+        {ok, ExistingRows} -> UserIds -- [Id || [Id] <- ExistingRows];
+        _ -> []
+    end.
 
 users_exist(_Conn, []) -> true;
 users_exist(Conn, UserIds) ->
@@ -1522,8 +1748,9 @@ user_map_full([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen])
     (user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen])) #{
       avatar_source_url => Avatar, banner_source_url => Banner}.
 
-forum_map([Id, Slug, Name, Desc, Pos, Tc, Rc, Last, Members, Joined]) ->
+forum_map([Id, Slug, Name, Desc, Pos, Owner, Tc, Rc, Last, Members, Joined]) ->
     #{id => pw_util:int(Id), slug => Slug, name => Name, description => Desc, position => pw_util:int(Pos),
+      owner_id => db_null(Owner),
       thread_count => pw_util:int(Tc), reply_count => pw_util:int(Rc), last_at => db_null(Last),
       member_count => pw_util:int(Members), joined => Joined}.
 
@@ -1534,18 +1761,47 @@ thread_row_map([Id, Fid, Fname, Uid, U, D, Avatar, Title, Body, Created, Updated
 
 thread_full_map([Id, Fid, Fname, Uid, U, D, Avatar, Title, Body, Created, Updated, Rc, Locked, Pinned, Views, Score, UserVote]) ->
     #{id => Id, forum_id => Fid, forum_name => Fname, user_id => Uid, username => U,
-      display_name => D, avatar_url => pw_util:proxied_image(Avatar), title => Title, body => Body,
+      display_name => D, avatar_url => pw_util:proxied_image(Avatar), title => Title, body => render_forum_body(Body),
       created_at => Created, updated_at => Updated, reply_count => Rc, locked => Locked,
       pinned => Pinned, views => Views, score => Score, user_vote => UserVote}.
 
 reply_map([Id, Tid, Uid, U, D, Avatar, Body, Created, Updated]) ->
     #{id => Id, thread_id => Tid, user_id => Uid, username => U, display_name => D,
-      avatar_url => pw_util:proxied_image(Avatar), body => Body, created_at => Created, updated_at => Updated}.
+      avatar_url => pw_util:proxied_image(Avatar), body => render_forum_body(Body), created_at => Created, updated_at => Updated}.
+
+%% Keep stored forum text untouched. Exact, standalone remote image URLs are
+%% converted only in API responses to signed same-origin media URLs. The media
+%% service performs DNS/IP validation, size limits, content checks and caching.
+render_forum_body(Body) when is_binary(Body) ->
+    Lines = binary:split(Body, <<"\n">>, [global]),
+    iolist_to_binary(lists:join(<<"\n">>, [render_forum_line(Line) || Line <- Lines]));
+render_forum_body(Body) -> Body.
+
+render_forum_line(Line) ->
+    Url = string:trim(Line),
+    case remote_image_url(Url) of
+        true -> <<"![image](", (pw_media:proxy_url(Url))/binary, ")">>;
+        false -> Line
+    end.
+
+remote_image_url(<<"http://", _/binary>> = Url) -> image_url_extension(Url);
+remote_image_url(<<"https://", _/binary>> = Url) -> image_url_extension(Url);
+remote_image_url(_) -> false.
+
+image_url_extension(Url) ->
+    try uri_string:parse(binary_to_list(Url)) of
+        #{path := Path} ->
+            Ext = string:lowercase(filename:extension(Path)),
+            lists:member(Ext, [".gif", ".png", ".jpg", ".jpeg", ".webp", ".avif"]);
+        _ -> false
+    catch _:_ -> false
+    end.
 
 friend_map([Status, Req, Addr, Id, U, D, Bio, Avatar, Banner, St, Theme, Created, Last], Viewer) ->
     #{status => Status,
       incoming => (Status =:= <<"pending">> andalso Addr =:= Viewer),
       outgoing => (Status =:= <<"pending">> andalso Req =:= Viewer),
+      blocked_by_me => (Status =:= <<"blocked">> andalso Req =:= Viewer),
       user => user_map([Id, U, D, Bio, Avatar, Banner, St, Theme, Created, Last])}.
 
 server_row_map([Id, Owner, Name, Desc, Icon, Created, Updated, Role, Members]) ->
@@ -1611,11 +1867,11 @@ batch_replied_messages(Conn, Ids, Scope, ScopeId) ->
         _ -> #{}
     end.
 
-conversation_row_map([Id, Name, Avatar, Owner, Created, Updated, LastRead, Muted, RequestState, Count, LastBody, LastMsg, Unread, PeerName, PeerAvatar, PeerUsername]) ->
+conversation_row_map([Id, Name, Avatar, Owner, Created, Updated, LastRead, Muted, RequestState, Count, LastBody, LastMsg, Unread, PeerId, PeerName, PeerAvatar, PeerUsername]) ->
     #{id => Id, name => Name, avatar_url => pw_util:proxied_image(Avatar), owner_id => Owner,
       created_at => Created, updated_at => Updated, last_read_message_id => LastRead, muted => Muted, request_state => RequestState,
       member_count => Count, last_body => load_message(LastBody), last_message_id => LastMsg, unread => Unread,
-      peer_name => PeerName, peer_avatar_url => pw_util:proxied_image(PeerAvatar), peer_username => PeerUsername}.
+      peer_id => PeerId, peer_name => PeerName, peer_avatar_url => pw_util:proxied_image(PeerAvatar), peer_username => PeerUsername}.
 
 conversation_full_map([Id, Name, Avatar, Owner, Created, Updated]) ->
     #{id => Id, name => Name, avatar_url => pw_util:proxied_image(Avatar),
@@ -1668,9 +1924,11 @@ friendship_status(Conn, A, B) ->
     {L, H} = pair(A, B),
     case one(Conn, "SELECT status, requester_id, addressee_id FROM friendships WHERE user_low = $1 AND user_high = $2", [L, H]) of
         {ok, [S, R, Ad]} ->
-            #{status => S, incoming => (S =:= <<"pending">> andalso Ad =:= A), outgoing => (S =:= <<"pending">> andalso R =:= A)};
+            #{status => S, incoming => (S =:= <<"pending">> andalso Ad =:= A),
+              outgoing => (S =:= <<"pending">> andalso R =:= A),
+              blocked_by_me => (S =:= <<"blocked">> andalso R =:= A)};
         _ ->
-            #{status => none}
+            #{status => none, blocked_by_me => false}
     end.
 
 is_friend(Conn, A, B) ->
@@ -1803,6 +2061,17 @@ create_notification_once(Conn, U, K, B, Url, Now) ->
 mark_url_seen0(Conn, Uid, Url) ->
     _ = exec(Conn, "UPDATE notifications SET seen = true WHERE user_id = $1 AND url = $2", [Uid, Url]),
     ok.
+
+record_thread_view(_Conn, undefined, _Uid) -> ok;
+record_thread_view(Conn, ThreadId, Uid) ->
+    %% Insertion and counter update are one statement. The primary key makes
+    %% refreshes, revisits, concurrent tabs, and retrying requests idempotent.
+    exec(Conn,
+        "WITH existing AS (SELECT id FROM threads WHERE id = $1), "
+        "inserted AS (INSERT INTO thread_views(thread_id,user_id,first_viewed_at) "
+        "SELECT id,$2,$3 FROM existing ON CONFLICT DO NOTHING RETURNING 1) "
+        "UPDATE threads SET views = views + (SELECT count(*) FROM inserted) WHERE id = $1",
+        [ThreadId, Uid, pw_util:now_ms()]).
 
 seed_forums(Conn) ->
     case rows(Conn, "SELECT count(*) FROM forums", []) of

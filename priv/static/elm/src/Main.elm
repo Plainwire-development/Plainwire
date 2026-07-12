@@ -35,6 +35,7 @@ type BridgeTag
     | BtWsEvent E.Value
     | BtSyncData E.Value
     | BtFileRead String String
+    | BtLoadMoreMessages
     | BtHashChange String
     | BtTick
 
@@ -57,6 +58,7 @@ bridgeDecoder = D.field "tag" D.string |> D.andThen (\tag ->
         "sync_data" -> D.map handleSyncData (D.field "data" D.value)
         "hash_change" -> D.map SetRoute (D.field "data" D.string)
         "file_read" -> D.map2 FileUpload (D.field "id" D.string) (D.field "data" (D.nullable D.string))
+        "load_more_messages" -> D.succeed LoadMoreMessages
         "rtc_peer_connected" -> D.map2 SetCallPeerConnected (D.field "user_id" D.int) (D.field "connected" D.bool)
         "tick" -> D.succeed (Tick (Time.millisToPosix 0))
         "presence_state" -> D.field "data" D.value |> D.map PresenceState
@@ -92,10 +94,10 @@ init _ url _ =
     in
     ( { me = Nothing, csrf = "", serverTime = 0, timeZone = Time.utc, absoluteTimestamps = False
       , forums = [], threads = [], currentThread = Nothing, replies = []
-      , servers = [], convs = [], friends = [], notifs = []
+      , servers = [], convs = [], conversationMembers = Dict.empty, friends = [], notifs = []
       , searchUsers = [], searchThreads = []
       , currentServer = Nothing, currentProfile = Nothing, invitePreview = Nothing
-      , msg = [], nextBefore = Nothing
+      , msg = [], nextBefore = Nothing, loadingOlderMessages = False, hasOlderMessages = True
       , active = active, serverCache = Dict.empty
       , drafts = Dict.empty, wsConnected = False, isLeader = False
       , tabId = "", subs = Set.empty
@@ -105,17 +107,19 @@ init _ url _ =
       , callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
       , callMode = Idle, soundEnabled = True, replyTo = Nothing
       , toast = Nothing, modal = Nothing, settingsTab = "profile"
-      , inputText = "", sidebarOpen = False, ctxMenu = Nothing
+      , inputText = "", sidebarOpen = False, serversSheetOpen = False, ctxMenu = Nothing
       , threadReply = "", searchQuery = ""
       , authMode = "login", authUsername = "", authBusy = False, authDisplayName = ""
       , authPassword = "", serverName = "", serverDescription = "", booting = True, userStatuses = Dict.empty
-      , failedMsgIds = Set.empty, currentProfileRelationship = "none"
+      , failedMsgIds = Set.empty, currentProfileRelationship = "none", currentProfileBlockedByMe = False
       , pendingMessages = Dict.empty
       , profileDisplayName = "", profileBio = ""
       , profileAvatarUrl = "", profileBannerUrl = ""
+      , profileAvatarPreviewUrl = "", profileBannerPreviewUrl = ""
+      , profileAvatarUploading = False, profileBannerUploading = False
       , profileStatus = "online", profileTheme = "system"
       , modalTitle = "", modalBody = "", modalUserIds = ""
-      , friendsTab = "online", friendQuery = ""
+      , friendsTab = "online", friendQuery = "", friendSearchAttempted = False
       }
     , Cmd.batch
         [ apiSend (encodeApiRequest (ApiGet "/me"))
@@ -150,9 +154,12 @@ update msg model =
             in ( { model | active = active
                   , msg = if clearMessages then [] else model.msg
                   , sidebarOpen = False
+                  , serversSheetOpen = False
                   , invitePreview = clearedInvite
                   , currentThread = clearedThread
                   , nextBefore = Nothing
+                  , loadingOlderMessages = False
+                  , hasOlderMessages = if clearMessages then True else model.hasOlderMessages
                   }
                , Cmd.batch
                     [ bridgeSend (E.object
@@ -194,10 +201,12 @@ update msg model =
                 ( "/logout", _ ) -> ( model, bridgeSend (E.object [("tag", E.string "reload"), ("data", E.null)]) )
                 ( "/profile", _ ) -> ( { model | toast = Just "Profile saved" }, apiSend (encodeApiRequest (ApiGet "/me")) )
                 ( "/notifications/seen", _ ) -> ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
+                ( "/notifications/clear", _ ) -> ( { model | notifs = [], toast = Just "Notifications cleared" }, Cmd.none )
                 ( "/friends/request", _ ) -> ( { model | toast = Just "Friend request sent" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
                 ( "/friends/accept", _ ) -> ( { model | toast = Just "Friend added" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
                 ( "/friends/remove", _ ) -> ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
-                ( "/friends/block", _ ) -> ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
+                ( "/friends/block", _ ) -> ( { model | currentProfileRelationship = "blocked", currentProfileBlockedByMe = True, toast = Just "User blocked" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
+                ( "/friends/unblock", _ ) -> ( { model | currentProfileRelationship = "none", currentProfileBlockedByMe = False, toast = Just "User unblocked" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
                 ( "/conversations", _ ) -> handleCreateConversation val model
                 ( "/threads", _ ) -> handleCreateThread val model
                 ( _, _ ) ->
@@ -209,10 +218,12 @@ update msg model =
                         ( model, apiSend (encodeApiRequest (ApiGet "/forums")) )
                     else if String.startsWith "/thread/" tag && String.endsWith "/replies" tag then
                         handleReplyCreated val model
+                    else if String.endsWith "/delete" tag then
+                        ( model, Cmd.none )
                     else if String.startsWith "/thread/" tag then
                         handleThread val model
                     else if String.startsWith "/messages?" tag then
-                        handleMessages val model
+                        handleMessages tag val model
                     else if String.startsWith "/channels/" tag && String.endsWith "/messages" tag then
                         handleMessageSent val model
                     else if String.startsWith "/conversation/" tag && String.endsWith "/messages" tag then
@@ -223,6 +234,8 @@ update msg model =
                         ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
                     else if String.startsWith "/conversation/" tag && String.endsWith "/members" tag then
                         ( { model | toast = Just "People added" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
+                    else if String.startsWith "/conversation/" tag && method == "GET" then
+                        handleConversationDetail val model
                     else if String.startsWith "/conversation/" tag then
                         ( { model | toast = Just "Conversation updated" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
                     else if String.startsWith "/users?q=" tag then
@@ -249,6 +262,8 @@ update msg model =
         ApiError tag method err ->
             if String.startsWith "/invites/" tag && not (String.endsWith "/join" tag) then
                 ( { model | invitePreview = Nothing, toast = Just (fmtErr err), modal = Just "join_invite", modalUserIds = "" }, setHash "#" )
+            else if String.startsWith "/users?q=" tag then
+                ( { model | friendSearchAttempted = False, toast = Just "Search is temporarily unavailable. Please try again." }, Cmd.none )
             else if err == "not_authenticated" && model.me == Nothing then
                 ( { model | booting = False }, Cmd.none )
             else
@@ -266,6 +281,8 @@ update msg model =
 
         ToggleSidebar -> ( { model | sidebarOpen = not model.sidebarOpen }, Cmd.none )
         CloseSidebar -> ( { model | sidebarOpen = False }, Cmd.none )
+        ToggleServersSheet -> ( { model | serversSheetOpen = not model.serversSheetOpen }, Cmd.none )
+        CloseServersSheet -> ( { model | serversSheetOpen = False }, Cmd.none )
 
         Toast s -> ( { model | toast = Just s }, Process.sleep 4000 |> Task.perform (\_ -> DismissToast) )
         DismissToast -> ( { model | toast = Nothing }, Cmd.none )
@@ -317,6 +334,7 @@ update msg model =
         MarkConvRead cid -> ( model, apiSend (encodeApiRequest (ApiPost ("/conversation/" ++ String.fromInt cid ++ "/read") (Just (E.object [])))) )
         OpenMessageCtx m x y -> ( { model | ctxMenu = Just (messageContext model.me m x y) }, Cmd.none )
         OpenConvCtx c x y -> ( { model | ctxMenu = Just (conversationContext c x y) }, Cmd.none )
+        OpenUserCtx user x y -> ( { model | ctxMenu = Just (userContext model user x y) }, Cmd.none )
         CopyText s -> ( { model | ctxMenu = Nothing }, copyText s )
 
         SilentSync _ ->
@@ -341,19 +359,19 @@ update msg model =
         SetFriendsTab tab ->
             ( { model | friendsTab = tab, friendQuery = if tab == "add" then model.friendQuery else "", searchUsers = if tab == "add" then model.searchUsers else [] }, Cmd.none )
 
-        FriendQuery query -> ( { model | friendQuery = query }, Cmd.none )
+        FriendQuery query -> ( { model | friendQuery = query, friendSearchAttempted = False }, Cmd.none )
 
         FindFriends ->
             let query = String.trim model.friendQuery
             in if String.length query < 2 then
                 ( { model | toast = Just "Enter at least 2 characters." }, Cmd.none )
                else
-                ( { model | searchUsers = [] }, apiSend (encodeApiRequest (ApiGet ("/users?q=" ++ Url.percentEncode query))) )
+                ( { model | searchUsers = [], friendSearchAttempted = True }, apiSend (encodeApiRequest (ApiGet ("/users?q=" ++ Url.percentEncode query))) )
 
         ProfileDisplayName s -> ( { model | profileDisplayName = s }, Cmd.none )
         ProfileBio s -> ( { model | profileBio = s }, Cmd.none )
-        ProfileAvatarUrl s -> ( { model | profileAvatarUrl = s }, Cmd.none )
-        ProfileBannerUrl s -> ( { model | profileBannerUrl = s }, Cmd.none )
+        ProfileAvatarUrl s -> ( { model | profileAvatarUrl = s, profileAvatarPreviewUrl = s }, Cmd.none )
+        ProfileBannerUrl s -> ( { model | profileBannerUrl = s, profileBannerPreviewUrl = s }, Cmd.none )
         ProfileStatus s ->
             let status = statusPreference s
             in ( { model | profileStatus = status }
@@ -380,7 +398,7 @@ update msg model =
 
         DoSearch -> ( model, setHash ("#search/" ++ model.searchQuery) )
 
-        ClearNotifs -> ( model, apiSend (encodeApiRequest (ApiPost "/notifications/seen" (Just (E.object [])))) )
+        ClearNotifs -> ( model, apiSend (encodeApiRequest (ApiPost "/notifications/clear" (Just (E.object [])))) )
 
         CreateServer name description ->
             ( model
@@ -540,19 +558,27 @@ update msg model =
                     ( model, cmd )
 
         ReadFile id ->
-            ( model, readFile id )
+            ( if id == "profileAvatarFile" then
+                { model | profileAvatarUploading = True }
+              else if id == "profileBannerFile" then
+                { model | profileBannerUploading = True }
+              else model
+            , readFile id )
 
         FileUpload id maybeData ->
             case maybeData of
                 Just data ->
                     if id == "profileAvatarFile" then
-                        ( { model | profileAvatarUrl = data }, Cmd.none )
+                        ( { model | profileAvatarUrl = data, profileAvatarPreviewUrl = data, profileAvatarUploading = False }, Cmd.none )
                     else if id == "profileBannerFile" then
-                        ( { model | profileBannerUrl = data }, Cmd.none )
+                        ( { model | profileBannerUrl = data, profileBannerPreviewUrl = data, profileBannerUploading = False }, Cmd.none )
                     else
                         ( model, Cmd.none )
                 Nothing ->
-                    ( { model | toast = Just "Could not read that file" }, Cmd.none )
+                    ( { model | toast = Just "Could not upload that file"
+                              , profileAvatarUploading = if id == "profileAvatarFile" then False else model.profileAvatarUploading
+                              , profileBannerUploading = if id == "profileBannerFile" then False else model.profileBannerUploading
+                      }, Cmd.none )
 
         CloseCtx ->
             ( { model | ctxMenu = Nothing }, Cmd.none )
@@ -578,11 +604,13 @@ update msg model =
             ( { model | voice = clearVoice model.voice, callMode = Idle, callUI = { incoming = model.callUI.incoming, outgoing = Nothing, active = Nothing } }, Cmd.none )
 
         LoadMoreMessages ->
-            case ( model.active, model.msg ) of
+            if model.loadingOlderMessages || not model.hasOlderMessages then
+                ( model, Cmd.none )
+            else case ( model.active, model.msg ) of
                 ( DmView id, firstMsg :: _ ) ->
-                    ( model, apiSend (encodeApiRequest (ApiGet ("/messages?scope=direct&scope_id=" ++ String.fromInt id ++ "&before=" ++ String.fromInt firstMsg.id))) )
+                    ( { model | loadingOlderMessages = True }, Cmd.batch [ bridgeSend (E.object [("tag", E.string "preserve_message_scroll"), ("data", E.null)]), apiSend (encodeApiRequest (ApiGet ("/messages?scope=direct&scope_id=" ++ String.fromInt id ++ "&before=" ++ String.fromInt firstMsg.id))) ] )
                 ( ChannelView id, firstMsg :: _ ) ->
-                    ( model, apiSend (encodeApiRequest (ApiGet ("/messages?scope=channel&scope_id=" ++ String.fromInt id ++ "&before=" ++ String.fromInt firstMsg.id))) )
+                    ( { model | loadingOlderMessages = True }, Cmd.batch [ bridgeSend (E.object [("tag", E.string "preserve_message_scroll"), ("data", E.null)]), apiSend (encodeApiRequest (ApiGet ("/messages?scope=channel&scope_id=" ++ String.fromInt id ++ "&before=" ++ String.fromInt firstMsg.id))) ] )
                 _ -> ( model, Cmd.none )
 
         _ -> ( model, Cmd.none )
@@ -606,6 +634,10 @@ handleMe val model =
                                     , profileBio = user.bio
                                     , profileAvatarUrl = avatarSource
                                     , profileBannerUrl = bannerSource
+                                    , profileAvatarPreviewUrl = user.avatarUrl
+                                    , profileBannerPreviewUrl = user.bannerUrl
+                                    , profileAvatarUploading = False
+                                    , profileBannerUploading = False
                                     , profileStatus = statusPreference (statusToString user.status)
                                     , profileTheme = user.theme
                                     }
@@ -631,7 +663,7 @@ handleSync val model =
                 nextModel =
                     { model
                         | notifs = data.notifications
-                        , convs = sortConvs data.conversations
+                        , convs = sortConvs (mergeConversationDetails model.convs data.conversations)
                         , servers = data.servers
                         , friends = data.friends
                         , serverTime = data.now
@@ -643,6 +675,15 @@ handleSync val model =
         Err _ -> ( model, Cmd.none )
 
 
+mergeConversationDetails : List Conversation -> List Conversation -> List Conversation
+mergeConversationDetails previous summaries =
+    let preserveMembers summary =
+            case List.filter (\old -> old.id == summary.id && not (List.isEmpty old.members)) previous |> List.head of
+                Just old -> { summary | members = old.members, memberCount = Basics.max summary.memberCount (List.length old.members) }
+                Nothing -> summary
+    in List.map preserveMembers summaries
+
+
 handleList : Decoder (List a) -> (List a -> Model -> Model) -> E.Value -> Model -> ( Model, Cmd Msg )
 handleList decoder apply val model =
     case D.decodeValue decoder val of
@@ -650,8 +691,8 @@ handleList decoder apply val model =
         Err _ -> ( model, Cmd.none )
 
 
-handleMessages : E.Value -> Model -> ( Model, Cmd Msg )
-handleMessages val model =
+handleMessages : String -> E.Value -> Model -> ( Model, Cmd Msg )
+handleMessages tag val model =
     case D.decodeValue (D.list decodeMessage) val of
         Ok items ->
             let cmd = case model.active of
@@ -664,13 +705,20 @@ handleMessages val model =
                 incomingIds = Set.fromList (List.map .id incoming)
                 preserved = List.filter (\m -> messageApplies model.active m && not (Set.member m.id incomingIds)) model.msg
                 merged = List.sortBy .createdAt (incoming ++ preserved)
+                olderPage = String.contains "&before=" tag
+                hasOlder = if List.length items < 80 then False else model.hasOlderMessages
             in
             if applies then
-                ( { model | msg = merged }, cmd )
+                ( { model | msg = merged, loadingOlderMessages = False, hasOlderMessages = hasOlder }
+                , if olderPage then
+                    Cmd.batch [ cmd, bridgeSend (E.object [("tag", E.string "restore_message_scroll"), ("data", E.null)]) ]
+                  else
+                    Cmd.batch [ cmd, bridgeSend (E.object [("tag", E.string "scroll_messages_to_bottom"), ("data", E.null)]) ]
+                )
             else
-                ( model, Cmd.none )
+                ( { model | loadingOlderMessages = False }, Cmd.none )
         Err err ->
-            ( { model | toast = Just ("Could not load messages: " ++ D.errorToString err) }, Cmd.none )
+            ( { model | toast = Just ("Could not load messages: " ++ D.errorToString err), loadingOlderMessages = False }, Cmd.none )
 
 
 handleThread : E.Value -> Model -> ( Model, Cmd Msg )
@@ -678,6 +726,25 @@ handleThread val model =
     case D.decodeValue threadDetailDecoder val of
         Ok detail -> ( { model | currentThread = Just detail.thread, replies = detail.replies }, Cmd.none )
         Err _ -> ( model, Cmd.none )
+
+
+handleConversationDetail : E.Value -> Model -> ( Model, Cmd Msg )
+handleConversationDetail val model =
+    case ( D.decodeValue (D.at [ "conversation", "id" ] D.int) val, D.decodeValue (D.field "members" (D.list decodeMemberUser)) val ) of
+        ( Ok conversationId, Ok members ) ->
+            let updateConversation conversation =
+                    if conversation.id == conversationId then
+                        { conversation | members = members, memberCount = List.length members }
+                    else
+                        conversation
+            in ( { model
+                    | convs = List.map updateConversation model.convs
+                    , conversationMembers = Dict.insert conversationId members model.conversationMembers
+                 }
+               , Cmd.none
+               )
+        _ ->
+            ( { model | toast = Just "Could not load group members" }, Cmd.none )
 
 
 handleMessageSent : E.Value -> Model -> ( Model, Cmd Msg )
@@ -758,13 +825,13 @@ submitModal model =
                         ]))))
                     )
             else if kind == "new_dm" then
-                let ids = csvInts model.modalUserIds in
-                if List.isEmpty ids then
-                    ( { model | toast = Just "Add at least one user" }, Cmd.none )
+                let usernames = csvUsernames model.modalUserIds in
+                if List.isEmpty usernames then
+                    ( { model | toast = Just "Enter at least one username" }, Cmd.none )
                 else
                     ( { model | modal = Nothing }
                     , apiSend (encodeApiRequest (ApiPost "/conversations" (Just (E.object
-                        [ ("user_ids", E.list E.int ids)
+                        [ ("usernames", E.list E.string usernames)
                         , ("name", E.string model.modalTitle)
                         ]))))
                     )
@@ -898,11 +965,12 @@ handleProfile : E.Value -> Model -> ( Model, Cmd Msg )
 handleProfile val model =
     let userResult = D.decodeValue (D.field "user" decodeUser) val
         relResult = D.decodeValue (D.field "relationship" (D.field "status" D.string)) val
+        blockedByMe = D.decodeValue (D.at [ "relationship", "blocked_by_me" ] D.bool) val |> Result.withDefault False
         rel = case relResult of
             Ok r -> r
             Err _ -> "none"
     in case userResult of
-        Ok user -> ( { model | currentProfile = Just user, currentProfileRelationship = rel }, bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string user.theme)]) )
+        Ok user -> ( { model | currentProfile = Just user, currentProfileRelationship = rel, currentProfileBlockedByMe = blockedByMe }, bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string user.theme)]) )
         Err _ -> ( model, Cmd.none )
 
 
@@ -954,7 +1022,10 @@ routeCmd active =
         Forums -> apiSend (encodeApiRequest (ApiGet "/forums"))
         ForumView id -> apiSend (encodeApiRequest (ApiGet ("/threads?forum_id=" ++ String.fromInt id)))
         ThreadView id -> apiSend (encodeApiRequest (ApiGet ("/thread/" ++ String.fromInt id)))
-        DmView id -> apiSend (encodeApiRequest (ApiGet ("/messages?scope=direct&scope_id=" ++ String.fromInt id)))
+        DmView id -> Cmd.batch
+            [ apiSend (encodeApiRequest (ApiGet ("/messages?scope=direct&scope_id=" ++ String.fromInt id)))
+            , apiSend (encodeApiRequest (ApiGet ("/conversation/" ++ String.fromInt id)))
+            ]
         ChannelView id -> apiSend (encodeApiRequest (ApiGet ("/messages?scope=channel&scope_id=" ++ String.fromInt id)))
         ServerView id -> apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt id)))
         ProfileView id -> apiSend (encodeApiRequest (ApiGet ("/profile/" ++ String.fromInt id)))
@@ -1005,6 +1076,7 @@ sendMessage model =
     let body = String.trim model.inputText
         replyField = Maybe.map .id model.replyTo
         payload = encodeMessage { body = body, replyToId = replyField }
+        scrollToBottom = bridgeSend (E.object [("tag", E.string "scroll_messages_to_bottom"), ("data", E.null)])
     in
     if String.isEmpty body then
         ( model, Cmd.none )
@@ -1018,7 +1090,7 @@ sendMessage model =
                         [] -> -1
                 in
                 ( { model2 | pendingMessages = Dict.insert lastMsgId path model.pendingMessages, failedMsgIds = Set.remove lastMsgId model.failedMsgIds }
-                , apiSend (encodeApiRequest (ApiPost path (Just payload)))
+                , Cmd.batch [ apiSend (encodeApiRequest (ApiPost path (Just payload))), scrollToBottom ]
                 )
             ChannelView id ->
                 let path = "/channels/" ++ String.fromInt id ++ "/messages"
@@ -1028,7 +1100,7 @@ sendMessage model =
                         [] -> -1
                 in
                 ( { model2 | pendingMessages = Dict.insert lastMsgId path model.pendingMessages, failedMsgIds = Set.remove lastMsgId model.failedMsgIds }
-                , apiSend (encodeApiRequest (ApiPost path (Just payload)))
+                , Cmd.batch [ apiSend (encodeApiRequest (ApiPost path (Just payload))), scrollToBottom ]
                 )
             ThreadView id ->
                 ( model, apiSend (encodeApiRequest (ApiPost ("/thread/" ++ String.fromInt id ++ "/replies") (Just (E.object [("body", E.string body)])))) )
@@ -1234,7 +1306,12 @@ handleMessageCreated ev model =
     case D.decodeValue (D.field "message" decodeMessage) ev of
         Ok message ->
             if messageApplies model.active message then
-                ( { model | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ] }, playNotification model.soundEnabled )
+                ( { model | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ] }
+                , Cmd.batch
+                    [ playNotification model.soundEnabled
+                    , bridgeSend (E.object [("tag", E.string "scroll_messages_to_bottom"), ("data", E.null)])
+                    ]
+                )
             else
                 ( model, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), playNotification model.soundEnabled ] )
         Err _ -> ( model, Cmd.none )
@@ -1375,7 +1452,14 @@ modalContent kind model =
         , div [ class "modal-body" ]
             [ div [ class "field" ] [ label [] [ text "Category ID" ], input [ value model.modalUserIds, placeholder "Forum/category ID", onInput ModalUserIds ] [] ]
             , div [ class "field" ] [ label [] [ text "Title" ], input [ value model.modalTitle, placeholder "What is this about?", onInput ModalTitle ] [] ]
-            , div [ class "field" ] [ label [] [ text "Body" ], textarea [ value model.modalBody, placeholder "Write the first post...", onInput ModalBody ] [] ]
+            , div [ class "field" ]
+                [ label [] [ text "Body" ]
+                , textarea [ id "compose", value model.modalBody, placeholder "Write the first post...", onInput ModalBody ] []
+                , div [ class "composer-footer modal-composer-footer" ]
+                    [ button [ class "btn secondary attach-btn", type_ "button", title "Attach files or images", onClick (BridgeEvent "pick_attachments" E.null) ] [ text "＋ Attach" ]
+                    , small [ class "muted" ] [ text "Images, GIFs, and files up to 250 MB." ]
+                    ]
+                ]
             ]
         , modalActions "Create thread"
         ]
@@ -1389,11 +1473,11 @@ modalContent kind model =
         , modalActions "Create community"
         ]
     else if kind == "new_dm" then
-        [ modalHead "New message" "Start a DM or group chat." 
+        [ modalHead "New message" "Start a DM or group chat by username."
         , div [ class "modal-body" ]
-            [ div [ class "field" ] [ label [] [ text "User IDs" ], input [ value model.modalUserIds, placeholder "Example: 2 or 2, 5, 9", onInput ModalUserIds ] [] ]
+            [ div [ class "field" ] [ label [] [ text "Usernames" ], input [ value model.modalUserIds, placeholder "alice, bob, charlie", onInput ModalUserIds, attribute "autocomplete" "off" ] [] ]
             , div [ class "field" ] [ label [] [ text "Group name optional" ], input [ value model.modalTitle, placeholder "Leave blank for a 1:1 DM", onInput ModalTitle ] [] ]
-            , p [ class "muted modal-hint" ] [ text "Tip: use Search to find a person, then press Message." ]
+            , p [ class "muted modal-hint" ] [ text "Separate usernames with commas. You can include or omit the @ sign." ]
             ]
         , modalActions "Start chat"
         ]
@@ -1502,8 +1586,12 @@ messageContext me message x y =
             [ { label = "Reply", icon = Just "↩", danger = False, sep = False, msg = SetReplyTo message }
             , { label = "Copy text", icon = Just "⧉", danger = False, sep = False, msg = CopyText message.body }
             ]
+        authorItems = if mine then [] else
+            [ { label = "View author profile", icon = Just "○", danger = False, sep = True, msg = Go ("#profile/" ++ String.fromInt message.userId) }
+            , { label = "Copy author username", icon = Just "@", danger = False, sep = False, msg = CopyText ("@" ++ message.username) }
+            ]
         mineItems = if mine then [ { label = "Delete message", icon = Just "×", danger = True, sep = True, msg = DeleteMessage message.id } ] else []
-    in { items = base ++ mineItems, x = x, y = y }
+    in { items = base ++ authorItems ++ mineItems, x = x, y = y }
 
 conversationContext : Conversation -> Int -> Int -> ContextMenu
 conversationContext c x y =
@@ -1522,6 +1610,30 @@ conversationContext c x y =
         ]
       , x = x, y = y
       }
+
+userContext : Model -> User -> Int -> Int -> ContextMenu
+userContext model user x y =
+    let isSelf = Maybe.map .id model.me == Just user.id
+        relationship = List.filter (\friend -> friend.user.id == user.id) model.friends |> List.head
+        blocked = Maybe.map .status relationship == Just "blocked"
+        blockedByMe = Maybe.map .blockedByMe relationship == Just True
+        actions =
+            if isSelf then
+                [ { label = "View my profile", icon = Just "○", danger = False, sep = False, msg = Go ("#profile/" ++ String.fromInt user.id) }
+                , { label = "Copy username", icon = Just "⧉", danger = False, sep = False, msg = CopyText ("@" ++ user.username) }
+                ]
+            else
+                [ { label = "View profile", icon = Just "○", danger = False, sep = False, msg = Go ("#profile/" ++ String.fromInt user.id) }
+                , { label = "Message", icon = Just "✉", danger = False, sep = False, msg = BridgeEvent "dm_user" (E.int user.id) }
+                , { label = "Copy username", icon = Just "⧉", danger = False, sep = False, msg = CopyText ("@" ++ user.username) }
+                , if blocked && blockedByMe then
+                    { label = "Unblock", icon = Just "✓", danger = False, sep = True, msg = BridgeEvent "unblock_user" (E.int user.id) }
+                  else if blocked then
+                    { label = "Unavailable", icon = Just "⊘", danger = False, sep = True, msg = NoOp }
+                  else
+                    { label = "Block", icon = Just "⊘", danger = True, sep = True, msg = BridgeEvent "block_user" (E.int user.id) }
+                ]
+    in { items = actions, x = x, y = y }
 
 onContextMenu : (Int -> Int -> Msg) -> Attribute Msg
 onContextMenu toMsg =
@@ -1685,6 +1797,20 @@ avatarImg url name cls =
             []
 
 
+presenceAvatar : Dict String String -> Int -> String -> String -> String -> Html Msg
+presenceAvatar statuses userId url name cls =
+    let presence = statusClass statuses userId
+        label = case presence of
+            "away" -> "Away"
+            "busy" -> "Busy"
+            "online" -> "Online"
+            _ -> "Offline"
+    in div [ class "presence-avatar", title label, attribute "aria-label" (name ++ " — " ++ label) ]
+        [ avatarImg url name cls
+        , span [ class ("avatar-presence-dot " ++ presence), attribute "aria-hidden" "true" ] []
+        ]
+
+
 -- AUTH VIEW
 
 renderAuth : Model -> Html Msg
@@ -1741,7 +1867,7 @@ renderApp model =
         , renderSideForRoute model
         , main_ [ class "main" ]
             [ renderTopbar model
-            , div [ class "content" ] [ renderPage model ]
+            , div [ class (contentClass model.active) ] [ renderPage model ]
             ]
         , renderRightPanel model
         , div [ class ("drawer-overlay" ++ if model.sidebarOpen then " open" else "")
@@ -1753,10 +1879,18 @@ renderApp model =
         , renderModal model
         ]
 
+
+contentClass : ActiveRoute -> String
+contentClass active =
+    case active of
+        DmView _ -> "content chat-content"
+        ChannelView _ -> "content chat-content"
+        _ -> "content"
+
 renderServersSheet : Model -> Html Msg
 renderServersSheet model =
-    if not model.sidebarOpen then text "" else
-    div [ class "servers-sheet", onClick CloseSidebar ]
+    if not model.serversSheetOpen then text "" else
+    div [ class "servers-sheet", onClick CloseServersSheet ]
         [ div [ class "servers-sheet-card", stopClick ]
             [ h3 [] [ text "Servers" ]
             , if List.isEmpty model.servers then
@@ -1767,7 +1901,7 @@ renderServersSheet model =
                 [ button [ class "btn", onClick (Go "#new-server") ] [ text "New Server" ]
                 , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Use Invite" ]
                 ]
-            , button [ class "btn secondary", style "margin-top" "8px", onClick CloseSidebar ] [ text "Close" ]
+            , button [ class "btn secondary", style "margin-top" "8px", onClick CloseServersSheet ] [ text "Close" ]
             ]
         ]
 
@@ -2008,7 +2142,7 @@ convRow c model =
          , onClick (Go ("#dm/" ++ String.fromInt c.id))
          , onContextMenu (OpenConvCtx c)
          ]
-        [ convAvatar c
+        [ convAvatar model c
         , div [ class "grow" ]
             [ div [ class "dm-row-head" ]
                 [ b [] [ text (convName c) ]
@@ -2026,12 +2160,12 @@ convName c =
     else if c.memberCount == 2 && not (String.isEmpty c.peerName) then c.peerName
     else "Group DM " ++ String.fromInt c.id
 
-convAvatar : Conversation -> Html Msg
-convAvatar c =
+convAvatar : Model -> Conversation -> Html Msg
+convAvatar model c =
     if not (String.isEmpty c.avatarUrl) then
         img [ class "avatar", src c.avatarUrl, alt "" ] []
     else if c.memberCount == 2 then
-        avatarImg c.peerAvatarUrl (convName c) ""
+        presenceAvatar model.userStatuses c.peerId c.peerAvatarUrl (convName c) ""
     else
         div [ class "avatar group-avatar" ] [ text (String.fromInt c.memberCount) ]
 
@@ -2039,7 +2173,7 @@ userPanel : Model -> Html Msg
 userPanel model = case model.me of
     Just u ->
         div [ class "user-panel" ]
-            [ avatarImg u.avatarUrl u.displayName ""
+            [ presenceAvatar model.userStatuses u.id u.avatarUrl u.displayName ""
             , div [ class "grow" ]
                 [ b [] [ text u.displayName ]
                 , small [] [ text (statusToString u.status) ]
@@ -2057,7 +2191,7 @@ renderMobileNav model =
         , mobileBtn "r/" "Forums" (model.active == Forums) (Go "#forums")
         , mobileBtn "D" "DMs" (isDmActive model) (Go "#dms")
         , mobileBtn "+" "Friends" (model.active == Friends) (Go "#friends")
-        , mobileBtn "≡" "Servers" False (ToggleSidebar)
+        , mobileBtn "≡" "Servers" model.serversSheetOpen ToggleServersSheet
         , mobileBtn "⚙" "You" (model.active == Settings) (Go "#settings")
         , if List.isEmpty model.servers then text "" else
             div [ class "mobile-server-dots" ]
@@ -2293,6 +2427,9 @@ renderForumPage id model =
                           else
                             button [ class "btn forum-join-btn", onClick (JoinForum f.id) ] [ text "Join" ]
                         , button [ class "btn", onClick (NewThreadModal (Just id)) ] [ text "New Thread" ]
+                        , if f.ownerId == Maybe.map .id model.me then
+                            button [ class "btn danger", onClick (BridgeEvent "delete_forum" (E.int f.id)) ] [ text "Delete Community" ]
+                          else text ""
                         ]
                     ]
             Nothing ->
@@ -2334,7 +2471,13 @@ renderThreadPage : Int -> Model -> Html Msg
 renderThreadPage threadId model =
     case model.currentThread of
         Just t ->
-            div [ class "thread-page" ]
+            let forumOwner = model.forums
+                    |> List.filter (\forum -> forum.id == t.forumId)
+                    |> List.head
+                    |> Maybe.andThen .ownerId
+                myId = Maybe.map .id model.me
+                canDelete = myId == Just t.userId || myId == forumOwner
+            in div [ class "thread-page" ]
                 [ div [ class "thread-breadcrumb" ]
                     [ a [ href ("#forum/" ++ String.fromInt t.forumId) ] [ text ("r/" ++ t.forumName) ]
                     , span [] [ text "›" ]
@@ -2351,11 +2494,14 @@ renderThreadPage threadId model =
                                 , span [ class "muted" ] [ text ("@" ++ t.username ++ " · " ++ ago model.serverTime t.createdAt ++ " ago") ]
                                 ]
                             ]
-                        , div [ class "thread-post-body" ] [ text t.body ]
+                        , div [ class "thread-post-body" ] (renderMessageBody t.body)
                         , div [ class "thread-post-footer" ]
                             [ span [] [ text (String.fromInt t.score ++ " points") ]
                             , span [] [ text (String.fromInt t.views ++ " views") ]
                             , span [] [ text (String.fromInt t.replyCount ++ " replies") ]
+                            , if canDelete then
+                                button [ class "thread-delete-btn", onClick (BridgeEvent "delete_thread" (E.object [ ("id", E.int t.id), ("forum_id", E.int t.forumId) ])) ] [ text "Delete thread" ]
+                              else text ""
                             ]
                         ]
                     ]
@@ -2401,7 +2547,7 @@ replyView model idx r =
                 , span [ class "muted" ] [ text (ago model.serverTime r.createdAt ++ " ago") ]
                 , span [ class "reply-number" ] [ text ("#" ++ String.fromInt (idx + 1)) ]
                 ]
-            , div [ class "reply-body" ] [ text r.body ]
+            , div [ class "reply-body" ] (renderMessageBody r.body)
             ]
         ]
 
@@ -2421,7 +2567,7 @@ renderDmsPage model =
         , if List.isEmpty requests then text "" else
             div [ class "dm-request-section" ]
                 [ h3 [ class "list-section-title" ] [ text ("Message requests · " ++ String.fromInt (List.length requests)) ]
-                , div [ class "card dm-list-card" ] (List.map messageRequestRow requests)
+                , div [ class "card dm-list-card" ] (List.map (messageRequestRow model) requests)
                 ]
         , h3 [ class "list-section-title" ] [ text "Messages" ]
         , div [ class "card dm-list-card" ]
@@ -2436,10 +2582,10 @@ renderDmsPage model =
             )
         ]
 
-messageRequestRow : Conversation -> Html Msg
-messageRequestRow conversation =
+messageRequestRow : Model -> Conversation -> Html Msg
+messageRequestRow model conversation =
     div [ class "row dm-row message-request-row" ]
-        [ convAvatar conversation
+        [ convAvatar model conversation
         , div [ class "grow" ]
             [ b [] [ text (convName conversation) ]
             , small [ class "muted dm-preview" ] [ text (Maybe.withDefault "Wants to message you" conversation.lastBody) ]
@@ -2516,7 +2662,9 @@ friendEmpty title body =
 
 addFriendPanel : Model -> Html Msg
 addFriendPanel model =
-    div [ class "add-friend-panel" ]
+    let candidates = model.searchUsers
+            |> List.filter (\user -> Just user.id /= Maybe.map .id model.me)
+    in div [ class "add-friend-panel" ]
         [ div [ class "add-friend-intro" ]
             [ span [ class "add-friend-icon" ] [ text "+" ]
             , div []
@@ -2535,20 +2683,23 @@ addFriendPanel model =
                 , b [] [ text "Friends make everything better" ]
                 , p [] [ text "Search above to find people. You can use only part of their display name." ]
                 ]
-          else if List.isEmpty model.searchUsers then
+          else if List.isEmpty candidates && model.friendSearchAttempted then
+            div [ class "friend-discovery-hint compact friend-not-found" ]
+                [ b [] [ text "Can't find that user" ]
+                , p [] [ text "Try again or check the spelling." ]
+                ]
+          else if List.isEmpty candidates then
             div [ class "friend-discovery-hint compact" ] [ b [] [ text "Ready to search" ], p [] [ text "Results will appear here after you press Send Search." ] ]
           else
             div [ class "card friends-list friend-results" ]
-                (model.searchUsers
-                    |> List.filter (\user -> Just user.id /= Maybe.map .id model.me)
-                    |> List.map (friendCandidateRow model.friends))
+                (candidates |> List.map (friendCandidateRow model))
         ]
 
-friendCandidateRow : List Friend -> User -> Html Msg
-friendCandidateRow relationships user =
-    let relationship = List.filter (\f -> f.user.id == user.id) relationships |> List.head
+friendCandidateRow : Model -> User -> Html Msg
+friendCandidateRow model user =
+    let relationship = List.filter (\f -> f.user.id == user.id) model.friends |> List.head
     in div [ class "row friend-row" ]
-        [ div [ class "clickable-user", onClick (ShowUserPopup user.id) ] [ avatarImg user.avatarUrl user.displayName "" ]
+        [ div [ class "clickable-user", onClick (ShowUserPopup user.id), onContextMenu (OpenUserCtx user) ] [ presenceAvatar model.userStatuses user.id user.avatarUrl user.displayName "" ]
         , div [ class "grow clickable-user", onClick (ShowUserPopup user.id) ]
             [ b [] [ text user.displayName ], small [ class "muted" ] [ text ("@" ++ user.username) ] ]
         , case relationship of
@@ -2570,12 +2721,11 @@ friendRow : Dict String String -> Friend -> Html Msg
 friendRow userStatuses f =
     let statusText = if f.status == "accepted" then statusLabel userStatuses f.user.id else if f.incoming then "Incoming friend request" else if f.outgoing then "Outgoing friend request" else "Blocked"
     in div [ class "row friend-row" ]
-        [ div [ class "clickable-user", onClick (ShowUserPopup f.user.id) ]
-            [ avatarImg f.user.avatarUrl f.user.displayName "" ]
+        [ div [ class "clickable-user", onClick (ShowUserPopup f.user.id), onContextMenu (OpenUserCtx f.user) ]
+            [ presenceAvatar userStatuses f.user.id f.user.avatarUrl f.user.displayName "" ]
         , div [ class "grow clickable-user", onClick (ShowUserPopup f.user.id) ]
             [ b [] [ text f.user.displayName ]
             , small [ class "muted" ] [ text ("@" ++ f.user.username ++ " · " ++ statusText) ]
-            , span [ class ("status-dot " ++ statusClass userStatuses f.user.id) ] []
             ]
         , div [ class "friend-actions" ]
             [ if f.incoming then button [ class "btn", onClick (BridgeEvent "accept_friend" (E.int f.user.id)) ] [ text "Accept" ] else text ""
@@ -2632,13 +2782,12 @@ channelRow c =
 
 memberRow : Dict String String -> ServerMember -> Html Msg
 memberRow userStatuses m =
-    div [ class "row member-row clickable-user", onClick (ShowUserPopup m.user.id) ]
-        [ avatarImg m.user.avatarUrl m.user.displayName ""
+    div [ class "row member-row clickable-user", onClick (ShowUserPopup m.user.id), onContextMenu (OpenUserCtx m.user) ]
+        [ presenceAvatar userStatuses m.user.id m.user.avatarUrl m.user.displayName ""
         , div [ class "grow" ]
             [ b [] [ text m.user.displayName ]
             , small [ class "muted" ] [ text ("@" ++ m.user.username ++ " · " ++ m.role) ]
             ]
-        , span [ class ("status-dot " ++ statusClass userStatuses m.user.id) ] []
         ]
 
 renderVoicePage : Int -> Model -> Html Msg
@@ -2695,6 +2844,7 @@ renderProfilePage model =
     case model.currentProfile of
         Just u ->
             let
+                viewingSelf = Maybe.map .id model.me == Just u.id
                 liveStatus = Dict.get (String.fromInt u.id) model.userStatuses
                 presence = Maybe.withDefault "offline" liveStatus
                 activityText =
@@ -2710,7 +2860,7 @@ renderProfilePage model =
             in div [ class "card profile" ]
                 [ div [ class "banner", style "background-image" (if String.isEmpty u.bannerUrl then "none" else "url('" ++ u.bannerUrl ++ "')") ] []
                 , div [ class "profile-body" ]
-                    [ avatarImg u.avatarUrl u.displayName "big"
+                    [ presenceAvatar model.userStatuses u.id u.avatarUrl u.displayName "big"
                     , div []
                         [ h1 [] [ text u.displayName ]
                         , p [ class "muted profile-identity" ]
@@ -2720,11 +2870,14 @@ renderProfilePage model =
                         , p [] [ text (if String.isEmpty u.bio then "No bio set." else u.bio) ]
                         , p [] [ span [ class ("pill presence-pill " ++ presence) ] [ span [ class ("status-dot " ++ presence) ] [], text activityText ] ]
                         , div [ class "nav-actions" ]
-                            [ button [ class "btn secondary", onClick (BridgeEvent "call_user" (E.int u.id)) ] [ text "Call" ]
-                            , button [ class "btn secondary", onClick (BridgeEvent "dm_user" (E.int u.id)) ] [ text "Message" ]
-                            , if model.currentProfileRelationship == "blocked" then
+                            [ if viewingSelf then button [ class "btn", onClick (Go "#settings") ] [ text "Edit profile" ] else text ""
+                            , if not viewingSelf && model.currentProfileRelationship /= "blocked" then button [ class "btn secondary", onClick (BridgeEvent "call_user" (E.int u.id)) ] [ text "Call" ] else text ""
+                            , if not viewingSelf && model.currentProfileRelationship /= "blocked" then button [ class "btn secondary", onClick (BridgeEvent "dm_user" (E.int u.id)) ] [ text "Message" ] else text ""
+                            , if not viewingSelf && model.currentProfileRelationship == "blocked" && model.currentProfileBlockedByMe then
                                 button [ class "btn danger", onClick (BridgeEvent "unblock_user" (E.int u.id)) ] [ text "Unblock" ]
-                              else if model.currentProfileRelationship == "none" || model.currentProfileRelationship == "" then
+                              else if not viewingSelf && model.currentProfileRelationship == "blocked" then
+                                button [ class "btn secondary", disabled True ] [ text "Unavailable" ]
+                              else if not viewingSelf then
                                 button [ class "btn danger", onClick (BridgeEvent "block_user" (E.int u.id)) ] [ text "Block" ]
                               else text ""
                             ]
@@ -2837,8 +2990,8 @@ renderNotificationSettings model =
 renderProfileSettings : User -> Model -> Html Msg
 renderProfileSettings u model =
     div [ class "settings-card" ]
-        [ div [ class "settings-banner", style "background-image" (if String.isEmpty model.profileBannerUrl then "linear-gradient(135deg, #5865f2, #232946)" else "url('" ++ model.profileBannerUrl ++ "')") ]
-            [ div [ class "settings-avatar-wrap" ] [ avatarImg model.profileAvatarUrl model.profileDisplayName "" ]
+        [ div [ class "settings-banner", style "background-image" (if String.isEmpty model.profileBannerPreviewUrl then "linear-gradient(135deg, #5865f2, #232946)" else "url('" ++ model.profileBannerPreviewUrl ++ "')") ]
+            [ div [ class "settings-avatar-wrap" ] [ avatarImg model.profileAvatarPreviewUrl model.profileDisplayName "" ]
             , div [ class "settings-name-block" ]
                 [ h2 [] [ text (if String.isEmpty model.profileDisplayName then u.displayName else model.profileDisplayName) ]
                 , p [ class "muted" ] [ text ("@" ++ u.username) ]
@@ -2857,16 +3010,16 @@ renderProfileSettings u model =
             [ label [] [ text "Avatar URL" ]
             , input [ value model.profileAvatarUrl, placeholder "https://...", onInput ProfileAvatarUrl ] []
             , div [ class "file-upload-row" ]
-                [ input [ id "profileAvatarFile", type_ "file", accept "image/*" ] []
-                , button [ class "btn secondary", onClick (ReadFile "profileAvatarFile") ] [ text "Use file" ]
+                [ input [ id "profileAvatarFile", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "profileAvatarFile")) ] []
+                , button [ class "btn secondary", onClick (ReadFile "profileAvatarFile"), disabled model.profileAvatarUploading ] [ text "Upload file" ]
                 ]
             ]
         , div [ class "field" ]
             [ label [] [ text "Banner URL" ]
             , input [ value model.profileBannerUrl, placeholder "https://...", onInput ProfileBannerUrl ] []
             , div [ class "file-upload-row" ]
-                [ input [ id "profileBannerFile", type_ "file", accept "image/*" ] []
-                , button [ class "btn secondary", onClick (ReadFile "profileBannerFile") ] [ text "Use file" ]
+                [ input [ id "profileBannerFile", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "profileBannerFile")) ] []
+                , button [ class "btn secondary", onClick (ReadFile "profileBannerFile"), disabled model.profileBannerUploading ] [ text "Upload file" ]
                 ]
             ]
         , div [ class "field" ]
@@ -2888,7 +3041,19 @@ renderProfileSettings u model =
                 ]
             ]
         , div [ class "nav-actions" ]
-            [ button [ class "btn", onClick SaveProfile ] [ text "Save profile" ] ]
+            [ button
+                [ class "btn"
+                , onClick SaveProfile
+                , disabled (model.profileAvatarUploading || model.profileBannerUploading)
+                ]
+                [ text
+                    (if model.profileAvatarUploading || model.profileBannerUploading then
+                        "Uploading image…"
+                     else
+                        "Save profile"
+                    )
+                ]
+            ]
             ]
         ]
 
@@ -2923,18 +3088,68 @@ renderMessagePage draftKey placeholderText model =
                 else
                     []
             _ -> []
-    in div [ class "chat-surface" ]
-        ( callBar
+        chatSurface = div [ class "chat-surface" ]
+            ( callBar
             ++ [ renderChatHeader model
                , div [ class "messages", id "messages" ]
-                    (if List.isEmpty model.msg then
+                    ([ div [ id "message-history-sentinel", class "message-history-sentinel", attribute "aria-hidden" "true" ]
+                         [ if model.loadingOlderMessages then text "Loading older messages…" else text "" ]
+                     ] ++ if List.isEmpty model.msg then
                         [ div [ class "empty chat-empty" ] [ h2 [] [ text "Start the conversation" ], p [ class "muted" ] [ text "Messages appear here instantly when people post." ] ] ]
                      else
                         groupedMessageViews model model.msg
                     )
                , composerView draftKey placeholderText model
                ]
-        )
+            )
+        groupMembers = case model.active of
+            DmView conversationId ->
+                model.convs
+                    |> List.filter (\conversation -> conversation.id == conversationId && conversation.memberCount > 2)
+                    |> List.head
+                    |> Maybe.map (\conversation ->
+                        let cachedMembers = Dict.get conversationId model.conversationMembers |> Maybe.withDefault conversation.members
+                        in renderGroupMembers model { conversation | members = cachedMembers }
+                    )
+            _ -> Nothing
+    in case groupMembers of
+        Just members -> div [ class "chat-with-members" ] [ chatSurface, members ]
+        Nothing -> chatSurface
+
+
+renderGroupMembers : Model -> Conversation -> Html Msg
+renderGroupMembers model conversation =
+    aside [ class "group-members", attribute "aria-label" "Group members" ]
+        [ div [ class "group-members-head" ]
+            [ span [ class "eyebrow" ] [ text "People" ]
+            , h3 [] [ text (String.fromInt conversation.memberCount ++ " members") ]
+            ]
+        , div [ class "group-members-list" ]
+            (if List.isEmpty conversation.members then
+                [ div [ class "group-members-loading" ]
+                    [ p [ class "muted" ] [ text "Members could not be loaded." ]
+                    , button [ class "btn secondary", onClick (SetRoute ("#dm/" ++ String.fromInt conversation.id)) ] [ text "Retry" ]
+                    ]
+                ]
+             else
+                List.map (groupMemberRow model conversation.ownerId) conversation.members
+            )
+        ]
+
+
+groupMemberRow : Model -> Int -> MemberUser -> Html Msg
+groupMemberRow model ownerId member =
+    let user = member.user
+    in button [ class "group-member", onClick (ShowUserPopup user.id), onContextMenu (OpenUserCtx user), attribute "aria-label" ("Open " ++ user.displayName ++ "'s profile") ]
+        [ div [ class "group-member-avatar" ]
+            [ presenceAvatar model.userStatuses user.id user.avatarUrl user.displayName ""
+            ]
+        , div [ class "group-member-copy" ]
+            [ b [] [ text user.displayName ]
+            , small [ class "muted" ] [ text ("@" ++ user.username) ]
+            ]
+        , if user.id == ownerId then span [ class "pill group-owner" ] [ text "owner" ] else text ""
+        ]
 
 renderChatHeader : Model -> Html Msg
 renderChatHeader model =
@@ -2947,7 +3162,7 @@ renderChatHeader model =
                             Nothing -> False
                         joinedCall = isJoinedCall id model
                     in div [ class "chat-header" ]
-                        [ convAvatar c
+                        [ convAvatar model c
                         , div [ class "grow" ]
                             [ h2 [] [ text (convName c) ]
                             , small [ class "muted" ] [ text (if c.memberCount > 2 then String.fromInt c.memberCount ++ " people" else "Direct message") ]
@@ -3041,7 +3256,7 @@ messageView model grouped m =
             Nothing -> False
         failed = Set.member m.id model.failedMsgIds
     in div [ class ("msg" ++ (if mine then " mine" else "") ++ (if grouped then " compact" else "") ++ (if m.id < 0 then " pending" else "") ++ (if failed then " failed" else "")), attribute "data-mid" (String.fromInt m.id), onContextMenu (OpenMessageCtx m) ]
-        [ if grouped then div [ class "avatar avatar-spacer" ] [] else avatarImg m.avatarUrl m.displayName ""
+        [ if grouped then div [ class "avatar avatar-spacer" ] [] else presenceAvatar model.userStatuses m.userId m.avatarUrl m.displayName ""
         , div [ class "msg-main" ]
             [ if grouped then
                 timestampButton model "msg-time compact-time" m
@@ -3096,7 +3311,7 @@ composerView key placeholderText model =
             Just reply ->
                 div [ class "reply-bar" ]
                     [ span [ class "reply-to-label" ] [ text ("Replying to " ++ reply.displayName) ]
-                    , span [ class "reply-preview-text" ] [ text reply.body ]
+                    , span [ class "reply-preview-text", title reply.body ] [ text ("“" ++ ellipsize 96 reply.body ++ "”") ]
                     , button [ class "btn secondary", onClick CancelReply ] [ text "Cancel" ]
                     ]
             Nothing -> text ""
@@ -3130,19 +3345,22 @@ renderMessageBody body =
 attachmentMarkup : String -> Maybe ( Bool, String, String )
 attachmentMarkup line =
     let
-        parse image prefix =
+        parse image prefix endpoint =
             if String.startsWith prefix line && String.endsWith ")" line then
-                case String.split "](/api/files/" line of
+                case String.split ("](" ++ endpoint) line of
                     [ left, idPart ] ->
                         let name = String.dropLeft (String.length prefix) left
                             ident = String.dropRight 1 idPart
                         in if String.isEmpty name || String.isEmpty ident || String.contains "/" ident then Nothing
-                           else Just ( image, name, "/api/files/" ++ ident )
+                           else Just ( image, name, endpoint ++ ident )
                     _ -> Nothing
             else Nothing
-    in case parse True "![" of
+    in case parse True "![" "/api/files/" of
         Just value -> Just value
-        Nothing -> parse False "["
+        Nothing ->
+            case parse True "![" "/api/media/" of
+                Just value -> Just value
+                Nothing -> parse False "[" "/api/files/"
 
 onComposerKeyDown : Attribute Msg
 onComposerKeyDown =
@@ -3163,7 +3381,8 @@ renderNotificationsPage model =
     div [ class "notifications-page" ]
         [ div [ class "section-head notifications-head" ]
             [ div [] [ h2 [] [ text "Notifications" ], p [ class "muted" ] [ text "Mentions, replies, requests, and messages." ] ]
-            , button [ class "btn secondary", onClick ClearNotifs ] [ text "Mark all read" ]
+            , div [ class "nav-actions" ]
+                [ button [ class "btn secondary", onClick ClearNotifs, disabled (List.isEmpty model.notifs) ] [ text "Clear all" ] ]
             ]
         , div [ class "card notifications-list" ]
             (if List.isEmpty model.notifs then
@@ -3284,6 +3503,9 @@ fmtErr err =
         "database_unavailable" -> "The server database is temporarily unavailable."
         "database_timeout" -> "The server database timed out. Please try again."
         "rate_limited" -> "Too many attempts. Wait a moment and try again."
+        "user_not_found" -> "One or more usernames could not be found. Check the spelling and try again."
+        "too_many_members" -> "Group chats can contain up to 50 people."
+        "forbidden" -> "That action is not allowed. A user may have blocked one of the selected accounts."
         _ -> err |> String.replace "_" " "
 
 authValidationError : Model -> Maybe String
@@ -3393,6 +3615,23 @@ csvInts value =
         |> String.split ","
         |> List.filterMap (String.trim >> String.toInt)
         |> List.filter (\i -> i > 0)
+
+csvUsernames : String -> List String
+csvUsernames value =
+    value
+        |> String.split ","
+        |> List.map normalizeUsernameInput
+        |> List.filter (not << String.isEmpty)
+        |> uniqueStrings
+
+uniqueStrings : List String -> List String
+uniqueStrings values =
+    List.foldl (\value found -> if List.member value found then found else found ++ [ value ]) [] values
+
+normalizeUsernameInput : String -> String
+normalizeUsernameInput value =
+    let trimmed = String.trim value
+    in String.toLower (if String.startsWith "@" trimmed then String.dropLeft 1 trimmed else trimmed)
 
 listAt : Int -> List a -> Maybe a
 listAt idx items =

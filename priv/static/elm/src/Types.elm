@@ -1,10 +1,10 @@
 module Types exposing
-    ( User, Conversation, Message, Forum, ForumThread, Reply
+    ( User, Conversation, MemberUser, Message, Forum, ForumThread, Reply
     , Server, Channel, ServerMember, ServerData, InvitePreview, Friend, Notification
     , VoiceState, CallUI, CallPopup, CallUser, ActiveCall, CallMode(..)
     , ActiveRoute(..), Route(..), Model, PageState
     , Status(..), Relationship(..), ContextMenu, CtxItem, Msg(..)
-    , decodeUser, decodeConversation, decodeMessage, decodeForum
+    , decodeUser, decodeConversation, decodeMemberUser, decodeMessage, decodeForum
     , decodeThread, decodeReply, decodeServer, decodeChannel
     , decodeServerMember, decodeFriend, decodeNotification
     , decodeSyncData, decodeCallUser, encodeMessage, defaultMsg, statusToString
@@ -56,7 +56,7 @@ type alias Conversation =
     , createdAt : Int, updatedAt : Int, lastReadMessageId : Int
     , muted : Bool, requestState : String, memberCount : Int, lastBody : Maybe String
     , lastMessageId : Maybe Int, unread : Int, members : List MemberUser
-    , peerName : String, peerAvatarUrl : String, peerUsername : String
+    , peerId : Int, peerName : String, peerAvatarUrl : String, peerUsername : String
     }
 
 type alias MemberUser =
@@ -75,7 +75,7 @@ type alias ReplyPreview =
 type alias Forum =
     { id : Int, slug : String, name : String, description : String
     , position : Int, threadCount : Int, replyCount : Int, lastAt : Maybe Int
-    , memberCount : Int, joined : Bool
+    , memberCount : Int, joined : Bool, ownerId : Maybe Int
     }
 
 type alias ForumThread =
@@ -106,7 +106,7 @@ type alias ServerMember =
     { user : User, role : String, muted : Bool, joinedAt : Int }
 
 type alias Friend =
-    { user : User, status : String, incoming : Bool, outgoing : Bool }
+    { user : User, status : String, incoming : Bool, outgoing : Bool, blockedByMe : Bool }
 
 type alias Notification =
     { id : Int, kind : String, body : String, url : String
@@ -174,11 +174,13 @@ type alias Model =
     , forums : List Forum, threads : List ForumThread
     , currentThread : Maybe ForumThread, replies : List Reply
     , servers : List Server, convs : List Conversation
+    , conversationMembers : Dict Int (List MemberUser)
     , friends : List Friend, notifs : List Notification
     , searchUsers : List User, searchThreads : List ForumThread
     , currentServer : Maybe ServerData, currentProfile : Maybe User
     , invitePreview : Maybe InvitePreview
     , msg : List Message, nextBefore : Maybe Int
+    , loadingOlderMessages : Bool, hasOlderMessages : Bool
     , active : ActiveRoute, serverCache : Dict Int ServerData
     , drafts : Drafts, wsConnected : Bool, isLeader : Bool
     , tabId : String, subs : Set String
@@ -186,20 +188,23 @@ type alias Model =
     , soundEnabled : Bool, replyTo : Maybe ReplyPreview
     , toast : Maybe String, modal : Maybe String
     , settingsTab : String, inputText : String
-    , sidebarOpen : Bool, ctxMenu : Maybe ContextMenu
+    , sidebarOpen : Bool, serversSheetOpen : Bool, ctxMenu : Maybe ContextMenu
     , threadReply : String, searchQuery : String
     , authMode : String, authUsername : String, authBusy : Bool
     , authDisplayName : String, authPassword : String
     , profileDisplayName : String, profileBio : String
     , profileAvatarUrl : String, profileBannerUrl : String
+    , profileAvatarPreviewUrl : String, profileBannerPreviewUrl : String
+    , profileAvatarUploading : Bool, profileBannerUploading : Bool
     , profileStatus : String, profileTheme : String
     , serverName : String, serverDescription : String
     , modalTitle : String, modalBody : String, modalUserIds : String
-    , friendsTab : String, friendQuery : String
+    , friendsTab : String, friendQuery : String, friendSearchAttempted : Bool
     , booting : Bool
     , userStatuses : Dict String String
     , failedMsgIds : Set Int
     , currentProfileRelationship : String
+    , currentProfileBlockedByMe : Bool
     , pendingMessages : Dict Int String
     }
 
@@ -239,6 +244,8 @@ type Msg
     | Go String
     | ToggleSidebar
     | CloseSidebar
+    | ToggleServersSheet
+    | CloseServersSheet
     | OpenDM Int
     | ShowUserPopup Int
     | CloseModal
@@ -258,6 +265,7 @@ type Msg
     | MarkConvRead Int
     | OpenMessageCtx Message Int Int
     | OpenConvCtx Conversation Int Int
+    | OpenUserCtx User Int Int
     | CopyText String
     | JoinInvite
     | NewDmModal
@@ -352,6 +360,7 @@ decodeConversation = D.succeed Conversation
     |> andMap (D.field "last_message_id" (D.nullable D.int))
     |> andMap (D.field "unread" D.int |> defaultValue 0)
     |> andMap (D.field "members" (D.list decodeMemberUser) |> defaultValue [])
+    |> andMap (D.field "peer_id" D.int |> defaultValue 0)
     |> andMap (D.field "peer_name" D.string |> defaultValue "")
     |> andMap (D.field "peer_avatar_url" D.string |> defaultValue "")
     |> andMap (D.field "peer_username" D.string |> defaultValue "")
@@ -385,7 +394,7 @@ decodeReplyPreview = D.map4 ReplyPreview
 
 decodeForum : D.Decoder Forum
 decodeForum = D.map8 (\id slug name description position threadCount replyCount lastAt ->
-        \memberCount joined -> Forum id slug name description position threadCount replyCount lastAt memberCount joined
+        \memberCount joined ownerId -> Forum id slug name description position threadCount replyCount lastAt memberCount joined ownerId
     )
     (D.field "id" D.int) (D.field "slug" D.string)
     (D.field "name" D.string) (D.field "description" D.string)
@@ -394,6 +403,7 @@ decodeForum = D.map8 (\id slug name description position threadCount replyCount 
     (D.field "last_at" (D.nullable D.int))
     |> andMap (D.field "member_count" D.int |> defaultValue 0)
     |> andMap (D.field "joined" D.bool |> defaultValue False)
+    |> andMap (D.field "owner_id" (D.nullable D.int) |> defaultValue Nothing)
 
 decodeThread : D.Decoder ForumThread
 decodeThread = D.succeed ForumThread
@@ -450,10 +460,11 @@ decodeServerMember = D.map4 ServerMember
     (D.field "joined_at" D.int |> defaultValue 0)
 
 decodeFriend : D.Decoder Friend
-decodeFriend = D.map4 Friend
+decodeFriend = D.map5 Friend
     (D.field "user" decodeUser) (D.field "status" D.string |> defaultValue "accepted")
     (D.field "incoming" D.bool |> defaultValue False)
     (D.field "outgoing" D.bool |> defaultValue False)
+    (D.field "blocked_by_me" D.bool |> defaultValue False)
 
 decodeNotification : D.Decoder Notification
 decodeNotification = D.map6 Notification
