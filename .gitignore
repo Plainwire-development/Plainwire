@@ -13,8 +13,8 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 scripts/*
-!scripts/install-openrc-release.sh
-!scripts/update-openrc-release.sh
+scripts/install-openrc-release.sh
+scripts/update-openrc-release.sh
 erl_crash.dump
 *.crashdump
 *.dump
