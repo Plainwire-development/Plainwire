@@ -12,7 +12,6 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-scripts/*
 scripts/install-openrc-release.sh
 scripts/update-openrc-release.sh
 erl_crash.dump
@@ -35,7 +34,8 @@ Thumbs.db
 .idea/
 .vscode/
 
-# Generated frontend assets. Build from Elm/SCSS on deploy.
+# Generated frontend assets. Build from Elm/SCSS/HAML on deploy.
+priv/static/index.html
 priv/static/app.js
 priv/static/app.css
 priv/static/elm/elm-stuff/
