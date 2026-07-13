@@ -129,7 +129,7 @@ handle_msg(#{<<"type">> := <<"call_cancel">>, <<"conversation_id">> := Cid0}, St
 handle_msg(#{<<"type">> := <<"call_join">>, <<"conversation_id">> := Cid0}, State=#{uid:=Uid, session:=Session}) ->
     Cid = pw_util:int(Cid0),
     case pw_db:member_of_conversation(Uid, Cid) of
-        true -> maybe_leave_call(State), pw_hub:call_accept(Cid, Uid, self(), maps:get(user,Session)), {ok, State#{call=>Cid}};
+        true -> maybe_leave_call(State), pw_hub:call_join(Cid, Uid, self(), maps:get(user,Session)), {ok, State#{call=>Cid}};
         false -> reply_error(State, forbidden)
     end;
 handle_msg(#{<<"type">> := <<"call_leave">>}, State) -> S1 = maybe_leave_call(State), {ok, S1#{call=>undefined}};
@@ -309,7 +309,6 @@ droppable_event(presence_online) -> true;
 droppable_event(presence_offline) -> true;
 droppable_event(presence_status) -> true;
 droppable_event(voice_state) -> true;
-droppable_event(call_state) -> true;
 droppable_event(_) -> false.
 
 room_summary(State) ->

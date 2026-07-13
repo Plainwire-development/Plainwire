@@ -29,6 +29,7 @@
   let messageScrollSnapshot = null;
   let presenceWatchTimer = null;
   let vad = null;
+  let wsPingTimer = null;
   const debugEnabled = window.PLAINWIRE_DEBUG !== false && localStorage.getItem('plainwire_debug') !== 'false';
   const startedAt = performance.now();
   const redact = (value) => {
@@ -334,6 +335,8 @@
           : { type: 'call_join', conversation_id: room.id };
         sendWs(join);
       }
+      if (wsPingTimer) clearInterval(wsPingTimer);
+      wsPingTimer = setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) sendWs({ type: 'ping' }); }, 60000);
     };
     ws.onmessage = (event) => {
       try {
@@ -348,6 +351,7 @@
     ws.onerror = () => debug('WS', 'transport_error', { ready_state: ws?.readyState }, 'error');
     ws.onclose = (event) => {
       debug('WS', 'closed', { code: event.code, reason: event.reason || '(none)', clean: event.wasClean, reconnect_ms: 800 }, 'warn');
+      if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
       ws = null;
       setTimeout(connectWs, 800);
     };
@@ -851,6 +855,13 @@
     if (['voice_state', 'call_state', 'voice_peer_joined', 'call_peer_joined', 'call_ringing', 'call_incoming'].includes(msg.type)) markActive();
     if (msg.type === 'voice_state') joinRtcRoom('voice', msg.channel_id, msg.users || []).catch(() => {});
     if (msg.type === 'call_state') joinRtcRoom('call', msg.conversation_id, msg.users || []).catch(() => {});
+    if (msg.type === 'call_peer_joined' && msg.user_id && room) {
+      const peerUid = Number(msg.user_id);
+      if (peerUid && peerUid !== meId && !peers.has(peerUid)) {
+        const shouldOffer = meId > peerUid;
+        ensurePeer(peerUid, !shouldOffer).then(() => { if (shouldOffer) callPeer(peerUid); }).catch(() => {});
+      }
+    }
     if (msg.type === 'call_peer_left' || msg.type === 'voice_peer_left') closePeer(Number(msg.user_id));
     if (msg.type === 'voice_signal' || msg.type === 'call_signal') handleSignal(msg).catch(() => {});
     if (['call_declined', 'call_cancelled', 'call_missed', 'call_ended'].includes(msg.type)) leaveRtcRoom();
