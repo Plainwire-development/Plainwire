@@ -36,6 +36,8 @@ This release removes generated demo content. There are no fake users, bots, seed
 * Multi-tab WebSocket coordination
 * Silent sync fallback
 * WebRTC peer-to-peer voice signaling
+* Screen sharing with transceiver-based track swapping
+* Server/channel categories with collapsible sidebar grouping
 * PostgreSQL persistence across restarts
 
 ## Security
@@ -196,6 +198,8 @@ http://localhost:8080
 | `PLAINWIRE_REQUIRE_TURN` | prod: `true` | Fail startup when TURN is missing                             |
 | `PLAINWIRE_ALLOW_STATIC_TURN_CREDENTIALS` | `false` | Permit long-lived TURN credentials in prod      |
 | `PLAINWIRE_ICE_TRANSPORT_POLICY` | `all` | Set to `relay` to force all calls through TURN             |
+| `PLAINWIRE_VOICE_MAX_PARTICIPANTS` |   `8` | Maximum participants in a voice room (2–32)               |
+| `PLAINWIRE_VOICE_MAX_SHARES` |   `2` | Maximum simultaneous screen shares per voice room (1–8)   |
 
 Generate an encryption key:
 
@@ -226,7 +230,7 @@ PLAINWIRE_TURN_SECRET=replace-with-at-least-32-random-bytes
 Plainwire stores application data, including uploaded profile images, in PostgreSQL. Message
 attachments live in `PLAINWIRE_UPLOAD_DIR`. Both must be included in production backups.
 
-Schema changes are tracked in `schema_migrations`. Migrations are additive and run automatically on boot.
+Schema changes are tracked in `schema_migrations`. Migrations are additive and run automatically on boot. Migration 11 adds `channel_categories` for Discord-style server layout with collapsible category groups in the sidebar.
 
 Back up the database before upgrading:
 
@@ -252,7 +256,20 @@ For public hosting:
 * Set `PLAINWIRE_TRUST_PROXY=true` only when the app port is reachable solely by your proxy
 
 WebRTC voice uses STUN for direct peer-to-peer connections and automatically falls back to the
-configured TURN server when a direct connection is blocked by NAT or a firewall. With
+configured TURN server when a direct connection is blocked by NAT or a firewall. Screen sharing
+uses `getDisplayMedia` with two pre-created transceivers (audio + video); screen and camera tracks
+are swapped via `replaceTrack` without renegotiation. The UI detects whether `getDisplayMedia` is
+available and shows a toast on unsupported platforms (iOS Safari, Android Chrome). Encoder bitrate
+is automatically tiered based on mesh participant count. The stage window supports click-to-fullscreen.
+
+Platform support for screen sharing:
+* Chrome/Edge desktop: full support
+* Firefox desktop: full support
+* Safari desktop: full support (no display audio)
+* iOS Safari: not supported (no `getDisplayMedia`)
+* Android Chrome: not supported (no `getDisplayMedia`)
+
+With
 `PLAINWIRE_TURN_SECRET`, the authenticated RTC endpoint creates a user-scoped, short-lived HMAC-SHA1
 credential compatible with coturn's `use-auth-secret`/`static-auth-secret` mechanism. The browser
 refreshes configuration periodically. Configure the exact same secret in coturn, set its realm,

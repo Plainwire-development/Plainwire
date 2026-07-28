@@ -1,11 +1,11 @@
 module Types exposing
     ( User, Conversation, MemberUser, Message, Forum, ForumThread, Reply
-    , Server, Channel, ServerMember, ServerData, InvitePreview, Friend, Notification
+    , Server, Channel, Category, ServerMember, ServerData, InvitePreview, Friend, Notification
     , VoiceState, CallUI, CallPopup, CallUser, ActiveCall, CallMode(..)
     , ActiveRoute(..), Route(..), Model, PageState
     , Status(..), Relationship(..), ContextMenu, CtxItem, Msg(..)
     , decodeUser, decodeConversation, decodeMemberUser, decodeMessage, decodeForum
-    , decodeThread, decodeReply, decodeServer, decodeChannel
+    , decodeThread, decodeReply, decodeServer, decodeChannel, decodeCategory
     , decodeServerMember, decodeFriend, decodeNotification
     , decodeSyncData, decodeCallUser, encodeMessage, defaultMsg, statusToString
     , defaultValue
@@ -100,6 +100,12 @@ type alias Server =
 type alias Channel =
     { id : Int, serverId : Int, name : String
     , kind : String, position : Int, topic : String, createdAt : Int
+    , categoryId : Maybe Int
+    }
+
+type alias Category =
+    { id : Int, serverId : Int, name : String
+    , position : Int, createdAt : Int
     }
 
 type alias ServerMember =
@@ -120,9 +126,10 @@ type alias VoiceState =
     { mode : Maybe String, id : Maybe Int
     , stream : Maybe String, peers : Dict Int Bool
     , users : Dict Int VoiceUser, muted : Bool, deafened : Bool
+    , screenShare : Bool
     }
 
-type alias VoiceUser = { userId : Int, muted : Bool, deafened : Bool }
+type alias VoiceUser = { userId : Int, muted : Bool, deafened : Bool, screen : Bool }
 
 type alias CallUser =
     { userId : Int, displayName : String, avatarUrl : String
@@ -165,7 +172,9 @@ type alias PageState =
     { route : ActiveRoute, serverCache : Dict Int ServerData }
 
 type alias ServerData =
-    { server : Server, channels : List Channel, members : List ServerMember }
+    { server : Server, channels : List Channel, members : List ServerMember
+    , categories : List Category
+    }
 
 type alias Drafts = Dict String String
 
@@ -206,6 +215,8 @@ type alias Model =
     , currentProfileRelationship : String
     , currentProfileBlockedByMe : Bool
     , pendingMessages : Dict Int String
+    , pendingConversationId : Maybe Int
+    , collapsedCategories : Set Int
     }
 
 type alias InvitePreview =
@@ -326,6 +337,14 @@ type Msg
     | PresenceOffline Int
     | PresenceStatus Int String
     | SetMyStatus String
+    | StartScreenShare
+    | StopScreenShare
+    | CreateCategoryModal Int
+    | SubmitCategory Int String
+    | UpdateCategoryName Int Int String
+    | DeleteCategory Int Int
+    | ToggleCategory Int
+    | MoveChannelToCategory Int (Maybe Int)
     | RtcJoinFailed String
 
 
@@ -447,10 +466,17 @@ decodeServer = D.map8 Server
     (D.field "created_at" D.int)
 
 decodeChannel : D.Decoder Channel
-decodeChannel = D.map7 Channel
+decodeChannel = D.map8 Channel
     (D.field "id" D.int) (D.field "server_id" D.int)
     (D.field "name" D.string) (D.field "kind" D.string)
     (D.field "position" D.int) (D.field "topic" D.string |> defaultValue "")
+    (D.field "created_at" D.int)
+    (D.field "category_id" (D.nullable D.int) |> defaultValue Nothing)
+
+decodeCategory : D.Decoder Category
+decodeCategory = D.map5 Category
+    (D.field "id" D.int) (D.field "server_id" D.int)
+    (D.field "name" D.string) (D.field "position" D.int)
     (D.field "created_at" D.int)
 
 decodeServerMember : D.Decoder ServerMember

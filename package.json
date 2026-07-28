@@ -7,7 +7,9 @@
     "build:haml": "bash scripts/build-haml.sh",
     "build:scss": "sass priv/static/style.scss priv/static/app.css --no-source-map",
     "build:elm": "bash scripts/build-elm.sh",
-    "dev": "npm run build:haml && npm run build:scss && bash scripts/build-elm.sh"
+    "dev": "npm run build:haml && npm run build:scss && bash scripts/build-elm.sh",
+    "start": "bash scripts/start.sh",
+    "start:build": "bash scripts/start.sh --build"
   },
   "devDependencies": {
     "sass": "^1.101.0"

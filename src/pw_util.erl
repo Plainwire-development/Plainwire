@@ -6,6 +6,9 @@
     read_json/1, read_json/2, ok_json/2, err_json/3, set_cookie/3, clear_cookie/1, cookie_value/2,
     require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1, hex_binary/1
 ]).
+-ifdef(TEST).
+-export([constant_time/2]).
+-endif.
 
 env_int(Name, Default) ->
     case os:getenv(Name) of
@@ -259,7 +262,7 @@ cookie_value(Req, Name) ->
 require_csrf(Req, Session) ->
     Csrf = maps:get(csrf, Session, <<>>),
     Header = cowboy_req:header(<<"x-csrf-token">>, Req, <<>>),
-    Csrf =/= <<>> andalso Header =:= Csrf.
+    Csrf =/= <<>> andalso constant_time(Header, Csrf).
 
 ip(Req) ->
     case env_bool("PLAINWIRE_TRUST_PROXY", false) of
@@ -267,13 +270,60 @@ ip(Req) ->
         false -> peer_ip(Req)
     end.
 
+%% A forwarded header is only meaningful when the immediate peer is a proxy we
+%% control. Without that check any client could spoof the header and evade
+%% every IP-keyed rate limit.
 forwarded_ip(Req) ->
-    Header = cowboy_req:header(<<"x-forwarded-for">>, Req, <<>>),
-    First = hd(binary:split(Header, <<",">>, [global]) ++ [<<>>]),
-    case inet:parse_address(binary_to_list(string:trim(First))) of
-        {ok, Addr} -> Addr;
-        _ -> peer_ip(Req)
+    Peer = peer_ip(Req),
+    case trusted_proxy(Peer) of
+        false -> Peer;
+        true ->
+            Header = cowboy_req:header(<<"x-forwarded-for">>, Req, <<>>),
+            First = hd(binary:split(Header, <<",">>, [global]) ++ [<<>>]),
+            case inet:parse_address(binary_to_list(string:trim(First))) of
+                {ok, Addr} -> Addr;
+                _ -> Peer
+            end
     end.
+
+%% Defaults to loopback so the common "reverse proxy on the same host" setup
+%% keeps working without extra configuration.
+trusted_proxy(Peer) ->
+    Configured = env_str("PLAINWIRE_TRUSTED_PROXIES", <<"127.0.0.1/32,::1/128">>),
+    Cidrs = [string:trim(C) || C <- binary:split(Configured, <<",">>, [global]), string:trim(C) =/= <<>>],
+    lists:any(fun(Cidr) -> ip_in_cidr(Peer, Cidr) end, Cidrs).
+
+ip_in_cidr(Addr, Cidr) ->
+    case binary:split(Cidr, <<"/">>) of
+        [NetBin, LenBin] ->
+            case {inet:parse_address(binary_to_list(NetBin)), int(LenBin)} of
+                {{ok, Net}, Len} when is_integer(Len) -> same_prefix(Addr, Net, Len);
+                _ -> false
+            end;
+        [NetBin] ->
+            case inet:parse_address(binary_to_list(NetBin)) of
+                {ok, Net} -> Addr =:= Net;
+                _ -> false
+            end;
+        _ -> false
+    end.
+
+same_prefix(Addr, Net, Len) when tuple_size(Addr) =:= tuple_size(Net) ->
+    Bits = tuple_size(Addr) * bits_per_element(Addr),
+    case Len >= 0 andalso Len =< Bits of
+        true ->
+            Shift = Bits - Len,
+            (ip_to_int(Addr) bsr Shift) =:= (ip_to_int(Net) bsr Shift);
+        false -> false
+    end;
+same_prefix(_, _, _) -> false.
+
+bits_per_element(Addr) when tuple_size(Addr) =:= 4 -> 8;
+bits_per_element(_) -> 16.
+
+ip_to_int(Addr) ->
+    Width = bits_per_element(Addr),
+    lists:foldl(fun(E, Acc) -> (Acc bsl Width) bor E end, 0, tuple_to_list(Addr)).
 
 peer_ip(Req) ->
     case cowboy_req:peer(Req) of

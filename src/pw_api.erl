@@ -63,13 +63,22 @@ handle(<<"POST">>, [<<"login">>], Req0, _) ->
                 end
         end
     end);
+%% Stays reachable unauthenticated so load balancers can probe liveness, but the
+%% scheduler, process and pool internals are only returned to a signed-in user.
 handle(<<"GET">>, [<<"health">>], Req0, _) ->
     case pw_db:health() of
-        {ok, Data} -> pw_util:ok_json(Req0, #{ok=>true,data=>Data#{app => ok,
-            schedulers => erlang:system_info(schedulers_online),
-            processes => erlang:system_info(process_count),
-            process_limit => erlang:system_info(process_limit),
-            rate_limiter => pw_rate:stats()}});
+        {ok, Data} ->
+            Body = case auth(Req0) of
+                {ok, _} ->
+                    Data#{app => ok,
+                        schedulers => erlang:system_info(schedulers_online),
+                        processes => erlang:system_info(process_count),
+                        process_limit => erlang:system_info(process_limit),
+                        rate_limiter => pw_rate:stats()};
+                _ ->
+                    #{app => ok, database => maps:get(database, Data, ok)}
+            end,
+            pw_util:ok_json(Req0, #{ok=>true, data=>Body});
         {error, _} -> pw_util:err_json(Req0, 503, <<"unhealthy">>)
     end;
 handle(Method, Path, Req0, State) ->
@@ -135,6 +144,12 @@ authed(<<"GET">>, [<<"server">>, Id], Req, Session, _) -> result(Req, pw_db:serv
 authed(<<"POST">>, [<<"server">>, Id], Req0, Session, _) ->
     with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_server(uid(Session), Id, M)) end);
 authed(<<"POST">>, [<<"server">>, Id, <<"channels">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_channel(uid(Session), Id, maps:get(<<"name">>,M,<<>>), maps:get(<<"kind">>,M,<<"text">>))) end);
+authed(<<"GET">>, [<<"server">>, Id, <<"categories">>], Req, Session, _) -> result(Req, pw_db:categories(uid(Session), Id));
+authed(<<"POST">>, [<<"server">>, Id, <<"categories">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_category(uid(Session), Id, maps:get(<<"name">>,M,<<>>))) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"category">>, CatId], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_category(uid(Session), Id, CatId, M)) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"categories">>, <<"reorder">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:reorder_categories(uid(Session), Id, maps:get(<<"order">>,M,[]))) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"category">>, CatId, <<"delete">>], Req, Session, _) -> result(Req, pw_db:delete_category(uid(Session), Id, CatId));
+authed(<<"POST">>, [<<"channel">>, ChannelId, <<"move">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:move_channel(uid(Session), ChannelId, maps:get(<<"category_id">>,M,undefined), maps:get(<<"position">>,M,undefined))) end);
 authed(<<"POST">>, [<<"server">>, Id, <<"invites">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_invite(uid(Session), Id, maps:get(<<"channel_id">>,M,undefined), maps:get(<<"max_uses">>,M,0))) end);
 authed(<<"POST">>, [<<"invites">>, Code, <<"join">>], Req, Session, _) -> result(Req, pw_db:join_invite(uid(Session), Code));
 authed(<<"GET">>, [<<"invites">>, Code], Req, _, _) -> result(Req, pw_db:invite_preview(Code));

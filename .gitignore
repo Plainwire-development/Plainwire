@@ -4,7 +4,7 @@ deps/
 rebar3.crashdump
 *.beam
 *.ez
-test/
+# test/ is tracked so EUnit coverage runs in CI.
 node_modules/
 coverage/
 .nyc_output/

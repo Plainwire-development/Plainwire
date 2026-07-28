@@ -15,11 +15,14 @@
     close_conversation/2, leave_conversation/2, accept_message_request/2, deny_message_request/2,
     mark_conversation_read/2, notifications/1, mark_notifications_seen/1, clear_notifications/1, mark_url_seen/2,
     member_of_channel/2, member_of_conversation/2, member_of_server/2, conversation_peer_ids/2,
-    begin_upload/6, finish_upload/3, abort_upload/2, get_upload/2, stale_uploads/2, delete_upload/1
+    subscribable/2,
+    begin_upload/6, finish_upload/3, abort_upload/2, get_upload/2, stale_uploads/2, delete_upload/1,
+    upload_ref_backfill/1,
+    categories/2, create_category/3, update_category/4, reorder_categories/3, delete_category/3, move_channel/4
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -ifdef(TEST).
--export([profile_file_signature/2]).
+-export([profile_file_signature/2, extract_file_ids/1]).
 -endif.
 
 -record(st, {}).
@@ -33,6 +36,7 @@
 -define(SESSION_GC_MS, 3600000).
 
 -define(SESSION_CACHE, pw_session_cache).
+-define(UPLOAD_REFS_READY, pw_db_upload_refs_ready).
 
 start_link() -> gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
@@ -179,6 +183,12 @@ create_server(Uid, Name, Desc) -> call({create_server, Uid, Name, Desc}).
 update_server(Uid, Sid, Patch) -> call({update_server, Uid, Sid, Patch}).
 server(Uid, ServerId) -> call({server, Uid, ServerId}).
 create_channel(Uid, ServerId, Name, Kind) -> call({create_channel, Uid, ServerId, Name, Kind}).
+categories(Uid, ServerId) -> call({categories, Uid, ServerId}).
+create_category(Uid, ServerId, Name) -> call({create_category, Uid, ServerId, Name}).
+update_category(Uid, ServerId, CatId, Patch) -> call({update_category, Uid, ServerId, CatId, Patch}).
+reorder_categories(Uid, ServerId, Order) -> call({reorder_categories, Uid, ServerId, Order}).
+delete_category(Uid, ServerId, CatId) -> call({delete_category, Uid, ServerId, CatId}).
+move_channel(Uid, ChannelId, CatId, Position) -> call({move_channel, Uid, ChannelId, CatId, Position}).
 create_invite(Uid, ServerId, ChannelId, MaxUses) -> call({create_invite, Uid, ServerId, ChannelId, MaxUses}).
 invite_preview(Code) -> call({invite_preview, Code}).
 join_invite(Uid, Code) -> call({join_invite, Uid, Code}).
@@ -206,12 +216,14 @@ member_of_channel(Uid, ChannelId) -> call({member_of_channel, Uid, ChannelId}).
 member_of_conversation(Uid, Cid) -> call({member_of_conversation, Uid, Cid}).
 member_of_server(Uid, Sid) -> call({member_of_server, Uid, Sid}).
 conversation_peer_ids(Uid, Cid) -> call({conversation_peer_ids, Uid, Cid}).
+subscribable(Kind, Id) -> call({subscribable, Kind, Id}).
 begin_upload(Uid, Id, Name, Type, Size, Path) -> call({begin_upload, Uid, Id, Name, Type, Size, Path}).
 finish_upload(Uid, Id, Hash) -> call({finish_upload, Uid, Id, Hash}).
 abort_upload(Uid, Id) -> call({abort_upload, Uid, Id}).
 get_upload(Uid, Id) -> call({get_upload, Uid, Id}).
 stale_uploads(PendingBefore, ReadyBefore) -> call({stale_uploads, PendingBefore, ReadyBefore}).
 delete_upload(Id) -> call({delete_upload, Id}).
+upload_ref_backfill(Batch) -> call({upload_ref_backfill, Batch}).
 
 init([]) ->
     application:ensure_all_started(inets),
@@ -347,6 +359,7 @@ read_msg({begin_upload, _, _, _, _, _, _}) -> false;
 read_msg({finish_upload, _, _, _}) -> false;
 read_msg({abort_upload, _, _}) -> false;
 read_msg({delete_upload, _}) -> false;
+read_msg({upload_ref_backfill, _}) -> false;
 read_msg({prune_sessions, _}) -> false;
 read_msg(_) -> true.
 
@@ -454,17 +467,17 @@ route({session, Token}, Conn) ->
             H = pw_util:sha256_hex(Token),
             Now = pw_util:now_ms(),
             Sql = "SELECT s.user_id, s.csrf, u.username, u.display_name, u.bio, u.avatar_url, "
-                  "u.banner_url, u.status, u.theme, u.created_at, u.last_seen "
+                  "u.banner_url, u.status, u.theme, u.created_at, u.last_seen, s.expires_at "
                   "FROM sessions s JOIN users u ON u.id = s.user_id "
                   "WHERE s.token_hash = $1 AND s.expires_at > $2",
             case one(Conn, Sql, [H, Now]) of
-                {ok, [Uid, Csrf, Un, Dn, Bio, Av, Ban, St, Th, Cr, Ls]} ->
+                {ok, [Uid, Csrf, Un, Dn, Bio, Av, Ban, St, Th, Cr, Ls, ExpiresAt]} ->
                     Cutoff = Now - 60000,
                     _ = exec(Conn, "UPDATE sessions SET last_seen = $1 WHERE token_hash = $2 AND last_seen < $3", [Now, H, Cutoff]),
                     _ = exec(Conn, "UPDATE users SET last_seen = $1 WHERE id = $2 AND last_seen < $3", [Now, Uid, Cutoff]),
                     Session = #{user => user_map_full([Uid, Un, Dn, Bio, Av, Ban, St, Th, Cr, Ls]),
                            csrf => Csrf, server_time => Now},
-                    ets:insert(?SESSION_CACHE, {H, Session, Now + 300000}),
+                    ets:insert(?SESSION_CACHE, {H, Session, session_cache_expiry(Now, ExpiresAt)}),
                     {ok, Session};
                 _ ->
                     {error, no_session}
@@ -495,6 +508,8 @@ route({update_profile, Uid, Display0, Patch}, Conn) ->
         "UPDATE users SET display_name = $1, bio = $2, avatar_url = $3, banner_url = $4, "
         "status = $5, theme = $6, updated_at = $7 WHERE id = $8",
         [Display, Bio, Avatar, Banner, Status, Theme, Now, Uid]),
+    insert_profile_upload_ref(Conn, Uid, Avatar),
+    insert_profile_upload_ref(Conn, Uid, Banner),
     invalidate_session_cache(Uid),
     {ok, #{updated => true}};
 route({sync, Uid, Since0}, Conn) ->
@@ -856,7 +871,7 @@ route({server, Uid, ServerId0}, Conn) ->
     case one(Conn, "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2", [Sid, Uid]) of
         {ok, [Role]} ->
             {ok, S} = one(Conn, "SELECT id, owner_id, name, description, icon_url, created_at, updated_at FROM servers WHERE id = $1", [Sid]),
-            {ok, Ch} = rows(Conn, "SELECT id, server_id, name, kind, position, topic, created_at FROM channels WHERE server_id = $1 ORDER BY position ASC, id ASC", [Sid]),
+            {ok, Ch} = rows(Conn, "SELECT id, server_id, name, kind, position, topic, created_at, category_id FROM channels WHERE server_id = $1 ORDER BY position ASC, id ASC", [Sid]),
             {ok, Ms} = rows(Conn,
                 "SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.banner_url, u.status, u.theme, "
                 "u.created_at, u.last_seen, sm.role, sm.muted, sm.joined_at "
@@ -889,6 +904,91 @@ route({create_channel, Uid, Sid0, Name0, Kind0}, Conn) ->
             {error, invalid_channel_name};
         {_, false} ->
             {error, forbidden}
+    end;
+route({categories, Uid, Sid0}, Conn) ->
+    Sid = pw_util:int(Sid0),
+    case is_member(Conn, Uid, Sid) of
+        true ->
+            {ok, Rows} = rows(Conn, "SELECT id, server_id, name, position, created_at FROM channel_categories WHERE server_id = $1 ORDER BY position ASC, id ASC", [Sid]),
+            {ok, [category_map(R) || R <- Rows]};
+        false ->
+            {error, forbidden}
+    end;
+route({create_category, Uid, Sid0, Name0}, Conn) ->
+    Sid = pw_util:int(Sid0),
+    Name = pw_util:clean_text(Name0, 80),
+    case {byte_size(Name) >= 1, can_manage_server(Conn, Uid, Sid)} of
+        {true, true} ->
+            Now = pw_util:now_ms(),
+            {ok, [Pos]} = one(Conn, "SELECT COALESCE(max(position), 0) + 1 FROM channel_categories WHERE server_id = $1", [Sid]),
+            {ok, Cid} = insert_returning(Conn,
+                "INSERT INTO channel_categories(server_id, name, position, created_at) VALUES($1,$2,$3,$4) RETURNING id",
+                [Sid, Name, Pos, Now]),
+            pw_hub:broadcast({server, Sid}, #{type => category_created, server_id => Sid, category_id => Cid}),
+            {ok, #{id => Cid}};
+        {false, _} -> {error, invalid_category_name};
+        {_, false} -> {error, forbidden}
+    end;
+route({update_category, Uid, Sid0, CatId0, Patch}, Conn) ->
+    Sid = pw_util:int(Sid0),
+    CatId = pw_util:int(CatId0),
+    case can_manage_server(Conn, Uid, Sid) of
+        true ->
+            Name = pw_util:clean_text(maps:get(<<"name">>, Patch, <<>>), 80),
+            case byte_size(Name) >= 1 of
+                true ->
+                    ok = exec(Conn, "UPDATE channel_categories SET name = $1 WHERE id = $2 AND server_id = $3", [Name, CatId, Sid]),
+                    pw_hub:broadcast({server, Sid}, #{type => category_updated, server_id => Sid, category_id => CatId}),
+                    {ok, #{updated => true}};
+                false -> {error, invalid_category_name}
+            end;
+        false -> {error, forbidden}
+    end;
+route({reorder_categories, Uid, Sid0, Order0}, Conn) ->
+    Sid = pw_util:int(Sid0),
+    case can_manage_server(Conn, Uid, Sid) of
+        true ->
+            Order = case Order0 of L when is_list(L) -> L; _ -> [] end,
+            lists:foreach(fun(Item) ->
+                CatId = pw_util:int(maps:get(<<"id">>, Item, undefined)),
+                Pos = pw_util:int(maps:get(<<"position">>, Item, undefined)),
+                case {CatId, Pos} of
+                    {I, P} when is_integer(I), is_integer(P) ->
+                        exec(Conn, "UPDATE channel_categories SET position = $1 WHERE id = $2 AND server_id = $3", [P, I, Sid]);
+                    _ -> ok
+                end
+            end, Order),
+            pw_hub:broadcast({server, Sid}, #{type => categories_reordered, server_id => Sid}),
+            {ok, #{updated => true}};
+        false -> {error, forbidden}
+    end;
+route({delete_category, Uid, Sid0, CatId0}, Conn) ->
+    Sid = pw_util:int(Sid0),
+    CatId = pw_util:int(CatId0),
+    case can_manage_server(Conn, Uid, Sid) of
+        true ->
+            ok = exec(Conn, "UPDATE channels SET category_id = NULL WHERE category_id = $1 AND server_id = $2", [CatId, Sid]),
+            ok = exec(Conn, "DELETE FROM channel_categories WHERE id = $1 AND server_id = $2", [CatId, Sid]),
+            pw_hub:broadcast({server, Sid}, #{type => category_deleted, server_id => Sid, category_id => CatId}),
+            {ok, #{deleted => true}};
+        false -> {error, forbidden}
+    end;
+route({move_channel, Uid, ChannelId0, CatId0, Position0}, Conn) ->
+    ChannelId = pw_util:int(ChannelId0),
+    CatId = pw_util:int(CatId0),
+    Position = pw_util:int(Position0),
+    case one(Conn, "SELECT server_id FROM channels WHERE id = $1", [ChannelId]) of
+        {ok, [Sid]} ->
+            case can_manage_server(Conn, Uid, Sid) of
+                true ->
+                    CatIdSafe = case CatId of undefined -> null; I when is_integer(I) -> I end,
+                    PosSafe = case Position of undefined -> 0; P when is_integer(P) -> P end,
+                    ok = exec(Conn, "UPDATE channels SET category_id = $1, position = $2 WHERE id = $3", [CatIdSafe, PosSafe, ChannelId]),
+                    pw_hub:broadcast({server, Sid}, #{type => channel_moved, server_id => Sid, channel_id => ChannelId}),
+                    {ok, #{updated => true}};
+                false -> {error, forbidden}
+            end;
+        _ -> {error, not_found}
     end;
 route({create_invite, Uid, Sid0, ChannelId0, MaxUses0}, Conn) ->
     Sid = pw_util:int(Sid0),
@@ -963,7 +1063,8 @@ route({delete_message, Uid, Mid0}, Conn) ->
     end;
 route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
     Cid = pw_util:int(ChannelId0),
-    Body = store_message(pw_util:clean_text(Body0, ?MAX_MSG)),
+    Plain = pw_util:clean_text(Body0, ?MAX_MSG),
+    Body = store_message(Plain),
     ReplyTo = pw_util:int(ReplyTo0),
     case {byte_size(Body) > 0, channel_server_member(Conn, Uid, Cid), valid_reply_to(Conn, <<"channel">>, Cid, ReplyTo)} of
         {true, {ok, Sid}, true} ->
@@ -971,6 +1072,7 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
             {ok, Mid} = insert_returning(Conn,
                 "INSERT INTO messages(scope, scope_id, user_id, body, reply_to_id, created_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
                 [<<"channel">>, Cid, Uid, Body, ReplyTo, Now]),
+            insert_upload_refs(Conn, Plain, <<"channel">>, Cid, Now),
             {ok, Row} = one(Conn, message_select() ++ " WHERE m.id = $1", [Mid]),
             Msg = message_map(Conn, Row),
             pw_hub:broadcast({channel, Cid}, #{type => message_created, scope => channel, scope_id => Cid, message => Msg}),
@@ -1173,7 +1275,8 @@ route({conversation, Uid, Cid0}, Conn) ->
     end;
 route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
     Cid = pw_util:int(Cid0),
-    Body = store_message(pw_util:clean_text(Body0, ?MAX_MSG)),
+    Plain = pw_util:clean_text(Body0, ?MAX_MSG),
+    Body = store_message(Plain),
     ReplyTo = pw_util:int(ReplyTo0),
     case {byte_size(Body) > 0, conversation_can_send(Conn, Uid, Cid), valid_reply_to(Conn, <<"direct">>, Cid, ReplyTo)} of
         {true, true, true} ->
@@ -1181,6 +1284,7 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
             {ok, Mid} = insert_returning(Conn,
                 "INSERT INTO messages(scope, scope_id, user_id, body, reply_to_id, created_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
                 [<<"direct">>, Cid, Uid, Body, ReplyTo, Now]),
+            insert_upload_refs(Conn, Plain, <<"direct">>, Cid, Now),
             ok = exec(Conn, "UPDATE direct_threads SET updated_at = $1 WHERE id = $2", [Now, Cid]),
             ok = exec(Conn, "UPDATE direct_members SET last_read_message_id = $1 WHERE thread_id = $2 AND user_id = $3", [Mid, Cid, Uid]),
             ok = exec(Conn, "UPDATE direct_members SET hidden = false WHERE thread_id = $1 AND user_id <> $2", [Cid, Uid]),
@@ -1227,9 +1331,36 @@ route({finish_upload, Uid, Id, Hash}, Conn) ->
     exec(Conn, "UPDATE uploads SET status = 'ready', sha256 = $1 WHERE id = $2 AND user_id = $3 AND status = 'pending'", [Hash, Id, Uid]);
 route({abort_upload, Uid, Id}, Conn) ->
     exec(Conn, "DELETE FROM uploads WHERE id = $1 AND user_id = $2 AND status = 'pending'", [Id, Uid]);
-route({get_upload, _Uid, Id}, Conn) ->
-    case one(Conn, "SELECT name,content_type,size,path,sha256 FROM uploads WHERE id = $1 AND status = 'ready'", [Id]) of
-        {ok, [Name, Type, Size, Path, Hash]} -> {ok, #{name => Name, content_type => Type, size => Size, path => Path, sha256 => Hash}};
+route({get_upload, Uid, Id}, Conn) ->
+    case one(Conn, "SELECT name,content_type,size,path,sha256,user_id FROM uploads WHERE id = $1 AND status = 'ready'", [Id]) of
+        {ok, [Name, Type, Size, Path, Hash, OwnerId]} ->
+            case upload_readable(Conn, Uid, Id, pw_util:int(OwnerId)) of
+                true -> {ok, #{name => Name, content_type => Type, size => Size, path => Path, sha256 => Hash}};
+                false -> {error, forbidden}
+            end;
+        _ -> {error, not_found}
+    end;
+route({upload_ref_backfill, Batch0}, Conn) ->
+    Batch = min(2000, max(1, pw_util:int(Batch0))),
+    case one(Conn, "SELECT cursor, done FROM upload_ref_backfill WHERE id = 1", []) of
+        {ok, [_, true]} -> {ok, done};
+        {ok, [Cursor0, _]} ->
+            Cursor = pw_util:int(Cursor0),
+            {ok, Rows} = rows(Conn,
+                "SELECT id, scope, scope_id, body, created_at FROM messages "
+                "WHERE id > $1 AND deleted_at IS NULL ORDER BY id ASC LIMIT $2", [Cursor, Batch]),
+            case Rows of
+                [] ->
+                    ok = exec(Conn, "UPDATE upload_ref_backfill SET done = true WHERE id = 1", []),
+                    {ok, done};
+                _ ->
+                    lists:foreach(fun([_, Scope, ScopeId, Body, CreatedAt]) ->
+                        insert_upload_refs(Conn, load_message(Body), Scope, pw_util:int(ScopeId), pw_util:int(CreatedAt))
+                    end, Rows),
+                    Last = lists:max([pw_util:int(Mid) || [Mid, _, _, _, _] <- Rows]),
+                    ok = exec(Conn, "UPDATE upload_ref_backfill SET cursor = $1 WHERE id = 1", [Last]),
+                    {ok, continue}
+            end;
         _ -> {error, not_found}
     end;
 route({stale_uploads, PendingBefore, ReadyBefore}, Conn) ->
@@ -1239,10 +1370,25 @@ route({stale_uploads, PendingBefore, ReadyBefore}, Conn) ->
         "(up.status = 'ready' AND up.created_at < $2)) "
         "AND NOT EXISTS (SELECT 1 FROM users u WHERE "
         "u.avatar_url = '/api/files/' || up.id OR u.banner_url = '/api/files/' || up.id) "
+        "AND NOT EXISTS (SELECT 1 FROM upload_refs r WHERE r.upload_id = up.id) "
         "LIMIT 500", [PendingBefore, ReadyBefore]),
     {ok, [#{id => Id, path => Path} || [Id, Path] <- Rows]};
 route({delete_upload, Id}, Conn) ->
     exec(Conn, "DELETE FROM uploads WHERE id = $1", [Id]);
+%% Forums and threads are readable by any authenticated account, but the id still
+%% has to exist. Accepting unknown ids let a client grow the hub subscription map
+%% without bound.
+route({subscribable, thread, Id}, Conn) ->
+    case one(Conn, "SELECT id FROM threads WHERE id = $1", [Id]) of
+        {ok, [_]} -> true;
+        _ -> false
+    end;
+route({subscribable, forum, Id}, Conn) ->
+    case one(Conn, "SELECT id FROM forums WHERE id = $1", [Id]) of
+        {ok, [_]} -> true;
+        _ -> false
+    end;
+route({subscribable, _, _}, _Conn) -> false;
 route({member_of_channel, Uid, Cid0}, Conn) ->
     case channel_server_member(Conn, Uid, pw_util:int(Cid0)) of
         {ok, _} -> true;
@@ -1271,6 +1417,14 @@ invalidate_session_cache(Uid) ->
     end, ok, ?SESSION_CACHE),
     ok.
 
+%% The cached entry must never outlive the stored session, otherwise a pruned or
+%% expired session keeps authenticating from ETS for the rest of the window.
+session_cache_expiry(Now, ExpiresAt) ->
+    case pw_util:int(ExpiresAt) of
+        Expires when is_integer(Expires) -> min(Now + 300000, Expires);
+        _ -> Now + 300000
+    end.
+
 make_session(Conn, Uid) ->
     Token = pw_util:random_token(32),
     Csrf = pw_util:random_token(24),
@@ -1281,7 +1435,7 @@ make_session(Conn, Uid) ->
         [H, Uid, Csrf, Now, Expires, Now]),
     {ok, User} = route({me, Uid}, Conn),
     Session = #{token => Token, csrf => Csrf, user => User, server_time => Now},
-    ets:insert(?SESSION_CACHE, {H, maps:remove(token, Session), Now + 300000}),
+    ets:insert(?SESSION_CACHE, {H, maps:remove(token, Session), session_cache_expiry(Now, Expires)}),
     Session.
 
 migrate(Conn) ->
@@ -1409,6 +1563,34 @@ migrations() -> [
         "PRIMARY KEY(thread_id,user_id))",
         "CREATE INDEX IF NOT EXISTS idx_thread_views_user ON thread_views(user_id,thread_id)",
         "UPDATE threads SET views = 0"
+    ]},
+    %% Uploads used to be readable by any authenticated account that knew an id.
+    %% Attachments are only referenced as /api/files/<id> inside message bodies,
+    %% which are ciphertext when encryption at rest is enabled, so readability
+    %% has to be recorded explicitly instead of derived from the body at query
+    %% time.
+    {10, [
+        "CREATE TABLE IF NOT EXISTS upload_refs(upload_id text NOT NULL REFERENCES uploads(id) ON DELETE CASCADE, "
+        "scope text NOT NULL CHECK(scope IN ('channel','direct','profile')), scope_id integer NOT NULL, "
+        "created_at bigint NOT NULL, PRIMARY KEY(upload_id, scope, scope_id))",
+        "CREATE INDEX IF NOT EXISTS idx_upload_refs_upload ON upload_refs(upload_id)",
+        "CREATE TABLE IF NOT EXISTS upload_ref_backfill(id integer PRIMARY KEY, cursor integer NOT NULL DEFAULT 0, "
+        "done boolean NOT NULL DEFAULT false)",
+        "INSERT INTO upload_ref_backfill(id, cursor, done) VALUES(1, 0, false) ON CONFLICT (id) DO NOTHING",
+        %% Avatars and banners are served from the same route and must stay
+        %% visible to every account, so those references are exact and cheap.
+        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
+        "SELECT up.id, 'profile', u.id, 0 FROM users u JOIN uploads up ON up.id = substring(u.avatar_url from 12) "
+        "WHERE u.avatar_url LIKE '/api/files/%' ON CONFLICT DO NOTHING",
+        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
+        "SELECT up.id, 'profile', u.id, 0 FROM users u JOIN uploads up ON up.id = substring(u.banner_url from 12) "
+        "WHERE u.banner_url LIKE '/api/files/%' ON CONFLICT DO NOTHING"
+    ]},
+    {11, [
+        "CREATE TABLE IF NOT EXISTS channel_categories(id serial PRIMARY KEY, server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, "
+        "name text NOT NULL, position integer NOT NULL, created_at bigint NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_channel_categories_server ON channel_categories(server_id, position ASC, id ASC)",
+        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS category_id integer REFERENCES channel_categories(id) ON DELETE SET NULL"
     ]}
 ].
 
@@ -1524,11 +1706,102 @@ store_image_url(Url0) ->
     end.
 
 valid_file_id(Id) when byte_size(Id) >= 24, byte_size(Id) =< 64 ->
-    lists:all(fun(C) ->
-        (C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z) orelse
-        (C >= $0 andalso C =< $9) orelse C =:= $- orelse C =:= $_
-    end, binary_to_list(Id));
+    lists:all(fun(C) -> file_id_char(C) end, binary_to_list(Id));
 valid_file_id(_) -> false.
+
+file_id_char(C) ->
+    (C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z) orelse
+    (C >= $0 andalso C =< $9) orelse C =:= $- orelse C =:= $_.
+
+%% An upload is readable by its owner, by anyone when it backs a profile image
+%% (avatars are served from the same route and must stay public), and by anyone
+%% who can read a message scope the file was posted into.
+upload_readable(_Conn, Uid, _Id, Uid) when is_integer(Uid) -> true;
+upload_readable(Conn, Uid, Id, _OwnerId) ->
+    case upload_refs_enforced(Conn) of
+        false -> true;
+        true ->
+            case rows(Conn, "SELECT scope, scope_id FROM upload_refs WHERE upload_id = $1 LIMIT 200", [Id]) of
+                {ok, Refs} -> lists:any(fun(Ref) -> upload_ref_grants(Conn, Uid, Ref) end, Refs);
+                _ -> false
+            end
+    end.
+
+upload_ref_grants(_Conn, _Uid, [<<"profile">>, _]) -> true;
+upload_ref_grants(Conn, Uid, [Scope, ScopeId]) when Scope =:= <<"channel">>; Scope =:= <<"direct">> ->
+    can_read_messages(Conn, Uid, Scope, pw_util:int(ScopeId));
+upload_ref_grants(_Conn, _Uid, _Ref) -> false.
+
+%% Historic message bodies cannot be scanned in SQL once encryption at rest is
+%% enabled, so references are rebuilt by a resumable background pass. Rejecting
+%% reads before that finishes would break existing attachments, so enforcement
+%% only begins once the pass is complete.
+upload_refs_enforced(Conn) ->
+    case persistent_term:get(?UPLOAD_REFS_READY, false) of
+        true -> true;
+        false ->
+            case one(Conn, "SELECT done FROM upload_ref_backfill WHERE id = 1", []) of
+                {ok, [true]} ->
+                    persistent_term:put(?UPLOAD_REFS_READY, true),
+                    true;
+                _ -> false
+            end
+    end.
+
+insert_upload_refs(Conn, Body, Scope, ScopeId, Now)
+        when is_binary(Body), is_integer(ScopeId), ScopeId > 0,
+             Scope =:= <<"channel">> orelse Scope =:= <<"direct">> ->
+    lists:foreach(fun(Id) ->
+        %% Selecting from uploads keeps a body that references a deleted or
+        %% foreign id from raising a foreign-key error on the shared connection.
+        _ = try exec(Conn,
+                "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
+                "SELECT up.id, $2, $3, $4 FROM uploads up WHERE up.id = $1 "
+                "ON CONFLICT DO NOTHING", [Id, Scope, ScopeId, Now])
+            catch _:_ -> ok end
+    end, extract_file_ids(Body)),
+    ok;
+insert_upload_refs(_Conn, _Body, _Scope, _ScopeId, _Now) -> ok.
+
+insert_profile_upload_ref(Conn, Uid, <<"/api/files/", Id/binary>>) ->
+    case valid_file_id(Id) of
+        true ->
+            _ = try exec(Conn,
+                    "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
+                    "SELECT up.id, 'profile', $2, $3 FROM uploads up WHERE up.id = $1 "
+                    "ON CONFLICT DO NOTHING", [Id, Uid, pw_util:now_ms()])
+                catch _:_ -> ok end,
+            ok;
+        false -> ok
+    end;
+insert_profile_upload_ref(_Conn, _Uid, _Url) -> ok.
+
+%% Attachments only appear as /api/files/<id> URLs inside a message body, so the
+%% ids have to be lifted out of the plaintext before it is encrypted for storage.
+extract_file_ids(Body) when is_binary(Body) ->
+    lists:usort(collect_file_ids(Body, 0, []));
+extract_file_ids(_) -> [].
+
+collect_file_ids(_Bin, Found, Acc) when Found >= 20 -> Acc;
+collect_file_ids(Bin, Found, Acc) ->
+    case binary:match(Bin, <<"/api/files/">>) of
+        nomatch -> Acc;
+        {Pos, Len} ->
+            Start = Pos + Len,
+            Rest = binary:part(Bin, Start, byte_size(Bin) - Start),
+            {Id, Tail} = take_file_id(Rest, 0),
+            case valid_file_id(Id) of
+                true -> collect_file_ids(Tail, Found + 1, [Id | Acc]);
+                false -> collect_file_ids(Tail, Found, Acc)
+            end
+    end.
+
+take_file_id(Bin, N) when N < byte_size(Bin) ->
+    case file_id_char(binary:at(Bin, N)) of
+        true -> take_file_id(Bin, N + 1);
+        false -> {binary:part(Bin, 0, N), binary:part(Bin, N, byte_size(Bin) - N)}
+    end;
+take_file_id(Bin, N) -> {binary:part(Bin, 0, N), <<>>}.
 
 current_profile_images(Conn, Uid) ->
     case one(Conn, "SELECT avatar_url, banner_url FROM users WHERE id = $1", [Uid]) of
@@ -1814,7 +2087,13 @@ server_full_map([Id, Owner, Name, Desc, Icon, Created, Updated], Role) ->
       icon_url => pw_util:proxied_image(Icon), created_at => Created, updated_at => Updated, role => Role}.
 
 channel_map([Id, Sid, Name, Kind, Pos, Topic, Created]) ->
-    #{id => Id, server_id => Sid, name => Name, kind => Kind, position => Pos, topic => Topic, created_at => Created}.
+    channel_map([Id, Sid, Name, Kind, Pos, Topic, Created, undefined]);
+channel_map([Id, Sid, Name, Kind, Pos, Topic, Created, CatId]) ->
+    #{id => Id, server_id => Sid, name => Name, kind => Kind, position => Pos, topic => Topic,
+      created_at => Created, category_id => db_null(CatId)}.
+
+category_map([Id, Sid, Name, Pos, Created]) ->
+    #{id => Id, server_id => Sid, name => Name, position => Pos, created_at => Created}.
 
 member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, Role, Muted, Joined]) ->
     #{user => user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last]),
@@ -1964,7 +2243,10 @@ can_read_messages(Conn, Uid, <<"channel">>, Id) ->
         {ok, _} -> true;
         _ -> false
     end;
-can_read_messages(Conn, Uid, <<"direct">>, Id) -> is_conversation_member(Conn, Uid, Id);
+%% Blocking previously only stopped sending, so a blocked participant kept
+%% reading the conversation they had been removed from.
+can_read_messages(Conn, Uid, <<"direct">>, Id) ->
+    is_conversation_member(Conn, Uid, Id) andalso not is_blocked_in_conversation(Conn, Uid, Id);
 can_read_messages(_, _, _, _) -> false.
 
 valid_reply_to(_, _, _, undefined) -> true;

@@ -20,6 +20,9 @@
   let remoteAudioUnlockInstalled = false;
   let audioUnlockToastShown = false;
   const peers = new Map();
+  let screenStream = null;
+  let screenSenders = new Map(); // uid -> RTCRtpSender for video
+  const displayMediaSupported = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
   const peerPromises = new Map();
   const defaultRtcConfig = { iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }] };
   let rtcConfig = window.PLAINWIRE_RTC_CONFIG || defaultRtcConfig;
@@ -30,6 +33,7 @@
   let presenceWatchTimer = null;
   let vad = null;
   let wsPingTimer = null;
+  const screenSharers = new Set();
   const debugEnabled = window.PLAINWIRE_DEBUG !== false && localStorage.getItem('plainwire_debug') !== 'false';
   const startedAt = performance.now();
   const redact = (value) => {
@@ -475,6 +479,281 @@
     vad.frame = requestAnimationFrame(sample);
   };
 
+  // ---- Floating window system (draggable stage video + preview) ----
+  const floatWindows = new Map(); // id -> { wrapper, video, title }
+  let floatZIndex = 900;
+  const floatPositions = {}; // id -> { x, y }
+
+  const makeFloatWindow = (id, titleText, accentColor, opts = {}) => {
+    const wrapper = document.createElement('div');
+    wrapper.id = 'pw-float-' + id;
+    wrapper.className = 'pw-float';
+    wrapper.style.cssText = 'position:fixed;z-index:' + (floatZIndex++) + ';display:none;transition:box-shadow .15s';
+    const saved = floatPositions[id];
+    if (saved) { wrapper.style.left = saved.x + 'px'; wrapper.style.top = saved.y + 'px'; }
+    else if (opts.right != null && opts.bottom != null) {
+      wrapper.style.right = opts.right + 'px';
+      wrapper.style.bottom = opts.bottom + 'px';
+    }
+
+    const bar = document.createElement('div');
+    bar.className = 'pw-float-bar';
+    bar.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 8px;background:' + accentColor + ';border-radius:8px 8px 0 0;cursor:grab;user-select:none;min-width:180px';
+
+    const title = document.createElement('span');
+    title.style.cssText = 'flex:1;color:#fff;font-size:11px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+    title.textContent = titleText;
+
+    const btnFs = document.createElement('button');
+    btnFs.className = 'pw-float-btn pw-float-fs';
+    btnFs.title = 'Fullscreen';
+    btnFs.textContent = '⛶';
+    btnFs.style.cssText = 'background:rgba(255,255,255,.2);border:none;color:#fff;width:22px;height:22px;border-radius:4px;cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center;transition:background .1s';
+    btnFs.addEventListener('mouseenter', () => { btnFs.style.background = 'rgba(255,255,255,.35)'; });
+    btnFs.addEventListener('mouseleave', () => { btnFs.style.background = 'rgba(255,255,255,.2)'; });
+    btnFs.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const vid = wrapper.querySelector('video');
+      if (vid) {
+        if (vid.requestFullscreen) vid.requestFullscreen().catch(() => {});
+        else if (vid.webkitRequestFullscreen) vid.webkitRequestFullscreen();
+      }
+    });
+
+    const btnClose = document.createElement('button');
+    btnClose.className = 'pw-float-btn pw-float-close';
+    btnClose.title = 'Close';
+    btnClose.textContent = '✕';
+    btnClose.style.cssText = 'background:rgba(255,255,255,.2);border:none;color:#fff;width:22px;height:22px;border-radius:4px;cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center;transition:background .1s';
+    btnClose.addEventListener('mouseenter', () => { btnClose.style.background = 'rgba(255,255,255,.35)'; });
+    btnClose.addEventListener('mouseleave', () => { btnClose.style.background = 'rgba(255,255,255,.2)'; });
+    if (opts.onClose) btnClose.addEventListener('click', (e) => { e.stopPropagation(); opts.onClose(); });
+
+    bar.appendChild(title);
+    bar.appendChild(btnFs);
+    bar.appendChild(btnClose);
+
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = true;
+    video.controls = false;
+    video.style.cssText = 'display:block;width:100%;height:auto;max-height:70vh;border-radius:0 0 8px 8px;background:#000;object-fit:contain';
+
+    wrapper.appendChild(bar);
+    wrapper.appendChild(video);
+    document.body.appendChild(wrapper);
+
+    // Drag logic
+    let dragging = false, dragOffX = 0, dragOffY = 0;
+    const onMove = (clientX, clientY) => {
+      if (!dragging) return;
+      let nx = clientX - dragOffX, ny = clientY - dragOffY;
+      nx = Math.max(0, Math.min(window.innerWidth - 80, nx));
+      ny = Math.max(0, Math.min(window.innerHeight - 40, ny));
+      wrapper.style.left = nx + 'px';
+      wrapper.style.top = ny + 'px';
+      wrapper.style.right = 'auto';
+      wrapper.style.bottom = 'auto';
+      floatPositions[id] = { x: nx, y: ny };
+    };
+    bar.addEventListener('mousedown', (e) => {
+      if (e.target.closest('.pw-float-btn')) return;
+      dragging = true;
+      const rect = wrapper.getBoundingClientRect();
+      dragOffX = e.clientX - rect.left;
+      dragOffY = e.clientY - rect.top;
+      bar.style.cursor = 'grabbing';
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', (e) => { onMove(e.clientX, e.clientY); });
+    document.addEventListener('mouseup', () => { if (dragging) { dragging = false; bar.style.cursor = 'grab'; } });
+    bar.addEventListener('touchstart', (e) => {
+      if (e.target.closest('.pw-float-btn')) return;
+      const t = e.touches[0];
+      dragging = true;
+      const rect = wrapper.getBoundingClientRect();
+      dragOffX = t.clientX - rect.left;
+      dragOffY = t.clientY - rect.top;
+    }, { passive: true });
+    document.addEventListener('touchmove', (e) => { if (dragging) { const t = e.touches[0]; onMove(t.clientX, t.clientY); } }, { passive: true });
+    document.addEventListener('touchend', () => { dragging = false; });
+
+    // Resize handle (bottom-right corner)
+    let resizing = false, startW = 0, startH = 0, startX = 0, startY = 0;
+    const resizeGrip = document.createElement('div');
+    resizeGrip.style.cssText = 'position:absolute;bottom:0;right:0;width:16px;height:16px;cursor:nwse-resize;opacity:.4;z-index:1';
+    resizeGrip.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" style="position:absolute;bottom:2px;right:2px"><path d="M11 1L1 11M11 5L5 11M11 9L9 11" stroke="#fff" stroke-width="1.5" fill="none"/></svg>';
+    wrapper.appendChild(resizeGrip);
+    wrapper.style.overflow = 'visible';
+    resizeGrip.addEventListener('mousedown', (e) => {
+      resizing = true;
+      startW = wrapper.offsetWidth;
+      startH = wrapper.offsetHeight;
+      startX = e.clientX;
+      startY = e.clientY;
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (!resizing) return;
+      const nw = Math.max(160, Math.min(window.innerWidth - 40, startW + (e.clientX - startX)));
+      const ratio = video.videoHeight / video.videoWidth || 0.56;
+      wrapper.style.width = nw + 'px';
+      video.style.height = Math.round(nw * ratio) + 'px';
+    });
+    document.addEventListener('mouseup', () => { resizing = false; });
+
+    floatWindows.set(id, { wrapper, video, title, bar });
+    return { wrapper, video, bar, title };
+  };
+
+  const ensureFloatWindow = (id, titleText, accentColor, opts) => {
+    if (floatWindows.has(id)) return floatWindows.get(id);
+    return makeFloatWindow(id, titleText, accentColor, opts);
+  };
+
+  // ---- Stage video for screenshare viewers ----
+  const showStageVideo = (uid, stream) => {
+    const { wrapper, video } = ensureFloatWindow('stage-' + uid, 'Screen Share', 'var(--accent,#5865f2)', {
+      right: 16, bottom: 80,
+      onClose: () => { wrapper.style.display = 'none'; video.srcObject = null; }
+    });
+    if (stream) {
+      video.srcObject = stream;
+      video.play().catch(() => {});
+    }
+    wrapper.style.display = '';
+  };
+
+  const hideStageVideo = (uid) => {
+    const w = floatWindows.get('stage-' + uid);
+    if (w) { w.wrapper.style.display = 'none'; w.video.srcObject = null; }
+  };
+
+  const removeStageVideo = (uid) => {
+    const w = floatWindows.get('stage-' + uid);
+    if (w) {
+      if (w.video.srcObject) { w.video.srcObject.getTracks().forEach((t) => t.stop()); w.video.srcObject = null; }
+      w.wrapper.remove();
+      floatWindows.delete('stage-' + uid);
+    }
+    screenSharers.delete(uid);
+  };
+
+  // ---- Local screen share preview ----
+  const showLocalScreenPreview = (stream) => {
+    const { wrapper, video } = ensureFloatWindow('local-preview', 'Your Screen Share', 'var(--ok,#23a55a)', {
+      right: 16, bottom: 80,
+      onClose: () => { stopScreenShare(); }
+    });
+    video.srcObject = stream;
+    video.play().catch(() => {});
+    wrapper.style.display = '';
+  };
+
+  const removeLocalScreenPreview = () => {
+    const w = floatWindows.get('local-preview');
+    if (w) {
+      if (w.video.srcObject) { w.video.srcObject.getTracks().forEach((t) => t.stop()); w.video.srcObject = null; }
+      w.wrapper.remove();
+      floatWindows.delete('local-preview');
+    }
+  };
+
+  // ---- Screen sharing ----
+  const screenShareEncoderTiers = [
+    { maxBitrate: 2500000, maxFramerate: 30, scaleResolutionDownBy: 1 },
+    { maxBitrate: 1500000, maxFramerate: 24, scaleResolutionDownBy: 1.5 },
+    { maxBitrate: 750000, maxFramerate: 15, scaleResolutionDownBy: 2 },
+  ];
+
+  const applyEncoderTier = (sender, participantCount) => {
+    if (!sender || !sender.track) return;
+    const tierIndex = Math.min(participantCount - 2, screenShareEncoderTiers.length - 1);
+    const tier = screenShareEncoderTiers[Math.max(0, tierIndex)];
+    sender.getParameters().then((params) => {
+      params.encodings = params.encodings || [{}];
+      params.encodings[0].maxBitrate = tier.maxBitrate;
+      params.encodings[0].maxFramerate = tier.maxFramerate;
+      params.encodings[0].scaleResolutionDownBy = tier.scaleResolutionDownBy;
+      sender.setParameters(params).catch(() => {});
+    }).catch(() => {});
+  };
+
+  const startScreenShare = async () => {
+    if (!displayMediaSupported) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing is not supported on this browser. Use Chrome, Edge, Firefox, or Safari on desktop.' });
+      return;
+    }
+    if (!room) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Join a voice channel first.' });
+      return;
+    }
+    try {
+      screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 30, max: 30 } },
+        audio: true
+      });
+    } catch (e) {
+      debug('MEDIA', 'display_media_failed', { name: e.name, error: e.message }, 'warn');
+      // Safari may not support audio in getDisplayMedia; retry without
+      if (e.name !== 'AbortError') {
+        try {
+          screenStream = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: { ideal: 30, max: 30 } }
+          });
+        } catch (e2) {
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing was cancelled or is not available.' });
+          return;
+        }
+      } else {
+        return;
+      }
+    }
+    const videoTrack = screenStream.getVideoTracks()[0];
+    if (videoTrack) {
+      videoTrack.contentHint = 'detail';
+      videoTrack.onended = () => stopScreenShare();
+    }
+    // Set screen flag on server
+    sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen: true } });
+    // Replace video track on all peer senders
+    peers.forEach((pc, peerUid) => {
+      if (pc._videoSender) {
+        pc._videoSender.replaceTrack(videoTrack).catch(() => {});
+        applyEncoderTier(pc._videoSender, peers.size + 1);
+        screenSenders.set(peerUid, pc._videoSender);
+      }
+    });
+    send(app.ports.bridgeReceive, { tag: 'screen_share_started', user_id: meId });
+    send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing started' });
+    showLocalScreenPreview(screenStream);
+    debug('MEDIA', 'screen_share_started', { tracks: screenStream.getTracks().length });
+  };
+
+  const stopScreenShare = () => {
+    if (!screenStream) return;
+    screenStream.getTracks().forEach((t) => t.stop());
+    screenStream = null;
+    // Restore camera video on all peer senders
+    const cameraTrack = localStream && localStream.getVideoTracks()[0];
+    peers.forEach((pc, peerUid) => {
+      if (pc._videoSender) {
+        pc._videoSender.replaceTrack(cameraTrack || null).catch(() => {});
+      }
+    });
+    screenSenders.clear();
+    removeLocalScreenPreview();
+    // Clear screen flag on server
+    if (room && ws?.readyState === WebSocket.OPEN) {
+      sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen: false } });
+    }
+    send(app.ports.bridgeReceive, { tag: 'screen_share_stopped', user_id: meId });
+    send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing stopped' });
+    debug('MEDIA', 'screen_share_stopped');
+  };
+
   const signalType = () => room && room.kind === 'voice' ? 'voice_signal' : 'call_signal';
 
   const sendSignal = (to, signal) => {
@@ -548,13 +827,29 @@
     }
     peers.delete(uid);
     debug('RTC', 'peer_closed', { peer_user_id: uid, remaining_peers: peers.size });
+    removeStageVideo(uid);
     document.getElementById('remote-audio-' + uid)?.remove();
     send(app.ports.bridgeReceive, { tag: 'rtc_peer_connected', user_id: uid, connected: false });
+  };
+
+  const cleanupAllFloatWindows = () => {
+    floatWindows.forEach((w, id) => {
+      if (w.video.srcObject) { w.video.srcObject.getTracks().forEach((t) => t.stop()); w.video.srcObject = null; }
+      w.wrapper.remove();
+    });
+    floatWindows.clear();
   };
 
   const leaveRtcRoom = () => {
     debug('RTC', 'room_leaving', { room, peers: peers.size });
     peers.forEach((_, uid) => closePeer(uid));
+    if (screenStream) {
+      screenStream.getTracks().forEach((t) => t.stop());
+      screenStream = null;
+    }
+    screenSenders.clear();
+    cleanupAllFloatWindows();
+    screenSharers.clear();
     stopVoiceDetection();
     room = null;
     if (localStream) {
@@ -565,6 +860,13 @@
 
   const cleanupRtcMedia = () => {
     peers.forEach((_, uid) => closePeer(uid));
+    if (screenStream) {
+      screenStream.getTracks().forEach((t) => t.stop());
+      screenStream = null;
+    }
+    screenSenders.clear();
+    cleanupAllFloatWindows();
+    screenSharers.clear();
     stopVoiceDetection();
     room = null;
     if (localStream) {
@@ -636,7 +938,17 @@
     pc._makingOffer = false;
     pc._pendingCandidates = [];
     pc._negotiated = false;
-    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    // Pre-create audio and video transceivers so adding/removing a screen
+    // share is a track swap instead of an m-line change, avoiding renegotiation
+    // glare across the mesh.
+    const audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+    const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
+    const audioTrack = stream.getAudioTracks()[0];
+    const videoTrack = stream.getVideoTracks()[0];
+    if (audioTrack) audioTransceiver.sender.replaceTrack(audioTrack);
+    if (videoTrack) videoTransceiver.sender.replaceTrack(videoTrack);
+    pc._audioSender = audioTransceiver.sender;
+    pc._videoSender = videoTransceiver.sender;
     pc.onnegotiationneeded = () => {
       if (pc._polite && !pc._negotiated) return;
       makeOffer(uid, pc).catch(() => closePeer(uid));
@@ -649,17 +961,27 @@
     };
     pc.ontrack = (ev) => {
       debug('RTC', 'remote_track', { peer_user_id: uid, kind: ev.track.kind, muted: ev.track.muted, ready_state: ev.track.readyState, streams: ev.streams?.length || 0 });
-      const audio = remoteAudio(uid);
-      if (ev.streams && ev.streams[0]) {
-        audio.srcObject = ev.streams[0];
-      } else {
-        const stream = audio.srcObject instanceof MediaStream ? audio.srcObject : new MediaStream();
-        stream.addTrack(ev.track);
-        audio.srcObject = stream;
+      if (ev.track.kind === 'audio') {
+        const audio = remoteAudio(uid);
+        if (ev.streams && ev.streams[0]) {
+          audio.srcObject = ev.streams[0];
+        } else {
+          const s = audio.srcObject instanceof MediaStream ? audio.srcObject : new MediaStream();
+          s.addTrack(ev.track);
+          audio.srcObject = s;
+        }
+        audio.muted = deafened;
+        playRemoteAudio(audio);
+        applySpeaker();
+      } else if (ev.track.kind === 'video') {
+        // Store stream for later — stage video only shown for screen sharers
+        if (!pc._videoStreams) pc._videoStreams = new Map();
+        const stream = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
+        pc._videoStreams.set(ev.track.id, stream);
+        if (screenSharers.has(uid)) {
+          showStageVideo(uid, stream);
+        }
       }
-      audio.muted = deafened;
-      playRemoteAudio(audio);
-      applySpeaker();
     };
     let reconnectAttempts = 0;
     pc.onconnectionstatechange = () => {
@@ -853,19 +1175,54 @@
   const handleRtcEvent = (msg) => {
     if (/^(voice|call)_/.test(msg.type || '')) debug('RTC', 'server_event', { message: msg });
     if (['voice_state', 'call_state', 'voice_peer_joined', 'call_peer_joined', 'call_ringing', 'call_incoming'].includes(msg.type)) markActive();
-    if (msg.type === 'voice_state') joinRtcRoom('voice', msg.channel_id, msg.users || []).catch(() => {});
+    if (msg.type === 'voice_state') {
+      joinRtcRoom('voice', msg.channel_id, msg.users || []).catch(() => {});
+      // Track who is screen sharing
+      const users = msg.users || [];
+      const newScreenSharers = new Set();
+      users.forEach((u) => { if (u.screen) newScreenSharers.add(u.user_id); });
+      // Show stage video for newly sharing peers
+      newScreenSharers.forEach((uid) => {
+        if (!screenSharers.has(uid)) {
+          const pc = peers.get(uid);
+          if (pc && pc._videoStreams) {
+            const lastStream = Array.from(pc._videoStreams.values()).pop();
+            if (lastStream) showStageVideo(uid, lastStream);
+          }
+        }
+      });
+      // Hide stage video for peers who stopped sharing
+      screenSharers.forEach((uid) => {
+        if (!newScreenSharers.has(uid)) hideStageVideo(uid);
+      });
+      screenSharers.clear();
+      newScreenSharers.forEach((uid) => screenSharers.add(uid));
+    }
     if (msg.type === 'call_state') joinRtcRoom('call', msg.conversation_id, msg.users || []).catch(() => {});
-    if (msg.type === 'call_peer_joined' && msg.user_id && room) {
+    if ((msg.type === 'call_peer_joined' || msg.type === 'voice_peer_joined') && msg.user_id && room) {
       const peerUid = Number(msg.user_id);
       if (peerUid && peerUid !== meId && !peers.has(peerUid)) {
         const shouldOffer = meId > peerUid;
         ensurePeer(peerUid, !shouldOffer).then(() => { if (shouldOffer) callPeer(peerUid); }).catch(() => {});
       }
     }
-    if (msg.type === 'call_peer_left' || msg.type === 'voice_peer_left') closePeer(Number(msg.user_id));
+    if (msg.type === 'call_peer_left' || msg.type === 'voice_peer_left') {
+      const leftUid = Number(msg.user_id);
+      screenSharers.delete(leftUid);
+      closePeer(leftUid);
+    }
     if (msg.type === 'voice_signal' || msg.type === 'call_signal') handleSignal(msg).catch(() => {});
     if (['call_declined', 'call_cancelled', 'call_missed', 'call_ended'].includes(msg.type)) leaveRtcRoom();
     if (msg.type === 'call_accepted') stopRingtones();
+    if (msg.type === 'voice_superseded' || msg.type === 'call_superseded') {
+      debug('RTC', 'superseded', { type: msg.type });
+      leaveRtcRoom();
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Another tab has taken over this session.' });
+    }
+    if (msg.type === 'share_denied') {
+      stopScreenShare();
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen share limit reached for this room.' });
+    }
   };
 
   const setMuted = (muted) => {
@@ -1274,6 +1631,12 @@
       case 'presence_update':
         setDesiredStatus(String(data));
         break;
+      case 'start_screen_share':
+        startScreenShare();
+        break;
+      case 'stop_screen_share':
+        stopScreenShare();
+        break;
       default:
         break;
     }
@@ -1290,16 +1653,37 @@
   document.addEventListener('error', (event) => {
     const target = event.target;
     if (!(target instanceof HTMLImageElement)) return;
-    target.removeAttribute('src');
-    target.removeAttribute('srcset');
-    if (target.dataset.avatarFallback) {
-      target.alt = target.dataset.avatarFallback;
+
+    const fallback = target.dataset.avatarFallback;
+    if (fallback) {
+      const retries = parseInt(target.dataset.avatarTries || '0', 10);
+      if (retries < 3) {
+        target.dataset.avatarTries = String(retries + 1);
+        setTimeout(() => {
+          const originalSrc = target.dataset.avatarSrc || target.src;
+          if (originalSrc) {
+            target.src = originalSrc;
+            target.classList.remove('image-failed');
+            target.classList.add('avatar-retrying');
+            setTimeout(() => target.classList.remove('avatar-retrying'), 1000);
+          }
+        }, Math.pow(2, retries) * 1000);
+        return;
+      }
+      target.removeAttribute('src');
+      target.removeAttribute('srcset');
+      delete target.dataset.avatarTries;
+      delete target.dataset.avatarSrc;
+      target.alt = fallback;
       target.setAttribute('role', 'img');
       target.setAttribute('aria-label', 'Avatar unavailable');
+      target.classList.add('image-failed');
     } else {
+      target.removeAttribute('src');
+      target.removeAttribute('srcset');
       target.alt = '';
+      target.classList.add('image-failed');
     }
-    target.classList.add('image-failed');
   }, true);
   window.addEventListener('pagehide', cleanupRtcMedia);
   window.addEventListener('beforeunload', cleanupRtcMedia);

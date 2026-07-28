@@ -1,6 +1,11 @@
 -module(pw_ws).
 -behaviour(cowboy_websocket).
 -export([init/2, websocket_init/1, websocket_handle/2, websocket_info/2, terminate/3]).
+-ifdef(TEST).
+-export([signal_ok/1]).
+-endif.
+
+-define(MAX_SUBS, 200).
 
 init(Req0, _State) ->
     case origin_allowed(Req0) of
@@ -60,9 +65,13 @@ handle_msg(#{<<"type">> := <<"subscribe">>, <<"key">> := Key0}, State=#{uid:=Uid
     case parse_key(Key0) of
         undefined -> {ok, State};
         Key ->
-            case can_subscribe(Uid, Key) of
-                true -> pw_hub:subscribe(self(), Key), {ok, State#{subs=>lists:usort([Key|Subs])}};
-                false -> reply_error(State, forbidden)
+            case length(Subs) >= ?MAX_SUBS andalso not lists:member(Key, Subs) of
+                true -> reply_error(State, too_many_subscriptions);
+                false ->
+                    case can_subscribe(Uid, Key) of
+                        true -> pw_hub:subscribe(self(), Key), {ok, State#{subs=>lists:usort([Key|Subs])}};
+                        false -> reply_error(State, forbidden)
+                    end
             end
     end;
 handle_msg(#{<<"type">> := <<"unsubscribe_all">>}, State) ->
@@ -75,13 +84,17 @@ handle_msg(#{<<"type">> := <<"presence_watch">>, <<"user_ids">> := Uids0}, State
 handle_msg(#{<<"type">> := <<"voice_join">>, <<"channel_id">> := Cid0}, State=#{uid:=Uid, session:=Session}) ->
     Cid = pw_util:int(Cid0),
     case pw_db:member_of_channel(Uid, Cid) of
-        true -> maybe_leave_voice(State), pw_hub:voice_join(Cid, Uid, self(), maps:get(user,Session)), {ok, State#{voice=>Cid}};
+        true ->
+            maybe_leave_voice(State),
+            case pw_hub:voice_join(Cid, Uid, self(), maps:get(user,Session)) of
+                ok -> {ok, State#{voice=>Cid}};
+                {error, Reason} -> reply_error(State#{voice=>undefined}, Reason)
+            end;
         false -> reply_error(State, forbidden)
     end;
 handle_msg(#{<<"type">> := <<"voice_leave">>}, State) -> S1 = maybe_leave_voice(State), {ok, S1#{voice=>undefined}};
 handle_msg(#{<<"type">> := <<"voice_state">>, <<"patch">> := Patch}, State=#{uid:=Uid, session:=Session, voice:=Cid}) when is_integer(Cid), is_map(Patch) ->
-    Clean = #{muted=>pw_util:bool(maps:get(<<"muted">>,Patch,false)), deafened=>pw_util:bool(maps:get(<<"deafened">>,Patch,false))},
-    pw_hub:voice_state(Cid, Uid, Clean, maps:get(user,Session)), {ok, State};
+    pw_hub:voice_state(Cid, Uid, clean_room_patch(Patch), maps:get(user,Session)), {ok, State};
 handle_msg(#{<<"type">> := <<"voice_signal">>, <<"to_user_id">> := To0, <<"signal">> := Sig}, State=#{uid:=Uid, voice:=Cid}) when is_integer(Cid) ->
     case {pw_util:int(To0), signal_ok(Sig)} of
         {To, true} when is_integer(To), To > 0 -> pw_hub:voice_signal(Cid, Uid, To, Sig), {ok, State};
@@ -109,8 +122,10 @@ handle_msg(#{<<"type">> := <<"call_accept">>, <<"conversation_id">> := Cid0}, St
     case pw_db:member_of_conversation(Uid, Cid) of
         true ->
             S1 = maybe_leave_call(State),
-            pw_hub:call_accept(Cid, Uid, self(), maps:get(user, Session)),
-            {ok, S1#{call => Cid}};
+            case pw_hub:call_accept(Cid, Uid, self(), maps:get(user, Session)) of
+                ok -> {ok, S1#{call => Cid}};
+                {error, Reason} -> reply_error(S1#{call => undefined}, Reason)
+            end;
         false ->
             reply_error(State, forbidden)
     end;
@@ -129,13 +144,17 @@ handle_msg(#{<<"type">> := <<"call_cancel">>, <<"conversation_id">> := Cid0}, St
 handle_msg(#{<<"type">> := <<"call_join">>, <<"conversation_id">> := Cid0}, State=#{uid:=Uid, session:=Session}) ->
     Cid = pw_util:int(Cid0),
     case pw_db:member_of_conversation(Uid, Cid) of
-        true -> maybe_leave_call(State), pw_hub:call_join(Cid, Uid, self(), maps:get(user,Session)), {ok, State#{call=>Cid}};
+        true ->
+            maybe_leave_call(State),
+            case pw_hub:call_join(Cid, Uid, self(), maps:get(user,Session)) of
+                ok -> {ok, State#{call=>Cid}};
+                {error, Reason} -> reply_error(State#{call=>undefined}, Reason)
+            end;
         false -> reply_error(State, forbidden)
     end;
 handle_msg(#{<<"type">> := <<"call_leave">>}, State) -> S1 = maybe_leave_call(State), {ok, S1#{call=>undefined}};
 handle_msg(#{<<"type">> := <<"call_state">>, <<"patch">> := Patch}, State=#{uid:=Uid, session:=Session, call:=Cid}) when is_integer(Cid), is_map(Patch) ->
-    Clean = #{muted=>pw_util:bool(maps:get(<<"muted">>,Patch,false)), deafened=>pw_util:bool(maps:get(<<"deafened">>,Patch,false))},
-    pw_hub:call_state(Cid, Uid, Clean, maps:get(user,Session)), {ok, State};
+    pw_hub:call_state(Cid, Uid, clean_room_patch(Patch), maps:get(user,Session)), {ok, State};
 handle_msg(#{<<"type">> := <<"call_signal">>, <<"to_user_id">> := To0, <<"signal">> := Sig}, State=#{uid:=Uid, call:=Cid}) when is_integer(Cid) ->
     case {pw_util:int(To0), signal_ok(Sig)} of
         {To, true} when is_integer(To), To > 0 -> pw_hub:call_signal(Cid, Uid, To, Sig), {ok, State};
@@ -144,7 +163,14 @@ handle_msg(#{<<"type">> := <<"call_signal">>, <<"to_user_id">> := To0, <<"signal
 handle_msg(#{<<"type">> := <<"voice_activity">>, <<"active">> := Active0}=Msg, State=#{uid:=Uid}) ->
     Active = pw_util:bool(Active0),
     Level = clamp_level(pw_util:int(maps:get(<<"level_db">>, Msg, -100))),
-    debug(info, case Active of true -> "voice_detected"; false -> "voice_stopped" end,
+    %% Speaking state drives the participant ring, so it is relayed to the room
+    %% rather than only logged. It is rate limited separately and dropped first
+    %% under queue pressure because a stale ring is harmless.
+    case pw_rate:allow({ws_activity, Uid}, 120, 60000) of
+        true -> relay_activity(State, Uid, Active);
+        false -> ok
+    end,
+    debug(debug, case Active of true -> "voice_detected"; false -> "voice_stopped" end,
         #{uid => Uid, active => Active, level_db => Level, room => room_summary(State)}),
     {ok, State};
 handle_msg(#{<<"type">> := <<"presence_update">>, <<"status">> := Status0}, #{uid:=Uid}=State) ->
@@ -199,11 +225,24 @@ make_key(Type, Id) -> {Type, Id}.
 can_subscribe(Uid, {channel, Id}) -> pw_db:member_of_channel(Uid, Id);
 can_subscribe(Uid, {direct, Id}) -> pw_db:member_of_conversation(Uid, Id);
 can_subscribe(Uid, {server, Id}) -> pw_db:member_of_server(Uid, Id);
-can_subscribe(_, {thread, _}) -> true;
-can_subscribe(_, {forum, _}) -> true.
+can_subscribe(_, {thread, Id}) -> pw_db:subscribable(thread, Id);
+can_subscribe(_, {forum, Id}) -> pw_db:subscribable(forum, Id).
 
-signal_ok(Sig) when is_map(Sig) -> byte_size(pw_util:json(Sig)) =< 32768;
+%% Signals are relayed verbatim to another participant, so the shape is checked
+%% here rather than trusting a bare size limit.
+signal_ok(#{<<"kind">> := <<"offer">>, <<"sdp">> := Sdp}) -> sdp_ok(Sdp);
+signal_ok(#{<<"kind">> := <<"answer">>, <<"sdp">> := Sdp}) -> sdp_ok(Sdp);
+signal_ok(#{<<"kind">> := <<"candidate">>, <<"candidate">> := Candidate}) -> candidate_ok(Candidate);
 signal_ok(_) -> false.
+
+sdp_ok(#{<<"type">> := Type, <<"sdp">> := Sdp}) when is_binary(Sdp) ->
+    lists:member(Type, [<<"offer">>, <<"answer">>, <<"pranswer">>, <<"rollback">>])
+        andalso byte_size(Sdp) =< 32768;
+sdp_ok(_) -> false.
+
+candidate_ok(Candidate) when is_map(Candidate) ->
+    byte_size(pw_util:json(Candidate)) =< 4096;
+candidate_ok(_) -> false.
 
 clean_status(<<"busy">>) -> <<"busy">>;
 clean_status(<<"away">>) -> <<"away">>;
@@ -234,7 +273,7 @@ revalidate_session(State=#{last_auth_check := Last, token := Token, uid := Uid})
                 {ok, Session} ->
                     User = maps:get(user, Session),
                     case maps:get(id, User) of
-                        Uid -> {ok, State#{session=>Session, last_auth_check=>Now}};
+                        Uid -> {ok, revalidate_rooms(State#{session=>Session, last_auth_check=>Now})};
                         _ -> {error, expired}
                     end;
                 _ ->
@@ -242,12 +281,39 @@ revalidate_session(State=#{last_auth_check := Last, token := Token, uid := Uid})
                         {ok, Session2} ->
                             User2 = maps:get(user, Session2),
                             case maps:get(id, User2) of
-                                Uid -> {ok, State#{session=>Session2, last_auth_check=>Now}};
+                                Uid -> {ok, revalidate_rooms(State#{session=>Session2, last_auth_check=>Now})};
                                 _ -> {error, expired}
                             end;
                         _ -> {error, expired}
                     end
             end
+    end.
+
+%% Access can be revoked while a call is in progress (kicked from a server,
+%% removed from a conversation, blocked). The socket stays open, but the room is
+%% left so media stops flowing to someone who is no longer a member.
+revalidate_rooms(State=#{uid:=Uid}) ->
+    S1 = case maps:get(voice, State, undefined) of
+        Cid when is_integer(Cid) ->
+            case pw_db:member_of_channel(Uid, Cid) of
+                true -> State;
+                _ ->
+                    pw_hub:voice_leave(Cid, Uid),
+                    self() ! {hub_json, #{type => voice_ejected, channel_id => Cid, reason => access_revoked}},
+                    State#{voice => undefined}
+            end;
+        _ -> State
+    end,
+    case maps:get(call, S1, undefined) of
+        Conv when is_integer(Conv) ->
+            case pw_db:member_of_conversation(Uid, Conv) of
+                true -> S1;
+                _ ->
+                    pw_hub:call_leave(Conv, Uid),
+                    self() ! {hub_json, #{type => call_ejected, conversation_id => Conv, reason => access_revoked}},
+                    S1#{call => undefined}
+            end;
+        _ -> S1
     end.
 
 configured_origins() ->
@@ -309,7 +375,19 @@ droppable_event(presence_online) -> true;
 droppable_event(presence_offline) -> true;
 droppable_event(presence_status) -> true;
 droppable_event(voice_state) -> true;
+droppable_event(call_state) -> true;
+droppable_event(voice_activity) -> true;
+droppable_event(call_activity) -> true;
 droppable_event(_) -> false.
+
+relay_activity(#{voice := Cid}, Uid, Active) when is_integer(Cid) -> pw_hub:voice_activity(voice, Cid, Uid, Active);
+relay_activity(#{call := Cid}, Uid, Active) when is_integer(Cid) -> pw_hub:voice_activity(call, Cid, Uid, Active);
+relay_activity(_State, _Uid, _Active) -> ok.
+
+clean_room_patch(Patch) ->
+    #{muted => pw_util:bool(maps:get(<<"muted">>, Patch, false)),
+      deafened => pw_util:bool(maps:get(<<"deafened">>, Patch, false)),
+      screen => pw_util:bool(maps:get(<<"screen">>, Patch, false))}.
 
 room_summary(State) ->
     #{voice => maps:get(voice, State, undefined), call => maps:get(call, State, undefined)}.

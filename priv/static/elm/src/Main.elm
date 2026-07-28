@@ -103,7 +103,7 @@ init _ url _ =
       , tabId = "", subs = Set.empty
       , voice = { mode = Nothing, id = Nothing, stream = Nothing
                 , peers = Dict.empty, users = Dict.empty
-                , muted = False, deafened = False }
+                , muted = False, deafened = False, screenShare = False }
       , callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
       , callMode = Idle, soundEnabled = True, replyTo = Nothing
       , toast = Nothing, modal = Nothing, settingsTab = "profile"
@@ -120,6 +120,8 @@ init _ url _ =
       , profileStatus = "online", profileTheme = "system"
       , modalTitle = "", modalBody = "", modalUserIds = ""
       , friendsTab = "online", friendQuery = "", friendSearchAttempted = False
+        , pendingConversationId = Nothing
+        , collapsedCategories = Set.empty
       }
     , Cmd.batch
         [ apiSend (encodeApiRequest (ApiGet "/me"))
@@ -151,6 +153,9 @@ update msg model =
                     ( DmView a, DmView b ) -> a /= b
                     ( ChannelView a, ChannelView b ) -> a /= b
                     ( _, _ ) -> model.active /= active
+                pendingId = case active of
+                    DmView id -> if model.pendingConversationId == Just id then model.pendingConversationId else Nothing
+                    _ -> Nothing
             in ( { model | active = active
                   , msg = if clearMessages then [] else model.msg
                   , sidebarOpen = False
@@ -160,6 +165,7 @@ update msg model =
                   , nextBefore = Nothing
                   , loadingOlderMessages = False
                   , hasOlderMessages = if clearMessages then True else model.hasOlderMessages
+                  , pendingConversationId = pendingId
                   }
                , Cmd.batch
                     [ bridgeSend (E.object
@@ -529,7 +535,7 @@ update msg model =
             in case tag of
                 "join_voice" ->
                     case D.decodeValue D.int data of
-                        Ok _ -> ( model, cmd )
+                        Ok channelId -> ( { model | voice = updateVoiceMode "voice" channelId model.voice, callMode = InCall }, cmd )
                         Err _ -> ( model, cmd )
                 "start_call" ->
                     case D.decodeValue D.int data of
@@ -554,6 +560,16 @@ update msg model =
                        )
                 "toggle_speaker" ->
                     ( model, cmd )
+                "start_screen_share" ->
+                    ( model, cmd )
+                "stop_screen_share" ->
+                    ( model, cmd )
+                "screen_share_started" ->
+                    let voice0 = model.voice
+                    in ( { model | voice = { voice0 | screenShare = True } }, Cmd.none )
+                "screen_share_stopped" ->
+                    let voice0 = model.voice
+                    in ( { model | voice = { voice0 | screenShare = False } }, Cmd.none )
                 _ ->
                     ( model, cmd )
 
@@ -602,6 +618,32 @@ update msg model =
             ( { model | profileStatus = status }, Cmd.none )
         RtcJoinFailed _ ->
             ( { model | voice = clearVoice model.voice, callMode = Idle, callUI = { incoming = model.callUI.incoming, outgoing = Nothing, active = Nothing } }, Cmd.none )
+
+        StartScreenShare ->
+            ( model, bridgeSend (E.object [("tag", E.string "start_screen_share"), ("data", E.null)]) )
+
+        StopScreenShare ->
+            let voice0 = model.voice
+            in ( { model | voice = { voice0 | screenShare = False } }, bridgeSend (E.object [("tag", E.string "stop_screen_share"), ("data", E.null)]) )
+
+        ToggleCategory catId ->
+            let newSet = if Set.member catId model.collapsedCategories then Set.remove catId model.collapsedCategories else Set.insert catId model.collapsedCategories
+            in ( { model | collapsedCategories = newSet }, Cmd.none )
+
+        CreateCategoryModal serverId ->
+            ( { model | modal = Just ("create_category:" ++ String.fromInt serverId), modalTitle = "New Category", modalBody = "" }, Cmd.none )
+
+        SubmitCategory serverId name ->
+            ( { model | modal = Nothing }, apiSend (encodeApiRequest (ApiPost ("/server/" ++ String.fromInt serverId ++ "/categories") (Just (E.object [("name", E.string name)])))) )
+
+        UpdateCategoryName serverId catId name ->
+            ( model, apiSend (encodeApiRequest (ApiPost ("/server/" ++ String.fromInt serverId ++ "/category/" ++ String.fromInt catId) (Just (E.object [("name", E.string name)])))) )
+
+        DeleteCategory serverId catId ->
+            ( model, apiSend (encodeApiRequest (ApiPost ("/server/" ++ String.fromInt serverId ++ "/category/" ++ String.fromInt catId ++ "/delete") Nothing)) )
+
+        MoveChannelToCategory channelId catId ->
+            ( model, apiSend (encodeApiRequest (ApiPost ("/channel/" ++ String.fromInt channelId ++ "/move") (Just (E.object [("category_id", E.null)]))) ))
 
         LoadMoreMessages ->
             if model.loadingOlderMessages || not model.hasOlderMessages then
@@ -656,10 +698,6 @@ handleSync val model =
     case D.decodeValue decodeSyncData val of
         Ok data ->
             let
-                activeConversationGone =
-                    case model.active of
-                        DmView id -> not (List.any (\c -> c.id == id) data.conversations)
-                        _ -> False
                 nextModel =
                     { model
                         | notifs = data.notifications
@@ -668,10 +706,19 @@ handleSync val model =
                         , friends = data.friends
                         , serverTime = data.now
                     }
-            in if activeConversationGone then
-                ( { nextModel | msg = [] }, setHash "#dms" )
-            else
-                ( nextModel, Cmd.none )
+                redirectIfGone =
+                    case model.active of
+                        DmView id ->
+                            if List.any (\c -> c.id == id) data.conversations then
+                                -- conversation found, clear any pending flag
+                                ( { nextModel | pendingConversationId = Nothing }, Cmd.none )
+                            else if model.pendingConversationId == Just id then
+                                -- stale sync, wait for the next one
+                                ( nextModel, Cmd.none )
+                            else
+                                ( { nextModel | msg = [] }, setHash "#dms" )
+                        _ -> ( nextModel, Cmd.none )
+            in redirectIfGone
         Err _ -> ( model, Cmd.none )
 
 
@@ -766,7 +813,7 @@ handleCreateConversation : E.Value -> Model -> ( Model, Cmd Msg )
 handleCreateConversation val model =
     case D.decodeValue (D.field "id" D.int) val of
         Ok id ->
-            ( model
+            ( { model | pendingConversationId = Just id }
             , Cmd.batch
                 [ apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
                 , setHash ("#dm/" ++ String.fromInt id)
@@ -955,10 +1002,11 @@ handleInviteCreated val model =
 
 serverDataDecoder : Decoder ServerData
 serverDataDecoder =
-    D.map3 (\server channels members -> { server = server, channels = channels, members = members })
+    D.map4 (\server channels members categories -> { server = server, channels = channels, members = members, categories = categories })
         (D.field "server" decodeServer)
         (D.field "channels" (D.list decodeChannel))
         (D.field "members" (D.list decodeServerMember))
+        (D.field "categories" (D.list decodeCategory) |> defaultValue [])
 
 
 handleProfile : E.Value -> Model -> ( Model, Cmd Msg )
@@ -1055,7 +1103,14 @@ updateVoiceMode mode id voice =
 
 clearVoice : VoiceState -> VoiceState
 clearVoice voice =
-    { voice | mode = Nothing, id = Nothing }
+    { voice | mode = Nothing, id = Nothing, screenShare = False, users = Dict.empty }
+
+
+isCurrentServer : Int -> Model -> Bool
+isCurrentServer serverId model =
+    model.currentServer
+        |> Maybe.map (\d -> d.server.id == serverId)
+        |> Maybe.withDefault False
 
 
 toggleMute : VoiceState -> VoiceState
@@ -1257,7 +1312,13 @@ handleWsEvent val model =
                         userDict = Dict.fromList (List.map (\u -> ( u.userId, u )) users)
                         voice0 = model.voice
                     in
-                    ( { model | voice = { voice0 | mode = Just "voice", id = Just channelId, users = userDict }, callMode = InCall }, Cmd.none )
+                    -- mode is set by the join handler before voice_state arrives
+                    -- so Nothing means user already left: ignore stale events
+                    case voice0.mode of
+                        Just "voice" ->
+                            ( { model | voice = { voice0 | id = Just channelId, users = userDict }, callMode = InCall }, Cmd.none )
+                        _ ->
+                            ( model, Cmd.none )
                 Err _ ->
                     ( model, Cmd.none )
         Ok ( "voice_peer_left", ev ) ->
@@ -1292,6 +1353,41 @@ handleWsEvent val model =
                 , ("data", E.string "error")
                 ])
             )
+        Ok ( "category_created", ev ) ->
+            case ( D.decodeValue (D.field "server_id" D.int) ev, D.decodeValue (D.field "category_id" D.int) ev ) of
+                ( Ok serverId, Ok _ ) ->
+                    if isCurrentServer serverId model then
+                        ( model, apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId))) )
+                    else ( model, Cmd.none )
+                _ -> ( model, Cmd.none )
+        Ok ( "category_updated", ev ) ->
+            case D.decodeValue (D.field "server_id" D.int) ev of
+                Ok serverId ->
+                    if isCurrentServer serverId model then
+                        ( model, apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId))) )
+                    else ( model, Cmd.none )
+                _ -> ( model, Cmd.none )
+        Ok ( "category_deleted", ev ) ->
+            case D.decodeValue (D.field "server_id" D.int) ev of
+                Ok serverId ->
+                    if isCurrentServer serverId model then
+                        ( model, apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId))) )
+                    else ( model, Cmd.none )
+                _ -> ( model, Cmd.none )
+        Ok ( "categories_reordered", ev ) ->
+            case D.decodeValue (D.field "server_id" D.int) ev of
+                Ok serverId ->
+                    if isCurrentServer serverId model then
+                        ( model, apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId))) )
+                    else ( model, Cmd.none )
+                _ -> ( model, Cmd.none )
+        Ok ( "channel_moved", ev ) ->
+            case D.decodeValue (D.field "server_id" D.int) ev of
+                Ok serverId ->
+                    if isCurrentServer serverId model then
+                        ( model, apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId))) )
+                    else ( model, Cmd.none )
+                _ -> ( model, Cmd.none )
         _ -> ( model, Cmd.none )
 
 
@@ -1375,18 +1471,19 @@ callStateDecoder =
         (D.field "conversation_id" D.int)
         (D.field "users" (D.list decodeCallUser))
 
-voiceStateDecoder : Decoder ( Int, List { userId : Int, muted : Bool, deafened : Bool } )
+voiceStateDecoder : Decoder ( Int, List { userId : Int, muted : Bool, deafened : Bool, screen : Bool } )
 voiceStateDecoder =
     D.map2 Tuple.pair
         (D.field "channel_id" D.int)
         (D.field "users" (D.list voiceUserDecoder))
 
-voiceUserDecoder : Decoder { userId : Int, muted : Bool, deafened : Bool }
+voiceUserDecoder : Decoder { userId : Int, muted : Bool, deafened : Bool, screen : Bool }
 voiceUserDecoder =
-    D.map3 (\uid muted deafened -> { userId = uid, muted = muted, deafened = deafened })
+    D.map4 (\uid muted deafened screen -> { userId = uid, muted = muted, deafened = deafened, screen = screen })
         (D.field "user_id" D.int)
         (D.field "muted" D.bool |> defaultValue False)
         (D.field "deafened" D.bool |> defaultValue False)
+        (D.field "screen" D.bool |> defaultValue False)
 
 callPeerJoinedDecoder : Decoder CallUser
 callPeerJoinedDecoder =
@@ -1422,7 +1519,11 @@ titleText model =
 
 renderToast : Model -> Html Msg
 renderToast model = case model.toast of
-    Just msg -> div [ class "toast", onClick DismissToast ] [ text msg ]
+    Just msg ->
+        div [ class "toast toast-visible" ]
+            [ span [ class "toast-text" ] [ text msg ]
+            , button [ class "toast-close", onClick DismissToast ] [ text "✕" ]
+            ]
     Nothing -> text ""
 
 renderContextMenu : Model -> Html Msg
@@ -1722,6 +1823,12 @@ renderCompactCallBar active model =
                 [ text (if model.voice.muted then "🔇" else "🎤") ]
             , button [ class ("btn icon-btn" ++ if model.voice.deafened then " call-muted" else ""), title "Toggle deafen", onClickStop (BridgeEvent "toggle_deafen" E.null) ]
                 [ text (if model.voice.deafened then "🔇" else "🔊") ]
+            , if model.voice.screenShare then
+                button [ class "btn icon-btn share-active", title "Stop screen share", onClickStop StopScreenShare ]
+                    [ text "🖥" ]
+              else
+                button [ class "btn icon-btn", title "Share screen", onClickStop StartScreenShare ]
+                    [ text "📺" ]
             , button [ class "btn icon-btn call-decline", title "Leave call", onClickStop EndCall ]
                 [ text "✕" ]
             ]
@@ -1792,7 +1899,9 @@ avatarImg url name cls =
             , src url
             , alt (name ++ " avatar")
             , attribute "decoding" "async"
+            , attribute "loading" "lazy"
             , attribute "data-avatar-fallback" (String.left 1 (String.toUpper name))
+            , attribute "data-avatar-src" url
             ]
             []
 
@@ -1999,6 +2108,27 @@ renderSideForRoute model =
 
 renderServerSide : Model -> ServerData -> Html Msg
 renderServerSide model data =
+    let textChannels = List.filter (\c -> c.kind /= "voice") data.channels
+        voiceChannels = List.filter (\c -> c.kind == "voice") data.channels
+        uncategorizedText = List.filter (\c -> c.categoryId == Nothing) textChannels
+        uncategorizedVoice = List.filter (\c -> c.categoryId == Nothing) voiceChannels
+        isCollapsed catId = Set.member catId model.collapsedCategories
+        categoryBlock cat channels =
+            if List.isEmpty channels then
+                []
+            else
+                [ div [ class "channel-group-title clickable", onClick (ToggleCategory cat.id) ]
+                    [ text (if isCollapsed cat.id then "▶ " else "▼ ")
+                    , text cat.name
+                    , if canManage then
+                        span [ class "category-actions" ]
+                            [ span [ class "ctx-trigger", stopClick, onClick (CreateCategoryModal data.server.id) ] [ text "+" ] ]
+                      else text ""
+                    ]
+                ] ++ (if isCollapsed cat.id then [] else List.map channelRow channels)
+        sortedCategories = List.sortBy .position data.categories
+        canManage = model.currentServer |> Maybe.map (\d -> d.server.role == "owner" || d.server.role == "admin") |> Maybe.withDefault False
+    in
     aside [ class ("side" ++ if model.sidebarOpen then " open" else "") ]
         [ div [ class "side-head" ]
             [ serverIcon data.server
@@ -2011,8 +2141,10 @@ renderServerSide model data =
                 ]
             ]
         , div [ class "list server-channel-list" ]
-            (channelGroup "Text channels" (List.filter (\c -> c.kind /= "voice") data.channels)
-             ++ channelGroup "Voice channels" (List.filter (\c -> c.kind == "voice") data.channels))
+            (channelGroup "Text channels" (List.filter (\c -> c.categoryId == Nothing) textChannels)
+             ++ List.concatMap (\cat -> categoryBlock cat (List.filter (\c -> c.categoryId == Just cat.id) textChannels)) sortedCategories
+             ++ channelGroup "Voice channels" (List.filter (\c -> c.categoryId == Nothing) voiceChannels)
+             ++ List.concatMap (\cat -> categoryBlock cat (List.filter (\c -> c.categoryId == Just cat.id) voiceChannels)) sortedCategories)
         , userPanel model
         ]
 
@@ -2795,48 +2927,77 @@ renderVoicePage channelId model =
     let joined = model.voice.mode == Just "voice" && model.voice.id == Just channelId
         members = Maybe.map .members model.currentServer |> Maybe.withDefault []
         voiceUsers = Dict.values model.voice.users
+        hasScreenShare = List.any .screen voiceUsers
+        shareCount = List.length (List.filter .screen voiceUsers)
+        participantCount = List.length voiceUsers
     in
     div []
-        [ div [ class "card pad" ]
-            [ h2 [] [ text "Voice channel" ]
+        [ div [ class "card pad voice-card" ]
+            [ div [ class "voice-header" ]
+                [ h2 [] [ text "Voice channel" ]
+                , if joined then
+                    span [ class "voice-count" ] [ text (String.fromInt participantCount ++ " in call") ]
+                  else text ""
+                ]
             , p [ class "muted" ] [ text "Join when you want to talk. Use Enable audio if your phone or browser blocks playback." ]
             , div [ class "voice-actions" ]
                 [ if joined then
                     button [ class "btn call-decline", onClick EndCall ] [ text "Leave" ]
                   else
-                    button [ class "btn", onClick (BridgeEvent "join_voice" (E.int channelId)) ] [ text "Join" ]
+                    button [ class "btn primary-join", onClick (BridgeEvent "join_voice" (E.int channelId)) ] [ text "Join" ]
                 , button [ class ("btn" ++ if model.voice.muted then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_mute" E.null) ] [ text (if model.voice.muted then "Unmute" else "Mute") ]
                 , button [ class ("btn" ++ if model.voice.deafened then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_deafen" E.null) ] [ text (if model.voice.deafened then "Undeafen" else "Deafen") ]
                 , button [ class "btn secondary", onClick (BridgeEvent "unlock_audio" E.null) ] [ text "Enable audio" ]
+                , if joined then
+                    if model.voice.screenShare then
+                        button [ class "btn call-decline share-active", onClick StopScreenShare ] [ text "Stop share" ]
+                    else
+                        button [ class "btn share-btn", onClick StartScreenShare ] [ text "Share screen" ]
+                  else text ""
                 ]
+            , if hasScreenShare then
+                div [ class "voice-screen-banner" ]
+                    [ span [ class "screen-pulse" ] []
+                    , text (String.fromInt shareCount ++ " sharing screen — look for the floating window")
+                    ]
+              else text ""
             , div [ class "voice-participants" ]
-                (if List.isEmpty voiceUsers then
-                    [ div [ class "empty" ] [ text (if joined then "Waiting for others to join..." else "Join to see voice participants.") ] ]
+                (if not joined || List.isEmpty voiceUsers then
+                    [ div [ class "empty voice-empty" ]
+                        [ text (if joined then "Waiting for others to join..." else "Join to see voice participants.") ]
+                 ]
                  else
                     List.map (voiceParticipantRow members) voiceUsers)
             ]
         ]
 
-voiceParticipantRow : List ServerMember -> { userId : Int, muted : Bool, deafened : Bool } -> Html Msg
+voiceParticipantRow : List ServerMember -> { userId : Int, muted : Bool, deafened : Bool, screen : Bool } -> Html Msg
 voiceParticipantRow members vu =
     let maybeMember = List.filter (\m -> m.user.id == vu.userId) members |> List.head
         name = maybeMember |> Maybe.map (\m -> m.user.displayName) |> Maybe.withDefault ("User " ++ String.fromInt vu.userId)
         avatarUrl = maybeMember |> Maybe.map (\m -> m.user.avatarUrl) |> Maybe.withDefault ""
         stateText =
-            if vu.deafened then
-                "Deafened"
-            else if vu.muted then
-                "Muted"
-            else
-                "Speaking enabled"
+            if vu.screen then "Sharing screen"
+            else if vu.deafened then "Deafened"
+            else if vu.muted then "Muted"
+            else "Live"
+        pillClass =
+            if vu.screen then "voice-state-pill sharing"
+            else if vu.muted || vu.deafened then "voice-state-pill muted"
+            else "voice-state-pill live"
+        pillText =
+            if vu.screen then "🖥 Share"
+            else if vu.deafened then "🔇"
+            else if vu.muted then "🔇 Muted"
+            else "● Live"
     in
-    div [ class "row voice-participant" ]
+    div [ class ("row voice-participant" ++ if vu.screen then " screen-sharing" else "") ]
         [ avatarImg avatarUrl name "small"
         , div [ class "grow" ]
             [ b [] [ text name ]
             , small [ class "muted" ] [ text stateText ]
             ]
-        , span [ class ("voice-state-pill" ++ if vu.deafened || vu.muted then " muted" else "") ] [ text (if vu.deafened then "D" else if vu.muted then "M" else "Live") ]
+        , span [ class pillClass ] [ text pillText ]
         ]
 
 renderProfilePage : Model -> Html Msg

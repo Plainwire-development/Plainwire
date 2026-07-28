@@ -546,8 +546,7 @@ button, a { touch-action: manipulation; }
   flex-shrink: 0;
   overflow: hidden;
   color: var(--text);
-  object-fit: cover;
-  img { width: 100%; height: 100%; object-fit: cover; }
+  img { width: 100%; height: 100%; object-fit: cover; object-position: center; }
   &.tiny { width: 22px; height: 22px; font-size: 10px; }
   &.big { width: 80px; height: 80px; font-size: 28px; }
 }
@@ -1101,28 +1100,7 @@ button, a { touch-action: manipulation; }
   .btn { min-width: 112px; border-radius: 10px; }
 }
 
-.toast {
-  position: fixed;
-  bottom: 20px;
-  right: 20px;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  padding: 12px 16px;
-  border-radius: 4px;
-  box-shadow: var(--shadow);
-  z-index: 200;
-  animation: fadein .2s ease;
-  max-width: 360px;
-  word-break: break-word;
-}
-
-@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-@keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
-
-@keyframes fadein {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: none; }
-}
+// toast styles moved to bottom of file
 
 .user-panel {
   margin-top: auto;
@@ -1312,18 +1290,32 @@ button, a { touch-action: manipulation; }
 
 .voice-participant {
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 12px;
   background: rgba(255,255,255,.03);
+  padding: 6px 10px;
+  transition: border-color .15s, background .15s;
+  &:hover { border-color: var(--hover); background: rgba(255,255,255,.05); }
+  &.screen-sharing {
+    border-color: var(--accent);
+    background: rgba(88,101,242,.06);
+    animation: share-glow 2s ease-in-out infinite alternate;
+  }
+}
+
+@keyframes share-glow {
+  from { box-shadow: 0 0 0 0 rgba(88,101,242,0); }
+  to   { box-shadow: 0 0 8px 2px rgba(88,101,242,.15); }
 }
 
 .voice-state-pill {
   margin-left: auto;
-  padding: 4px 8px;
+  padding: 4px 10px;
   border-radius: 999px;
   font-size: 11px;
   font-weight: 700;
-  color: var(--ok);
-  background: rgba(35,165,90,.12);
+  white-space: nowrap;
+  &.live { color: var(--ok); background: rgba(35,165,90,.12); }
+  &.sharing { color: var(--accent); background: rgba(88,101,242,.15); }
   &.muted { color: var(--muted); background: var(--hover); }
 }
 
@@ -2233,6 +2225,10 @@ img { max-width: 100%; }
   line-height: normal;
   text-align: center;
 }
+.avatar.avatar-retrying {
+  opacity: 0.6;
+  transition: opacity 0.3s;
+}
 
 .content {
   padding: var(--page-pad);
@@ -2365,7 +2361,7 @@ img { max-width: 100%; }
 
   .toast {
     left: 10px; right: 10px; bottom: calc(74px + env(safe-area-inset-bottom));
-    max-width: none; text-align: center;
+    max-width: none; text-align: center; justify-content: center;
   }
 }
 
@@ -3105,4 +3101,153 @@ img { max-width: 100%; }
   .request-actions .btn { flex: 1; }
   .notifications-list .notif { align-items: flex-start; gap: 10px; }
   .notif-time { padding-left: 0; }
+}
+
+.channel-group-title.clickable {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  &:hover { color: var(--text2); }
+}
+.category-actions {
+  margin-left: auto;
+  .ctx-trigger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px; height: 18px;
+    border-radius: 4px;
+    font-size: 14px;
+    color: var(--muted);
+    cursor: pointer;
+    &:hover { background: var(--hover); color: var(--text); }
+  }
+}
+
+.voice-participant.screen-sharing {
+  border-color: var(--accent);
+  background: rgba(88,101,242,.06);
+}
+
+// ---- Voice page improvements ----
+.voice-card {
+  .voice-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    h2 { margin: 0; }
+  }
+}
+.voice-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ok);
+  background: rgba(35,165,90,.12);
+  white-space: nowrap;
+}
+.primary-join {
+  background: var(--accent) !important;
+  color: #fff !important;
+  font-weight: 600;
+  &:hover { background: var(--accent2) !important; }
+}
+.share-btn {
+  background: rgba(88,101,242,.1) !important;
+  color: var(--accent) !important;
+  border: 1px solid rgba(88,101,242,.3) !important;
+  font-weight: 600;
+  &:hover { background: rgba(88,101,242,.18) !important; }
+}
+.share-active {
+  background: rgba(218,55,60,.1) !important;
+  color: var(--danger) !important;
+  border: 1px solid rgba(218,55,60,.3) !important;
+  font-weight: 600;
+  &:hover { background: rgba(218,55,60,.18) !important; }
+}
+.voice-screen-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: rgba(88,101,242,.08);
+  border: 1px solid rgba(88,101,242,.18);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 500;
+}
+.screen-pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .4; transform: scale(.7); }
+}
+.voice-empty {
+  text-align: center;
+  padding: 24px 16px;
+  color: var(--muted);
+  font-size: 14px;
+}
+.voice-actions {
+  .btn { transition: background .1s, transform .05s; &:active { transform: scale(.97); } }
+}
+
+// ---- Toast improvements ----
+.toast {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  padding: 10px 14px;
+  border-radius: 8px;
+  box-shadow: 0 4px 20px rgba(0,0,0,.35);
+  z-index: 200;
+  max-width: 380px;
+  word-break: break-word;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  animation: toast-in .25s ease;
+}
+.toast-text { flex: 1; }
+.toast-close {
+  flex-shrink: 0;
+  width: 24px; height: 24px;
+  border: none; border-radius: 6px;
+  background: var(--hover);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .1s, color .1s;
+  &:hover { background: var(--active); color: var(--text); }
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(12px) scale(.95); }
+  to   { opacity: 1; transform: none; }
+}
+
+// ---- Floating windows (screen share) ----
+.pw-float {
+  transition: box-shadow .15s;
+  &:hover { box-shadow: 0 8px 32px rgba(0,0,0,.45); }
+  video { pointer-events: none; }
 }

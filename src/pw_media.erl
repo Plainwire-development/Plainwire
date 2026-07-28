@@ -121,8 +121,16 @@ resolve_fetch_url(Url, Key, Now) ->
                         false ->
                             {error, too_large}
                     end;
+                {error, blocked_url} = Err ->
+                    Err;
+                {error, unsupported_type} = Err ->
+                    ets:insert(?CACHE, {Key, <<"error">>, <<"error">>, Now + 3600000}),
+                    Err;
                 Err ->
-                    ets:insert(?CACHE, {Key, <<"error">>, <<"error">>, Now + 60000}),
+                    %% Transient upstream failures (timeout, DNS, overload)
+                    %% are cached briefly to avoid hammering a struggling
+                    %% origin while still recovering quickly.
+                    ets:insert(?CACHE, {Key, <<"error">>, <<"error">>, Now + 5000}),
                     Err
             end;
         Err ->
@@ -198,12 +206,18 @@ decode_token(Token) ->
                 _ -> erlang:error(invalid_token)
             end;
         [Legacy] ->
-            %% Compatibility for URLs issued before signed proxy tokens. The
-            %% decoded URL still passes DNS/IP and production allowlist checks.
-            Url = pw_util:base64url_decode(Legacy),
-            case byte_size(Url) > 0 of
-                true -> Url;
-                false -> erlang:error(invalid_token)
+            %% Compatibility for URLs issued before signed proxy tokens. These
+            %% carry no signature, so anyone who knows the encoding can drive
+            %% fetches. Accept them only outside production, where the allowlist
+            %% is not yet enforced anyway.
+            case production_env() andalso not pw_util:env_bool("PLAINWIRE_ALLOW_UNSIGNED_MEDIA_TOKENS", false) of
+                true -> erlang:error(invalid_token);
+                false ->
+                    Url = pw_util:base64url_decode(Legacy),
+                    case byte_size(Url) > 0 of
+                        true -> Url;
+                        false -> erlang:error(invalid_token)
+                    end
             end;
         _ -> erlang:error(invalid_token)
     end.
@@ -238,12 +252,30 @@ production_env() ->
     lists:member(os:getenv("PLAINWIRE_ENV"), ["prod", "production"]) orelse
         lists:member(os:getenv("NODE_ENV"), ["prod", "production"]).
 
+%% This used to be a textual prefix list compared with string:prefix/2, which
+%% returns the remainder after the prefix rather than the prefix itself, so it
+%% never matched anything. Simply inverting the test would have blocked real
+%% hostnames such as 0.gravatar.com, because those prefixes describe IP
+%% literals. Literals are now matched against the same address table used for
+%% resolved names, and hostnames are left to addresses_blocked/1.
 blocked_host(H) ->
-    lists:any(fun(Prefix) -> string:prefix(H, Prefix) =:= Prefix end,
-        ["localhost", "127.", "0.", "10.", "192.168.", "172.16.", "172.17.",
-         "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.",
-         "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
-         "172.30.", "172.31.", "[::1]", "::1"]) orelse H =:= "169.254.169.254".
+    case host_to_addr(H) of
+        {ok, Addr} -> blocked_addr(Addr);
+        error -> H =:= "localhost" orelse lists:suffix(".localhost", H)
+    end.
+
+host_to_addr([$[ | Rest]) ->
+    case string:split(Rest, "]") of
+        [Inner, _] -> parse_addr(Inner);
+        _ -> error
+    end;
+host_to_addr(H) -> parse_addr(H).
+
+parse_addr(S) ->
+    case inet:parse_address(S) of
+        {ok, Addr} -> {ok, Addr};
+        _ -> error
+    end.
 
 blocked_host_or_addr(H) ->
     blocked_host(H) orelse addresses_blocked(H).
@@ -283,25 +315,59 @@ blocked_addr({_,_,_,_,_,_,_,_}) -> false;
 blocked_addr(_) -> true.
 
 http_get(Url) ->
-    case pw_http_fetch:get(Url, ?MAX_BYTES) of
+    http_get_redirect(Url, ?MAX_BYTES, 5).
+
+http_get_redirect(_Url, _MaxBytes, 0) ->
+    {error, too_many_redirects};
+http_get_redirect(Url, MaxBytes, Depth) ->
+    case pw_http_fetch:get(Url, MaxBytes) of
         {ok, Code, RespHeaders, Body} when Code >= 200, Code < 300 ->
             Type = content_type(RespHeaders),
             case allowed_type(Type) of
                 true -> {ok, Body, Type};
                 false -> {error, unsupported_type}
             end;
-        {ok, Code, _, _} when Code >= 300, Code < 400 ->
-            {error, blocked_url};
+        {ok, Code, RespHeaders, _} when Code >= 300, Code < 400 ->
+            case header_value("location", RespHeaders) of
+                undefined -> {error, {http, Code}};
+                Location0 ->
+                    Location = resolve_redirect(Url, pw_util:bin(Location0)),
+                    case validate_url(Location) of
+                        ok -> http_get_redirect(Location, MaxBytes, Depth - 1);
+                        _ -> {error, blocked_url}
+                    end
+            end;
         {ok, Code, _, _} ->
             {error, {http, Code}};
         {error, Reason} ->
             {error, Reason}
     end.
 
+resolve_redirect(OriginalUrl, Location) when is_list(Location) ->
+    resolve_redirect(OriginalUrl, pw_util:bin(Location));
+resolve_redirect(OriginalUrl, <<"/", _/binary>> = Relative) ->
+    case uri_string:parse(binary_to_list(OriginalUrl)) of
+        #{scheme := Scheme, host := Host, port := Port} ->
+            Base = list_to_binary(uri_string:recompose(#{scheme => Scheme, host => Host, port => Port})),
+            redirect_resolve(Base, Relative);
+        #{scheme := Scheme, host := Host} ->
+            Base = list_to_binary(uri_string:recompose(#{scheme => Scheme, host => Host})),
+            redirect_resolve(Base, Relative);
+        _ -> Relative
+    end;
+resolve_redirect(_OriginalUrl, Absolute) ->
+    pw_util:bin(Absolute).
+
+redirect_resolve(Base, <<"/", Path/binary>>) ->
+    <<Base/binary, Path/binary>>.
+
 content_type(Headers) ->
     case header_value("content-type", Headers) of
         undefined -> <<"application/octet-stream">>;
-        CT -> pw_util:bin(string:trim(hd(string:split(CT, ";"))))
+        CT when is_list(CT) ->
+            pw_util:bin(string:trim(hd(string:split(CT, ";"))));
+        CT when is_binary(CT) ->
+            pw_util:bin(string:trim(hd(binary:split(CT, <<";">>))))
     end.
 
 header_value(Name, Headers) ->

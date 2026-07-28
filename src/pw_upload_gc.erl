@@ -5,17 +5,38 @@
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
+%% Authorization is cached per {user, upload} while file metadata is cached per
+%% upload. Caching the combined result under the upload id alone would let the
+%% first authorized reader warm a cache entry that every other account then hits.
 lookup(Uid, Id) ->
     Now = erlang:monotonic_time(millisecond),
-    case ets:lookup(pw_upload_metadata_cache, Id) of
-        [{Id, Value, Expires}] when Expires > Now -> Value;
+    case authorized(Uid, Id, Now) of
+        {ok, false} -> {error, forbidden};
+        {ok, true} ->
+            case ets:lookup(pw_upload_metadata_cache, Id) of
+                [{Id, Value, Expires}] when Expires > Now -> Value;
+                _ -> fetch(Uid, Id, Now)
+            end;
+        unknown -> fetch(Uid, Id, Now)
+    end.
+
+fetch(Uid, Id, Now) ->
+    Value = pw_db:get_upload(Uid, Id),
+    case Value of
+        {ok, _} ->
+            ets:insert(pw_upload_metadata_cache, {Id, Value, Now + 300000}),
+            ets:insert(pw_upload_authz_cache, {{Uid, Id}, true, Now + 300000});
+        {error, forbidden} ->
+            ets:insert(pw_upload_authz_cache, {{Uid, Id}, false, Now + 60000});
         _ ->
-            Value = pw_db:get_upload(Uid, Id),
-            case Value of
-                {ok, _} -> ets:insert(pw_upload_metadata_cache, {Id, Value, Now + 300000});
-                _ -> ok
-            end,
-            Value
+            ok
+    end,
+    Value.
+
+authorized(Uid, Id, Now) ->
+    case ets:lookup(pw_upload_authz_cache, {Uid, Id}) of
+        [{_, Allowed, Expires}] when Expires > Now -> {ok, Allowed};
+        _ -> unknown
     end.
 
 acquire(Uid) ->
@@ -38,8 +59,11 @@ release(Uid) ->
 init([]) ->
     _ = ets:new(pw_upload_metadata_cache, [named_table, public, set,
         {read_concurrency, true}, {write_concurrency, true}]),
+    _ = ets:new(pw_upload_authz_cache, [named_table, public, set,
+        {read_concurrency, true}, {write_concurrency, true}]),
     _ = ets:new(pw_upload_active, [named_table, public, set, {write_concurrency, true}]),
     erlang:send_after(60000, self(), sweep),
+    erlang:send_after(5000, self(), upload_ref_backfill),
     {ok, #{}}.
 
 handle_info(sweep, State) ->
@@ -57,10 +81,27 @@ handle_info(sweep, State) ->
             end, Items);
         _ -> ok
     end,
-    _ = ets:select_delete(pw_upload_metadata_cache,
-        [{{'_', '_', '$1'}, [{'<', '$1', erlang:monotonic_time(millisecond)}], [true]}]),
+    Expiry = [{{'_', '_', '$1'}, [{'<', '$1', erlang:monotonic_time(millisecond)}], [true]}],
+    _ = ets:select_delete(pw_upload_metadata_cache, Expiry),
+    _ = ets:select_delete(pw_upload_authz_cache, Expiry),
     erlang:send_after(3600000, self(), sweep),
     {noreply, State};
+%% Rebuilds upload references for message bodies written before the references
+%% existed. Encrypted bodies cannot be scanned in SQL, so this walks them in
+%% batches and is resumable across restarts via a stored cursor.
+handle_info(upload_ref_backfill, State) ->
+    case pw_db:upload_ref_backfill(500) of
+        {ok, done} ->
+            logger:notice("[plainwire:uploads] upload_ref_backfill complete"),
+            {noreply, State};
+        {ok, continue} ->
+            erlang:send_after(250, self(), upload_ref_backfill),
+            {noreply, State};
+        Other ->
+            logger:warning("[plainwire:uploads] upload_ref_backfill deferred result=~p", [Other]),
+            erlang:send_after(30000, self(), upload_ref_backfill),
+            {noreply, State}
+    end;
 handle_info(_, State) -> {noreply, State}.
 
 handle_call(_, _, State) -> {reply, ok, State}.
