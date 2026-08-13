@@ -67,10 +67,7 @@ verify_password(Pass, Salt, Stored) ->
     case Parts of
         [IterBin, Hex] ->
             Iter = int(IterBin),
-            %% Treat corrupt or maliciously modified hashes as invalid rather
-            %% than allowing an unbounded PBKDF2 cost to pin a scheduler.
-            %% Accept legacy/test hashes with a lower work factor; production
-            %% startup separately enforces a strong configured minimum.
+            %% cap corrupt hashes before PBKDF2 eats a scheduler for lunch.
             case is_integer(Iter) andalso Iter >= 1 andalso Iter =< 2000000
                  andalso byte_size(Hex) =:= 64 of
                 true ->
@@ -199,18 +196,26 @@ headers() ->
         <<"content-type">> => <<"application/json; charset=utf-8">>
     }).
 
-security_headers() -> #{
-    <<"cache-control">> => <<"no-store">>,
-    <<"x-content-type-options">> => <<"nosniff">>,
-    <<"x-frame-options">> => <<"SAMEORIGIN">>,
-    <<"cross-origin-resource-policy">> => <<"same-origin">>,
-    <<"referrer-policy">> => <<"same-origin">>,
-    <<"cross-origin-opener-policy">> => <<"same-origin">>,
-    <<"x-permitted-cross-domain-policies">> => <<"none">>,
-    <<"strict-transport-security">> => <<"max-age=31536000; includeSubDomains">>,
-    <<"content-security-policy">> => <<"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'">>,
-    <<"permissions-policy">> => <<"camera=(), microphone=(self), geolocation=(), payment=(), usb=(), browsing-topics=()">>
-}.
+security_headers() ->
+    ScriptPolicy = case env_bool("PLAINWIRE_KRISP_ENABLED", false) of
+        true -> <<"script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; ">>;
+        false -> <<"script-src 'self'; worker-src 'self'; ">>
+    end,
+    Csp = <<"default-src 'self'; ", ScriptPolicy/binary,
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; ",
+        "connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'">>,
+    #{
+        <<"cache-control">> => <<"no-store">>,
+        <<"x-content-type-options">> => <<"nosniff">>,
+        <<"x-frame-options">> => <<"SAMEORIGIN">>,
+        <<"cross-origin-resource-policy">> => <<"same-origin">>,
+        <<"referrer-policy">> => <<"same-origin">>,
+        <<"cross-origin-opener-policy">> => <<"same-origin">>,
+        <<"x-permitted-cross-domain-policies">> => <<"none">>,
+        <<"strict-transport-security">> => <<"max-age=31536000; includeSubDomains">>,
+        <<"content-security-policy">> => Csp,
+        <<"permissions-policy">> => <<"camera=(), microphone=(self), geolocation=(), payment=(), usb=(), browsing-topics=()">>
+    }.
 
 proxied_image(Url0) ->
     Url = bin(Url0),
@@ -270,9 +275,7 @@ ip(Req) ->
         false -> peer_ip(Req)
     end.
 
-%% A forwarded header is only meaningful when the immediate peer is a proxy we
-%% control. Without that check any client could spoof the header and evade
-%% every IP-keyed rate limit.
+%% forwarded IPs only count when our proxy sent them. clients lie.
 forwarded_ip(Req) ->
     Peer = peer_ip(Req),
     case trusted_proxy(Peer) of
@@ -286,8 +289,7 @@ forwarded_ip(Req) ->
             end
     end.
 
-%% Defaults to loopback so the common "reverse proxy on the same host" setup
-%% keeps working without extra configuration.
+%% loopback proxy works out of the box.
 trusted_proxy(Peer) ->
     Configured = env_str("PLAINWIRE_TRUSTED_PROXIES", <<"127.0.0.1/32,::1/128">>),
     Cidrs = [string:trim(C) || C <- binary:split(Configured, <<",">>, [global]), string:trim(C) =/= <<>>],

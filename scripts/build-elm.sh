@@ -19,7 +19,12 @@ export PATH="${clean_path}"
 
 elm_bin="${ELM_BIN:-$(command -v elm || true)}"
 if [ -z "${elm_bin}" ]; then
-  printf '%s\n' "Elm compiler not found. Install Elm 0.19.x on the server PATH, then rerun scripts/build-elm.sh." >&2
+  if command -v guix >/dev/null 2>&1; then
+    printf '%s\n' "Elm compiler not found on PATH; building with 'guix shell elm'."
+    exec guix shell elm -- bash "${BASH_SOURCE[0]}"
+  fi
+
+  printf '%s\n' "Elm compiler not found. Install Elm 0.19.x or Guix, then rerun scripts/build-elm.sh." >&2
   exit 127
 fi
 

@@ -1,48 +1,35 @@
-# Plainwire Relay
+# plainwire relay
 
-Plainwire Relay is a hosted chat and forum platform with real-time messaging, servers, direct messages, forums, profiles, notifications, and voice calls.
+Plainwire Relay is a hosted chat/forum app with messages, servers, DMs, profiles,
+notifications, and voice calls.
 
-Plainwire is designed to run on our servers. Users are not expected to clone the project or run their own instance. The source can still be built locally for development, testing, or self-hosting, but the main use case is the hosted Plainwire service.
+Most people should use the hosted service. The repo is still buildable for dev,
+testing, poking around, or running your own copy.
 
-## Version
+## version
 
 **Plainwire Relay 1.1.0**
 
-This release removes generated demo content. There are no fake users, bots, seeded messages, or sample threads. On first boot, Plainwire only creates the default empty forum categories.
+No demo bots, fake users, or mystery sample posts. A fresh database starts fresh.
 
 > Link to the old [Plainwire Forums Concept](https://github.com/RobertFlexx/Plainwire-Forum)
 
-## Features
+## features
 
-* Account registration and login
-* Persistent user sessions
-* User profiles with avatar, banner, bio, status, and theme field
-* Friend requests, accept/remove/block
-* Direct messages and group DMs
-* Server creation
-* Text and voice channels
-* Server invite links with preview pages
-* Member sidebars for servers and channels
-* Forum categories, threads, and replies
-* Notifications
-* Message replies
-* Message deletion
-* Compact message grouping
-* Link embeds using Open Graph metadata
-* External image proxying
-* Streamed picture and file attachments up to 250 MB
-* Clipboard image paste, drag-and-drop uploads, inline image embeds, and file downloads
-* WebSocket live updates
-* Multi-tab WebSocket coordination
-* Silent sync fallback
-* WebRTC peer-to-peer voice signaling
-* Screen sharing with transceiver-based track swapping
-* Server/channel categories with collapsible sidebar grouping
-* PostgreSQL persistence across restarts
+* accounts, persistent sessions, profiles, friends, and blocking
+* DMs, group chats, servers, text channels, and voice channels
+* forums, threads, replies, notifications, and message replies/deletion
+* server invites, banners, accent colors, categories, and member sidebars
+* pasted or dragged uploads up to 250 MB, plus inline image/audio/video playback
+* Open Graph embeds and same-origin image proxying
+* live updates over WebSocket, including multi-tab coordination
+* peer-to-peer WebRTC voice and screen sharing
+* audio-device selection, mic testing, and optional Krisp processing
+* PostgreSQL persistence, because losing the chat on restart would be awkward
 
-## Security
+## security
 
-Plainwire includes the core security protections needed for a hosted community app:
+The important bits:
 
 * PBKDF2 password hashing
 * HttpOnly SameSite session cookies
@@ -53,9 +40,10 @@ Plainwire includes the core security protections needed for a hosted community a
 * Additive schema migrations through `schema_migrations`
 * External image proxying so third-party image hosts do not receive each user’s direct IP address
 
-Message encryption is encryption at rest, not end-to-end encryption. The server still handles message delivery, notifications, replies, moderation, and other platform features.
+Message encryption is at rest, not end-to-end. The server still sees message
+content while doing server things.
 
-## Stack
+## stack
 
 * [Erlang/OTP](https://github.com/erlang/otp)
 * [Cowboy](https://github.com/ninenines/cowboy)
@@ -67,53 +55,31 @@ Message encryption is encryption at rest, not end-to-end encryption. The server 
 * [WebRTC](https://github.com/webrtc)
 * [rebar3](https://github.com/erlang/rebar3)
 
-## Debug logging
+## debug logging
 
-The browser bridge logs API timing, WebSocket lifecycle and messages, microphone
-tracks, voice activity, WebRTC signaling/state changes, Elm commands, network
-changes, and uncaught errors. Sensitive fields and message bodies are redacted.
+Browser tracing is off by default; realtime logs get loud fast. In the console,
+use `PlainwireDebug.setEnabled(true)` and reload. Sensitive fields and message
+bodies are redacted.
 
-In the browser console, run `PlainwireDebug.snapshot()` for the current voice
-and connection state. Logging is enabled by default; use
-`PlainwireDebug.setEnabled(false)` (or `true`) to persist the setting and reload.
-Voice activity transitions and room/connection lifecycle events are also printed
-by the Erlang backend when the server is running. No audio is sent to the backend.
+`PlainwireDebug.snapshot()` dumps the current connection/voice state.
+`PlainwireDebug.setEnabled(false)` turns the firehose back off. The backend logs
+room lifecycle events, not audio. that would be weird.
 
-## Production capacity
+## capacity, roughly
 
-The relay uses concurrent PostgreSQL connections, ETS-based rate limiting and
-session caches, bounded/deduplicated media fetching, selective presence watches,
-WebSocket slow-client backpressure, and Ranch connection tuning. See
-`.env.example` for capacity controls. The health endpoint reports scheduler,
-process, database-pool queue, and rate-limiter data.
+Capacity knobs live in `.env.example`; health details are available to signed-in
+users at `/api/health`.
 
-Capacity is deployment-specific: benchmark with realistic message fan-out,
-animated avatars, TLS termination, PostgreSQL latency, and WebRTC signaling.
-Put `/api/media/*` behind a CDN, enforce OS file-descriptor limits, monitor BEAM
-mailboxes/memory, and scale relay nodes horizontally before sustained saturation.
+There is no magic "users per server" number. Load-test the actual deployment,
+watch database queues/BEAM memory/file descriptors, and add capacity before the
+graphs become modern art.
 
-# Below is information on how to host (If you want to be a hosting candidate)
+## local dev and self-hosting
 
-> Or you're a contributor and want to code, test, build, and push. either goes.
+This part is for contributors, private deployments, and anyone who enjoys
+owning their own database problems.
 
-## Hosting model
-
-Plainwire is hosted-first.
-
-Normal users should use the official Plainwire instance. They do not need to install Erlang, PostgreSQL, Elm, or any build tools.
-
-Running a local copy is mainly useful for:
-
-* Development
-* Testing
-* Contributions
-* Auditing
-* Private deployments
-* Experimentation
-
-Self-hosting is supported, but it is not required for normal use.
-
-## Requirements for local development
+### requirements
 
 * Erlang/OTP 24+
 * PostgreSQL 13+
@@ -121,7 +87,25 @@ Self-hosting is supported, but it is not required for normal use.
 * Elm 0.19.x
 * Sass/SCSS compiler
 
-## Database setup
+### database setup
+
+Quickest route with Guix:
+
+```sh
+guix shell postgresql -- ./scripts/dev-db.sh start
+./scripts/start.sh --build
+```
+
+If PostgreSQL is already in the shell:
+
+```sh
+./scripts/start.sh --with-db --build
+```
+
+Use `guix shell postgresql -- ./scripts/dev-db.sh stop` to stop the development
+database. Its data is kept under `${XDG_DATA_HOME:-$HOME/.local/share}/plainwire`.
+
+Manual setup still works too:
 
 ```sh
 createdb plainwire
@@ -135,7 +119,7 @@ On PostgreSQL 15+, also grant schema privileges:
 psql plainwire -c "GRANT ALL ON SCHEMA public TO plainwire;"
 ```
 
-## Build frontend assets
+### build frontend assets
 
 Build Elm:
 
@@ -150,7 +134,7 @@ Build SCSS:
 sass priv/static/style.scss priv/static/app.css --no-source-map
 ```
 
-## Run locally
+### run locally
 
 ```sh
 rebar3 get-deps
@@ -158,13 +142,13 @@ rebar3 compile
 rebar3 shell --apps plainwire_relay
 ```
 
-Then open:
+then open:
 
 ```text
 http://localhost:8080
 ```
 
-## Configuration
+## configuration
 
 | Variable                 |     Default | Purpose                                                       |
 | ------------------------ | ----------: | ------------------------------------------------------------- |
@@ -189,6 +173,8 @@ http://localhost:8080
 | `PLAINWIRE_UPLOAD_RETENTION_DAYS` | `90` | Attachment retention period before automatic cleanup |
 | `PLAINWIRE_UPLOAD_CONCURRENCY` | `64` | Maximum simultaneous uploads across one relay node |
 | `PLAINWIRE_UPLOAD_USER_CONCURRENCY` | `4` | Maximum simultaneous uploads from one user |
+| `PLAINWIRE_UPLOAD_INFLIGHT_BYTES` | `1073741824` | Maximum bytes being uploaded concurrently per relay node |
+| `PLAINWIRE_UPLOAD_USER_INFLIGHT_BYTES` | `536870912` | Maximum bytes being uploaded concurrently by one user |
 | `PLAINWIRE_ALLOW_ARBITRARY_MEDIA` | `false` | Explicitly allow unrestricted hosts (not recommended)   |
 | `PLAINWIRE_STUN_URLS`    | Google STUN | Comma-separated STUN server URLs                              |
 | `PLAINWIRE_TURN_URLS`    |       unset | Comma-separated TURN URLs (`turn:` or `turns:`)               |
@@ -200,6 +186,8 @@ http://localhost:8080
 | `PLAINWIRE_ICE_TRANSPORT_POLICY` | `all` | Set to `relay` to force all calls through TURN             |
 | `PLAINWIRE_VOICE_MAX_PARTICIPANTS` |   `8` | Maximum participants in a voice room (2–32)               |
 | `PLAINWIRE_VOICE_MAX_SHARES` |   `2` | Maximum simultaneous screen shares per voice room (1–8)   |
+| `PLAINWIRE_RTC_RECONNECT_GRACE_MS` | `15000` | Preserve call membership during a short refresh or reconnect |
+| `PLAINWIRE_KRISP_ENABLED` | `false` | Offer licensed Krisp processing after its local SDK assets pass verification |
 
 Generate an encryption key:
 
@@ -225,12 +213,12 @@ PLAINWIRE_TURN_USERNAME=plainwire
 PLAINWIRE_TURN_SECRET=replace-with-at-least-32-random-bytes
 ```
 
-## Persistence and upgrades
+## persistence and upgrades
 
-Plainwire stores application data, including uploaded profile images, in PostgreSQL. Message
-attachments live in `PLAINWIRE_UPLOAD_DIR`. Both must be included in production backups.
+App data lives in PostgreSQL. Message attachments live in
+`PLAINWIRE_UPLOAD_DIR`. Back up both, not just the one you remembered first.
 
-Schema changes are tracked in `schema_migrations`. Migrations are additive and run automatically on boot. Migration 11 adds `channel_categories` for Discord-style server layout with collapsible category groups in the sidebar.
+Additive migrations run on boot and are tracked in `schema_migrations`.
 
 Back up the database before upgrading:
 
@@ -238,7 +226,7 @@ Back up the database before upgrading:
 pg_dump plainwire > plainwire.backup.sql
 ```
 
-## Production notes
+## production notes
 
 For public hosting:
 
@@ -255,38 +243,35 @@ For public hosting:
 * Restrict outbound traffic and keep `PLAINWIRE_MEDIA_ALLOWED_HOSTS` narrow
 * Set `PLAINWIRE_TRUST_PROXY=true` only when the app port is reachable solely by your proxy
 
-WebRTC voice uses STUN for direct peer-to-peer connections and automatically falls back to the
-configured TURN server when a direct connection is blocked by NAT or a firewall. Screen sharing
-uses `getDisplayMedia` with two pre-created transceivers (audio + video); screen and camera tracks
-are swapped via `replaceTrack` without renegotiation. The UI detects whether `getDisplayMedia` is
-available and shows a toast on unsupported platforms (iOS Safari, Android Chrome). Encoder bitrate
-is automatically tiered based on mesh participant count. The stage window supports click-to-fullscreen.
+Voice tries direct peer-to-peer connections with STUN, then TURN when the network
+says no. Screen sharing uses `getDisplayMedia`; tracks are swapped with
+`replaceTrack` so the call does not renegotiate for every share.
 
-Platform support for screen sharing:
+screen sharing support:
+
 * Chrome/Edge desktop: full support
 * Firefox desktop: full support
 * Safari desktop: full support (no display audio)
 * iOS Safari: not supported (no `getDisplayMedia`)
 * Android Chrome: not supported (no `getDisplayMedia`)
 
-With
-`PLAINWIRE_TURN_SECRET`, the authenticated RTC endpoint creates a user-scoped, short-lived HMAC-SHA1
-credential compatible with coturn's `use-auth-secret`/`static-auth-secret` mechanism. The browser
-refreshes configuration periodically. Configure the exact same secret in coturn, set its realm,
-disable anonymous access, cap allocations/quotas, and expose UDP/TCP 3478 plus TLS 5349. Include
-both `turn:` and `turns:` URLs so restrictive networks have a TLS fallback.
+With `PLAINWIRE_TURN_SECRET`, the RTC endpoint creates short-lived coturn
+credentials. Use the same secret and a realm in coturn, disable anonymous
+access, set quotas, and expose UDP/TCP 3478 plus TLS 5349. Include both `turn:`
+and `turns:` URLs; some networks are deeply committed to being difficult.
 
-Production startup deliberately fails without HTTPS public-origin configuration, secure cookies,
-database TLS, a non-default database password, encryption, an adequate password-hash cost, and TURN
-(unless `PLAINWIRE_REQUIRE_TURN=false` is explicitly set). Remote media and embed fetching is denied
-in production unless its host is allowlisted or unrestricted fetching is explicitly enabled. Keep
-network-level egress rules as a second SSRF boundary even when using the allowlist.
+Krisp is optional and separately licensed. Put its complete browser `dist`
+bundle in `priv/static/krisp/`, set `PLAINWIRE_KRISP_ENABLED=true`, and restart.
+If the SDK/module files are missing, Plainwire quietly sticks with native noise
+cancellation instead of doing interpretive audio failure.
 
-## Development notes
+Production startup is picky: HTTPS origin, secure cookies, database
+TLS/password, encryption, a sane password-hash cost, and usually TURN. Remote
+media also needs an allowlist. Keep network egress rules as a second SSRF fence.
 
-Plainwire should stay focused and maintainable.
+## development notes
 
-Current architecture rules:
+boring architecture rules (boring is good here):
 
 * Keep the Erlang backend
 * Keep PostgreSQL as the database
@@ -298,14 +283,12 @@ Current architecture rules:
 * Avoid generated demo content in public releases
 * Avoid unnecessary rewrites
 
-## License
+## license
 
 AGPL 3
 
-Plainwire Relay is licensed under the GNU Affero General Public License v3.0.
-
-The AGPL is used because Plainwire is a hosted web application. It allows people to use, study, modify, and share the code, but if someone modifies Plainwire and runs it as a public network service, they must make their modified source code available to the users of that service.
-
-This helps keep improvements open while still allowing others to run and contribute to the project.
+Plainwire Relay uses the GNU Affero General Public License v3.0. If a modified
+version is offered as a public network service, its source must be available to
+that service's users.
 
 The Plainwire name, logo, and branding are not included in this license unless stated otherwise.

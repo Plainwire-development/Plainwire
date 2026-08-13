@@ -26,8 +26,7 @@ cache_data_url(<<"data:", Rest/binary>> = DataUrl) ->
     Now = pw_util:now_ms(),
     case cache_lookup(Key) of
         [{Key, _Body, _ContentType, Expires}] when Expires > Now ->
-            %% Profile maps are built often; avoid repeatedly base64-decoding
-            %% the same multi-megabyte avatar while its cache entry is alive.
+            %% don't decode the same enormous avatar on every profile map.
             proxy_url(SynthUrl);
         _ ->
             case safe_data_url_parse(Rest) of
@@ -57,8 +56,7 @@ safe_data_url_parse(Rest) ->
     end.
 
 fetch(Uid, Token) ->
-    %% Remote requests must not run inside the gen_server: one slow avatar used
-    %% to block every other image request behind it.
+    %% fetch outside the gen_server. one slow avatar once held up the lot.
     try resolve_fetch(Uid, Token)
     catch C:R:S ->
         error_logger:error_msg("media fetch failed ~p:~p ~p~n", [C, R, S]),
@@ -127,9 +125,7 @@ resolve_fetch_url(Url, Key, Now) ->
                     ets:insert(?CACHE, {Key, <<"error">>, <<"error">>, Now + 3600000}),
                     Err;
                 Err ->
-                    %% Transient upstream failures (timeout, DNS, overload)
-                    %% are cached briefly to avoid hammering a struggling
-                    %% origin while still recovering quickly.
+                    %% cache upstream misery briefly; no need to pile on.
                     ets:insert(?CACHE, {Key, <<"error">>, <<"error">>, Now + 5000}),
                     Err
             end;
@@ -137,9 +133,7 @@ resolve_fetch_url(Url, Key, Now) ->
             Err
     end.
 
-%% A popular uncached GIF can be requested by hundreds of page renders at the
-%% same instant. Only one process downloads a URL; followers wait for its
-%% short-lived result. A global semaphore also caps distinct upstream fetches.
+%% one download per URL, with a global cap. GIF stampedes are real somehow.
 coalesced_http_get(Url, Key) ->
     Now = erlang:monotonic_time(millisecond),
     case ets:lookup(?RESULTS, Key) of
@@ -206,10 +200,7 @@ decode_token(Token) ->
                 _ -> erlang:error(invalid_token)
             end;
         [Legacy] ->
-            %% Compatibility for URLs issued before signed proxy tokens. These
-            %% carry no signature, so anyone who knows the encoding can drive
-            %% fetches. Accept them only outside production, where the allowlist
-            %% is not yet enforced anyway.
+            %% old unsigned tokens are dev-only. production has standards.
             case production_env() andalso not pw_util:env_bool("PLAINWIRE_ALLOW_UNSIGNED_MEDIA_TOKENS", false) of
                 true -> erlang:error(invalid_token);
                 false ->
@@ -252,12 +243,7 @@ production_env() ->
     lists:member(os:getenv("PLAINWIRE_ENV"), ["prod", "production"]) orelse
         lists:member(os:getenv("NODE_ENV"), ["prod", "production"]).
 
-%% This used to be a textual prefix list compared with string:prefix/2, which
-%% returns the remainder after the prefix rather than the prefix itself, so it
-%% never matched anything. Simply inverting the test would have blocked real
-%% hostnames such as 0.gravatar.com, because those prefixes describe IP
-%% literals. Literals are now matched against the same address table used for
-%% resolved names, and hostnames are left to addresses_blocked/1.
+%% only IP literals use the blocked-address table; 0.gravatar.com is a hostname.
 blocked_host(H) ->
     case host_to_addr(H) of
         {ok, Addr} -> blocked_addr(Addr);

@@ -1,7 +1,7 @@
 module Types exposing
     ( User, Conversation, MemberUser, Message, Forum, ForumThread, Reply
     , Server, Channel, Category, ServerMember, ServerData, InvitePreview, Friend, Notification
-    , VoiceState, CallUI, CallPopup, CallUser, ActiveCall, CallMode(..)
+    , VoiceState, CallUI, CallPopup, CallUser, ActiveCall, CallMode(..), AudioDevice
     , ActiveRoute(..), Route(..), Model, PageState
     , Status(..), Relationship(..), ContextMenu, CtxItem, Msg(..)
     , decodeUser, decodeConversation, decodeMemberUser, decodeMessage, decodeForum
@@ -25,8 +25,7 @@ defaultValue fallback decoder =
 
 resilientList : D.Decoder a -> D.Decoder (List a)
 resilientList decoder =
-    -- A single legacy or malformed row must not erase an entire navigation
-    -- collection. Keep valid records while the server-side row is repaired.
+    -- one weird old row should not eat the whole nav list.
     D.list (D.maybe decoder)
         |> D.map (List.filterMap identity)
 
@@ -93,7 +92,8 @@ type alias Reply =
 
 type alias Server =
     { id : Int, name : String, description : String
-    , iconUrl : String, ownerId : Int, role : String
+    , iconUrl : String, bannerUrl : String, accentColor : String
+    , ownerId : Int, role : String
     , memberCount : Int, createdAt : Int
     }
 
@@ -125,15 +125,21 @@ type alias Notification =
 type alias VoiceState =
     { mode : Maybe String, id : Maybe Int
     , stream : Maybe String, peers : Dict Int Bool
+    , failedPeers : Dict Int Bool
     , users : Dict Int VoiceUser, muted : Bool, deafened : Bool
     , screenShare : Bool
     }
 
-type alias VoiceUser = { userId : Int, muted : Bool, deafened : Bool, screen : Bool }
+type alias VoiceUser =
+    { userId : Int, muted : Bool, deafened : Bool, screen : Bool
+    , reconnecting : Bool
+    }
 
 type alias CallUser =
     { userId : Int, displayName : String, avatarUrl : String
     , muted : Bool, deafened : Bool, connected : Bool
+    , connectionFailed : Bool
+    , reconnecting : Bool
     }
 
 type alias ActiveCall =
@@ -152,6 +158,9 @@ type alias CallPopup =
     }
 
 type CallMode = Idle | Ringing | Calling | Connected | InCall
+
+type alias AudioDevice =
+    { id : String, label : String }
 
 
 -- ROUTING
@@ -191,9 +200,9 @@ type alias Model =
     , msg : List Message, nextBefore : Maybe Int
     , loadingOlderMessages : Bool, hasOlderMessages : Bool
     , active : ActiveRoute, serverCache : Dict Int ServerData
-    , drafts : Drafts, wsConnected : Bool, isLeader : Bool
+    , drafts : Drafts, wsConnected : Bool, pageVisible : Bool, isLeader : Bool
     , tabId : String, subs : Set String
-    , voice : VoiceState, callUI : CallUI, callMode : CallMode
+    , voice : VoiceState, callUI : CallUI, activeCalls : Dict Int ActiveCall, callMode : CallMode
     , soundEnabled : Bool, replyTo : Maybe ReplyPreview
     , toast : Maybe String, modal : Maybe String
     , settingsTab : String, inputText : String
@@ -208,6 +217,7 @@ type alias Model =
     , profileStatus : String, profileTheme : String
     , serverName : String, serverDescription : String
     , modalTitle : String, modalBody : String, modalUserIds : String
+    , modalBannerUrl : String, modalAccentColor : String
     , friendsTab : String, friendQuery : String, friendSearchAttempted : Bool
     , booting : Bool
     , userStatuses : Dict String String
@@ -217,6 +227,16 @@ type alias Model =
     , pendingMessages : Dict Int String
     , pendingConversationId : Maybe Int
     , collapsedCategories : Set Int
+    , audioInputs : List AudioDevice
+    , audioOutputs : List AudioDevice
+    , selectedAudioInput : String
+    , selectedAudioOutput : String
+    , outputSelectionSupported : Bool
+    , voiceProcessingMode : String
+    , krispAvailable : Bool
+    , micTesting : Bool
+    , micTestLevel : Int
+    , micMonitoring : Bool
     }
 
 type alias InvitePreview =
@@ -283,13 +303,18 @@ type Msg
     | SearchUsersModal
     | InviteModal Int
     | ChannelModal Int
+    | ChannelModalInCategory Int Int
     | EditServerModal Server
+    | EditCategoryModal Int Category
     | EditConversationModal Conversation
     | NewThreadModal (Maybe Int)
     | NewForumModal
     | ModalTitle String
     | ModalBody String
     | ModalUserIds String
+    | ModalBannerUrl String
+    | ModalAccentColor String
+    | SetModalChoice String String
     | SubmitModal
     | CreateThread Int String String
     | JoinForum Int
@@ -307,12 +332,16 @@ type Msg
     | ServerName String
     | ServerDescription String
     | ToggleSound
+    | SetSoundPreference Bool
     | Logout
     | CloseCtx
     | CtxAction Int
     | LoadMoreMessages
     | SilentSync Bool
     | Tick Time.Posix
+    | WsStatus Bool
+    | PageVisibility Bool
+    | RtcResuming String Int Bool Bool
     | FileUpload String (Maybe String)
     | ReadFile String
     | SetSettingsTab String
@@ -331,7 +360,9 @@ type Msg
     | EndCall
     | CallSignal Int String
     | ToggleCallOverlay
-    | SetCallPeerConnected Int Bool
+    | SetCallPeerConnected String Int Int Bool
+    | SetCallPeerFailed String Int Int Bool
+    | RetryCallPeer Int
     | PresenceState E.Value
     | PresenceOnline Int String
     | PresenceOffline Int
@@ -340,12 +371,18 @@ type Msg
     | StartScreenShare
     | StopScreenShare
     | CreateCategoryModal Int
-    | SubmitCategory Int String
-    | UpdateCategoryName Int Int String
     | DeleteCategory Int Int
     | ToggleCategory Int
     | MoveChannelToCategory Int (Maybe Int)
     | RtcJoinFailed String
+    | AudioDevices E.Value
+    | SelectAudioInput String
+    | SelectAudioOutput String
+    | SelectVoiceProcessing String
+    | ToggleMicTest
+    | ToggleMicMonitor
+    | MicTestLevel Int
+    | MicTestFailed String
 
 
 -- DECODERS
@@ -457,13 +494,17 @@ decodeReply = D.succeed Reply
     |> andMap (D.field "updated_at" D.int)
 
 decodeServer : D.Decoder Server
-decodeServer = D.map8 Server
-    (D.field "id" D.int) (D.field "name" D.string)
-    (D.field "description" D.string |> defaultValue "")
-    (D.field "icon_url" D.string |> defaultValue "")
-    (D.field "owner_id" D.int) (D.field "role" D.string |> defaultValue "member")
-    (D.field "member_count" D.int |> defaultValue 1)
-    (D.field "created_at" D.int)
+decodeServer = D.succeed Server
+    |> andMap (D.field "id" D.int)
+    |> andMap (D.field "name" D.string)
+    |> andMap (D.field "description" D.string |> defaultValue "")
+    |> andMap (D.field "icon_url" D.string |> defaultValue "")
+    |> andMap (D.field "banner_url" D.string |> defaultValue "")
+    |> andMap (D.field "accent_color" D.string |> defaultValue "#5865f2")
+    |> andMap (D.field "owner_id" D.int)
+    |> andMap (D.field "role" D.string |> defaultValue "member")
+    |> andMap (D.field "member_count" D.int |> defaultValue 1)
+    |> andMap (D.field "created_at" D.int)
 
 decodeChannel : D.Decoder Channel
 decodeChannel = D.map8 Channel
@@ -518,13 +559,15 @@ defaultMsg = Message 0 "" 0 0 "" "" "" "" Nothing Nothing 0 Nothing Nothing
 
 decodeCallUser : D.Decoder CallUser
 decodeCallUser =
-    D.map6 CallUser
+    D.map8 CallUser
         (D.field "user_id" D.int)
         (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "Unknown" ])
         (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
         (D.field "muted" D.bool |> defaultValue False)
         (D.field "deafened" D.bool |> defaultValue False)
         (D.field "connected" D.bool |> defaultValue False)
+        (D.succeed False)
+        (D.field "reconnecting" D.bool |> defaultValue False)
 
 encodeMessage : { body : String, replyToId : Maybe Int } -> E.Value
 encodeMessage m =

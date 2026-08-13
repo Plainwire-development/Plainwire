@@ -1,8 +1,7 @@
 -module(pw_crypto).
 -export([enabled/0, encrypt/1, decrypt/1, proxy_token/1, verify_proxy_token/2]).
 
-%% AES-256-GCM field encryption for message bodies at rest.
-%% Set PLAINWIRE_ENC_KEY to a base64-encoded 32-byte key.
+%% message-body encryption at rest. key comes from PLAINWIRE_ENC_KEY.
 
 enabled() ->
     case key() of
@@ -48,8 +47,7 @@ decrypt(X) -> decrypt(pw_util:bin(X)).
 %% Signed opaque tokens for proxied media URLs (no raw URL in client requests).
 proxy_token(Url) ->
     {ok, Key} = signing_key(),
-    %% Keep media URLs stable across API refreshes. Random tokens caused
-    %% browsers to reload every avatar on each sync even when unchanged.
+    %% stable tokens stop every sync from reloading every avatar. fun times.
     <<Nonce:8/binary, _/binary>> = crypto:mac(hmac, sha256, Key, <<"media:", Url/binary>>),
     Mac = crypto:mac(hmac, sha256, Key, <<Nonce/binary, Url/binary>>),
     <<$p, $1, $:, (pw_util:base64url(<<Nonce/binary, Mac:16/binary>>))/binary, $., (pw_util:base64url(Url))/binary>>.

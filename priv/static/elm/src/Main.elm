@@ -59,7 +59,18 @@ bridgeDecoder = D.field "tag" D.string |> D.andThen (\tag ->
         "hash_change" -> D.map SetRoute (D.field "data" D.string)
         "file_read" -> D.map2 FileUpload (D.field "id" D.string) (D.field "data" (D.nullable D.string))
         "load_more_messages" -> D.succeed LoadMoreMessages
-        "rtc_peer_connected" -> D.map2 SetCallPeerConnected (D.field "user_id" D.int) (D.field "connected" D.bool)
+        "rtc_peer_connected" ->
+            D.map4 SetCallPeerConnected
+                (D.field "room_kind" D.string)
+                (D.field "room_id" D.int)
+                (D.field "user_id" D.int)
+                (D.field "connected" D.bool)
+        "rtc_peer_failed" ->
+            D.map4 SetCallPeerFailed
+                (D.field "room_kind" D.string)
+                (D.field "room_id" D.int)
+                (D.field "user_id" D.int)
+                (D.field "failed" D.bool)
         "tick" -> D.succeed (Tick (Time.millisToPosix 0))
         "presence_state" -> D.field "data" D.value |> D.map PresenceState
         "presence_online" -> D.field "data" (D.map2 PresenceOnline (D.field "user_id" D.int) (D.field "status" D.string))
@@ -67,6 +78,17 @@ bridgeDecoder = D.field "tag" D.string |> D.andThen (\tag ->
         "presence_status" -> D.field "data" (D.map2 PresenceStatus (D.field "user_id" D.int) (D.field "status" D.string))
         "status_change" -> D.map SetMyStatus (D.field "data" D.string)
         "rtc_join_failed" -> D.map RtcJoinFailed (D.field "data" D.string)
+        "audio_devices" -> D.map AudioDevices (D.field "data" D.value)
+        "mic_test_level" -> D.map MicTestLevel (D.field "data" D.int)
+        "mic_test_failed" -> D.map MicTestFailed (D.field "data" D.string)
+        "ws_status" -> D.map WsStatus (D.field "data" D.bool)
+        "rtc_resuming" ->
+            D.map4 RtcResuming
+                (D.field "room_kind" D.string)
+                (D.field "room_id" D.int)
+                (D.field "muted" D.bool)
+                (D.field "deafened" D.bool)
+        "sound_preference" -> D.map SetSoundPreference (D.field "data" D.bool)
         _ -> D.succeed NoOp
     )
 
@@ -99,12 +121,13 @@ init _ url _ =
       , currentServer = Nothing, currentProfile = Nothing, invitePreview = Nothing
       , msg = [], nextBefore = Nothing, loadingOlderMessages = False, hasOlderMessages = True
       , active = active, serverCache = Dict.empty
-      , drafts = Dict.empty, wsConnected = False, isLeader = False
+      , drafts = Dict.empty, wsConnected = False, pageVisible = True, isLeader = False
       , tabId = "", subs = Set.empty
       , voice = { mode = Nothing, id = Nothing, stream = Nothing
-                , peers = Dict.empty, users = Dict.empty
+                , peers = Dict.empty, failedPeers = Dict.empty, users = Dict.empty
                 , muted = False, deafened = False, screenShare = False }
       , callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
+      , activeCalls = Dict.empty
       , callMode = Idle, soundEnabled = True, replyTo = Nothing
       , toast = Nothing, modal = Nothing, settingsTab = "profile"
       , inputText = "", sidebarOpen = False, serversSheetOpen = False, ctxMenu = Nothing
@@ -119,9 +142,15 @@ init _ url _ =
       , profileAvatarUploading = False, profileBannerUploading = False
       , profileStatus = "online", profileTheme = "system"
       , modalTitle = "", modalBody = "", modalUserIds = ""
+      , modalBannerUrl = "", modalAccentColor = "#5865f2"
       , friendsTab = "online", friendQuery = "", friendSearchAttempted = False
         , pendingConversationId = Nothing
         , collapsedCategories = Set.empty
+        , audioInputs = [], audioOutputs = []
+        , selectedAudioInput = "", selectedAudioOutput = ""
+        , outputSelectionSupported = False
+        , voiceProcessingMode = "noise", krispAvailable = False
+        , micTesting = False, micTestLevel = 0, micMonitoring = False
       }
     , Cmd.batch
         [ apiSend (encodeApiRequest (ApiGet "/me"))
@@ -206,6 +235,7 @@ update msg model =
                 ( "/forums", _ ) -> handleCreateForum val model
                 ( "/logout", _ ) -> ( model, bridgeSend (E.object [("tag", E.string "reload"), ("data", E.null)]) )
                 ( "/profile", _ ) -> ( { model | toast = Just "Profile saved" }, apiSend (encodeApiRequest (ApiGet "/me")) )
+                ( "/profile/theme", _ ) -> ( model, Cmd.none )
                 ( "/notifications/seen", _ ) -> ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
                 ( "/notifications/clear", _ ) -> ( { model | notifs = [], toast = Just "Notifications cleared" }, Cmd.none )
                 ( "/friends/request", _ ) -> ( { model | toast = Just "Friend request sent" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
@@ -224,6 +254,12 @@ update msg model =
                         ( model, apiSend (encodeApiRequest (ApiGet "/forums")) )
                     else if String.startsWith "/thread/" tag && String.endsWith "/replies" tag then
                         handleReplyCreated val model
+                    else if String.startsWith "/server/" tag && method == "POST" && String.contains "/categor" tag then
+                        ( { model | toast = Just (if String.endsWith "/delete" tag then "Category deleted" else if String.contains "/category/" tag then "Category saved" else "Category created") }
+                        , Cmd.batch [ refreshCurrentServer model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) ]
+                        )
+                    else if String.startsWith "/channel/" tag && String.endsWith "/move" tag then
+                        ( { model | toast = Just "Channel moved" }, refreshCurrentServer model )
                     else if String.endsWith "/delete" tag then
                         ( model, Cmd.none )
                     else if String.startsWith "/thread/" tag then
@@ -349,18 +385,75 @@ update msg model =
             )
 
         Tick now ->
-            let elapsed = Time.posixToMillis now - model.serverTime
-                shouldSync = model.me /= Nothing && elapsed > 15000
-            in ( { model | serverTime = Time.posixToMillis now }
-               , if shouldSync then apiSend (encodeApiRequest (ApiGet "/sync?since=0")) else Cmd.none
+            ( { model | serverTime = Time.posixToMillis now }, Cmd.none )
+
+        WsStatus connected ->
+            ( { model | wsConnected = connected }
+            , if connected && not model.wsConnected && model.me /= Nothing then
+                apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+              else
+                Cmd.none
+            )
+
+        PageVisibility visible ->
+            ( { model | pageVisible = visible }
+            , if visible && model.me /= Nothing then
+                apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+              else
+                Cmd.none
+            )
+
+        RtcResuming roomKind roomId muted deafened ->
+            let
+                voiceBase = updateVoiceMode roomKind roomId model.voice
+                resumedVoice = { voiceBase | muted = muted, deafened = deafened }
+            in
+            if roomKind == "call" then
+                let
+                    active =
+                        Dict.get roomId model.activeCalls
+                            |> Maybe.withDefault
+                                { conversationId = roomId, users = [], startTime = model.serverTime, expanded = False }
+                in
+                ( { model
+                    | voice = resumedVoice
+                    , callMode = Connected
+                    , activeCalls = Dict.insert roomId active model.activeCalls
+                    , callUI = { incoming = Nothing, outgoing = Nothing, active = Just active }
+                  }
+                , Cmd.none
+                )
+            else
+                ( { model | voice = resumedVoice, callMode = InCall }, Cmd.none )
+
+        ToggleSound ->
+            let enabled = not model.soundEnabled
+            in ( { model | soundEnabled = enabled }
+               , Cmd.batch
+                    [ bridgeSend (E.object [("tag", E.string "set_sound_preference"), ("data", E.bool enabled)])
+                    , if enabled then playNotification True else Cmd.none
+                    ]
                )
 
-        ToggleSound -> ( { model | soundEnabled = not model.soundEnabled }
-                       , if not model.soundEnabled then playNotification True else Cmd.none )
+        SetSoundPreference enabled ->
+            ( { model | soundEnabled = enabled }, Cmd.none )
 
         Logout -> ( model, apiSend (encodeApiRequest (ApiPost "/logout" (Just (E.object [])))) )
 
-        SetSettingsTab t -> ( { model | settingsTab = t }, Cmd.none )
+        SetSettingsTab t ->
+            ( { model
+                | settingsTab = t
+                , micTesting = if t == "voice" then model.micTesting else False
+                , micTestLevel = if t == "voice" then model.micTestLevel else 0
+                , micMonitoring = if t == "voice" then model.micMonitoring else False
+              }
+            , if t == "voice" then
+                bridgeSend (E.object [("tag", E.string "list_audio_devices"), ("data", E.null)])
+              else if model.micTesting then
+                bridgeSend (E.object [("tag", E.string "stop_mic_test"), ("data", E.null)])
+              else
+                Cmd.none
+            )
 
         SetFriendsTab tab ->
             ( { model | friendsTab = tab, friendQuery = if tab == "add" then model.friendQuery else "", searchUsers = if tab == "add" then model.searchUsers else [] }, Cmd.none )
@@ -383,7 +476,13 @@ update msg model =
             in ( { model | profileStatus = status }
                , bridgeSend (E.object [("tag", E.string "presence_update"), ("data", E.string status)])
                )
-        ProfileTheme s -> ( { model | profileTheme = s }, bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string s)]) )
+        ProfileTheme s ->
+            ( { model | profileTheme = s }
+            , Cmd.batch
+                [ bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string s)])
+                , apiSend (encodeApiRequest (ApiPost "/profile/theme" (Just (E.object [("theme", E.string s)]))))
+                ]
+            )
 
         SaveProfile ->
             ( model
@@ -457,17 +556,23 @@ update msg model =
             let toggle a = { a | expanded = not a.expanded }
             in ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Maybe.map toggle model.callUI.active } }, Cmd.none )
 
-        SetCallPeerConnected userId connected ->
-            let
-                updateUser u =
-                    if u.userId == userId then
-                        { u | connected = connected }
-                    else
-                        u
-                updateActive active =
-                    { active | users = List.map updateUser active.users }
-            in
-            ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Maybe.map updateActive model.callUI.active } }, Cmd.none )
+        SetCallPeerConnected roomKind roomId userId connected ->
+            ( setRtcPeerConnected roomKind roomId userId connected model, Cmd.none )
+
+        SetCallPeerFailed roomKind roomId userId failed ->
+            ( setRtcPeerFailed roomKind roomId userId failed model, Cmd.none )
+
+        RetryCallPeer userId ->
+            case ( model.voice.mode, model.voice.id ) of
+                ( Just roomKind, Just roomId ) ->
+                    ( model
+                        |> setRtcPeerConnected roomKind roomId userId False
+                        |> setRtcPeerFailed roomKind roomId userId False
+                    , bridgeSend (E.object [("tag", E.string "retry_rtc_peer"), ("data", E.int userId)])
+                    )
+
+                _ ->
+                    ( model, Cmd.none )
 
         StartCall conversationId ->
             let active = { conversationId = conversationId, users = [], startTime = model.serverTime, expanded = False }
@@ -507,6 +612,14 @@ update msg model =
         ModalTitle s -> ( { model | modalTitle = s }, Cmd.none )
         ModalBody s -> ( { model | modalBody = s }, Cmd.none )
         ModalUserIds s -> ( { model | modalUserIds = s }, Cmd.none )
+        ModalBannerUrl s -> ( { model | modalBannerUrl = s }, Cmd.none )
+        ModalAccentColor s -> ( { model | modalAccentColor = s }, Cmd.none )
+        SetModalChoice field value ->
+            case field of
+                "body" -> ( { model | modalBody = value }, Cmd.none )
+                "user_ids" -> ( { model | modalUserIds = value }, Cmd.none )
+                "accent" -> ( { model | modalAccentColor = value }, Cmd.none )
+                _ -> ( model, Cmd.none )
         SubmitModal -> submitModal model
 
         InviteModal serverId ->
@@ -516,16 +629,35 @@ update msg model =
                 ( { model | modal = Just ("invite:" ++ String.fromInt serverId), modalTitle = "", modalBody = "0", modalUserIds = "" }, Cmd.none )
 
         ChannelModal serverId ->
-            ( { model | modal = Just ("channel:" ++ String.fromInt serverId), modalTitle = "", modalBody = "text" }, Cmd.none )
+            ( { model | modal = Just ("channel:" ++ String.fromInt serverId), modalTitle = "", modalBody = "text", modalUserIds = "" }, Cmd.none )
+
+        ChannelModalInCategory serverId categoryId ->
+            ( { model
+                | modal = Just ("channel:" ++ String.fromInt serverId)
+                , modalTitle = ""
+                , modalBody = "text"
+                , modalUserIds = String.fromInt categoryId
+              }
+            , Cmd.none
+            )
 
         EditServerModal server ->
-            ( { model | modal = Just ("edit_server:" ++ String.fromInt server.id), modalTitle = server.name, modalBody = server.description, modalUserIds = server.iconUrl }, Cmd.none )
+            ( { model
+                | modal = Just ("edit_server:" ++ String.fromInt server.id)
+                , modalTitle = server.name
+                , modalBody = server.description
+                , modalUserIds = server.iconUrl
+                , modalBannerUrl = server.bannerUrl
+                , modalAccentColor = server.accentColor
+              }
+            , Cmd.none
+            )
 
         EditConversationModal conversation ->
-            ( model, bridgeSend (E.object [("tag", E.string "edit_conversation"), ("data", E.int conversation.id)]) )
+            ( { model | modal = Just ("edit_conversation:" ++ String.fromInt conversation.id), modalTitle = conversation.name, modalBody = "" }, Cmd.none )
 
         AddPeopleModal conversationId ->
-            ( model, bridgeSend (E.object [("tag", E.string "add_people"), ("data", E.int conversationId)]) )
+            ( { model | modal = Just ("add_people:" ++ String.fromInt conversationId), modalUserIds = "", modalTitle = "" }, Cmd.none )
 
         ShowUserPopup userId ->
             ( model, setHash ("#profile/" ++ String.fromInt userId) )
@@ -535,7 +667,14 @@ update msg model =
             in case tag of
                 "join_voice" ->
                     case D.decodeValue D.int data of
-                        Ok channelId -> ( { model | voice = updateVoiceMode "voice" channelId model.voice, callMode = InCall }, cmd )
+                        Ok channelId ->
+                            ( { model
+                                | voice = updateVoiceMode "voice" channelId model.voice
+                                , callMode = InCall
+                                , callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
+                              }
+                            , cmd
+                            )
                         Err _ -> ( model, cmd )
                 "start_call" ->
                     case D.decodeValue D.int data of
@@ -618,6 +757,56 @@ update msg model =
             ( { model | profileStatus = status }, Cmd.none )
         RtcJoinFailed _ ->
             ( { model | voice = clearVoice model.voice, callMode = Idle, callUI = { incoming = model.callUI.incoming, outgoing = Nothing, active = Nothing } }, Cmd.none )
+        AudioDevices val ->
+            case D.decodeValue audioDevicesDecoder val of
+                Ok devices ->
+                    ( { model
+                        | audioInputs = devices.inputs
+                        , audioOutputs = devices.outputs
+                        , selectedAudioInput = devices.selectedInput
+                        , selectedAudioOutput = devices.selectedOutput
+                        , outputSelectionSupported = devices.outputSupported
+                        , voiceProcessingMode = devices.processingMode
+                        , krispAvailable = devices.krispAvailable
+                        , micMonitoring = devices.micMonitoring
+                      }
+                    , Cmd.none
+                    )
+                Err _ -> ( model, Cmd.none )
+        SelectAudioInput deviceId ->
+            ( { model | selectedAudioInput = deviceId, micTesting = False, micTestLevel = 0, micMonitoring = False }
+            , bridgeSend (E.object [("tag", E.string "select_audio_input"), ("data", E.string deviceId)])
+            )
+        SelectAudioOutput deviceId ->
+            ( { model | selectedAudioOutput = deviceId }
+            , bridgeSend (E.object [("tag", E.string "select_audio_output"), ("data", E.string deviceId)])
+            )
+        SelectVoiceProcessing processingMode ->
+            ( { model
+                | voiceProcessingMode = processingMode
+                , micTesting = False
+                , micTestLevel = 0
+                , micMonitoring = False
+              }
+            , bridgeSend (E.object [("tag", E.string "select_voice_processing"), ("data", E.string processingMode)])
+            )
+        ToggleMicTest ->
+            let testing = not model.micTesting
+            in ( { model
+                    | micTesting = testing
+                    , micTestLevel = if testing then model.micTestLevel else 0
+                    , micMonitoring = if testing then model.micMonitoring else False
+                 }
+               , bridgeSend (E.object
+                    [("tag", E.string (if testing then "start_mic_test" else "stop_mic_test")), ("data", E.null)])
+               )
+        ToggleMicMonitor ->
+            let monitoring = model.micTesting && not model.micMonitoring
+            in ( { model | micMonitoring = monitoring }
+               , bridgeSend (E.object [("tag", E.string "set_mic_monitor"), ("data", E.bool monitoring)])
+               )
+        MicTestLevel level -> ( { model | micTestLevel = level }, Cmd.none )
+        MicTestFailed message -> ( { model | micTesting = False, micTestLevel = 0, micMonitoring = False, toast = Just message }, Cmd.none )
 
         StartScreenShare ->
             ( model, bridgeSend (E.object [("tag", E.string "start_screen_share"), ("data", E.null)]) )
@@ -631,19 +820,21 @@ update msg model =
             in ( { model | collapsedCategories = newSet }, Cmd.none )
 
         CreateCategoryModal serverId ->
-            ( { model | modal = Just ("create_category:" ++ String.fromInt serverId), modalTitle = "New Category", modalBody = "" }, Cmd.none )
+            ( { model | modal = Just ("create_category:" ++ String.fromInt serverId), modalTitle = "", modalBody = "", modalUserIds = "" }, Cmd.none )
 
-        SubmitCategory serverId name ->
-            ( { model | modal = Nothing }, apiSend (encodeApiRequest (ApiPost ("/server/" ++ String.fromInt serverId ++ "/categories") (Just (E.object [("name", E.string name)])))) )
-
-        UpdateCategoryName serverId catId name ->
-            ( model, apiSend (encodeApiRequest (ApiPost ("/server/" ++ String.fromInt serverId ++ "/category/" ++ String.fromInt catId) (Just (E.object [("name", E.string name)])))) )
+        EditCategoryModal serverId category ->
+            ( { model
+                | modal = Just ("edit_category:" ++ String.fromInt serverId ++ ":" ++ String.fromInt category.id)
+                , modalTitle = category.name
+              }
+            , Cmd.none
+            )
 
         DeleteCategory serverId catId ->
-            ( model, apiSend (encodeApiRequest (ApiPost ("/server/" ++ String.fromInt serverId ++ "/category/" ++ String.fromInt catId ++ "/delete") Nothing)) )
+            ( { model | modal = Nothing }, apiSend (encodeApiRequest (ApiPost ("/server/" ++ String.fromInt serverId ++ "/category/" ++ String.fromInt catId ++ "/delete") Nothing)) )
 
         MoveChannelToCategory channelId catId ->
-            ( model, apiSend (encodeApiRequest (ApiPost ("/channel/" ++ String.fromInt channelId ++ "/move") (Just (E.object [("category_id", E.null)]))) ))
+            ( model, apiSend (encodeApiRequest (ApiPost ("/channel/" ++ String.fromInt channelId ++ "/move") (Just (E.object [("category_id", maybeInt catId)]))) ))
 
         LoadMoreMessages ->
             if model.loadingOlderMessages || not model.hasOlderMessages then
@@ -686,6 +877,7 @@ handleMe val model =
                                 , Cmd.batch
                                     [ bridgeSend (E.object [("tag", E.string "connect_ws"), ("data", E.null)])
                                     , bridgeSend (E.object [("tag", E.string "presence_update"), ("data", E.string (statusPreference (statusToString user.status)))])
+                                    , bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string user.theme)])
                                     , apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
                                     , routeCmd model.active
                                     ]
@@ -801,9 +993,25 @@ handleMessageSent val model =
             let newMsgs = List.filter (\m -> m.id > 0 && m.id /= message.id) model.msg ++ [ message ]
                 negIds = List.map .id (List.filter (\m -> m.id < 0) model.msg)
                 cleanedPending = List.foldl (\id acc -> Dict.remove id acc) model.pendingMessages negIds
+                updateConversation conversation =
+                    if message.scope == "direct" && conversation.id == message.scopeId then
+                        { conversation
+                            | lastBody = Just message.body
+                            , lastMessageId = Just message.id
+                            , updatedAt = message.createdAt
+                            , unread = 0
+                        }
+                    else
+                        conversation
             in
-            ( { model | msg = newMsgs, inputText = "", replyTo = Nothing, pendingMessages = cleanedPending }
-            , apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+            ( { model
+                | msg = newMsgs
+                , convs = List.map updateConversation model.convs
+                , inputText = ""
+                , replyTo = Nothing
+                , pendingMessages = cleanedPending
+              }
+            , Cmd.none
             )
         Err err ->
             ( { model | inputText = "", replyTo = Nothing, toast = Just ("Message sent, but could not display it yet: " ++ D.errorToString err) }, routeCmd model.active )
@@ -894,6 +1102,7 @@ submitModal model =
                             , apiSend (encodeApiRequest (ApiPost ("/server/" ++ String.fromInt serverId ++ "/channels") (Just (E.object
                                 [ ("name", E.string model.modalTitle)
                                 , ("kind", E.string model.modalBody)
+                                , ("category_id", maybeInt (String.toInt (String.trim model.modalUserIds)))
                                 ]))))
                             )
                     Nothing ->
@@ -918,6 +1127,63 @@ submitModal model =
                     , setHash ("#invite/" ++ code)
                     )
 
+            else if String.startsWith "create_category:" kind then
+                case String.toInt (String.dropLeft 16 kind) of
+                    Just serverId ->
+                        if String.isEmpty (String.trim model.modalTitle) then
+                            ( { model | toast = Just "Add a category name" }, Cmd.none )
+                        else
+                            ( { model | modal = Nothing }
+                            , apiSend (encodeApiRequest (ApiPost ("/server/" ++ String.fromInt serverId ++ "/categories") (Just (E.object
+                                [ ("name", E.string model.modalTitle) ]))))
+                            )
+                    Nothing ->
+                        ( { model | modal = Nothing }, Cmd.none )
+
+            else if String.startsWith "edit_category:" kind then
+                case String.split ":" (String.dropLeft 14 kind) of
+                    [ serverIdText, categoryIdText ] ->
+                        case ( String.toInt serverIdText, String.toInt categoryIdText ) of
+                            ( Just serverId, Just categoryId ) ->
+                                if String.isEmpty (String.trim model.modalTitle) then
+                                    ( { model | toast = Just "Add a category name" }, Cmd.none )
+                                else
+                                    ( { model | modal = Nothing }
+                                    , apiSend (encodeApiRequest (ApiPost ("/server/" ++ String.fromInt serverId ++ "/category/" ++ String.fromInt categoryId) (Just (E.object
+                                        [ ("name", E.string model.modalTitle) ]))))
+                                    )
+                            _ ->
+                                ( { model | modal = Nothing }, Cmd.none )
+                    _ ->
+                        ( { model | modal = Nothing }, Cmd.none )
+
+            else if String.startsWith "edit_conversation:" kind then
+                case String.toInt (String.dropLeft 18 kind) of
+                    Just conversationId ->
+                        if String.isEmpty (String.trim model.modalTitle) then
+                            ( { model | toast = Just "Add a group name" }, Cmd.none )
+                        else
+                            ( { model | modal = Nothing }
+                            , apiSend (encodeApiRequest (ApiPost ("/conversation/" ++ String.fromInt conversationId) (Just (E.object
+                                [ ("name", E.string model.modalTitle) ]))))
+                            )
+                    Nothing ->
+                        ( { model | modal = Nothing }, Cmd.none )
+
+            else if String.startsWith "add_people:" kind then
+                case String.toInt (String.dropLeft 11 kind) of
+                    Just conversationId ->
+                        let usernames = csvUsernames model.modalUserIds in
+                        if List.isEmpty usernames then
+                            ( { model | toast = Just "Choose at least one username" }, Cmd.none )
+                        else
+                            ( { model | modal = Nothing }
+                            , apiSend (encodeApiRequest (ApiPost ("/conversation/" ++ String.fromInt conversationId ++ "/members") (Just (E.object
+                                [ ("usernames", E.list E.string usernames) ]))))
+                            )
+                    Nothing ->
+                        ( { model | modal = Nothing }, Cmd.none )
+
             else if String.startsWith "edit_server:" kind then
                 case String.toInt (String.dropLeft 12 kind) of
                     Just serverId ->
@@ -929,6 +1195,8 @@ submitModal model =
                                 [ ("name", E.string model.modalTitle)
                                 , ("description", E.string model.modalBody)
                                 , ("icon_url", E.string model.modalUserIds)
+                                , ("banner_url", E.string model.modalBannerUrl)
+                                , ("accent_color", E.string model.modalAccentColor)
                                 ]))))
                             )
                     Nothing ->
@@ -1018,7 +1286,7 @@ handleProfile val model =
             Ok r -> r
             Err _ -> "none"
     in case userResult of
-        Ok user -> ( { model | currentProfile = Just user, currentProfileRelationship = rel, currentProfileBlockedByMe = blockedByMe }, bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string user.theme)]) )
+        Ok user -> ( { model | currentProfile = Just user, currentProfileRelationship = rel, currentProfileBlockedByMe = blockedByMe }, Cmd.none )
         Err _ -> ( model, Cmd.none )
 
 
@@ -1098,12 +1366,121 @@ routeSubCmd active =
 
 updateVoiceMode : String -> Int -> VoiceState -> VoiceState
 updateVoiceMode mode id voice =
-    { voice | mode = Just mode, id = Just id }
+    if voice.mode == Just mode && voice.id == Just id then
+        voice
+    else
+        { voice | mode = Just mode, id = Just id, stream = Nothing
+        , peers = Dict.empty, failedPeers = Dict.empty, users = Dict.empty, screenShare = False }
 
 
 clearVoice : VoiceState -> VoiceState
 clearVoice voice =
-    { voice | mode = Nothing, id = Nothing, screenShare = False, users = Dict.empty }
+    { voice | mode = Nothing, id = Nothing, stream = Nothing, screenShare = False
+    , peers = Dict.empty, failedPeers = Dict.empty, users = Dict.empty }
+
+
+setRtcPeerConnected : String -> Int -> Int -> Bool -> Model -> Model
+setRtcPeerConnected roomKind roomId userId connected model =
+    let
+        roomIsCurrent = model.voice.mode == Just roomKind && model.voice.id == Just roomId
+        updateUser user =
+            if user.userId == userId then
+                { user
+                    | connected = connected
+                    , connectionFailed = if connected then False else user.connectionFailed
+                }
+            else
+                user
+        updateActive active = { active | users = List.map updateUser active.users }
+        voice0 = model.voice
+        nextVoice =
+            if roomIsCurrent then
+                { voice0
+                    | peers = Dict.insert userId connected voice0.peers
+                    , failedPeers = if connected then Dict.insert userId False voice0.failedPeers else voice0.failedPeers
+                }
+            else
+                voice0
+        nextOverlay =
+            if roomIsCurrent && roomKind == "call" then
+                Maybe.map updateActive model.callUI.active
+            else
+                model.callUI.active
+        nextCalls =
+            if roomIsCurrent && roomKind == "call" then
+                Dict.update roomId (Maybe.map updateActive) model.activeCalls
+            else
+                model.activeCalls
+    in
+    { model
+        | voice = nextVoice
+        , activeCalls = nextCalls
+        , callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = nextOverlay }
+    }
+
+
+setRtcPeerFailed : String -> Int -> Int -> Bool -> Model -> Model
+setRtcPeerFailed roomKind roomId userId failed model =
+    let
+        roomIsCurrent = model.voice.mode == Just roomKind && model.voice.id == Just roomId
+        updateUser user =
+            if user.userId == userId then
+                { user | connectionFailed = failed, connected = if failed then False else user.connected }
+            else
+                user
+        updateActive active = { active | users = List.map updateUser active.users }
+        voice0 = model.voice
+        nextVoice =
+            if roomIsCurrent then
+                { voice0
+                    | failedPeers =
+                        if failed then
+                            Dict.insert userId True voice0.failedPeers
+                        else
+                            Dict.insert userId False voice0.failedPeers
+                    , peers = if failed then Dict.insert userId False voice0.peers else voice0.peers
+                }
+            else
+                voice0
+        nextOverlay =
+            if roomIsCurrent && roomKind == "call" then
+                Maybe.map updateActive model.callUI.active
+            else
+                model.callUI.active
+        nextCalls =
+            if roomIsCurrent && roomKind == "call" then
+                Dict.update roomId (Maybe.map updateActive) model.activeCalls
+            else
+                model.activeCalls
+    in
+    { model
+        | voice = nextVoice
+        , activeCalls = nextCalls
+        , callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = nextOverlay }
+    }
+
+
+mergeCallUserRtc : String -> Int -> List CallUser -> Model -> CallUser -> CallUser
+mergeCallUserRtc roomKind roomId existingUsers model user =
+    let
+        previous = List.filter (\old -> old.userId == user.userId) existingUsers |> List.head
+        previousConnected = Maybe.map .connected previous |> Maybe.withDefault user.connected
+        previousFailed = Maybe.map .connectionFailed previous |> Maybe.withDefault user.connectionFailed
+        roomIsCurrent = model.voice.mode == Just roomKind && model.voice.id == Just roomId
+        connected =
+            if roomIsCurrent then
+                Dict.get user.userId model.voice.peers |> Maybe.withDefault previousConnected
+            else
+                previousConnected
+        failed =
+            if connected then
+                False
+            else if roomIsCurrent then
+                Dict.get user.userId model.voice.failedPeers |> Maybe.withDefault previousFailed
+            else
+                previousFailed
+    in
+    { user | connected = connected, connectionFailed = failed }
 
 
 isCurrentServer : Int -> Model -> Bool
@@ -1111,6 +1488,16 @@ isCurrentServer serverId model =
     model.currentServer
         |> Maybe.map (\d -> d.server.id == serverId)
         |> Maybe.withDefault False
+
+
+refreshCurrentServer : Model -> Cmd Msg
+refreshCurrentServer model =
+    case model.currentServer of
+        Just data ->
+            apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt data.server.id)))
+
+        Nothing ->
+            Cmd.none
 
 
 toggleMute : VoiceState -> VoiceState
@@ -1200,9 +1587,9 @@ handleWsEvent val model =
         Ok ( "message_deleted", ev ) ->
             handleMessageDeleted ev model
         Ok ( "direct_message", _ ) ->
-            ( model, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), playNotification model.soundEnabled ] )
+            handleNotifiedMessage val model
         Ok ( "channel_message", _ ) ->
-            ( model, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), playNotification model.soundEnabled ] )
+            handleNotifiedMessage val model
         Ok ( "notification", _ ) ->
             ( model, bridgeSend (E.object [("tag", E.string "silent_sync"), ("data", E.null)]) )
         Ok ( "friend_request", _ ) ->
@@ -1211,21 +1598,64 @@ handleWsEvent val model =
             ( model, bridgeSend (E.object [("tag", E.string "silent_sync"), ("data", E.null)]) )
         Ok ( "conversation_created", _ ) ->
             ( model, bridgeSend (E.object [("tag", E.string "silent_sync"), ("data", E.null)]) )
-        Ok ( "conversation_members_added", _ ) ->
-            ( model, bridgeSend (E.object [("tag", E.string "silent_sync"), ("data", E.null)]) )
+        Ok ( "conversation_members_added", ev ) ->
+            handleConversationStructureEvent ev model
+        Ok ( "conversation_members_changed", ev ) ->
+            handleConversationStructureEvent ev model
+        Ok ( "conversation_updated", ev ) ->
+            handleConversationStructureEvent ev model
+        Ok ( "server_updated", ev ) ->
+            handleServerStructureEvent ev model
+        Ok ( "channel_created", ev ) ->
+            handleServerStructureEvent ev model
+        Ok ( "member_joined", ev ) ->
+            handleServerStructureEvent ev model
+        Ok ( "thread_created", ev ) ->
+            handleThreadListEvent ev model
+        Ok ( "thread_deleted", ev ) ->
+            handleThreadDeletedEvent ev model
+        Ok ( "forum_deleted", ev ) ->
+            handleForumDeletedEvent ev model
+        Ok ( "thread_reply", ev ) ->
+            handleThreadReplyEvent ev model
         Ok ( "call_incoming", ev ) ->
             handleCallIncoming ev model
         Ok ( "call_ringing", ev ) ->
             case D.decodeValue callOutgoingDecoder ev of
                 Ok out ->
-                    ( { model | callUI = { incoming = Nothing, outgoing = Just { conversationId = out.convId, userId = 0, displayName = out.displayName, avatarUrl = out.avatarUrl }, active = model.callUI.active }, callMode = Ringing }, playOutgoingRingtone True )
+                    let
+                        active =
+                            case model.callUI.active of
+                                Just current ->
+                                    if current.conversationId == out.convId then current
+                                    else { conversationId = out.convId, users = [], startTime = model.serverTime, expanded = False }
+                                Nothing ->
+                                    { conversationId = out.convId, users = [], startTime = model.serverTime, expanded = False }
+                    in
+                    ( { model
+                        | callUI =
+                            { incoming = Nothing
+                            , outgoing = Just { conversationId = out.convId, userId = 0, displayName = out.displayName, avatarUrl = out.avatarUrl }
+                            , active = Just active
+                            }
+                        , activeCalls = Dict.insert out.convId active model.activeCalls
+                        , callMode = Ringing
+                        , voice = updateVoiceMode "call" out.convId model.voice
+                      }
+                    , playOutgoingRingtone True
+                    )
                 Err _ ->
                     ( { model | callUI = { incoming = Nothing, outgoing = model.callUI.outgoing, active = model.callUI.active }, callMode = Ringing }, playOutgoingRingtone True )
         Ok ( "call_accepted", ev ) ->
             case D.decodeValue callAcceptedDecoder ev of
                 Ok accepted ->
                     let
-                        peer = { userId = accepted.userId, displayName = accepted.displayName, avatarUrl = accepted.avatarUrl, muted = False, deafened = False, connected = False }
+                        rawPeer =
+                            { userId = accepted.userId, displayName = accepted.displayName, avatarUrl = accepted.avatarUrl
+                            , muted = False, deafened = False, connected = False
+                            , connectionFailed = False, reconnecting = False
+                            }
+                        peer = mergeCallUserRtc "call" accepted.convId [] model rawPeer
                         addPeer users =
                             if List.any (\u -> u.userId == peer.userId) users then
                                 users
@@ -1238,7 +1668,20 @@ handleWsEvent val model =
                                 Nothing ->
                                     Just { conversationId = accepted.convId, users = [ peer ], startTime = model.serverTime, expanded = False }
                     in
-                    ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = active }, callMode = Connected }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
+                    let
+                        nextCalls =
+                            case active of
+                                Just call -> Dict.insert accepted.convId call model.activeCalls
+                                Nothing -> model.activeCalls
+                    in
+                    ( { model
+                        | callUI = { incoming = Nothing, outgoing = Nothing, active = active }
+                        , activeCalls = nextCalls
+                        , callMode = Connected
+                        , voice = updateVoiceMode "call" accepted.convId model.voice
+                      }
+                    , Cmd.batch [ playRingtone False, playOutgoingRingtone False ]
+                    )
                 Err _ ->
                     ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = model.callUI.active }, callMode = Connected }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
         Ok ( "call_declined", _ ) ->
@@ -1261,50 +1704,91 @@ handleWsEvent val model =
         Ok ( "call_state", ev ) ->
             case D.decodeValue callStateDecoder ev of
                 Ok ( cid, users ) ->
-                    let currentCid = case model.callUI.active of
-                            Just a -> a.conversationId
-                            Nothing -> 0
-                        isCurrentCall = cid == currentCid || currentCid == 0
-                    in if not isCurrentCall then
+                    if not (isJoinedCall cid model) then
                         ( model, Cmd.none )
-                       else
+                    else
                         let existing = Maybe.andThen (\a -> if a.conversationId == cid then Just a else Nothing) model.callUI.active
-                            existingUsers = Maybe.withDefault [] (Maybe.map .users existing)
-                            myId = Maybe.withDefault 0 (Maybe.map .id model.me)
-                            mergeConnected u =
-                                let wasConnected = List.any (\e -> e.userId == u.userId && e.connected) existingUsers
-                                    isSelf = u.userId == myId
-                                in { u | connected = wasConnected || isSelf }
+                            mappedUsers = Dict.get cid model.activeCalls |> Maybe.map .users |> Maybe.withDefault []
+                            existingUsers = Maybe.withDefault [] (Maybe.map .users existing) ++ mappedUsers
                             safeUsers =
                                 if List.isEmpty users && isJoinedCall cid model then
                                     Maybe.withDefault [] (Maybe.map .users existing)
                                 else
-                                    List.map mergeConnected users
+                                    List.map (mergeCallUserRtc "call" cid existingUsers model) users
                             active = { conversationId = cid, users = safeUsers
                                 , startTime = Maybe.withDefault model.serverTime (Maybe.map .startTime existing)
                                 , expanded = Maybe.withDefault False (Maybe.map .expanded existing)
                                 }
-                        in ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Just active } }, Cmd.none )
+                        in
+                        ( { model
+                            | activeCalls = Dict.insert cid active model.activeCalls
+                            , callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Just active }
+                          }
+                        , Cmd.none
+                        )
                 Err _ -> ( model, Cmd.none )
+        Ok ( "call_presence", ev ) ->
+            handleCallPresence ev model
         Ok ( "call_peer_joined", ev ) ->
-            case D.decodeValue callPeerJoinedDecoder ev of
-                Ok peer ->
-                    let addUser users =
-                            if List.any (\u -> u.userId == peer.userId) users then
+            case ( D.decodeValue (D.field "conversation_id" D.int) ev, D.decodeValue callPeerJoinedDecoder ev ) of
+                ( Ok cid, Ok peer ) ->
+                    let
+                        knownPeer = mergeCallUserRtc "call" cid [] model peer
+                        addUser users =
+                            if List.any (\u -> u.userId == knownPeer.userId) users then
                                 users
                             else
-                                users ++ [ peer ]
+                                users ++ [ knownPeer ]
                         updateActive a = { a | users = addUser a.users }
-                    in ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Maybe.map updateActive model.callUI.active } }, Cmd.none )
-                Err _ -> ( model, Cmd.none )
+                    in if isJoinedCall cid model then
+                        let
+                            nextOverlay = Maybe.map updateActive model.callUI.active
+                            nextCalls =
+                                case nextOverlay of
+                                    Just active -> Dict.insert cid active model.activeCalls
+                                    Nothing -> Dict.update cid (Maybe.map updateActive) model.activeCalls
+                        in
+                        ( { model
+                            | activeCalls = nextCalls
+                            , callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = nextOverlay }
+                          }
+                        , Cmd.none
+                        )
+                       else ( model, Cmd.none )
+                _ -> ( model, Cmd.none )
         Ok ( "call_peer_left", ev ) ->
-            case D.decodeValue (D.field "user_id" D.int) ev of
-                Ok uid ->
+            case ( D.decodeValue (D.field "conversation_id" D.int) ev, D.decodeValue (D.field "user_id" D.int) ev ) of
+                ( Ok cid, Ok uid ) ->
                     let removeUser users = List.filter (\u -> u.userId /= uid) users
                         updateActive a = { a | users = removeUser a.users }
-                    in ( { model | callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = Maybe.map updateActive model.callUI.active } }, Cmd.none )
-                Err _ -> ( model, Cmd.none )
+                    in if isJoinedCall cid model then
+                        let
+                            nextOverlay = Maybe.map updateActive model.callUI.active
+                            nextCalls =
+                                case nextOverlay of
+                                    Just active -> Dict.insert cid active model.activeCalls
+                                    Nothing -> Dict.update cid (Maybe.map updateActive) model.activeCalls
+                            voice0 = model.voice
+                            nextVoice =
+                                { voice0
+                                    | peers = Dict.remove uid voice0.peers
+                                    , failedPeers = Dict.remove uid voice0.failedPeers
+                                }
+                        in
+                        ( { model
+                            | activeCalls = nextCalls
+                            , voice = nextVoice
+                            , callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = nextOverlay }
+                          }
+                        , Cmd.none
+                        )
+                       else ( model, Cmd.none )
+                _ -> ( model, Cmd.none )
         Ok ( "call_signal", ev ) -> ( model, Cmd.none )
+        Ok ( "call_superseded", ev ) ->
+            clearSupersededCall ev model
+        Ok ( "call_ejected", ev ) ->
+            clearSupersededCall ev model
         Ok ( "voice_state", ev ) ->
             case D.decodeValue voiceStateDecoder ev of
                 Ok ( channelId, users ) ->
@@ -1312,11 +1796,13 @@ handleWsEvent val model =
                         userDict = Dict.fromList (List.map (\u -> ( u.userId, u )) users)
                         voice0 = model.voice
                     in
-                    -- mode is set by the join handler before voice_state arrives
-                    -- so Nothing means user already left: ignore stale events
+                    -- Nothing means we left already; this event is old news.
                     case voice0.mode of
                         Just "voice" ->
-                            ( { model | voice = { voice0 | id = Just channelId, users = userDict }, callMode = InCall }, Cmd.none )
+                            if voice0.id == Just channelId then
+                                ( { model | voice = { voice0 | users = userDict }, callMode = InCall }, Cmd.none )
+                            else
+                                ( model, Cmd.none )
                         _ ->
                             ( model, Cmd.none )
                 Err _ ->
@@ -1325,12 +1811,26 @@ handleWsEvent val model =
             case D.decodeValue (D.field "user_id" D.int) ev of
                 Ok uid ->
                     let voice0 = model.voice
-                    in ( { model | voice = { voice0 | users = Dict.remove uid model.voice.users } }, Cmd.none )
+                    in
+                    ( { model
+                        | voice =
+                            { voice0
+                                | users = Dict.remove uid voice0.users
+                                , peers = Dict.remove uid voice0.peers
+                                , failedPeers = Dict.remove uid voice0.failedPeers
+                            }
+                      }
+                    , Cmd.none
+                    )
                 Err _ ->
                     ( model, Cmd.none )
         Ok ( "voice_user_joined", ev ) -> ( model, Cmd.none )
         Ok ( "voice_user_left", ev ) -> ( model, Cmd.none )
         Ok ( "voice_signal", ev ) -> ( model, Cmd.none )
+        Ok ( "voice_superseded", _ ) ->
+            ( { model | voice = clearVoice model.voice, callMode = Idle }, Cmd.none )
+        Ok ( "voice_ejected", _ ) ->
+            ( { model | voice = clearVoice model.voice, callMode = Idle }, Cmd.none )
         Ok ( "presence_state", ev ) ->
             case D.decodeValue (D.field "statuses" (D.dict D.string)) ev of
                 Ok statuses -> ( { model | userStatuses = statuses }, Cmd.none )
@@ -1354,41 +1854,130 @@ handleWsEvent val model =
                 ])
             )
         Ok ( "category_created", ev ) ->
-            case ( D.decodeValue (D.field "server_id" D.int) ev, D.decodeValue (D.field "category_id" D.int) ev ) of
-                ( Ok serverId, Ok _ ) ->
-                    if isCurrentServer serverId model then
-                        ( model, apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId))) )
-                    else ( model, Cmd.none )
-                _ -> ( model, Cmd.none )
+            handleServerStructureEvent ev model
         Ok ( "category_updated", ev ) ->
-            case D.decodeValue (D.field "server_id" D.int) ev of
-                Ok serverId ->
-                    if isCurrentServer serverId model then
-                        ( model, apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId))) )
-                    else ( model, Cmd.none )
-                _ -> ( model, Cmd.none )
+            handleServerStructureEvent ev model
         Ok ( "category_deleted", ev ) ->
-            case D.decodeValue (D.field "server_id" D.int) ev of
-                Ok serverId ->
-                    if isCurrentServer serverId model then
-                        ( model, apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId))) )
-                    else ( model, Cmd.none )
-                _ -> ( model, Cmd.none )
+            handleServerStructureEvent ev model
         Ok ( "categories_reordered", ev ) ->
-            case D.decodeValue (D.field "server_id" D.int) ev of
-                Ok serverId ->
-                    if isCurrentServer serverId model then
-                        ( model, apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId))) )
-                    else ( model, Cmd.none )
-                _ -> ( model, Cmd.none )
+            handleServerStructureEvent ev model
         Ok ( "channel_moved", ev ) ->
-            case D.decodeValue (D.field "server_id" D.int) ev of
-                Ok serverId ->
-                    if isCurrentServer serverId model then
-                        ( model, apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId))) )
-                    else ( model, Cmd.none )
-                _ -> ( model, Cmd.none )
+            handleServerStructureEvent ev model
         _ -> ( model, Cmd.none )
+
+
+handleServerStructureEvent : E.Value -> Model -> ( Model, Cmd Msg )
+handleServerStructureEvent ev model =
+    case D.decodeValue (D.field "server_id" D.int) ev of
+        Ok serverId ->
+            let
+                refreshServer =
+                    if isCurrentServer serverId model then
+                        apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId)))
+                    else
+                        Cmd.none
+            in
+            ( { model | serverCache = Dict.remove serverId model.serverCache }
+            , Cmd.batch
+                [ apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+                , refreshServer
+                ]
+            )
+        Err _ ->
+            ( model, Cmd.none )
+
+
+handleConversationStructureEvent : E.Value -> Model -> ( Model, Cmd Msg )
+handleConversationStructureEvent ev model =
+    case D.decodeValue (D.field "conversation_id" D.int) ev of
+        Ok conversationId ->
+            ( model
+            , Cmd.batch
+                [ apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+                , apiSend (encodeApiRequest (ApiGet ("/conversation/" ++ String.fromInt conversationId)))
+                ]
+            )
+        Err _ ->
+            ( model, Cmd.none )
+
+
+handleThreadListEvent : E.Value -> Model -> ( Model, Cmd Msg )
+handleThreadListEvent ev model =
+    case ( D.decodeValue (D.field "forum_id" D.int) ev, model.active ) of
+        ( Ok forumId, ForumView currentId ) ->
+            if forumId == currentId then
+                ( model, routeCmd model.active )
+            else
+                ( model, Cmd.none )
+        _ ->
+            ( model, Cmd.none )
+
+
+handleThreadDeletedEvent : E.Value -> Model -> ( Model, Cmd Msg )
+handleThreadDeletedEvent ev model =
+    case ( D.decodeValue (D.field "forum_id" D.int) ev, D.decodeValue (D.field "thread_id" D.int) ev ) of
+        ( Ok forumId, Ok threadId ) ->
+            case model.active of
+                ThreadView currentId ->
+                    if currentId == threadId then
+                        ( model, setHash ("#forum/" ++ String.fromInt forumId) )
+                    else
+                        ( model, Cmd.none )
+                ForumView currentId ->
+                    if currentId == forumId then ( model, routeCmd model.active ) else ( model, Cmd.none )
+                _ ->
+                    ( model, Cmd.none )
+        _ ->
+            ( model, Cmd.none )
+
+
+handleForumDeletedEvent : E.Value -> Model -> ( Model, Cmd Msg )
+handleForumDeletedEvent ev model =
+    case ( D.decodeValue (D.field "forum_id" D.int) ev, model.active ) of
+        ( Ok forumId, ForumView currentId ) ->
+            if forumId == currentId then ( model, setHash "#forums" ) else ( model, Cmd.none )
+        ( Ok _, ThreadView _ ) ->
+            ( model, setHash "#forums" )
+        _ ->
+            ( model, Cmd.none )
+
+
+handleThreadReplyEvent : E.Value -> Model -> ( Model, Cmd Msg )
+handleThreadReplyEvent ev model =
+    case D.decodeValue (D.field "thread_id" D.int) ev of
+        Ok threadId ->
+            case model.active of
+                ThreadView currentId ->
+                    if currentId /= threadId then
+                        ( model, Cmd.none )
+                    else
+                        case D.decodeValue (D.field "reply" decodeReply) ev of
+                            Ok reply ->
+                                if List.any (\existing -> existing.id == reply.id) model.replies then
+                                    ( model, Cmd.none )
+                                else
+                                    ( { model | replies = model.replies ++ [ reply ] }, Cmd.none )
+                            Err _ ->
+                                ( model, routeCmd model.active )
+                _ ->
+                    ( model, Cmd.none )
+        Err _ ->
+            ( model, Cmd.none )
+
+
+clearSupersededCall : E.Value -> Model -> ( Model, Cmd Msg )
+clearSupersededCall ev model =
+    let
+        conversationId = D.decodeValue (D.field "conversation_id" D.int) ev |> Result.withDefault 0
+    in
+    ( { model
+        | callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
+        , activeCalls = Dict.remove conversationId model.activeCalls
+        , callMode = Idle
+        , voice = clearVoice model.voice
+      }
+    , Cmd.batch [ playRingtone False, playOutgoingRingtone False ]
+    )
 
 
 wsEventDecoder : Decoder ( String, E.Value )
@@ -1401,7 +1990,30 @@ handleMessageCreated : E.Value -> Model -> ( Model, Cmd Msg )
 handleMessageCreated ev model =
     case D.decodeValue (D.field "message" decodeMessage) ev of
         Ok message ->
-            if messageApplies model.active message then
+            let alreadyPresent = List.any (\existing -> existing.id == message.id) model.msg
+                fromMe = Maybe.map .id model.me == Just message.userId
+                notification = if fromMe then Cmd.none else playNotification model.soundEnabled
+            in if alreadyPresent then
+                ( model, Cmd.none )
+            else if messageApplies model.active message then
+                ( { model | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ] }
+                , Cmd.batch
+                    [ notification
+                    , bridgeSend (E.object [("tag", E.string "scroll_messages_to_bottom"), ("data", E.null)])
+                    ]
+                )
+            else
+                ( model, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), notification ] )
+        Err _ -> ( model, Cmd.none )
+
+handleNotifiedMessage : E.Value -> Model -> ( Model, Cmd Msg )
+handleNotifiedMessage ev model =
+    case D.decodeValue (D.field "message" decodeMessage) ev of
+        Ok message ->
+            let alreadyPresent = List.any (\existing -> existing.id == message.id) model.msg
+            in if alreadyPresent then
+                ( model, Cmd.none )
+            else if messageApplies model.active message then
                 ( { model | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ] }
                 , Cmd.batch
                     [ playNotification model.soundEnabled
@@ -1410,6 +2022,55 @@ handleMessageCreated ev model =
                 )
             else
                 ( model, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), playNotification model.soundEnabled ] )
+        Err _ ->
+            ( model, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), playNotification model.soundEnabled ] )
+
+handleCallPresence : E.Value -> Model -> ( Model, Cmd Msg )
+handleCallPresence ev model =
+    case D.decodeValue callPresenceDecoder ev of
+        Ok ( cid, activeNow, users ) ->
+            let existing =
+                    case Dict.get cid model.activeCalls of
+                        Just call -> Just call
+                        Nothing -> Maybe.andThen (\call -> if call.conversationId == cid then Just call else Nothing) model.callUI.active
+                overlayUsers =
+                    Maybe.andThen
+                        (\call -> if call.conversationId == cid then Just call.users else Nothing)
+                        model.callUI.active
+                        |> Maybe.withDefault []
+                existingUsers = Maybe.withDefault [] (Maybe.map .users existing) ++ overlayUsers
+                mergeConnected user =
+                    mergeCallUserRtc "call" cid existingUsers model user
+                nextCall =
+                    { conversationId = cid
+                    , users = List.map mergeConnected users
+                    , startTime = Maybe.withDefault model.serverTime (Maybe.map .startTime existing)
+                    , expanded = Maybe.withDefault False (Maybe.map .expanded existing)
+                    }
+                nextCalls = if activeNow then Dict.insert cid nextCall model.activeCalls else Dict.remove cid model.activeCalls
+                nextOverlay =
+                    if activeNow && isJoinedCall cid model then
+                        Just nextCall
+                    else
+                        case model.callUI.active of
+                            Just call -> if not activeNow && call.conversationId == cid && not (isJoinedCall cid model) then Nothing else Just call
+                            Nothing -> Nothing
+            in if activeNow then
+                ( { model
+                    | activeCalls = nextCalls
+                    , callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = nextOverlay }
+                  }
+                , Cmd.none
+                )
+               else if isJoinedCall cid model then
+                ( { model | activeCalls = nextCalls }, Cmd.none )
+               else
+                ( { model
+                    | activeCalls = nextCalls
+                    , callUI = { incoming = model.callUI.incoming, outgoing = model.callUI.outgoing, active = nextOverlay }
+                  }
+                , Cmd.none
+                )
         Err _ -> ( model, Cmd.none )
 
 handleMessageDeleted : E.Value -> Model -> ( Model, Cmd Msg )
@@ -1432,7 +2093,7 @@ handleCallIncoming ev model =
             ( { model | callUI =
                 { incoming = Just { conversationId = convId, userId = userId
                                   , displayName = displayName, avatarUrl = avatarUrl }
-                , outgoing = Nothing, active = Nothing }
+                , outgoing = Nothing, active = model.callUI.active }
               , callMode = Ringing
               }
             , bridgeSend (E.object
@@ -1471,29 +2132,73 @@ callStateDecoder =
         (D.field "conversation_id" D.int)
         (D.field "users" (D.list decodeCallUser))
 
-voiceStateDecoder : Decoder ( Int, List { userId : Int, muted : Bool, deafened : Bool, screen : Bool } )
+callPresenceDecoder : Decoder ( Int, Bool, List CallUser )
+callPresenceDecoder =
+    D.map3 (\cid active users -> ( cid, active, users ))
+        (D.field "conversation_id" D.int)
+        (D.field "active" D.bool)
+        (D.field "users" (D.list decodeCallUser))
+
+voiceStateDecoder : Decoder ( Int, List { userId : Int, muted : Bool, deafened : Bool, screen : Bool, reconnecting : Bool } )
 voiceStateDecoder =
     D.map2 Tuple.pair
         (D.field "channel_id" D.int)
         (D.field "users" (D.list voiceUserDecoder))
 
-voiceUserDecoder : Decoder { userId : Int, muted : Bool, deafened : Bool, screen : Bool }
+voiceUserDecoder : Decoder { userId : Int, muted : Bool, deafened : Bool, screen : Bool, reconnecting : Bool }
 voiceUserDecoder =
-    D.map4 (\uid muted deafened screen -> { userId = uid, muted = muted, deafened = deafened, screen = screen })
+    D.map5 (\uid muted deafened screen reconnecting -> { userId = uid, muted = muted, deafened = deafened, screen = screen, reconnecting = reconnecting })
         (D.field "user_id" D.int)
         (D.field "muted" D.bool |> defaultValue False)
         (D.field "deafened" D.bool |> defaultValue False)
         (D.field "screen" D.bool |> defaultValue False)
+        (D.field "reconnecting" D.bool |> defaultValue False)
 
 callPeerJoinedDecoder : Decoder CallUser
 callPeerJoinedDecoder =
-    D.map6 CallUser
+    D.map8 CallUser
         (D.field "user_id" D.int)
         (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "Unknown" ])
         (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
         (D.succeed False)
         (D.succeed False)
         (D.succeed False)
+        (D.succeed False)
+        (D.succeed False)
+
+audioDeviceDecoder : Decoder AudioDevice
+audioDeviceDecoder =
+    D.map2 AudioDevice
+        (D.field "id" D.string)
+        (D.field "label" D.string)
+
+audioDevicesDecoder : Decoder
+    { inputs : List AudioDevice
+    , outputs : List AudioDevice
+    , selectedInput : String
+    , selectedOutput : String
+    , outputSupported : Bool
+    , processingMode : String
+    , krispAvailable : Bool
+    , micMonitoring : Bool
+    }
+audioDevicesDecoder =
+    D.map8
+        (\inputs outputs selectedInput selectedOutput outputSupported processingMode krispAvailable micMonitoring ->
+            { inputs = inputs, outputs = outputs, selectedInput = selectedInput
+            , selectedOutput = selectedOutput, outputSupported = outputSupported
+            , processingMode = processingMode, krispAvailable = krispAvailable
+            , micMonitoring = micMonitoring
+            }
+        )
+        (D.field "inputs" (D.list audioDeviceDecoder))
+        (D.field "outputs" (D.list audioDeviceDecoder))
+        (D.field "selected_input" D.string |> defaultValue "")
+        (D.field "selected_output" D.string |> defaultValue "")
+        (D.field "output_selection_supported" D.bool |> defaultValue False)
+        (D.field "processing_mode" D.string |> defaultValue "noise")
+        (D.field "krisp_available" D.bool |> defaultValue False)
+        (D.field "mic_monitoring" D.bool |> defaultValue False)
 
 
 -- VIEW
@@ -1590,16 +2295,47 @@ modalContent kind model =
         , modalActions "Search"
         ]
     else if String.startsWith "channel:" kind then
+        let
+            serverId = String.toInt (String.dropLeft 8 kind) |> Maybe.withDefault 0
+            categories =
+                model.serverCache
+                    |> Dict.get serverId
+                    |> Maybe.map .categories
+                    |> Maybe.withDefault
+                        (model.currentServer
+                            |> Maybe.andThen
+                                (\data ->
+                                    if data.server.id == serverId then
+                                        Just data.categories
+                                    else
+                                        Nothing
+                                )
+                            |> Maybe.withDefault []
+                        )
+            selectedCategory = String.toInt (String.trim model.modalUserIds)
+        in
         [ modalHead "Create channel" "Add a text or voice room."
         , div [ class "modal-body" ]
-            [ div [ class "field" ] [ label [] [ text "Channel name" ], input [ value model.modalTitle, placeholder "general, updates, voice-chat", onInput ModalTitle ] [] ]
+            [ div [ class "field" ] [ label [] [ text "Channel name" ], input [ value model.modalTitle, maxlength 40, placeholder "general, updates, voice-chat", onInput ModalTitle ] [] ]
             , div [ class "field" ]
                 [ label [] [ text "Type" ]
-                , select [ value model.modalBody, onInput ModalBody ]
-                    [ option [ value "text" ] [ text "Text" ]
-                    , option [ value "voice" ] [ text "Voice" ]
+                , div [ class "choice-grid two" ]
+                    [ choiceCard (model.modalBody == "text") "#" "Text channel" "Messages, files, and media." (SetModalChoice "body" "text")
+                    , choiceCard (model.modalBody == "voice") "♪" "Voice channel" "Drop-in audio and screen sharing." (SetModalChoice "body" "voice")
                     ]
                 ]
+            , if List.isEmpty categories then
+                text ""
+              else
+                div [ class "field" ]
+                    [ label [] [ text "Category" ]
+                    , div [ class "segmented-choice" ]
+                        (choicePill (selectedCategory == Nothing) "No category" (SetModalChoice "user_ids" "")
+                            :: List.map
+                                (\category -> choicePill (selectedCategory == Just category.id) category.name (SetModalChoice "user_ids" (String.fromInt category.id)))
+                                categories
+                        )
+                    ]
             ]
         , modalActions "Create channel"
         ]
@@ -1612,22 +2348,124 @@ modalContent kind model =
         ]
 
     else if String.startsWith "invite:" kind then
-        [ modalHead "Create invite" "Copy a join link for this server."
+        let
+            serverId = String.toInt (String.dropLeft 7 kind) |> Maybe.withDefault 0
+            channels =
+                model.serverCache
+                    |> Dict.get serverId
+                    |> Maybe.map .channels
+                    |> Maybe.withDefault
+                        (model.currentServer
+                            |> Maybe.andThen
+                                (\data ->
+                                    if data.server.id == serverId then
+                                        Just data.channels
+                                    else
+                                        Nothing
+                                )
+                            |> Maybe.withDefault []
+                        )
+            selectedChannel = String.toInt (String.trim model.modalUserIds)
+            channelChoices =
+                choiceCard (selectedChannel == Nothing) "◎" "Server home" "Let friends choose where to begin." (SetModalChoice "user_ids" "")
+                    :: List.map
+                        (\channel ->
+                            choiceCard
+                                (selectedChannel == Just channel.id)
+                                (if channel.kind == "voice" then "♪" else "#")
+                                channel.name
+                                (if channel.kind == "voice" then "Open this voice room" else "Open this text channel")
+                                (SetModalChoice "user_ids" (String.fromInt channel.id))
+                        )
+                        channels
+        in
+        [ modalHead "Invite friends" "Choose where the invite opens, then copy one secure link."
         , div [ class "modal-body" ]
-            [ div [ class "field" ] [ label [] [ text "Channel ID optional" ], input [ value model.modalUserIds, placeholder "Leave blank for server invite", onInput ModalUserIds ] [] ]
-            , div [ class "field" ] [ label [] [ text "Max uses" ], input [ value model.modalBody, placeholder "0 for unlimited", onInput ModalBody ] [] ]
-            , p [ class "muted modal-hint" ] [ text "Existing matching invites are reused instead of creating duplicates." ]
+            [ div [ class "field" ] [ label [] [ text "Open invite in" ], div [ class "choice-grid invite-destination-grid" ] channelChoices ]
+            , div [ class "field" ]
+                [ label [] [ text "Usage limit" ]
+                , div [ class "segmented-choice" ]
+                    [ choicePill (model.modalBody == "0") "Unlimited" (SetModalChoice "body" "0")
+                    , choicePill (model.modalBody == "1") "One use" (SetModalChoice "body" "1")
+                    , choicePill (model.modalBody == "10") "10 uses" (SetModalChoice "body" "10")
+                    , choicePill (model.modalBody == "25") "25 uses" (SetModalChoice "body" "25")
+                    ]
+                ]
+            , p [ class "muted modal-hint" ] [ text "Plainwire reuses an equivalent active invite, so repeated clicks do not create clutter." ]
             ]
         , modalActions "Copy invite"
         ]
     else if String.startsWith "edit_server:" kind then
-        [ modalHead "Customize server" "Update the name, description, and icon."
+        [ modalHead "Customize server" "Give this server its own identity across desktop and mobile."
         , div [ class "modal-body" ]
-            [ div [ class "field" ] [ label [] [ text "Server name" ], input [ value model.modalTitle, placeholder "Server name", onInput ModalTitle ] [] ]
-            , div [ class "field" ] [ label [] [ text "Description" ], textarea [ value model.modalBody, placeholder "What is this server for?", onInput ModalBody ] [] ]
+            [ div [ class "field" ] [ label [] [ text "Server name" ], input [ value model.modalTitle, maxlength 80, placeholder "Server name", onInput ModalTitle ] [] ]
+            , div [ class "field" ] [ label [] [ text "Description" ], textarea [ value model.modalBody, maxlength 280, placeholder "What is this server for?", onInput ModalBody ] [] ]
             , div [ class "field" ] [ label [] [ text "Icon URL" ], input [ value model.modalUserIds, placeholder "https://...", onInput ModalUserIds ] [] ]
+            , div [ class "field" ] [ label [] [ text "Banner URL" ], input [ value model.modalBannerUrl, placeholder "https://...", onInput ModalBannerUrl ] [] ]
+            , div [ class "field server-color-field" ]
+                [ label [] [ text "Accent color" ]
+                , div [ class "server-color-control" ]
+                    [ input [ type_ "color", value model.modalAccentColor, onInput ModalAccentColor, attribute "aria-label" "Server accent color" ] []
+                    , input [ value model.modalAccentColor, placeholder "#5865f2", maxlength 7, onInput ModalAccentColor ] []
+                    ]
+                , div [ class "accent-swatches", attribute "aria-label" "Suggested accent colors" ]
+                    (List.map
+                        (\color ->
+                            button
+                                [ type_ "button", class ("accent-swatch" ++ if model.modalAccentColor == color then " active" else "")
+                                , style "background-color" color
+                                , onClick (SetModalChoice "accent" color)
+                                , attribute "aria-label" ("Use " ++ color)
+                                ] []
+                        )
+                        [ "#5865f2", "#3b82f6", "#14b8a6", "#22c55e", "#eab308", "#f97316", "#ec4899", "#8b5cf6" ]
+                    )
+                ]
             ]
         , modalActions "Save server"
+        ]
+    else if String.startsWith "create_category:" kind then
+        [ modalHead "Create category" "Group related channels in the server sidebar."
+        , div [ class "modal-body" ]
+            [ div [ class "field" ] [ label [] [ text "Category name" ], input [ value model.modalTitle, maxlength 40, placeholder "Games, Projects, Social…", onInput ModalTitle ] [] ]
+            , div [ class "category-preview" ]
+                [ span [] [ text "▾" ]
+                , b [] [ text (if String.isEmpty (String.trim model.modalTitle) then "NEW CATEGORY" else String.toUpper (String.trim model.modalTitle)) ]
+                , span [ class "muted" ] [ text "# channel" ]
+                ]
+            ]
+        , modalActions "Create category"
+        ]
+    else if String.startsWith "edit_category:" kind then
+        let
+            ids = String.split ":" (String.dropLeft 14 kind)
+            serverId = listAt 0 ids |> Maybe.andThen String.toInt |> Maybe.withDefault 0
+            categoryId = listAt 1 ids |> Maybe.andThen String.toInt |> Maybe.withDefault 0
+        in
+        [ modalHead "Edit category" "Rename this group or delete it without deleting its channels."
+        , div [ class "modal-body" ]
+            [ div [ class "field" ] [ label [] [ text "Category name" ], input [ value model.modalTitle, maxlength 40, placeholder "Games, Projects, Social…", onInput ModalTitle ] [] ]
+            ]
+        , div [ class "modal-actions category-modal-actions" ]
+            [ button [ class "btn danger", onClick (DeleteCategory serverId categoryId), disabled (serverId == 0 || categoryId == 0) ] [ text "Delete category" ]
+            , span [ class "grow" ] []
+            , button [ class "btn secondary", onClick CloseModal ] [ text "Cancel" ]
+            , button [ class "btn", onClick SubmitModal ] [ text "Save category" ]
+            ]
+        ]
+    else if String.startsWith "edit_conversation:" kind then
+        [ modalHead "Rename group" "Use a name everyone will recognize."
+        , div [ class "modal-body" ]
+            [ div [ class "field" ] [ label [] [ text "Group name" ], input [ value model.modalTitle, maxlength 80, placeholder "Group name", onInput ModalTitle ] [] ] ]
+        , modalActions "Save name"
+        ]
+    else if String.startsWith "add_people:" kind then
+        [ modalHead "Add people" "Invite existing Plainwire users to this group."
+        , div [ class "modal-body" ]
+            [ div [ class "field" ] [ label [] [ text "Usernames" ], input [ value model.modalUserIds, maxlength 800, placeholder "alice, bob, charlie", onInput ModalUserIds, attribute "autocomplete" "off" ] [] ]
+            , p [ class "muted modal-hint" ] [ text "Separate usernames with commas. The group supports up to 50 members." ]
+            ]
+        , modalActions "Add people"
         ]
     else if String.startsWith "invite_result:" kind then
         let rest = String.dropLeft 14 kind
@@ -1670,6 +2508,32 @@ modalActions submitLabel =
         [ button [ class "btn secondary", onClick CloseModal ] [ text "Cancel" ]
         , button [ class "btn", onClick SubmitModal ] [ text submitLabel ]
         ]
+
+choiceCard : Bool -> String -> String -> String -> Msg -> Html Msg
+choiceCard selected icon heading copy msg =
+    button
+        [ type_ "button"
+        , class ("choice-card" ++ if selected then " selected" else "")
+        , onClick msg
+        , attribute "aria-pressed" (if selected then "true" else "false")
+        ]
+        [ span [ class "choice-card-icon" ] [ text icon ]
+        , span [ class "choice-card-copy" ]
+            [ b [] [ text heading ]
+            , small [ class "muted" ] [ text copy ]
+            ]
+        , span [ class "choice-card-check" ] [ text (if selected then "✓" else "") ]
+        ]
+
+choicePill : Bool -> String -> Msg -> Html Msg
+choicePill selected label msg =
+    button
+        [ type_ "button"
+        , class ("choice-pill" ++ if selected then " selected" else "")
+        , onClick msg
+        , attribute "aria-pressed" (if selected then "true" else "false")
+        ]
+        [ text label ]
 
 ctxItemView : Int -> CtxItem -> Html Msg
 ctxItemView idx item =
@@ -1755,16 +2619,14 @@ onClickStop msg =
 
 renderCallLayer : Model -> Html Msg
 renderCallLayer model =
-    let inCall = model.callMode == Connected || model.callMode == InCall || model.callMode == Ringing
-        showInCall = inCall || model.voice.mode == Just "call" || model.voice.mode == Just "voice"
-        popups = List.filterMap identity
+    let popups = List.filterMap identity
             [ Maybe.map (\i -> renderCallPopup "incoming" i model) model.callUI.incoming
             , Maybe.map (\o -> renderCallPopup "outgoing" o model) model.callUI.outgoing
             ]
-        activeOverlay = case ( showInCall, model.callUI.active ) of
-            ( True, Just active ) ->
+        activeOverlay = case model.callUI.active of
+            Just active ->
                 let joinedCall = isJoinedCall active.conversationId model
-                in if not joinedCall && List.isEmpty active.users then
+                in if not joinedCall || model.callMode == Ringing || model.callMode == Calling then
                     []
                 else if active.expanded then
                     [ renderExpandedCallOverlay active model ]
@@ -1804,8 +2666,21 @@ renderCallPopup kind popup model =
 
 renderCompactCallBar : ActiveCall -> Model -> Html Msg
 renderCompactCallBar active model =
-    let count = List.length active.users
-        countText = if count == 0 then "Connecting..." else String.fromInt count ++ " participant" ++ (if count /= 1 then "s" else "")
+    let
+        myId = Maybe.map .id model.me
+        remoteUsers = List.filter (\user -> Just user.userId /= myId) active.users
+        count = List.length active.users
+        connectedCount = List.length (List.filter .connected remoteUsers)
+        failedCount = List.length (List.filter .connectionFailed remoteUsers)
+        countText =
+            if List.isEmpty remoteUsers then
+                "Waiting for others"
+            else if failedCount > 0 then
+                "Audio failed · Open to retry"
+            else if connectedCount == List.length remoteUsers then
+                "Audio connected · " ++ String.fromInt count ++ " participant" ++ (if count /= 1 then "s" else "")
+            else
+                "Connecting audio · " ++ String.fromInt connectedCount ++ "/" ++ String.fromInt (List.length remoteUsers)
         userAvatars = List.take 3 active.users
             |> List.map (\u -> avatarImg u.avatarUrl u.displayName "small")
         overflow = count - 3
@@ -1845,7 +2720,11 @@ renderExpandedCallOverlay active model =
             [ div [ class "call-overlay-title" ]
                 [ span [ class "call-overlay-icon" ] [ text "♪" ]
                 , span [] [ text "In Call" ]
-                , span [ class "call-overlay-timer" ] [ text timerText ]
+                , span
+                    [ class "call-overlay-timer pw-live-call-timer"
+                    , attribute "data-call-start" (String.fromInt active.startTime)
+                    ]
+                    [ text timerText ]
                 ]
             , button [ class "btn icon-btn", title "Minimize", onClick ToggleCallOverlay ] [ text "─" ]
             ]
@@ -1853,7 +2732,7 @@ renderExpandedCallOverlay active model =
             (if List.isEmpty active.users then
                 [ div [ class "call-empty" ] [ text "Connecting audio..." ] ]
              else
-                List.map renderCallUser active.users)
+                List.map (renderCallUser model) active.users)
         , div [ class "call-overlay-controls" ]
             [ button [ class ("btn" ++ if model.voice.muted then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_mute" E.null) ]
                 [ text (if model.voice.muted then "🔇 Unmute" else "🎤 Mute") ]
@@ -1865,26 +2744,39 @@ renderExpandedCallOverlay active model =
             ]
         ]
 
-renderCallUser : CallUser -> Html Msg
-renderCallUser u =
+renderCallUser : Model -> CallUser -> Html Msg
+renderCallUser model u =
     let
-        avatarClass = "small" ++ if u.connected && not u.muted then " live" else ""
+        isSelf = Maybe.map .id model.me == Just u.userId
+        avatarClass = "small" ++ if (u.connected || isSelf) && not u.muted then " live" else ""
         statusText =
-            if u.muted then
+            if u.reconnecting then
+                "Reconnecting"
+            else if u.connectionFailed then
+                "Audio connection failed"
+            else if u.muted then
                 "Muted"
             else if u.deafened then
                 "Deafened"
+            else if isSelf then
+                "You · Ready"
             else if u.connected then
-                "Connected"
+                "Connected to you"
             else
-                "Connecting"
+                "Connecting audio"
+        retryButton =
+            if u.connectionFailed && not isSelf then
+                button [ class "btn secondary call-retry", onClick (RetryCallPeer u.userId) ] [ text "Retry audio" ]
+            else
+                text ""
     in div [ class "call-user-row" ]
         [ avatarImg u.avatarUrl u.displayName avatarClass
         , div [ class "call-user-info" ]
             [ span [ class "call-user-name" ] [ text u.displayName ]
-            , span [ class ("call-user-status" ++ if u.muted then " muted" else if u.deafened then " deafened" else "") ]
+            , span [ class ("call-user-status" ++ if u.connectionFailed then " failed" else if u.reconnecting then " reconnecting" else if u.muted then " muted" else if u.deafened then " deafened" else "") ]
                 [ text statusText ]
             ]
+        , retryButton
         ]
 
 
@@ -2114,20 +3006,26 @@ renderServerSide model data =
         uncategorizedVoice = List.filter (\c -> c.categoryId == Nothing) voiceChannels
         isCollapsed catId = Set.member catId model.collapsedCategories
         categoryBlock cat channels =
-            if List.isEmpty channels then
-                []
-            else
-                [ div [ class "channel-group-title clickable", onClick (ToggleCategory cat.id) ]
-                    [ text (if isCollapsed cat.id then "▶ " else "▼ ")
-                    , text cat.name
-                    , if canManage then
-                        span [ class "category-actions" ]
-                            [ span [ class "ctx-trigger", stopClick, onClick (CreateCategoryModal data.server.id) ] [ text "+" ] ]
-                      else text ""
-                    ]
-                ] ++ (if isCollapsed cat.id then [] else List.map channelRow channels)
+            [ div [ class "channel-group-title clickable", onClick (ToggleCategory cat.id) ]
+                [ text (if isCollapsed cat.id then "▶ " else "▼ ")
+                , text cat.name
+                , if canManage then
+                    span [ class "category-actions" ]
+                        [ button [ class "ctx-trigger", type_ "button", title ("Add a channel to " ++ cat.name), onClickStop (ChannelModalInCategory data.server.id cat.id) ] [ text "+" ]
+                        , button [ class "ctx-trigger", type_ "button", title ("Edit " ++ cat.name), onClickStop (EditCategoryModal data.server.id cat) ] [ text "⋯" ]
+                        ]
+                  else text ""
+                ]
+            ] ++
+                (if isCollapsed cat.id then
+                    []
+                 else if List.isEmpty channels then
+                    [ div [ class "category-empty" ] [ text "No channels yet" ] ]
+                 else
+                    List.map (managedChannelRow canManage data.categories) channels
+                )
         sortedCategories = List.sortBy .position data.categories
-        canManage = model.currentServer |> Maybe.map (\d -> d.server.role == "owner" || d.server.role == "admin") |> Maybe.withDefault False
+        canManage = data.server.role == "owner" || data.server.role == "admin"
     in
     aside [ class ("side" ++ if model.sidebarOpen then " open" else "") ]
         [ div [ class "side-head" ]
@@ -2135,16 +3033,20 @@ renderServerSide model data =
             , h1 [] [ text data.server.name ]
             , small [] [ text data.server.description ]
             , div [ class "nav-actions" ]
-                [ button [ class "btn secondary", onClick (InviteModal data.server.id) ] [ text "Invite" ]
-                , button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Channel" ]
-                , button [ class "btn secondary", onClick (EditServerModal data.server) ] [ text "Edit" ]
-                ]
+                (if canManage then
+                    [ button [ class "btn secondary", onClick (InviteModal data.server.id) ] [ text "Invite" ]
+                    , button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Channel" ]
+                    , button [ class "btn secondary", onClick (CreateCategoryModal data.server.id) ] [ text "Category" ]
+                    , button [ class "btn secondary", onClick (EditServerModal data.server) ] [ text "Edit" ]
+                    ]
+                 else
+                    []
+                )
             ]
         , div [ class "list server-channel-list" ]
-            (channelGroup "Text channels" (List.filter (\c -> c.categoryId == Nothing) textChannels)
-             ++ List.concatMap (\cat -> categoryBlock cat (List.filter (\c -> c.categoryId == Just cat.id) textChannels)) sortedCategories
-             ++ channelGroup "Voice channels" (List.filter (\c -> c.categoryId == Nothing) voiceChannels)
-             ++ List.concatMap (\cat -> categoryBlock cat (List.filter (\c -> c.categoryId == Just cat.id) voiceChannels)) sortedCategories)
+            (channelGroup "Text channels" uncategorizedText
+             ++ channelGroup "Voice channels" uncategorizedVoice
+             ++ List.concatMap (\cat -> categoryBlock cat (List.filter (\c -> c.categoryId == Just cat.id) data.channels)) sortedCategories)
         , userPanel model
         ]
 
@@ -2881,17 +3783,30 @@ renderServerPage : Model -> Html Msg
 renderServerPage model =
     case model.currentServer of
         Just data ->
-            div [ class "server-page" ]
-                [ div [ class "card pad server-hero" ]
+            let canManage = data.server.role == "owner" || data.server.role == "admin"
+            in div [ class "server-page" ]
+                [ div
+                    [ class "card pad server-hero"
+                    , style "--server-accent" data.server.accentColor
+                    , style "background-image"
+                        (if String.isEmpty data.server.bannerUrl then
+                            "none"
+                         else
+                            "url('" ++ data.server.bannerUrl ++ "')"
+                        )
+                    ]
                     [ serverIcon data.server
                     , div []
                         [ h2 [] [ text data.server.name ]
                         , p [ class "muted" ] [ text (if String.isEmpty data.server.description then "No description yet." else data.server.description) ]
-                , div [ class "nav-actions server-hero-actions" ]
-                            [ button [ class "btn", onClick (InviteModal data.server.id) ] [ text "Invite people" ]
-                            , button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Add channel" ]
-                            , button [ class "btn secondary", onClick (EditServerModal data.server) ] [ text "Customize" ]
-                            ]
+                , if canManage then
+                    div [ class "nav-actions server-hero-actions" ]
+                        [ button [ class "btn", onClick (InviteModal data.server.id) ] [ text "Invite people" ]
+                        , button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Add channel" ]
+                        , button [ class "btn secondary", onClick (EditServerModal data.server) ] [ text "Customize" ]
+                        ]
+                  else
+                    text ""
                         ]
                     ]
                 , h3 [ class "server-section-title" ] [ text "Channels" ]
@@ -2910,6 +3825,35 @@ channelRow c =
     in a [ class "row", onClick (Go (target ++ String.fromInt c.id)) ]
         [ span [ class "server-icon" ] [ text icon ]
         , div [ class "grow" ] [ b [] [ text c.name ], small [ class "muted" ] [ text c.kind ] ]
+        ]
+
+
+managedChannelRow : Bool -> List Category -> Channel -> Html Msg
+managedChannelRow canManage categories channel =
+    let
+        target = if channel.kind == "voice" then "#voice/" else "#channel/"
+        icon = if channel.kind == "voice" then "♪" else "#"
+        selectedCategory = Maybe.map String.fromInt channel.categoryId |> Maybe.withDefault ""
+        moveTarget raw = MoveChannelToCategory channel.id (if String.isEmpty raw then Nothing else String.toInt raw)
+        categoryOptions =
+            option [ value "" ] [ text "No category" ]
+                :: List.map (\category -> option [ value (String.fromInt category.id) ] [ text category.name ]) categories
+    in
+    div [ class "row", onClick (Go (target ++ String.fromInt channel.id)) ]
+        [ span [ class "server-icon" ] [ text icon ]
+        , div [ class "grow" ] [ b [] [ text channel.name ], small [ class "muted" ] [ text channel.kind ] ]
+        , if canManage then
+            select
+                [ class "channel-category-select"
+                , value selectedCategory
+                , title "Move channel to category"
+                , attribute "aria-label" ("Move " ++ channel.name ++ " to category")
+                , stopClick
+                , onInput moveTarget
+                ]
+                categoryOptions
+          else
+            text ""
         ]
 
 memberRow : Dict String String -> ServerMember -> Html Msg
@@ -2971,22 +3915,25 @@ renderVoicePage channelId model =
             ]
         ]
 
-voiceParticipantRow : List ServerMember -> { userId : Int, muted : Bool, deafened : Bool, screen : Bool } -> Html Msg
+voiceParticipantRow : List ServerMember -> { userId : Int, muted : Bool, deafened : Bool, screen : Bool, reconnecting : Bool } -> Html Msg
 voiceParticipantRow members vu =
     let maybeMember = List.filter (\m -> m.user.id == vu.userId) members |> List.head
         name = maybeMember |> Maybe.map (\m -> m.user.displayName) |> Maybe.withDefault ("User " ++ String.fromInt vu.userId)
         avatarUrl = maybeMember |> Maybe.map (\m -> m.user.avatarUrl) |> Maybe.withDefault ""
         stateText =
-            if vu.screen then "Sharing screen"
+            if vu.reconnecting then "Reconnecting"
+            else if vu.screen then "Sharing screen"
             else if vu.deafened then "Deafened"
             else if vu.muted then "Muted"
             else "Live"
         pillClass =
-            if vu.screen then "voice-state-pill sharing"
+            if vu.reconnecting then "voice-state-pill reconnecting"
+            else if vu.screen then "voice-state-pill sharing"
             else if vu.muted || vu.deafened then "voice-state-pill muted"
             else "voice-state-pill live"
         pillText =
-            if vu.screen then "🖥 Share"
+            if vu.reconnecting then "↻ Rejoining"
+            else if vu.screen then "🖥 Share"
             else if vu.deafened then "🔇"
             else if vu.muted then "🔇 Muted"
             else "● Live"
@@ -3056,6 +4003,7 @@ renderSettingsPage model =
                     [ div [ class "settings-nav-label" ] [ text "User settings" ]
                     , a [ class ("settings-tab" ++ if model.settingsTab == "profile" then " active" else ""), onClick (SetSettingsTab "profile") ] [ span [ class "settings-tab-icon" ] [ text "●" ], text "Profile" ]
                     , a [ class ("settings-tab" ++ if model.settingsTab == "appearance" then " active" else ""), onClick (SetSettingsTab "appearance") ] [ span [ class "settings-tab-icon" ] [ text "◐" ], text "Appearance" ]
+                    , a [ class ("settings-tab" ++ if model.settingsTab == "voice" then " active" else ""), onClick (SetSettingsTab "voice") ] [ span [ class "settings-tab-icon" ] [ text "◖" ], text "Voice & Video" ]
                     , a [ class ("settings-tab" ++ if model.settingsTab == "sound" then " active" else ""), onClick (SetSettingsTab "sound") ] [ span [ class "settings-tab-icon" ] [ text "◖" ], text "Notifications" ]
                     , div [ class "settings-nav-separator" ] []
                     , a [ class ("settings-tab" ++ if model.settingsTab == "account" then " active" else ""), onClick (SetSettingsTab "account") ] [ span [ class "settings-tab-icon" ] [ text "⚙" ], text "Account" ]
@@ -3068,6 +4016,7 @@ renderSettingsPage model =
                     , div [ class "settings-content-inner" ]
                         [ case model.settingsTab of
                             "appearance" -> renderAppearanceSettings model
+                            "voice" -> renderVoiceSettings model
                             "sound" -> renderNotificationSettings model
                             "account" -> renderAccountSettings u
                             _ -> renderProfileSettings u model
@@ -3080,6 +4029,7 @@ settingsTitle : String -> String
 settingsTitle tab =
     case tab of
         "appearance" -> "Appearance"
+        "voice" -> "Voice & Video"
         "sound" -> "Notifications"
         "account" -> "Account"
         _ -> "My Profile"
@@ -3113,7 +4063,11 @@ renderAppearanceSettings model =
         [ div [ class "settings-card-head" ] [ h2 [] [ text "Appearance" ], p [ class "muted" ] [ text "Make Plainwire feel comfortable on this device." ] ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Theme" ], small [ class "muted" ] [ text "Use your system colors or choose a theme." ] ]
-            , select [ value model.profileTheme, onInput ProfileTheme ] [ option [ value "system" ] [ text "System" ], option [ value "light" ] [ text "Light" ], option [ value "dark" ] [ text "Dark" ] ]
+            , div [ class "appearance-choice-grid" ]
+                [ choiceCard (model.profileTheme == "system") "◐" "System" "Follow this device." (ProfileTheme "system")
+                , choiceCard (model.profileTheme == "dark") "●" "Dark" "Dim, focused surfaces." (ProfileTheme "dark")
+                , choiceCard (model.profileTheme == "light") "○" "Light" "Bright and clean." (ProfileTheme "light")
+                ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Interface density" ], small [ class "muted" ] [ text "Compact mode fits more channels and messages on screen." ] ]
@@ -3146,12 +4100,92 @@ renderNotificationSettings model =
             [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "◉" ], div [] [ b [] [ text "Desktop notifications" ], small [ class "muted" ] [ text "Get alerts while Plainwire is open in the background." ] ] ]
             , button [ class "btn secondary settings-action", onClick (BridgeEvent "request_notifications" E.null) ] [ text "Review permission" ]
             ]
+        , div [ class "notification-sound-preview" ]
+            [ div [] [ b [] [ text "Sound preview" ], small [ class "muted" ] [ text "Short, soft cues designed to stay out of the way." ] ]
+            , div [ class "segmented-control" ]
+                [ button [ class "btn secondary", onClick (BridgeEvent "preview_sound" (E.string "notification")) ] [ text "Message" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "preview_sound" (E.string "incoming")) ] [ text "Incoming call" ]
+                ]
+            ]
+        ]
+
+renderVoiceSettings : Model -> Html Msg
+renderVoiceSettings model =
+    let
+        deviceOptions devices =
+            option [ value "" ] [ text "System default" ]
+                :: List.map (\device -> option [ value device.id ] [ text device.label ]) devices
+        level = String.fromInt (Basics.max 0 (Basics.min 100 model.micTestLevel)) ++ "%"
+        processingButton processingMode heading copy enabled =
+            button
+                [ type_ "button"
+                , class ("voice-mode" ++ if model.voiceProcessingMode == processingMode then " active" else "")
+                , onClick (SelectVoiceProcessing processingMode)
+                , disabled (not enabled)
+                , attribute "aria-pressed" (if model.voiceProcessingMode == processingMode then "true" else "false")
+                ]
+                [ span [ class "voice-mode-title" ] [ text heading ]
+                , span [ class "voice-mode-copy" ] [ text copy ]
+                ]
+    in
+    div [ class "settings-card settings-panel voice-settings" ]
+        [ div [ class "settings-card-head" ]
+            [ h2 [] [ text "Voice & Video" ]
+            , p [ class "muted" ] [ text "Choose devices and verify your microphone before joining friends." ]
+            ]
+        , div [ class "setting-row setting-row-stack" ]
+            [ div [] [ b [] [ text "Input device" ], small [ class "muted" ] [ text "The microphone used in calls and voice channels." ] ]
+            , select [ value model.selectedAudioInput, onInput SelectAudioInput ] (deviceOptions model.audioInputs)
+            ]
+        , div [ class "setting-row setting-row-stack" ]
+            [ div [] [ b [] [ text "Output device" ], small [ class "muted" ] [ text (if model.outputSelectionSupported then "Where call audio plays." else "This browser uses your system output device.") ] ]
+            , select [ value model.selectedAudioOutput, onInput SelectAudioOutput, disabled (not model.outputSelectionSupported) ] (deviceOptions model.audioOutputs)
+            ]
+        , div [ class "setting-row setting-row-stack" ]
+            [ div []
+                [ b [] [ text "Microphone processing" ]
+                , small [ class "muted" ] [ text "Pick a lightweight everyday mode or preserve the microphone's natural signal." ]
+                ]
+            , div [ class "voice-mode-grid", attribute "role" "group", attribute "aria-label" "Microphone processing mode" ]
+                [ processingButton "noise" "Noise cancelling" "Browser echo control, noise reduction, and automatic level." True
+                , processingButton "studio" "Studio mic" "Unprocessed, full-band input for a quiet room and headphones." True
+                , processingButton "krisp" "Krisp AI" (if model.krispAvailable then "Licensed Krisp processing is ready on this server." else "Add the licensed Krisp browser SDK and models to enable.") model.krispAvailable
+                ]
+            ]
+        , div [ class "setting-row setting-row-stack mic-test-card" ]
+            [ div [] [ b [] [ text "Mic test" ], small [ class "muted" ] [ text "Speak normally. The meter and playback use the selected processing mode." ] ]
+            , div [ class "mic-meter", attribute "role" "meter", attribute "aria-label" "Microphone input level", attribute "aria-valuenow" (String.fromInt model.micTestLevel), attribute "aria-valuemin" "0", attribute "aria-valuemax" "100" ]
+                [ span [ class "mic-meter-fill", style "width" level ] []
+                , span [ class "mic-meter-peak" ] []
+                ]
+            , div [ class "mic-test-actions" ]
+                [ button [ class ("btn " ++ if model.micTesting then "danger" else "secondary"), onClick ToggleMicTest ]
+                    [ text (if model.micTesting then "Stop test" else "Test microphone") ]
+                , button
+                    [ class ("btn secondary" ++ if model.micMonitoring then " active" else "")
+                    , onClick ToggleMicMonitor
+                    , disabled (not model.micTesting)
+                    , attribute "aria-pressed" (if model.micMonitoring then "true" else "false")
+                    , title "Use headphones to avoid feedback"
+                    ]
+                    [ text (if model.micMonitoring then "Stop playback" else "Hear myself") ]
+                , button [ class "btn ghost", onClick (BridgeEvent "list_audio_devices" E.null) ] [ text "Refresh devices" ]
+                ]
+            , if model.micMonitoring then
+                small [ class "mic-monitor-warning" ] [ text "Playback is on. Wear headphones to prevent feedback." ]
+              else
+                text ""
+            ]
+        , div [ class "voice-settings-note" ]
+            [ b [] [ text "Connection tip" ]
+            , p [ class "muted" ] [ text "For calls outside your home network, configure TURN before launch. Plainwire will show each remote peer as connected only after ICE and audio are actually established." ]
+            ]
         ]
 
 renderProfileSettings : User -> Model -> Html Msg
 renderProfileSettings u model =
     div [ class "settings-card" ]
-        [ div [ class "settings-banner", style "background-image" (if String.isEmpty model.profileBannerPreviewUrl then "linear-gradient(135deg, #5865f2, #232946)" else "url('" ++ model.profileBannerPreviewUrl ++ "')") ]
+        [ div [ class "settings-banner", style "background-image" (if String.isEmpty model.profileBannerPreviewUrl then "none" else "url('" ++ model.profileBannerPreviewUrl ++ "')") ]
             [ div [ class "settings-avatar-wrap" ] [ avatarImg model.profileAvatarPreviewUrl model.profileDisplayName "" ]
             , div [ class "settings-name-block" ]
                 [ h2 [] [ text (if String.isEmpty model.profileDisplayName then u.displayName else model.profileDisplayName) ]
@@ -3220,10 +4254,32 @@ renderProfileSettings u model =
 
 renderNewServerPage : Model -> Html Msg
 renderNewServerPage model =
-    div [ class "card pad" ]
-        [ div [ class "field" ] [ label [] [ text "Name" ], input [ value model.serverName, onInput ServerName ] [] ]
-        , div [ class "field" ] [ label [] [ text "Description" ], textarea [ value model.serverDescription, onInput ServerDescription ] [] ]
-        , button [ class "btn", onClick (CreateServer model.serverName model.serverDescription) ] [ text "Create" ]
+    div [ class "server-create-page" ]
+        [ section [ class "server-create-intro" ]
+            [ span [ class "server-create-mark" ] [ text "+" ]
+            , span [ class "eyebrow" ] [ text "New space" ]
+            , h1 [] [ text "Create a server" ]
+            , p [ class "muted" ] [ text "Give your group a home. Plainwire creates sensible text and voice defaults, and you can customize everything afterward." ]
+            , div [ class "server-create-preview" ]
+                [ div [ class "server-icon" ] [ text (if String.isEmpty (String.trim model.serverName) then "S" else String.left 1 (String.toUpper model.serverName)) ]
+                , div []
+                    [ b [] [ text (if String.isEmpty (String.trim model.serverName) then "Your server" else String.trim model.serverName) ]
+                    , small [ class "muted" ] [ text (if String.isEmpty (String.trim model.serverDescription) then "A place for your friends" else String.trim model.serverDescription) ]
+                    ]
+                ]
+            ]
+        , section [ class "card server-create-form" ]
+            [ div [ class "field" ] [ label [] [ text "Server name" ], input [ value model.serverName, maxlength 80, placeholder "Weekend crew", onInput ServerName ] [] ]
+            , div [ class "field" ] [ label [] [ text "What is it for?" ], textarea [ value model.serverDescription, maxlength 280, placeholder "Games, projects, hanging out…", onInput ServerDescription ] [] ]
+            , div [ class "server-create-defaults" ]
+                [ div [] [ span [ class "server-default-icon" ] [ text "#" ], span [] [ b [] [ text "general" ], small [ class "muted" ] [ text "Text channel" ] ] ]
+                , div [] [ span [ class "server-default-icon" ] [ text "♪" ], span [] [ b [] [ text "Lounge" ], small [ class "muted" ] [ text "Voice ready" ] ] ]
+                ]
+            , div [ class "modal-actions server-create-actions" ]
+                [ button [ class "btn secondary", onClick (Go "#") ] [ text "Cancel" ]
+                , button [ class "btn", disabled (String.length (String.trim model.serverName) < 2), onClick (CreateServer model.serverName model.serverDescription) ] [ text "Create server" ]
+                ]
+            ]
         ]
 
 renderInvitePage : Model -> Html Msg
@@ -3242,12 +4298,11 @@ renderInvitePage model =
 
 renderMessagePage : String -> String -> Model -> Html Msg
 renderMessagePage draftKey placeholderText model =
-    let callBar = case ( model.active, model.callUI.active ) of
-            ( DmView convId, Just active ) ->
-                if active.conversationId == convId then
-                    [ renderDmCallBar active model ]
-                else
-                    []
+    let callBar = case model.active of
+            DmView convId ->
+                case callForConversation convId model of
+                    Just active -> [ renderDmCallBar active model ]
+                    Nothing -> []
             _ -> []
         chatSurface = div [ class "chat-surface" ]
             ( callBar
@@ -3318,9 +4373,7 @@ renderChatHeader model =
         DmView id ->
             case List.filter (\c -> c.id == id) model.convs of
                 c :: _ ->
-                    let hasCall = case model.callUI.active of
-                            Just a -> a.conversationId == id
-                            Nothing -> False
+                    let hasCall = callForConversation id model /= Nothing
                         joinedCall = isJoinedCall id model
                     in div [ class "chat-header" ]
                         [ convAvatar model c
@@ -3343,6 +4396,15 @@ isJoinedCall : Int -> Model -> Bool
 isJoinedCall conversationId model =
     model.voice.mode == Just "call" && model.voice.id == Just conversationId
 
+callForConversation : Int -> Model -> Maybe ActiveCall
+callForConversation conversationId model =
+    if isJoinedCall conversationId model then
+        Maybe.andThen
+            (\call -> if call.conversationId == conversationId then Just call else Nothing)
+            model.callUI.active
+    else
+        Dict.get conversationId model.activeCalls
+
 renderDmCallBar : ActiveCall -> Model -> Html Msg
 renderDmCallBar active model =
     let count = List.length active.users
@@ -3359,7 +4421,11 @@ renderDmCallBar active model =
         [ div [ class "dm-call-bar-main" ]
             [ span [ class "dm-call-bar-icon" ] [ text "♪" ]
             , span [ class "dm-call-bar-title" ] [ text (if joinedCall then "In Call" else "Call active") ]
-            , span [ class "dm-call-bar-timer" ] [ text (if joinedCall then minutes ++ ":" ++ seconds else "Ready to join") ]
+            , span
+                ([ class ("dm-call-bar-timer" ++ if joinedCall then " pw-live-call-timer" else "") ]
+                    ++ (if joinedCall then [ attribute "data-call-start" (String.fromInt active.startTime) ] else [])
+                )
+                [ text (if joinedCall then minutes ++ ":" ++ seconds else "Ready to join") ]
             , span [ class "dm-call-bar-count" ] [ text countText ]
             ]
         , div [ class "dm-call-bar-controls" ]
@@ -3490,10 +4556,48 @@ renderMessageBody body =
     in lines
         |> List.indexedMap (\index line ->
             case attachmentMarkup line of
-                Just ( True, name, url ) ->
+                Just ( AttachmentImage, name, url ) ->
                     a [ class "message-image-link", href url, target "_blank", rel "noopener" ]
                         [ img [ class "message-image", src url, alt name, attribute "loading" "lazy" ] [] ]
-                Just ( False, name, url ) ->
+                Just ( AttachmentAudio, name, url ) ->
+                    div [ class "media-attachment pw-media-player pw-audio-player", attribute "data-media-url" url ]
+                        [ audio [ class "pw-audio-element", src url, preload "metadata" ] []
+                        , button [ type_ "button", class "pw-media-play", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
+                        , div [ class "pw-media-copy" ]
+                            [ div [ class "pw-media-heading" ]
+                                [ b [ class "pw-media-name", title name ] [ text name ]
+                                , a [ class "pw-media-download", href url, attribute "download" name, title "Download audio" ] [ text "Download" ]
+                                ]
+                            , div [ class "pw-media-timeline" ]
+                                [ span [ class "pw-media-time" ] [ text "0:00" ]
+                                , input [ class "pw-media-seek", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1000", step "1", attribute "aria-label" "Seek audio" ] []
+                                , span [ class "pw-media-duration" ] [ text "–:––" ]
+                                ]
+                            ]
+                        , button [ type_ "button", class "pw-media-mute", attribute "data-media-action" "mute", attribute "aria-label" "Mute audio" ] [ text "Sound" ]
+                        , input [ class "pw-media-volume", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1", step "0.02", attribute "aria-label" "Audio volume" ] []
+                        ]
+                Just ( AttachmentVideo, name, url ) ->
+                    div [ class "media-attachment pw-media-player pw-video-player", attribute "data-media-url" url ]
+                        [ div [ class "pw-video-frame" ]
+                            [ video [ class "message-video", src url, preload "metadata", attribute "playsinline" "" ] []
+                            , button [ type_ "button", class "pw-video-center-play", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
+                            ]
+                        , div [ class "pw-video-controls" ]
+                            [ button [ type_ "button", class "pw-media-play compact", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
+                            , span [ class "pw-media-time" ] [ text "0:00" ]
+                            , input [ class "pw-media-seek", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1000", step "1", attribute "aria-label" "Seek video" ] []
+                            , span [ class "pw-media-duration" ] [ text "–:––" ]
+                            , button [ type_ "button", class "pw-media-mute compact", attribute "data-media-action" "mute", attribute "aria-label" "Mute video" ] [ text "Sound" ]
+                            , input [ class "pw-media-volume", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1", step "0.02", attribute "aria-label" "Video volume" ] []
+                            , button [ type_ "button", class "pw-media-fullscreen", attribute "data-media-action" "fullscreen", attribute "aria-label" "Fullscreen video" ] [ text "Full" ]
+                            ]
+                        , div [ class "pw-video-meta" ]
+                            [ span [ title name ] [ text name ]
+                            , a [ href url, attribute "download" name, title "Download video" ] [ text "Download" ]
+                            ]
+                        ]
+                Just ( AttachmentFile, name, url ) ->
                     a [ class "message-file", href url, target "_blank", rel "noopener" ]
                         [ span [ class "message-file-icon" ] [ text "↧" ], span [] [ text name ] ]
                 Nothing ->
@@ -3503,25 +4607,41 @@ renderMessageBody body =
                         span [] [ text line, if index < List.length lines - 1 then br [] [] else text "" ]
         )
 
-attachmentMarkup : String -> Maybe ( Bool, String, String )
+type AttachmentKind
+    = AttachmentImage
+    | AttachmentAudio
+    | AttachmentVideo
+    | AttachmentFile
+
+
+attachmentMarkup : String -> Maybe ( AttachmentKind, String, String )
 attachmentMarkup line =
     let
-        parse image prefix endpoint =
+        parse kind prefix endpoint =
             if String.startsWith prefix line && String.endsWith ")" line then
                 case String.split ("](" ++ endpoint) line of
                     [ left, idPart ] ->
                         let name = String.dropLeft (String.length prefix) left
                             ident = String.dropRight 1 idPart
                         in if String.isEmpty name || String.isEmpty ident || String.contains "/" ident then Nothing
-                           else Just ( image, name, endpoint ++ ident )
+                           else Just ( kind name, name, endpoint ++ ident )
                     _ -> Nothing
             else Nothing
-    in case parse True "![" "/api/files/" of
+        fileKind name =
+            let lower = String.toLower name
+                has extensions = List.any (\extension -> String.endsWith extension lower) extensions
+            in if has [ ".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac", ".opus" ] then
+                AttachmentAudio
+               else if has [ ".mp4", ".webm", ".mov", ".m4v", ".ogv" ] then
+                AttachmentVideo
+               else
+                AttachmentFile
+    in case parse (always AttachmentImage) "![" "/api/files/" of
         Just value -> Just value
         Nothing ->
-            case parse True "![" "/api/media/" of
+            case parse (always AttachmentImage) "![" "/api/media/" of
                 Just value -> Just value
-                Nothing -> parse False "[" "/api/files/"
+                Nothing -> parse fileKind "[" "/api/files/"
 
 onComposerKeyDown : Attribute Msg
 onComposerKeyDown =
@@ -3808,6 +4928,8 @@ encodeServer server =
         , ("name", E.string server.name)
         , ("description", E.string server.description)
         , ("icon_url", E.string server.iconUrl)
+        , ("banner_url", E.string server.bannerUrl)
+        , ("accent_color", E.string server.accentColor)
         ]
 
 
@@ -3815,12 +4937,21 @@ encodeServer server =
 
 subscriptions : Model -> Sub Msg
 subscriptions model =
+    let
+        clockInterval =
+            if model.pageVisible then 30000 else 120000
+        syncInterval =
+            if not model.pageVisible then 300000
+            else if model.wsConnected then 300000
+            else 5000
+    in
     Sub.batch
         [ onHashChange SetRoute
         , apiReceive decodeApi
         , wsReceive WsEvent
         , bridgeReceive decodeBridge
         , fileInput decodeFileInput
-        , Browser.Events.onVisibilityChange (\_ -> NoOp)
-        , Time.every 3000 Tick
+        , Browser.Events.onVisibilityChange (\visibility -> PageVisibility (visibility == Browser.Events.Visible))
+        , Time.every clockInterval Tick
+        , Time.every syncInterval (\_ -> SilentSync True)
         ]

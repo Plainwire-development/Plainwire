@@ -22,8 +22,8 @@ upload(Req0, Session) ->
         {_, false, _} -> pw_util:err_json(Req0, 413, <<"file_too_large">>);
         {_, _, false} -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
         {true, true, true} ->
-            case pw_upload_gc:acquire(Uid) of
-                ok -> try begin_upload(Req0, Uid, Size) after pw_upload_gc:release(Uid) end;
+            case pw_upload_gc:acquire(Uid, Size) of
+                ok -> try begin_upload(Req0, Uid, Size) after pw_upload_gc:release(Uid, Size) end;
                 {error, busy} -> pw_util:err_json(Req0, 429, <<"too_many_concurrent_uploads">>)
             end
     end.

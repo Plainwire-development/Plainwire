@@ -36,10 +36,20 @@ turn_config_test() ->
         ?assertEqual(<<"secret">>, maps:get(credential, Turn))
     end).
 
+voice_processing_is_disabled_without_license_assets_test() ->
+    with_env([{"PLAINWIRE_KRISP_ENABLED", "false"}], fun() ->
+        Config = pw_rtc_config:voice_processing(),
+        ?assertEqual(false, maps:get(krisp_available, Config)),
+        ?assertEqual(<<"/assets/krisp/krispsdk.mjs">>, maps:get(sdk_url, Config)),
+        ?assertEqual(<<"/assets/krisp/models/model_8.kef">>, maps:get(model_8_url, Config)),
+        ?assertEqual(<<"/assets/krisp/models/model_nc_mq.kef">>, maps:get(model_nc_url, Config))
+    end).
+
 with_env(Pairs, Fun) ->
     Names = ["PLAINWIRE_STUN_URLS", "PLAINWIRE_TURN_URLS",
         "PLAINWIRE_TURN_USERNAME", "PLAINWIRE_TURN_CREDENTIAL", "PLAINWIRE_TURN_SECRET",
-        "PLAINWIRE_TURN_TTL_SECONDS", "PLAINWIRE_ICE_TRANSPORT_POLICY"],
+        "PLAINWIRE_TURN_TTL_SECONDS", "PLAINWIRE_ICE_TRANSPORT_POLICY",
+        "PLAINWIRE_KRISP_ENABLED"],
     Old = [{Name, os:getenv(Name)} || Name <- Names],
     lists:foreach(fun os:unsetenv/1, Names),
     lists:foreach(fun({Name, Value}) -> os:putenv(Name, Value) end, Pairs),

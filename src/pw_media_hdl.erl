@@ -40,9 +40,7 @@ auth(Req) ->
         Token ->
             case pw_db:session_fast(Token) of
                 {ok, Session} -> {ok, maps:get(id, maps:get(user, Session))};
-                %% The ETS session cache is deliberately short lived. Media
-                %% requests must still accept a valid persistent session after
-                %% that cache expires (notably pages with many animated GIFs).
+                %% ETS expired, not necessarily the session. check the DB.
                 _ ->
                     case pw_db:session(Token) of
                         {ok, Session} -> {ok, maps:get(id, maps:get(user, Session))};

@@ -13,18 +13,11 @@ import Json.Decode as D
 import Json.Encode as E
 
 
-{-| JS boundary for effects Elm cannot perform directly.
-FOR FUTURE DEVS:
-
-Keep this module small and boring. Ports are intentionally raw at the boundary,
-but callers should prefer typed helpers like `ApiRequest` instead of constructing
-JSON ad hoc in feature code. Dont overdo this file.
--}
+{-| the JS escape hatch. keep it small and boring, please. -}
 
 
 -- API (HTTP)
--- Encoded requests are consumed by `elm-bridge.js`, which prefixes `/api` and
--- attaches CSRF. Only same-origin absolute-path API routes should be sent.
+-- elm-bridge adds /api and CSRF. paths stay same-origin.
 
 type ApiRequest
     = ApiGet String
@@ -63,15 +56,14 @@ port apiReceive : (E.Value -> msg) -> Sub msg
 
 
 -- WEBSOCKET
--- Incoming websocket payloads must be decoded/validated in Main before use.
+-- decode this stuff in Main before believing it.
 
 port wsSend : E.Value -> Cmd msg
 port wsReceive : (E.Value -> msg) -> Sub msg
 
 
 -- BRIDGE
--- Escape hatch for call/WebRTC and small browser APIs. Prefer adding a typed
--- port above if a command becomes broadly reused.
+-- calls/WebRTC and other browser-shaped oddities.
 
 port bridgeSend : E.Value -> Cmd msg
 port bridgeReceive : (E.Value -> msg) -> Sub msg

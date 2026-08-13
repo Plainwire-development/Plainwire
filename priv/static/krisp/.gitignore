@@ -1,0 +1,4 @@
+# licensed blobs stay local. lawyers enjoy that sort of thing.
+*
+!.gitignore
+!README.md

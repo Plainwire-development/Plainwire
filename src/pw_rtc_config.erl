@@ -1,5 +1,5 @@
 -module(pw_rtc_config).
--export([get/0, get/1, validate/1]).
+-export([get/0, get/1, voice_processing/0, validate/1]).
 
 -define(DEFAULT_STUN, <<"stun:stun.l.google.com:19302">>).
 -define(DEFAULT_TTL_SECONDS, 3600).
@@ -20,6 +20,16 @@ get(UserId) ->
     end,
     #{iceServers => IceServers, iceTransportPolicy => Policy}.
 
+voice_processing() ->
+    Enabled = pw_util:env_bool("PLAINWIRE_KRISP_ENABLED", false),
+    Ready = Enabled andalso krisp_assets_ready(),
+    #{
+        krisp_available => Ready,
+        sdk_url => <<"/assets/krisp/krispsdk.mjs">>,
+        model_8_url => <<"/assets/krisp/models/model_8.kef">>,
+        model_nc_url => <<"/assets/krisp/models/model_nc_mq.kef">>
+    }.
+
 validate(Production) ->
     TurnUrls = urls("PLAINWIRE_TURN_URLS", [], turn),
     RequireTurn = pw_util:env_bool("PLAINWIRE_REQUIRE_TURN", Production),
@@ -32,6 +42,19 @@ validate(Production) ->
         {false, [], _} -> ok;
         {false, _, false} -> {error, turn_credentials_required};
         _ -> ok
+    end.
+
+krisp_assets_ready() ->
+    case code:priv_dir(plainwire_relay) of
+        Priv when is_list(Priv) ->
+            Root = filename:join([Priv, "static", "krisp"]),
+            lists:all(fun filelib:is_regular/1, [
+                filename:join(Root, "krispsdk.mjs"),
+                filename:join([Root, "models", "model_8.kef"]),
+                filename:join([Root, "models", "model_nc_mq.kef"])
+            ]);
+        _ ->
+            false
     end.
 
 maybe_server([], Acc) -> Acc;

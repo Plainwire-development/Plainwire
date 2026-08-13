@@ -63,8 +63,7 @@ handle(<<"POST">>, [<<"login">>], Req0, _) ->
                 end
         end
     end);
-%% Stays reachable unauthenticated so load balancers can probe liveness, but the
-%% scheduler, process and pool internals are only returned to a signed-in user.
+%% public gets alive/dead; signed-in users get the nerdy bits.
 handle(<<"GET">>, [<<"health">>], Req0, _) ->
     case pw_db:health() of
         {ok, Data} ->
@@ -113,12 +112,15 @@ uid(Session) -> maps:get(id, maps:get(user, Session)).
 authed(<<"GET">>, [<<"me">>], Req, Session, _) -> pw_util:ok_json(Req, #{ok=>true,data=>Session});
 authed(<<"GET">>, [<<"rtc-config">>], Req, Session, _) ->
     pw_util:ok_json(Req, #{ok=>true,data=>pw_rtc_config:get(uid(Session))});
+authed(<<"GET">>, [<<"voice-processing-config">>], Req, _Session, _) ->
+    pw_util:ok_json(Req, #{ok=>true,data=>pw_rtc_config:voice_processing()});
 authed(<<"POST">>, [<<"logout">>], Req0, _, _) ->
     Token = pw_util:cookie_value(Req0, <<"pw_session">>),
     _ = case Token of undefined -> ok; _ -> pw_db:logout(Token) end,
     pw_util:ok_json(pw_util:clear_cookie(Req0), #{ok=>true});
 authed(<<"GET">>, [<<"sync">>], Req, Session, _) -> result(Req, pw_db:sync(uid(Session), qs(Req, <<"since">>)));
 authed(<<"POST">>, [<<"profile">>], Req0, Session, _) -> with_json_large(Req0, fun(M, Req) -> result(Req, pw_db:update_profile(uid(Session), maps:get(<<"display_name">>, M, maps:get(display_name, maps:get(user,Session))), M)) end);
+authed(<<"POST">>, [<<"profile">>, <<"theme">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_theme(uid(Session), maps:get(<<"theme">>, M, <<"system">>))) end);
 authed(<<"POST">>, [<<"notifications">>, <<"clear">>], Req, Session, _) -> result(Req, pw_db:clear_notifications(uid(Session)));
 authed(<<"GET">>, [<<"forums">>], Req, Session, _) -> result(Req, pw_db:forums(uid(Session)));
 authed(<<"POST">>, [<<"forums">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_forum(uid(Session), maps:get(<<"name">>,M,<<>>), maps:get(<<"slug">>,M,<<>>), maps:get(<<"description">>,M,<<>>))) end);
@@ -143,7 +145,7 @@ authed(<<"POST">>, [<<"servers">>], Req0, Session, _) -> with_json(Req0, fun(M, 
 authed(<<"GET">>, [<<"server">>, Id], Req, Session, _) -> result(Req, pw_db:server(uid(Session), Id));
 authed(<<"POST">>, [<<"server">>, Id], Req0, Session, _) ->
     with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_server(uid(Session), Id, M)) end);
-authed(<<"POST">>, [<<"server">>, Id, <<"channels">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_channel(uid(Session), Id, maps:get(<<"name">>,M,<<>>), maps:get(<<"kind">>,M,<<"text">>))) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"channels">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_channel(uid(Session), Id, maps:get(<<"name">>,M,<<>>), maps:get(<<"kind">>,M,<<"text">>), maps:get(<<"category_id">>,M,undefined))) end);
 authed(<<"GET">>, [<<"server">>, Id, <<"categories">>], Req, Session, _) -> result(Req, pw_db:categories(uid(Session), Id));
 authed(<<"POST">>, [<<"server">>, Id, <<"categories">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_category(uid(Session), Id, maps:get(<<"name">>,M,<<>>))) end);
 authed(<<"POST">>, [<<"server">>, Id, <<"category">>, CatId], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_category(uid(Session), Id, CatId, M)) end);
@@ -164,7 +166,8 @@ authed(<<"GET">>, [<<"embed">>], Req, _, _) ->
             end
     end;
 authed(<<"GET">>, [<<"messages">>], Req, Session, _) -> result(Req, pw_db:messages(uid(Session), qs(Req, <<"scope">>), qs(Req, <<"scope_id">>), qs(Req, <<"before">>), qs(Req, <<"after">>)));
-authed(<<"POST">>, [<<"channels">>, Id, <<"messages">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:post_channel_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
+authed(<<"POST">>, [<<"channels">>, Id, <<"messages">>], Req0, Session, _) ->
+    with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:post_channel_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
 authed(<<"POST">>, [<<"delete_message">>, MsgId], Req, Session, _) -> result(Req, pw_db:delete_message(uid(Session), MsgId));
 authed(<<"GET">>, [<<"conversations">>], Req, Session, _) -> result(Req, pw_db:conversations(uid(Session)));
 authed(<<"POST">>, [<<"conversations">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) ->
@@ -185,7 +188,8 @@ authed(<<"POST">>, [<<"conversation">>, Id, <<"members">>], Req0, Session, _) ->
     result(Req, Result)
 end);
 authed(<<"POST">>, [<<"conversation">>, Id, <<"read">>], Req, Session, _) -> result(Req, pw_db:mark_conversation_read(uid(Session), Id));
-authed(<<"POST">>, [<<"conversation">>, Id, <<"messages">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:post_direct_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
+authed(<<"POST">>, [<<"conversation">>, Id, <<"messages">>], Req0, Session, _) ->
+    with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:post_direct_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
 authed(<<"POST">>, [<<"conversation">>, Id, <<"leave">>], Req, Session, _) -> result(Req, pw_db:leave_conversation(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"close">>], Req, Session, _) -> result(Req, pw_db:close_conversation(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"request">>, <<"accept">>], Req, Session, _) -> result(Req, pw_db:accept_message_request(uid(Session), Id));
@@ -203,9 +207,16 @@ with_json_public(Req0, Fun) ->
     end.
 with_json(Req0, Fun) -> with_json_public(Req0, Fun).
 
+with_message_limit(Req0, Uid, Fun) ->
+    %% chat gets a tighter limit. bursts are fine; floods can go outside.
+    case pw_rate:allow({message, Uid, burst}, 12, 5000) andalso
+         pw_rate:allow({message, Uid, sustained}, 90, 60000) of
+        true -> with_json(Req0, Fun);
+        false -> pw_util:err_json(Req0, 429, <<"message_rate_limited">>)
+    end.
+
 with_json_large(Req0, Fun) ->
-    %% Two 8 MiB images expand to roughly 21.4 MiB as base64 data URLs.
-    %% Leave a small envelope for profile metadata while keeping a hard cap.
+    %% two 8 MiB images balloon in base64. leave a little room for JSON.
     case pw_util:read_json(Req0, 25165824) of
         {ok, M, Req} -> Fun(M, Req);
         {error, too_large, Req} -> pw_util:err_json(Req, 413, <<"profile_images_too_large">>);

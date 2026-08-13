@@ -8,9 +8,7 @@
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-%% The request path never enters the gen_server. ETS update_counter is atomic,
-%% so API/WebSocket/media checks run concurrently on scheduler threads instead
-%% of queueing behind one global rate-limit process.
+%% hot path stays in atomic ETS, not one sad global mailbox.
 allow(Key, Limit, WindowMs) when Limit > 0, WindowMs > 0 ->
     Now = erlang:monotonic_time(millisecond),
     Bucket = Now div WindowMs,

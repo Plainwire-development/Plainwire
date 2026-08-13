@@ -11,10 +11,7 @@ init([]) ->
         #{id => pw_media, start => {pw_media, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_media]},
         #{id => pw_db, start => {pw_db, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_db]},
         #{id => pw_upload_gc, start => {pw_upload_gc, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_upload_gc]},
-        %% Listed last so the database pool and hub are ready before the socket
-        %% starts accepting. Supervising the listener instead of starting it from
-        %% the application callback means a crashed listener is restarted rather
-        %% than leaving the node up with no HTTP.
+        %% listener goes last; DB and hub should exist before traffic does.
         http_listener_spec()
     ],
     {ok, {{one_for_one, 20, 10}, Children}}.
@@ -37,11 +34,10 @@ http_listener_spec() ->
     TransportOpts = #{
         num_acceptors => Acceptors,
         max_connections => MaxConnections,
-        %% cowboy:start_clear/3 defaults the connection type to supervisor and
-        %% mirrors it into the protocol options; both are set explicitly here
-        %% because ranch:child_spec/5 does not apply cowboy's defaults.
+        %% ranch child specs skip cowboy's defaults, so spell this one out.
         connection_type => supervisor,
-        socket_opts => [{port, Port}, {backlog, 4096}, {nodelay, true}, {keepalive, true}, {reuseaddr, true}]
+        %% ranch adds reuseaddr itself, then complains if we do. neat.
+        socket_opts => [{port, Port}, {backlog, 4096}, {nodelay, true}, {keepalive, true}]
     },
     ProtocolOpts = #{
         connection_type => supervisor,

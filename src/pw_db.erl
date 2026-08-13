@@ -3,11 +3,11 @@
 -export([
     start_link/0,
     health/0,
-    register/3, login/2, session/1, session_fast/1, logout/1, me/1, update_profile/3,
+    register/3, login/2, session/1, session_fast/1, logout/1, me/1, update_profile/3, update_theme/2,
     sync/2, users/1, profile/2,
     friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friend_unblock/2, friends/1,
     forums/1, create_forum/4, delete_forum/2, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, delete_thread/2, reply_thread/3, vote_thread/3,
-    servers/1, create_server/3, update_server/3, server/2, create_channel/4,
+    servers/1, create_server/3, update_server/3, server/2, create_channel/4, create_channel/5,
     create_invite/4, invite_preview/1, join_invite/2,
     messages/5, post_channel_message/4, delete_message/2,
     conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4,
@@ -88,9 +88,7 @@ call_with_pool(Msg, #pool{conns = Conns, size = Size, counter = Counter}) ->
     end.
 
 run_connection_locked(Idx, Msg, Conn, Started, QueueLen) ->
-    %% epgsql serializes individual queries, not an entire BEGIN..COMMIT
-    %% sequence. Lock the complete route per physical connection so unrelated
-    %% requests can never execute inside another request's transaction.
+    %% epgsql locks queries, not whole transactions. lock the whole route.
     LockId = {{?MODULE, connection, Idx}, self()},
     try global:trans(LockId, fun() ->
         CurrentConn = case ets:lookup(?POOL_CONNS, Idx) of [{Idx, C}] -> C; [] -> Conn end,
@@ -110,8 +108,7 @@ run_connection_locked(Idx, Msg, Conn, Started, QueueLen) ->
             {error, database_unavailable}
     end.
 
-%% "Power of two choices" avoids blindly piling requests onto a busy epgsql
-%% process while keeping selection O(1), even with a large connection pool.
+%% two random choices keeps one connection from getting dogpiled.
 pick_connection(Conns, Size, Counter) ->
     A = atomics:add_get(Counter, 1, 1) rem Size + 1,
     B = case Size of 1 -> A; _ -> atomics:add_get(Counter, 1, 1) rem Size + 1 end,
@@ -158,6 +155,7 @@ session(T) -> call({session, T}).
 logout(T) -> call({logout, T}).
 me(Uid) -> call({me, Uid}).
 update_profile(Uid, Display, Patch) -> call({update_profile, Uid, Display, Patch}).
+update_theme(Uid, Theme) -> call({update_theme, Uid, Theme}).
 sync(Uid, Since) -> call({sync, Uid, Since}).
 users(Q) -> call({users, Q}).
 profile(Viewer, UserId) -> call({profile, Viewer, UserId}).
@@ -182,7 +180,8 @@ servers(Uid) -> call({servers, Uid}).
 create_server(Uid, Name, Desc) -> call({create_server, Uid, Name, Desc}).
 update_server(Uid, Sid, Patch) -> call({update_server, Uid, Sid, Patch}).
 server(Uid, ServerId) -> call({server, Uid, ServerId}).
-create_channel(Uid, ServerId, Name, Kind) -> call({create_channel, Uid, ServerId, Name, Kind}).
+create_channel(Uid, ServerId, Name, Kind) -> create_channel(Uid, ServerId, Name, Kind, undefined).
+create_channel(Uid, ServerId, Name, Kind, CategoryId) -> call({create_channel, Uid, ServerId, Name, Kind, CategoryId}).
 categories(Uid, ServerId) -> call({categories, Uid, ServerId}).
 create_category(Uid, ServerId, Name) -> call({create_category, Uid, ServerId, Name}).
 update_category(Uid, ServerId, CatId, Patch) -> call({update_category, Uid, ServerId, CatId, Patch}).
@@ -233,8 +232,7 @@ init([]) ->
     {ok, MigConn} = connect_with_retry(10, 500),
     ok = migrate(MigConn),
     try epgsql:close(MigConn) catch _:_ -> ok end,
-    %% Bound configuration before it reaches tuple indexing/modulo operations
-    %% or opens an unreasonable number of database connections.
+    %% clamp this before tuple math (and before opening 9000 connections).
     PoolSize = min(128, max(1, pw_util:env_int("PLAINWIRE_DB_POOL_SIZE", 10))),
     Conns = list_to_tuple([
         begin
@@ -255,7 +253,7 @@ handle_info(session_gc, St) ->
     Now = pw_util:now_ms(),
     _ = ets:select_delete(?SESSION_CACHE,
         [{{'_', '_', '$1'}, [{'<', '$1', Now}], [true]}]),
-    %% Delete in bounded batches so cleanup cannot create a long table lock.
+    %% small batches; cleanup doesn't deserve a giant lock.
     _ = call({prune_sessions, Now}),
     erlang:send_after(?SESSION_GC_MS, self(), session_gc),
     {noreply, St};
@@ -325,6 +323,7 @@ read_msg({register, _, _, _}) -> false;
 read_msg({login, _, _}) -> false;
 read_msg({logout, _}) -> false;
 read_msg({update_profile, _, _, _}) -> false;
+read_msg({update_theme, _, _}) -> false;
 read_msg({friend_request, _, _}) -> false;
 read_msg({friend_accept, _, _}) -> false;
 read_msg({friend_remove, _, _}) -> false;
@@ -336,7 +335,7 @@ read_msg({delete_forum, _, _}) -> false;
 read_msg({reply_thread, _, _, _}) -> false;
 read_msg({create_server, _, _, _}) -> false;
 read_msg({update_server, _, _, _}) -> false;
-read_msg({create_channel, _, _, _, _}) -> false;
+read_msg({create_channel, _, _, _, _, _}) -> false;
 read_msg({create_invite, _, _, _, _}) -> false;
 read_msg({join_invite, _, _}) -> false;
 read_msg({post_channel_message, _, _, _, _}) -> false;
@@ -502,7 +501,7 @@ route({update_profile, Uid, Display0, Patch}, Conn) ->
     Avatar = store_profile_image(maps:get(<<"avatar_url">>, Patch, <<>>), CurrentAvatar, Conn, Uid),
     Banner = store_profile_image(maps:get(<<"banner_url">>, Patch, <<>>), CurrentBanner, Conn, Uid),
     Status = pw_util:clean_text(maps:get(<<"status">>, Patch, <<>>), 100),
-    Theme = pw_util:clean_text(maps:get(<<"theme">>, Patch, <<"system">>), 32),
+    Theme = normalize_theme(maps:get(<<"theme">>, Patch, <<"system">>)),
     Now = pw_util:now_ms(),
     ok = exec(Conn,
         "UPDATE users SET display_name = $1, bio = $2, avatar_url = $3, banner_url = $4, "
@@ -512,6 +511,12 @@ route({update_profile, Uid, Display0, Patch}, Conn) ->
     insert_profile_upload_ref(Conn, Uid, Banner),
     invalidate_session_cache(Uid),
     {ok, #{updated => true}};
+route({update_theme, Uid, Theme0}, Conn) ->
+    Theme = normalize_theme(Theme0),
+    ok = exec(Conn, "UPDATE users SET theme = $1, updated_at = $2 WHERE id = $3",
+        [Theme, pw_util:now_ms(), Uid]),
+    invalidate_session_cache(Uid),
+    {ok, #{theme => Theme}};
 route({sync, Uid, Since0}, Conn) ->
     Since = case pw_util:int(Since0) of undefined -> 0; I -> I end,
     Notifs = case Since > 0 of
@@ -541,8 +546,7 @@ route({profile, Viewer, UserId0}, Conn) ->
     case route({me, UserId}, Conn) of
         {ok, U} ->
             Rel = friendship_status(Conn, Viewer, UserId),
-            %% Source URLs are edit-state for the account owner, not public
-            %% profile data. In particular, an uploaded data URL can be large.
+            %% source URLs are private edit state, and data URLs can be huge.
             Public = maps:without([avatar_source_url, banner_source_url], U),
             {ok, #{user => Public, relationship => Rel}};
         E ->
@@ -625,6 +629,8 @@ route({friend_block, Uid, Target0}, Conn) ->
                   "requester_id = EXCLUDED.requester_id, addressee_id = EXCLUDED.addressee_id, "
                   "status = 'blocked', updated_at = EXCLUDED.updated_at",
             ok = exec(Conn, Sql, [A, B, Uid, Target, <<"blocked">>, Now, Now]),
+            pw_upload_gc:invalidate_user(Uid),
+            pw_upload_gc:invalidate_user(Target),
             {ok, #{status => blocked}}
     end;
 route({friend_unblock, Uid, Target0}, Conn) ->
@@ -634,8 +640,7 @@ route({friend_unblock, Uid, Target0}, Conn) ->
         Uid -> {error, cannot_unblock_self};
         _ ->
             {A, B} = pair(Uid, Target),
-            %% Only the account that created the block may remove it. Without
-            %% this requester check, the blocked party could unblock itself.
+            %% only the blocker gets to undo the block. seems fair.
             case one(Conn,
                 "SELECT requester_id FROM friendships WHERE user_low = $1 AND user_high = $2 AND status = 'blocked'",
                 [A, B]) of
@@ -685,19 +690,28 @@ route({create_forum, Uid, Name0, Slug0, Desc0}, Conn) ->
     end;
 route({delete_forum, Uid, ForumId0}, Conn) ->
     ForumId = pw_util:int(ForumId0),
-    with_tx(Conn, fun() ->
+    Result = with_tx(Conn, fun() ->
         case one(Conn, "SELECT owner_id FROM forums WHERE id = $1 FOR UPDATE", [ForumId]) of
             {ok, [Uid]} ->
+                {ok, ThreadRows} = rows(Conn, "SELECT id FROM threads WHERE forum_id = $1", [ForumId]),
                 ok = exec(Conn,
                     "DELETE FROM notifications WHERE url IN "
                     "(SELECT '#/thread/' || id::text FROM threads WHERE forum_id = $1)", [ForumId]),
                 ok = exec(Conn, "DELETE FROM forums WHERE id = $1", [ForumId]),
-                pw_hub:broadcast({forum, ForumId}, #{type => forum_deleted, forum_id => ForumId}),
-                {ok, #{deleted => true, id => ForumId}};
+                {ok, #{deleted => true, id => ForumId,
+                    deleted_thread_ids => [only_id(Row) || Row <- ThreadRows]}};
             {ok, [_]} -> {error, forbidden};
             _ -> {error, not_found}
         end
-    end);
+    end),
+    case Result of
+        {ok, #{deleted_thread_ids := ThreadIds} = Data} ->
+            DeletedEvent = #{type => forum_deleted, forum_id => ForumId},
+            pw_hub:broadcast({forum, ForumId}, DeletedEvent),
+            [pw_hub:broadcast({thread, ThreadId}, DeletedEvent) || ThreadId <- ThreadIds],
+            {ok, maps:remove(deleted_thread_ids, Data)};
+        Other -> Other
+    end;
 route({join_forum, Uid, ForumId0}, Conn) ->
     ForumId = pw_util:int(ForumId0),
     case one(Conn, "SELECT id FROM forums WHERE id = $1", [ForumId]) of
@@ -754,19 +768,27 @@ route({create_thread, Uid, ForumId0, Title0, Body0}, Conn) ->
     end;
 route({delete_thread, Uid, ThreadId0}, Conn) ->
     ThreadId = pw_util:int(ThreadId0),
-    with_tx(Conn, fun() ->
+    Result = with_tx(Conn, fun() ->
         case one(Conn,
             "SELECT t.user_id,f.owner_id,t.forum_id FROM threads t "
             "JOIN forums f ON f.id = t.forum_id WHERE t.id = $1 FOR UPDATE", [ThreadId]) of
             {ok, [AuthorId, ForumOwnerId, ForumId]} when Uid =:= AuthorId; Uid =:= ForumOwnerId ->
                 ok = exec(Conn, "DELETE FROM notifications WHERE url = $1", [<<"#/thread/", (integer_to_binary(ThreadId))/binary>>]),
                 ok = exec(Conn, "DELETE FROM threads WHERE id = $1", [ThreadId]),
-                pw_hub:broadcast({forum, ForumId}, #{type => thread_deleted, forum_id => ForumId, thread_id => ThreadId}),
                 {ok, #{deleted => true, id => ThreadId, forum_id => ForumId}};
             {ok, _} -> {error, forbidden};
             _ -> {error, not_found}
         end
-    end);
+    end),
+    case Result of
+        {ok, #{forum_id := ForumId} = Data} ->
+            DeletedEvent = #{type => thread_deleted, forum_id => ForumId, thread_id => ThreadId},
+            pw_hub:broadcast({forum, ForumId}, DeletedEvent),
+            %% readers follow the thread key too. tell both after commit.
+            pw_hub:broadcast({thread, ThreadId}, DeletedEvent),
+            {ok, Data};
+        Other -> Other
+    end;
 route({reply_thread, Uid, ThreadId0, Body0}, Conn) ->
     ThreadId = pw_util:int(ThreadId0),
     Body = pw_util:clean_text(Body0, ?MAX_BODY),
@@ -812,7 +834,7 @@ route({vote_thread, Uid, ThreadId0, Value0}, Conn) ->
             {error, not_found}
     end;
 route({servers, Uid}, Conn) ->
-    Sql = "SELECT s.id, s.owner_id, s.name, s.description, s.icon_url, s.created_at, s.updated_at, sm.role, "
+    Sql = "SELECT s.id, s.owner_id, s.name, s.description, s.icon_url, s.banner_url, s.accent_color, s.created_at, s.updated_at, sm.role, "
           "(SELECT count(*) FROM server_members WHERE server_id = s.id) "
           "FROM servers s JOIN server_members sm ON sm.server_id = s.id AND sm.user_id = $1 "
           "ORDER BY sm.joined_at ASC",
@@ -839,7 +861,7 @@ route({create_server, Uid, Name0, Desc0}, Conn) ->
                     ok = exec(Conn, "INSERT INTO channels(server_id, name, kind, position, topic, created_at) VALUES($1,$2,$3,$4,$5,$6)",
                         [Sid, <<"general">>, <<"text">>, 1, <<>>, Now]),
                     ok = exec(Conn, "INSERT INTO channels(server_id, name, kind, position, topic, created_at) VALUES($1,$2,$3,$4,$5,$6)",
-                        [Sid, <<"Lobby">>, <<"voice">>, 2, <<>>, Now]),
+                        [Sid, <<"Lounge">>, <<"voice">>, 2, <<>>, Now]),
                     {ok, #{id => Sid}}
             end
     end;
@@ -850,17 +872,28 @@ route({update_server, Uid, Sid0, Patch}, Conn) ->
             Now = pw_util:now_ms(),
             Name = pw_util:clean_text(maps:get(<<"name">>, Patch, <<>>), 80),
             Desc = pw_util:clean_text(maps:get(<<"description">>, Patch, <<>>), 280),
-            Icon = store_image_url(maps:get(<<"icon_url">>, Patch, <<>>)),
+            RawIcon = maps:get(<<"icon_url">>, Patch, <<>>),
+            RawBanner = maps:get(<<"banner_url">>, Patch, <<>>),
+            Icon = store_image_url(RawIcon),
+            Banner = store_image_url(RawBanner),
+            Accent = clean_accent(maps:get(<<"accent_color">>, Patch, <<>>)),
+            HasDesc = maps:is_key(<<"description">>, Patch),
+            %% /api/media is derived output. don't save it over the real source.
+            HasIcon = maps:is_key(<<"icon_url">>, Patch) andalso not derived_media_url(RawIcon),
+            HasBanner = maps:is_key(<<"banner_url">>, Patch) andalso not derived_media_url(RawBanner),
+            HasAccent = maps:is_key(<<"accent_color">>, Patch) andalso Accent =/= undefined,
             case duplicate_server_name(Conn, Uid, Sid, Name) of
                 true ->
                     {error, server_exists};
                 false ->
                     ok = exec(Conn,
                         "UPDATE servers SET name = COALESCE(NULLIF($1,''), name), "
-                        "description = COALESCE(NULLIF($2,''), description), "
-                        "icon_url = CASE WHEN $3 = '' THEN icon_url ELSE $3 END, updated_at = $4 WHERE id = $5",
-                        [Name, Desc, Icon, Now, Sid]),
-                    pw_hub:broadcast({server, Sid}, #{type => server_updated, server_id => Sid}),
+                        "description = CASE WHEN $3 THEN $2 ELSE description END, "
+                        "icon_url = CASE WHEN $4 THEN $5 ELSE icon_url END, "
+                        "banner_url = CASE WHEN $6 THEN $7 ELSE banner_url END, "
+                        "accent_color = CASE WHEN $8 THEN $9 ELSE accent_color END, updated_at = $10 WHERE id = $11",
+                        [Name, Desc, HasDesc, HasIcon, Icon, HasBanner, Banner, HasAccent, Accent, Now, Sid]),
+                    publish_server_event(Conn, Sid, #{type => server_updated, server_id => Sid}),
                     route({server, Uid, Sid}, Conn)
             end;
         false ->
@@ -870,24 +903,26 @@ route({server, Uid, ServerId0}, Conn) ->
     Sid = pw_util:int(ServerId0),
     case one(Conn, "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2", [Sid, Uid]) of
         {ok, [Role]} ->
-            {ok, S} = one(Conn, "SELECT id, owner_id, name, description, icon_url, created_at, updated_at FROM servers WHERE id = $1", [Sid]),
+            {ok, S} = one(Conn, "SELECT id, owner_id, name, description, icon_url, banner_url, accent_color, created_at, updated_at FROM servers WHERE id = $1", [Sid]),
             {ok, Ch} = rows(Conn, "SELECT id, server_id, name, kind, position, topic, created_at, category_id FROM channels WHERE server_id = $1 ORDER BY position ASC, id ASC", [Sid]),
+            {ok, Cats} = rows(Conn, "SELECT id, server_id, name, position, created_at FROM channel_categories WHERE server_id = $1 ORDER BY position ASC, id ASC", [Sid]),
             {ok, Ms} = rows(Conn,
                 "SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.banner_url, u.status, u.theme, "
                 "u.created_at, u.last_seen, sm.role, sm.muted, sm.joined_at "
                 "FROM server_members sm JOIN users u ON u.id = sm.user_id WHERE sm.server_id = $1 "
                 "ORDER BY CASE sm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, u.display_name ASC",
                 [Sid]),
-            {ok, #{server => server_full_map(S, Role), channels => [channel_map(R) || R <- Ch], members => [member_map(R) || R <- Ms]}};
+            {ok, #{server => server_full_map(S, Role), channels => [channel_map(R) || R <- Ch], members => [member_map(R) || R <- Ms], categories => [category_map(R) || R <- Cats]}};
         _ ->
             {error, forbidden}
     end;
-route({create_channel, Uid, Sid0, Name0, Kind0}, Conn) ->
+route({create_channel, Uid, Sid0, Name0, Kind0, CategoryId0}, Conn) ->
     Sid = pw_util:int(Sid0),
     Name = pw_util:clean_text(Name0, 40),
     Kind = case pw_util:clean_text(Kind0, 10) of <<"voice">> -> <<"voice">>; _ -> <<"text">> end,
-    case {byte_size(Name) >= 1, can_manage_server(Conn, Uid, Sid)} of
-        {true, true} ->
+    CategoryId = optional_id(CategoryId0),
+    case {byte_size(Name) >= 1, can_manage_server(Conn, Uid, Sid), valid_channel_category(Conn, Sid, CategoryId)} of
+        {true, true, true} ->
             case one(Conn, "SELECT id FROM channels WHERE server_id = $1 AND lower(name) = lower($2) LIMIT 1", [Sid, Name]) of
                 {ok, [_]} ->
                     {error, channel_exists};
@@ -895,15 +930,17 @@ route({create_channel, Uid, Sid0, Name0, Kind0}, Conn) ->
                     Now = pw_util:now_ms(),
                     {ok, [Pos]} = one(Conn, "SELECT COALESCE(max(position), 0) + 1 FROM channels WHERE server_id = $1", [Sid]),
                     {ok, Cid} = insert_returning(Conn,
-                        "INSERT INTO channels(server_id, name, kind, position, topic, created_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
-                        [Sid, Name, Kind, Pos, <<>>, Now]),
-                    pw_hub:broadcast({server, Sid}, #{type => channel_created, server_id => Sid, channel_id => Cid}),
+                        "INSERT INTO channels(server_id, name, kind, position, topic, created_at, category_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+                        [Sid, Name, Kind, Pos, <<>>, Now, sql_optional_id(CategoryId)]),
+                    publish_server_event(Conn, Sid, #{type => channel_created, server_id => Sid, channel_id => Cid}),
                     {ok, #{id => Cid}}
             end;
-        {false, _} ->
+        {false, _, _} ->
             {error, invalid_channel_name};
-        {_, false} ->
-            {error, forbidden}
+        {_, false, _} ->
+            {error, forbidden};
+        {_, _, false} ->
+            {error, invalid_category}
     end;
 route({categories, Uid, Sid0}, Conn) ->
     Sid = pw_util:int(Sid0),
@@ -924,7 +961,7 @@ route({create_category, Uid, Sid0, Name0}, Conn) ->
             {ok, Cid} = insert_returning(Conn,
                 "INSERT INTO channel_categories(server_id, name, position, created_at) VALUES($1,$2,$3,$4) RETURNING id",
                 [Sid, Name, Pos, Now]),
-            pw_hub:broadcast({server, Sid}, #{type => category_created, server_id => Sid, category_id => Cid}),
+            publish_server_event(Conn, Sid, #{type => category_created, server_id => Sid, category_id => Cid}),
             {ok, #{id => Cid}};
         {false, _} -> {error, invalid_category_name};
         {_, false} -> {error, forbidden}
@@ -938,7 +975,7 @@ route({update_category, Uid, Sid0, CatId0, Patch}, Conn) ->
             case byte_size(Name) >= 1 of
                 true ->
                     ok = exec(Conn, "UPDATE channel_categories SET name = $1 WHERE id = $2 AND server_id = $3", [Name, CatId, Sid]),
-                    pw_hub:broadcast({server, Sid}, #{type => category_updated, server_id => Sid, category_id => CatId}),
+                    publish_server_event(Conn, Sid, #{type => category_updated, server_id => Sid, category_id => CatId}),
                     {ok, #{updated => true}};
                 false -> {error, invalid_category_name}
             end;
@@ -958,7 +995,7 @@ route({reorder_categories, Uid, Sid0, Order0}, Conn) ->
                     _ -> ok
                 end
             end, Order),
-            pw_hub:broadcast({server, Sid}, #{type => categories_reordered, server_id => Sid}),
+            publish_server_event(Conn, Sid, #{type => categories_reordered, server_id => Sid}),
             {ok, #{updated => true}};
         false -> {error, forbidden}
     end;
@@ -969,24 +1006,25 @@ route({delete_category, Uid, Sid0, CatId0}, Conn) ->
         true ->
             ok = exec(Conn, "UPDATE channels SET category_id = NULL WHERE category_id = $1 AND server_id = $2", [CatId, Sid]),
             ok = exec(Conn, "DELETE FROM channel_categories WHERE id = $1 AND server_id = $2", [CatId, Sid]),
-            pw_hub:broadcast({server, Sid}, #{type => category_deleted, server_id => Sid, category_id => CatId}),
+            publish_server_event(Conn, Sid, #{type => category_deleted, server_id => Sid, category_id => CatId}),
             {ok, #{deleted => true}};
         false -> {error, forbidden}
     end;
 route({move_channel, Uid, ChannelId0, CatId0, Position0}, Conn) ->
     ChannelId = pw_util:int(ChannelId0),
-    CatId = pw_util:int(CatId0),
+    CatId = optional_id(CatId0),
     Position = pw_util:int(Position0),
     case one(Conn, "SELECT server_id FROM channels WHERE id = $1", [ChannelId]) of
         {ok, [Sid]} ->
-            case can_manage_server(Conn, Uid, Sid) of
-                true ->
-                    CatIdSafe = case CatId of undefined -> null; I when is_integer(I) -> I end,
-                    PosSafe = case Position of undefined -> 0; P when is_integer(P) -> P end,
+            case {can_manage_server(Conn, Uid, Sid), valid_channel_category(Conn, Sid, CatId)} of
+                {true, true} ->
+                    CatIdSafe = sql_optional_id(CatId),
+                    PosSafe = case Position of undefined -> 0; P when is_integer(P) -> min(10000, max(0, P)) end,
                     ok = exec(Conn, "UPDATE channels SET category_id = $1, position = $2 WHERE id = $3", [CatIdSafe, PosSafe, ChannelId]),
-                    pw_hub:broadcast({server, Sid}, #{type => channel_moved, server_id => Sid, channel_id => ChannelId}),
+                    publish_server_event(Conn, Sid, #{type => channel_moved, server_id => Sid, channel_id => ChannelId}),
                     {ok, #{updated => true}};
-                false -> {error, forbidden}
+                {false, _} -> {error, forbidden};
+                {_, false} -> {error, invalid_category}
             end;
         _ -> {error, not_found}
     end;
@@ -1031,7 +1069,14 @@ route({invite_preview, Code0}, Conn) ->
 route({join_invite, Uid, Code0}, Conn) ->
     Code = pw_util:clean_text(Code0, 80),
     Now = pw_util:now_ms(),
-    with_tx(Conn, fun() -> join_invite_tx(Conn, Uid, Code, Now) end);
+    Result = with_tx(Conn, fun() -> join_invite_tx(Conn, Uid, Code, Now) end),
+    case Result of
+        {ok, #{server_id := Sid, membership_created := true} = Data} ->
+            publish_server_event(Conn, Sid, #{type => member_joined, server_id => Sid, user_id => Uid}),
+            {ok, maps:remove(membership_created, Data)};
+        {ok, Data} -> {ok, maps:remove(membership_created, Data)};
+        Other -> Other
+    end;
 route({messages, Uid, Scope0, ScopeId0, Before0, After0}, Conn) ->
     Scope = pw_util:clean_text(Scope0, 16),
     ScopeId = pw_util:int(ScopeId0),
@@ -1118,9 +1163,7 @@ route({create_conversation, Uid, Name0, UserIds0}, Conn) ->
         {[Peer], _, true, true} when Name =:= <<>> ->
             case existing_one_to_one(Conn, Uid, Peer) of
                 {ok, Tid} ->
-                    %% "New DM" also acts as reopen. Previously it returned the
-                    %% old thread while leaving it hidden, so the user was sent
-                    %% to a conversation that remained absent from their list.
+                    %% "new DM" also reopens the old one. less ghost chat, yay.
                     ok = exec(Conn, "UPDATE direct_members SET hidden = false WHERE thread_id = $1 AND user_id = $2", [Tid, Uid]),
                     {ok, #{id => Tid, existing => true}};
                 not_found -> create_conversation0(Conn, Uid, Name, UserIds)
@@ -1145,13 +1188,15 @@ route({create_conversation_usernames, Uid, Name0, Usernames0}, Conn) ->
 route({update_conversation, Uid, Cid0, Name0, Patch}, Conn) ->
     Cid = pw_util:int(Cid0),
     Name = pw_util:clean_text(Name0, 80),
-    Avatar = store_image_url(maps:get(<<"avatar_url">>, Patch, <<>>)),
+    RawAvatar = maps:get(<<"avatar_url">>, Patch, <<>>),
+    Avatar = store_image_url(RawAvatar),
+    HasAvatar = maps:is_key(<<"avatar_url">>, Patch) andalso not derived_media_url(RawAvatar),
     case is_conversation_owner(Conn, Uid, Cid) of
         true ->
             Now = pw_util:now_ms(),
-            ok = exec(Conn, "UPDATE direct_threads SET name = $1, avatar_url = $2, updated_at = $3 WHERE id = $4",
-                [Name, Avatar, Now, Cid]),
-            pw_hub:broadcast({direct, Cid}, #{type => conversation_updated, conversation_id => Cid}),
+            ok = exec(Conn, "UPDATE direct_threads SET name = $1, avatar_url = CASE WHEN $2 THEN $3 ELSE avatar_url END, updated_at = $4 WHERE id = $5",
+                [Name, HasAvatar, Avatar, Now, Cid]),
+            publish_conversation_event(Conn, Cid, #{type => conversation_updated, conversation_id => Cid}),
             {ok, #{updated => true}};
         false ->
             {error, forbidden}
@@ -1160,10 +1205,16 @@ route({add_conversation_members, Uid, Cid0, UserIds0}, Conn) ->
     Cid = pw_util:int(Cid0),
     case Cid of
         I when is_integer(I), I > 0 ->
-            with_tx(Conn, fun() ->
+            Result = with_tx(Conn, fun() ->
                 _ = rows(Conn, "SELECT pg_advisory_xact_lock($1)", [Cid]),
                 route({add_conversation_members_locked, Uid, Cid, UserIds0}, Conn)
-            end);
+            end),
+            case Result of
+                {ok, #{added := Added}} when Added > 0 ->
+                    publish_conversation_event(Conn, Cid, #{type => conversation_members_added, conversation_id => Cid}),
+                    Result;
+                _ -> Result
+            end;
         _ -> {error, invalid_conversation}
     end;
 route({add_conversation_members_locked, Uid, Cid0, UserIds0}, Conn) ->
@@ -1188,7 +1239,6 @@ route({add_conversation_members_locked, Uid, Cid0, UserIds0}, Conn) ->
                 "INSERT INTO direct_members(thread_id, user_id, last_read_message_id, muted, nickname, joined_at) "
                 "VALUES($1,$2,0,false,$3,$4) ON CONFLICT (thread_id, user_id) DO NOTHING",
                 [Cid, U, <<>>, Now]) || U <- UserIds],
-            notify_direct_members(Conn, Cid, Uid, #{type => conversation_members_added, conversation_id => Cid}, Now),
             {ok, #{added => length(UserIds)}};
         {false, _, _, _, _, _} ->
             {error, forbidden}
@@ -1215,17 +1265,41 @@ route({close_conversation, Uid, Cid0}, Conn) ->
     end;
 route({leave_conversation, Uid, Cid0}, Conn) ->
     Cid = pw_util:int(Cid0),
-    case is_conversation_member(Conn, Uid, Cid) of
-        true ->
-            case conversation_member_count(Conn, Cid) =< 2 of
-                true ->
-                    {ok, #{left => false, closed => true}};
-                false ->
-                    ok = exec(Conn, "DELETE FROM direct_members WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]),
-                    {ok, #{left => true}}
-            end;
-        false ->
-            {error, not_found}
+    Result = with_tx(Conn, fun() ->
+        case one(Conn, "SELECT owner_id FROM direct_threads WHERE id = $1 FOR UPDATE", [Cid]) of
+            {ok, [OwnerId]} ->
+                case is_conversation_member(Conn, Uid, Cid) of
+                    true ->
+                        case conversation_member_count(Conn, Cid) =< 2 of
+                            true ->
+                                %% 1:1 chats close; they don't implode.
+                                ok = exec(Conn, "UPDATE direct_members SET hidden = true WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]),
+                                {ok, #{left => false, closed => true}};
+                            false ->
+                                ok = exec(Conn, "DELETE FROM direct_members WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]),
+                                pw_upload_gc:invalidate_user(Uid),
+                                case OwnerId =:= Uid of
+                                    true ->
+                                        %% pass the keys on before the owner leaves.
+                                        ok = exec(Conn,
+                                            "UPDATE direct_threads SET owner_id = (SELECT user_id FROM direct_members WHERE thread_id = $1 ORDER BY joined_at ASC LIMIT 1) WHERE id = $1",
+                                            [Cid]);
+                                    false -> ok
+                                end,
+                                {ok, #{left => true}}
+                        end;
+                    false ->
+                        {error, not_found}
+                end;
+            _ ->
+                {error, not_found}
+        end
+    end),
+    case Result of
+        {ok, #{left := true}} ->
+            publish_conversation_event(Conn, Cid, #{type => conversation_members_changed, conversation_id => Cid}),
+            Result;
+        _ -> Result
     end;
 route({accept_message_request, Uid, Cid0}, Conn) ->
     Cid = pw_util:int(Cid0),
@@ -1243,9 +1317,11 @@ route({deny_message_request, Uid, Cid0}, Conn) ->
     case one(Conn, "SELECT request_state FROM direct_members WHERE thread_id = $1 AND user_id = $2", [Cid, Uid]) of
         {ok, [<<"pending">>]} ->
             Now = pw_util:now_ms(),
+            {ok, MemberRows} = rows(Conn, "SELECT user_id FROM direct_members WHERE thread_id = $1", [Cid]),
             notify_direct_members(Conn, Cid, Uid, #{type => conversation_closed, conversation_id => Cid, reason => request_denied}, Now),
             ok = exec(Conn, "DELETE FROM messages WHERE scope = 'direct' AND scope_id = $1", [Cid]),
             ok = exec(Conn, "DELETE FROM direct_threads WHERE id = $1", [Cid]),
+            [pw_upload_gc:invalidate_user(only_id(Row)) || Row <- MemberRows],
             {ok, #{denied => true, conversation_id => Cid}};
         _ -> {error, no_message_request}
     end;
@@ -1375,9 +1451,7 @@ route({stale_uploads, PendingBefore, ReadyBefore}, Conn) ->
     {ok, [#{id => Id, path => Path} || [Id, Path] <- Rows]};
 route({delete_upload, Id}, Conn) ->
     exec(Conn, "DELETE FROM uploads WHERE id = $1", [Id]);
-%% Forums and threads are readable by any authenticated account, but the id still
-%% has to exist. Accepting unknown ids let a client grow the hub subscription map
-%% without bound.
+%% public-to-members, yes. imaginary ids, no; they bloat hub subscriptions.
 route({subscribable, thread, Id}, Conn) ->
     case one(Conn, "SELECT id FROM threads WHERE id = $1", [Id]) of
         {ok, [_]} -> true;
@@ -1417,8 +1491,7 @@ invalidate_session_cache(Uid) ->
     end, ok, ?SESSION_CACHE),
     ok.
 
-%% The cached entry must never outlive the stored session, otherwise a pruned or
-%% expired session keeps authenticating from ETS for the rest of the window.
+%% cache expiry cannot outlive the real session.
 session_cache_expiry(Now, ExpiresAt) ->
     case pw_util:int(ExpiresAt) of
         Expires when is_integer(Expires) -> min(Now + 300000, Expires);
@@ -1564,11 +1637,7 @@ migrations() -> [
         "CREATE INDEX IF NOT EXISTS idx_thread_views_user ON thread_views(user_id,thread_id)",
         "UPDATE threads SET views = 0"
     ]},
-    %% Uploads used to be readable by any authenticated account that knew an id.
-    %% Attachments are only referenced as /api/files/<id> inside message bodies,
-    %% which are ciphertext when encryption at rest is enabled, so readability
-    %% has to be recorded explicitly instead of derived from the body at query
-    %% time.
+    %% old uploads had no ACL. refs add one without trying to query ciphertext.
     {10, [
         "CREATE TABLE IF NOT EXISTS upload_refs(upload_id text NOT NULL REFERENCES uploads(id) ON DELETE CASCADE, "
         "scope text NOT NULL CHECK(scope IN ('channel','direct','profile')), scope_id integer NOT NULL, "
@@ -1577,8 +1646,7 @@ migrations() -> [
         "CREATE TABLE IF NOT EXISTS upload_ref_backfill(id integer PRIMARY KEY, cursor integer NOT NULL DEFAULT 0, "
         "done boolean NOT NULL DEFAULT false)",
         "INSERT INTO upload_ref_backfill(id, cursor, done) VALUES(1, 0, false) ON CONFLICT (id) DO NOTHING",
-        %% Avatars and banners are served from the same route and must stay
-        %% visible to every account, so those references are exact and cheap.
+        %% profile pictures are public refs.
         "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
         "SELECT up.id, 'profile', u.id, 0 FROM users u JOIN uploads up ON up.id = substring(u.avatar_url from 12) "
         "WHERE u.avatar_url LIKE '/api/files/%' ON CONFLICT DO NOTHING",
@@ -1591,6 +1659,10 @@ migrations() -> [
         "name text NOT NULL, position integer NOT NULL, created_at bigint NOT NULL)",
         "CREATE INDEX IF NOT EXISTS idx_channel_categories_server ON channel_categories(server_id, position ASC, id ASC)",
         "ALTER TABLE channels ADD COLUMN IF NOT EXISTS category_id integer REFERENCES channel_categories(id) ON DELETE SET NULL"
+    ]},
+    {12, [
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS banner_url text NOT NULL DEFAULT ''",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS accent_color text NOT NULL DEFAULT '#5865f2'"
     ]}
 ].
 
@@ -1637,10 +1709,9 @@ join_invite_tx(Conn, Uid, Code, Now) ->
                 true -> ok;
                 false ->
                     ok = exec(Conn, "UPDATE server_invites SET uses = uses + 1 WHERE code = $1", [Code]),
-                    pw_hub:broadcast({server, Sid}, #{type => member_joined, server_id => Sid, user_id => Uid}),
                     ok
             end,
-            {ok, #{server_id => Sid, channel_id => ChannelId}};
+            {ok, #{server_id => Sid, channel_id => ChannelId, membership_created => not AlreadyMember}};
         _ ->
             {error, invalid_invite}
     end.
@@ -1686,19 +1757,13 @@ store_image_url(Url0) ->
         <<>> -> <<>>;
         <<"data:", _/binary>> ->
             case pw_util:safe_image_data_url(Url) of
-                %% Keep the source bytes in PostgreSQL. The media cache is ETS
-                %% backed and is intentionally disposable; persisting its
-                %% synthetic URL made uploaded avatars disappear after every
-                %% application restart. user_map/1 turns this durable source
-                %% into a short, signed media URL whenever it is returned.
+                %% keep the source. ETS URLs vanish on restart (ask how we know).
                 true -> Url;
                 false -> <<>>
             end;
         <<"/api/files/", Id/binary>> ->
             case valid_file_id(Id) of true -> Url; false -> <<>> end;
-        %% Proxy URLs are derived response values, not durable image sources.
-        %% Saving one would discard an uploaded data URL and make the image
-        %% dependent on the current media-signing key and in-memory cache.
+        %% proxy URLs are output, not durable source data.
         <<"/api/media/", _/binary>> -> <<>>;
         <<"http://", _/binary>> -> Url;
         <<"https://", _/binary>> -> Url;
@@ -1713,9 +1778,7 @@ file_id_char(C) ->
     (C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z) orelse
     (C >= $0 andalso C =< $9) orelse C =:= $- orelse C =:= $_.
 
-%% An upload is readable by its owner, by anyone when it backs a profile image
-%% (avatars are served from the same route and must stay public), and by anyone
-%% who can read a message scope the file was posted into.
+%% owner, public profile image, or a readable message scope.
 upload_readable(_Conn, Uid, _Id, Uid) when is_integer(Uid) -> true;
 upload_readable(Conn, Uid, Id, _OwnerId) ->
     case upload_refs_enforced(Conn) of
@@ -1732,10 +1795,7 @@ upload_ref_grants(Conn, Uid, [Scope, ScopeId]) when Scope =:= <<"channel">>; Sco
     can_read_messages(Conn, Uid, Scope, pw_util:int(ScopeId));
 upload_ref_grants(_Conn, _Uid, _Ref) -> false.
 
-%% Historic message bodies cannot be scanned in SQL once encryption at rest is
-%% enabled, so references are rebuilt by a resumable background pass. Rejecting
-%% reads before that finishes would break existing attachments, so enforcement
-%% only begins once the pass is complete.
+%% encrypted old messages need a resumable backfill before ACLs turn on.
 upload_refs_enforced(Conn) ->
     case persistent_term:get(?UPLOAD_REFS_READY, false) of
         true -> true;
@@ -1752,8 +1812,7 @@ insert_upload_refs(Conn, Body, Scope, ScopeId, Now)
         when is_binary(Body), is_integer(ScopeId), ScopeId > 0,
              Scope =:= <<"channel">> orelse Scope =:= <<"direct">> ->
     lists:foreach(fun(Id) ->
-        %% Selecting from uploads keeps a body that references a deleted or
-        %% foreign id from raising a foreign-key error on the shared connection.
+        %% unknown/deleted ids should not trip the shared DB connection.
         _ = try exec(Conn,
                 "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
                 "SELECT up.id, $2, $3, $4 FROM uploads up WHERE up.id = $1 "
@@ -1776,8 +1835,7 @@ insert_profile_upload_ref(Conn, Uid, <<"/api/files/", Id/binary>>) ->
     end;
 insert_profile_upload_ref(_Conn, _Uid, _Url) -> ok.
 
-%% Attachments only appear as /api/files/<id> URLs inside a message body, so the
-%% ids have to be lifted out of the plaintext before it is encrypted for storage.
+%% pull file ids out before the body becomes ciphertext soup.
 extract_file_ids(Body) when is_binary(Body) ->
     lists:usort(collect_file_ids(Body, 0, []));
 extract_file_ids(_) -> [].
@@ -1811,9 +1869,7 @@ current_profile_images(Conn, Uid) ->
 
 store_profile_image(Url0, Current, Conn, Uid) ->
     Url = pw_util:clean_text(Url0, 17825792),
-    %% The profile editor is populated from API output, where durable sources
-    %% are represented by signed /api/media URLs. Preserve the source when the
-    %% client submits that unchanged derived value.
+    %% unchanged signed output means "keep the source".
     case Url =:= pw_util:proxied_image(Current) of
         true -> Current;
         false ->
@@ -1865,6 +1921,10 @@ normalize_max_uses(undefined) -> 0;
 normalize_max_uses(I) when is_integer(I), I > 0, I =< 1000 -> I;
 normalize_max_uses(I) when is_integer(I), I > 1000 -> 1000;
 normalize_max_uses(_) -> 0.
+
+normalize_theme(<<"light">>) -> <<"light">>;
+normalize_theme(<<"dark">>) -> <<"dark">>;
+normalize_theme(_) -> <<"system">>.
 
 forum_position(Conn) ->
     case one(Conn, "SELECT COALESCE(max(position), 0) + 1 FROM forums", []) of
@@ -2042,9 +2102,7 @@ reply_map([Id, Tid, Uid, U, D, Avatar, Body, Created, Updated]) ->
     #{id => Id, thread_id => Tid, user_id => Uid, username => U, display_name => D,
       avatar_url => pw_util:proxied_image(Avatar), body => render_forum_body(Body), created_at => Created, updated_at => Updated}.
 
-%% Keep stored forum text untouched. Exact, standalone remote image URLs are
-%% converted only in API responses to signed same-origin media URLs. The media
-%% service performs DNS/IP validation, size limits, content checks and caching.
+%% rewrite standalone image URLs on output; stored forum text stays boring.
 render_forum_body(Body) when is_binary(Body) ->
     Lines = binary:split(Body, <<"\n">>, [global]),
     iolist_to_binary(lists:join(<<"\n">>, [render_forum_line(Line) || Line <- Lines]));
@@ -2077,14 +2135,28 @@ friend_map([Status, Req, Addr, Id, U, D, Bio, Avatar, Banner, St, Theme, Created
       blocked_by_me => (Status =:= <<"blocked">> andalso Req =:= Viewer),
       user => user_map([Id, U, D, Bio, Avatar, Banner, St, Theme, Created, Last])}.
 
-server_row_map([Id, Owner, Name, Desc, Icon, Created, Updated, Role, Members]) ->
+server_row_map([Id, Owner, Name, Desc, Icon, Banner, Accent, Created, Updated, Role, Members]) ->
     #{id => Id, owner_id => Owner, name => Name, description => Desc,
-      icon_url => pw_util:proxied_image(Icon), created_at => Created, updated_at => Updated,
+      icon_url => pw_util:proxied_image(Icon), banner_url => pw_util:proxied_image(Banner), accent_color => Accent,
+      created_at => Created, updated_at => Updated,
       role => Role, member_count => Members}.
 
-server_full_map([Id, Owner, Name, Desc, Icon, Created, Updated], Role) ->
+server_full_map([Id, Owner, Name, Desc, Icon, Banner, Accent, Created, Updated], Role) ->
     #{id => Id, owner_id => Owner, name => Name, description => Desc,
-      icon_url => pw_util:proxied_image(Icon), created_at => Created, updated_at => Updated, role => Role}.
+      icon_url => pw_util:proxied_image(Icon), banner_url => pw_util:proxied_image(Banner), accent_color => Accent,
+      created_at => Created, updated_at => Updated, role => Role}.
+
+clean_accent(<<"#", Hex:6/binary>>) ->
+    case lists:all(fun(C) ->
+        (C >= $0 andalso C =< $9) orelse (C >= $a andalso C =< $f) orelse (C >= $A andalso C =< $F)
+    end, binary_to_list(Hex)) of
+        true -> <<"#", Hex/binary>>;
+        false -> undefined
+    end;
+clean_accent(_) -> undefined.
+
+derived_media_url(<<"/api/media/", _/binary>>) -> true;
+derived_media_url(_) -> false.
 
 channel_map([Id, Sid, Name, Kind, Pos, Topic, Created]) ->
     channel_map([Id, Sid, Name, Kind, Pos, Topic, Created, undefined]);
@@ -2103,6 +2175,22 @@ message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edit
     #{id => Id, scope => Scope, scope_id => ScopeId, user_id => Uid, username => U, display_name => D,
       avatar_url => pw_util:proxied_image(Avatar), body => load_message(Body), reply_to_id => db_null(ReplyTo),
       created_at => Created, edited_at => db_null(Edited), deleted_at => db_null(Deleted)}.
+
+optional_id(Value) ->
+    case pw_util:int(Value) of
+        Id when is_integer(Id), Id > 0 -> Id;
+        _ -> undefined
+    end.
+
+valid_channel_category(_Conn, _Sid, undefined) -> true;
+valid_channel_category(Conn, Sid, CategoryId) ->
+    case one(Conn, "SELECT id FROM channel_categories WHERE id = $1 AND server_id = $2", [CategoryId, Sid]) of
+        {ok, [_]} -> true;
+        _ -> false
+    end.
+
+sql_optional_id(undefined) -> null;
+sql_optional_id(Id) -> Id.
 
 db_null(null) -> undefined;
 db_null(X) -> X.
@@ -2243,8 +2331,7 @@ can_read_messages(Conn, Uid, <<"channel">>, Id) ->
         {ok, _} -> true;
         _ -> false
     end;
-%% Blocking previously only stopped sending, so a blocked participant kept
-%% reading the conversation they had been removed from.
+%% blocked means no reading either. the old half-block was not much of a block.
 can_read_messages(Conn, Uid, <<"direct">>, Id) ->
     is_conversation_member(Conn, Uid, Id) andalso not is_blocked_in_conversation(Conn, Uid, Id);
 can_read_messages(_, _, _, _) -> false.
@@ -2303,9 +2390,30 @@ notify_channel_members(Conn, Sid, Sender, Cid, Msg, Now) ->
          U = only_id(R),
          create_notification(Conn, U, <<"channel_message">>, maps:get(body, Msg),
              <<"#/channel/", (integer_to_binary(Cid))/binary>>, Now),
-         pw_hub:notify_user(U, #{type => channel_message, channel_id => Cid})
+         %% send the row too; tabs dedupe it if the scoped event also lands.
+         pw_hub:notify_user(U, #{type => channel_message, channel_id => Cid, message => Msg})
      end || R <- Rows],
     ok.
+
+%% server chrome changes go to every member, whatever page they're on.
+publish_server_event(Conn, Sid, Event) ->
+    case rows(Conn, "SELECT user_id FROM server_members WHERE server_id = $1", [Sid]) of
+        {ok, Members} ->
+            [pw_hub:notify_user(only_id(Row), Event) || Row <- Members],
+            ok;
+        _ ->
+            ok
+    end.
+
+%% group housekeeping, without pretending a message arrived.
+publish_conversation_event(Conn, Cid, Event) ->
+    case rows(Conn, "SELECT user_id FROM direct_members WHERE thread_id = $1", [Cid]) of
+        {ok, Members} ->
+            [pw_hub:notify_user(only_id(Row), Event) || Row <- Members],
+            ok;
+        _ ->
+            ok
+    end.
 
 notify_direct_members(Conn, Cid, Sender, Event, Now) ->
     {ok, Rows} = rows(Conn, "SELECT user_id, request_state FROM direct_members WHERE thread_id = $1 AND user_id <> $2 AND muted = false", [Cid, Sender]),
@@ -2346,8 +2454,7 @@ mark_url_seen0(Conn, Uid, Url) ->
 
 record_thread_view(_Conn, undefined, _Uid) -> ok;
 record_thread_view(Conn, ThreadId, Uid) ->
-    %% Insertion and counter update are one statement. The primary key makes
-    %% refreshes, revisits, concurrent tabs, and retrying requests idempotent.
+    %% one statement + primary key = refreshes don't count twice.
     exec(Conn,
         "WITH existing AS (SELECT id FROM threads WHERE id = $1), "
         "inserted AS (INSERT INTO thread_views(thread_id,user_id,first_viewed_at) "

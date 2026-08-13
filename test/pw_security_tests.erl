@@ -33,6 +33,10 @@ signal_ok_candidate_test() ->
     Sig = #{<<"kind">> => <<"candidate">>, <<"candidate">> => #{<<"candidate">> => <<"1">>, <<"sdpMid">> => <<"0">>}},
     ?assert(pw_ws:signal_ok(Sig)).
 
+signal_ok_renegotiate_test() ->
+    ?assert(pw_ws:signal_ok(#{<<"kind">> => <<"renegotiate">>})),
+    ?assertNot(pw_ws:signal_ok(#{<<"kind">> => <<"renegotiate">>, <<"junk">> => <<"payload">>})).
+
 signal_ok_rejects_unknown_kind_test() ->
     ?assertNot(pw_ws:signal_ok(#{<<"kind">> => <<"banana">>})).
 

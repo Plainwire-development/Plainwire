@@ -4,9 +4,7 @@
 
 start(_Type, _Args) ->
     ensure_secure_config(),
-    %% The HTTP listener is a supervised child of pw_sup rather than being
-    %% started here, so it survives a crash instead of leaving the node running
-    %% with a dead socket.
+    %% listener belongs under the supervisor. dead-but-running is a bad look.
     pw_sup:start_link().
 
 stop(_State) -> ok.
