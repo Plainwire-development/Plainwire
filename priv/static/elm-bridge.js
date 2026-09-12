@@ -26,7 +26,7 @@
   });
   document.title = clientConfig.appName;
   if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false';
-  const app = window.Elm.Main.init({ node: root, flags: clientConfig.appName });
+  const app = window.Elm.Main.init({ node: root, flags: { appName: clientConfig.appName, uploadMaxBytes: clientConfig.uploadMaxBytes } });
   if (!clientConfig.registrationEnabled) {
     const hideRegistration = () => {
       const buttons = document.querySelectorAll('.auth-mode-switch .auth-mode-btn');

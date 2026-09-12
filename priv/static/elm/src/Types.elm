@@ -188,7 +188,7 @@ type alias ServerData =
 type alias Drafts = Dict String String
 
 type alias Model =
-    { appName : String, me : Maybe User, csrf : String, serverTime : Int, timeZone : Time.Zone, absoluteTimestamps : Bool
+    { appName : String, uploadMaxBytes : Int, me : Maybe User, csrf : String, serverTime : Int, timeZone : Time.Zone, absoluteTimestamps : Bool
     , forums : List Forum, threads : List ForumThread
     , currentThread : Maybe ForumThread, replies : List Reply
     , servers : List Server, convs : List Conversation

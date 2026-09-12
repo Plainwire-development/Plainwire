@@ -97,6 +97,17 @@ bridgeDecoder = D.field "tag" D.string |> D.andThen (\tag ->
         _ -> D.succeed NoOp
     )
 
+-- byte formatting for upload-limit copy, sourced from the server's actual
+-- config (see pw_client_config:upload_max_bytes/0 via /api/client-config)
+-- instead of a hardcoded number that can drift from what's really enforced.
+formatBytesShort : Int -> String
+formatBytesShort bytes =
+    if bytes >= 1073741824 then
+        String.fromInt (round (toFloat bytes / 1073741824)) ++ " GB"
+    else
+        String.fromInt (round (toFloat bytes / 1048576)) ++ " MB"
+
+
 handleSyncData : E.Value -> Msg
 handleSyncData val = case D.decodeValue decodeSyncData val of
     Ok d -> SilentSync True  -- will refetch
@@ -105,7 +116,10 @@ handleSyncData val = case D.decodeValue decodeSyncData val of
 
 -- MAIN
 
-main : Program String Model Msg
+type alias Flags =
+    { appName : String, uploadMaxBytes : Int }
+
+main : Program Flags Model Msg
 main = Browser.application
     { init = init, update = update, view = view
     , subscriptions = subscriptions, onUrlChange = \_ -> NoOp
@@ -115,11 +129,14 @@ main = Browser.application
 
 -- INIT
 
-init : String -> Url -> Nav.Key -> ( Model, Cmd Msg )
-init appName url _ =
+init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
+init flags url _ =
     let active = parseRoute (Maybe.withDefault "" url.fragment)
+        appName = flags.appName
     in
-    ( { appName = if String.isEmpty (String.trim appName) then "Plainwire" else String.left 48 (String.trim appName), me = Nothing, csrf = "", serverTime = 0, timeZone = Time.utc, absoluteTimestamps = False
+    ( { appName = if String.isEmpty (String.trim appName) then "Plainwire" else String.left 48 (String.trim appName)
+      , uploadMaxBytes = if flags.uploadMaxBytes > 0 then flags.uploadMaxBytes else 262144000
+      , me = Nothing, csrf = "", serverTime = 0, timeZone = Time.utc, absoluteTimestamps = False
       , forums = [], threads = [], currentThread = Nothing, replies = []
       , servers = [], convs = [], conversationMembers = Dict.empty, friends = [], notifs = []
       , searchUsers = [], searchThreads = []
@@ -2297,7 +2314,7 @@ modalContent kind model =
                 , textarea [ id "compose", value model.modalBody, placeholder "Write the first post...", onInput ModalBody ] []
                 , div [ class "composer-footer modal-composer-footer" ]
                     [ button [ class "btn secondary attach-btn", type_ "button", title "Attach files or images", onClick (BridgeEvent "pick_attachments" E.null) ] [ text "＋ Attach" ]
-                    , small [ class "muted" ] [ text "Images, GIFs, and files up to 250 MB." ]
+                    , small [ class "muted" ] [ text ("Images, GIFs, and files up to " ++ formatBytesShort model.uploadMaxBytes ++ ".") ]
                     ]
                 ]
             ]
@@ -4707,7 +4724,7 @@ composerView key placeholderText model =
         , textarea [ id "compose", placeholder placeholderText, value model.inputText, onInput InputText, onComposerKeyDown model.chatEnterSends ] []
         , div [ class "composer-footer" ]
             [ button [ class "btn secondary attach-btn", type_ "button", title "Attach files or images", onClick (BridgeEvent "pick_attachments" E.null) ] [ text "＋ Attach" ]
-            , small [ class "muted" ] [ text "Paste images or attach files up to 250 MB." ]
+            , small [ class "muted" ] [ text ("Paste images or attach files up to " ++ formatBytesShort model.uploadMaxBytes ++ ".") ]
             , button [ class "btn", disabled (String.isEmpty (String.trim model.inputText)), onClick SendMessage ] [ text "Send" ]
             ]
         ]
