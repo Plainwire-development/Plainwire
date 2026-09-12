@@ -97,69 +97,15 @@ bridgeDecoder = D.field "tag" D.string |> D.andThen (\tag ->
         _ -> D.succeed NoOp
     )
 
--- BYTE FORMATTING (for upload-limit copy; keeps whole-number MB/GB, matching
--- how these limits are actually configured in bytes)
-
-formatBytesShort : Int -> String
-formatBytesShort bytes =
-    let gb = toFloat bytes / 1073741824
-        mb = toFloat bytes / 1048576
-    in
-    if bytes >= 1073741824 then
-        String.fromInt (round gb) ++ " GB"
-    else
-        String.fromInt (round mb) ++ " MB"
-
-formatQuotaWindow : Int -> String
-formatQuotaWindow windowMs =
-    let hours = round (toFloat windowMs / 3600000)
-    in
-    if hours == 1 then "1 hour" else String.fromInt hours ++ " hours"
-
-
 handleSyncData : E.Value -> Msg
 handleSyncData val = case D.decodeValue decodeSyncData val of
     Ok d -> SilentSync True  -- will refetch
     Err _ -> NoOp
 
 
--- FLAGS
---
--- Runtime limits come from the server's /api/config so the UI text never
--- drifts from what is actually enforced (see pw_util:upload_config/0), and
--- the app name comes from the client config so the brand can be set per
--- instance. Falls back to the server's own defaults if flags are missing or
--- malformed, e.g. if elm-bridge.js passed a bad value.
-
-type alias Flags =
-    { appName : String
-    , uploadMaxBytes : Int
-    , uploadQuotaBytes : Int
-    , uploadQuotaWindowMs : Int
-    }
-
-defaultFlags : Flags
-defaultFlags =
-    { appName = "Plainwire", uploadMaxBytes = 262144000, uploadQuotaBytes = 1073741824, uploadQuotaWindowMs = 10800000 }
-
-decodeFlags : D.Decoder Flags
-decodeFlags =
-    D.map4 Flags
-        (D.field "appName" D.string)
-        (D.field "uploadMaxBytes" D.int)
-        (D.field "uploadQuotaBytes" D.int)
-        (D.field "uploadQuotaWindowMs" D.int)
-
-flagsFromValue : E.Value -> Flags
-flagsFromValue value =
-    case D.decodeValue decodeFlags value of
-        Ok flags -> flags
-        Err _ -> defaultFlags
-
-
 -- MAIN
 
-main : Program E.Value Model Msg
+main : Program String Model Msg
 main = Browser.application
     { init = init, update = update, view = view
     , subscriptions = subscriptions, onUrlChange = \_ -> NoOp
@@ -169,12 +115,11 @@ main = Browser.application
 
 -- INIT
 
-init : E.Value -> Url -> Nav.Key -> ( Model, Cmd Msg )
-init flagsValue url _ =
+init : String -> Url -> Nav.Key -> ( Model, Cmd Msg )
+init appName url _ =
     let active = parseRoute (Maybe.withDefault "" url.fragment)
-        flags = flagsFromValue flagsValue
     in
-    ( { appName = flags.appName, me = Nothing, csrf = "", serverTime = 0, timeZone = Time.utc, absoluteTimestamps = False
+    ( { appName = if String.isEmpty (String.trim appName) then "Plainwire" else String.left 48 (String.trim appName), me = Nothing, csrf = "", serverTime = 0, timeZone = Time.utc, absoluteTimestamps = False
       , forums = [], threads = [], currentThread = Nothing, replies = []
       , servers = [], convs = [], conversationMembers = Dict.empty, friends = [], notifs = []
       , searchUsers = [], searchThreads = []
@@ -211,9 +156,6 @@ init flagsValue url _ =
         , outputSelectionSupported = False
         , voiceProcessingMode = "noise", krispAvailable = False
         , micTesting = False, micTestLevel = 0, micMonitoring = False
-        , uploadMaxBytes = flags.uploadMaxBytes
-        , uploadQuotaBytes = flags.uploadQuotaBytes
-        , uploadQuotaWindowMs = flags.uploadQuotaWindowMs
       }
     , Cmd.batch
         [ apiSend (encodeApiRequest (ApiGet "/me"))
@@ -2355,7 +2297,7 @@ modalContent kind model =
                 , textarea [ id "compose", value model.modalBody, placeholder "Write the first post...", onInput ModalBody ] []
                 , div [ class "composer-footer modal-composer-footer" ]
                     [ button [ class "btn secondary attach-btn", type_ "button", title "Attach files or images", onClick (BridgeEvent "pick_attachments" E.null) ] [ text "＋ Attach" ]
-                    , small [ class "muted" ] [ text ("Images, GIFs, and files up to " ++ formatBytesShort model.uploadMaxBytes ++ ".") ]
+                    , small [ class "muted" ] [ text "Images, GIFs, and files up to 250 MB." ]
                     ]
                 ]
             ]
@@ -3068,9 +3010,9 @@ renderRail model =
     nav [ class "rail" ]
         ([ div [ class "mark", title model.appName ] []
          , railBtn "⌂" (model.active == Home) (Go "#")
-         , railBtn "F" (model.active == Forums) (Go "#forums")
-         , railBtn "D" (isDmActive model) (Go "#dms")
-         , railBtn "+" (model.active == Friends) (Go "#friends")
+         , railBtn "◫" (model.active == Forums) (Go "#forums")
+         , railBtn "✉" (isDmActive model) (Go "#dms")
+         , railBtn "☺" (model.active == Friends) (Go "#friends")
          , div [ class "rail-spacer" ] []
          ] ++ List.map (\s -> renderServerIcon s model) (List.take 8 model.servers)
          ++ [ railBtn "⚙" (model.active == Settings) (Go "#settings") ])
@@ -3232,10 +3174,10 @@ sideHead : Model -> Html Msg
 sideHead model =
     div [ class "side-head" ]
         [ h1 [] [ text model.appName ]
-        , small [] [ text "Chat app" ]
+        , small [] [ text "Communities, direct messages, and calls" ]
         , div [ class "nav-actions" ]
-            [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "New server" ]
-            , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Use invite" ]
+            [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "Create server" ]
+            , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with invite" ]
             ]
         ]
 
@@ -3361,9 +3303,9 @@ renderMobileNav : Model -> Html Msg
 renderMobileNav model =
     nav [ class "mobile-nav" ]
         [ mobileBtn "⌂" "Home" (model.active == Home) (Go "#")
-        , mobileBtn "r/" "Forums" (model.active == Forums) (Go "#forums")
-        , mobileBtn "D" "DMs" (isDmActive model) (Go "#dms")
-        , mobileBtn "+" "Friends" (model.active == Friends) (Go "#friends")
+        , mobileBtn "◫" "Forums" (model.active == Forums) (Go "#forums")
+        , mobileBtn "✉" "DMs" (isDmActive model) (Go "#dms")
+        , mobileBtn "☺" "Friends" (model.active == Friends) (Go "#friends")
         , mobileBtn "≡" "Servers" model.serversSheetOpen ToggleServersSheet
         , mobileBtn "⚙" "You" (model.active == Settings) (Go "#settings")
         , if List.isEmpty model.servers then text "" else
@@ -4765,7 +4707,7 @@ composerView key placeholderText model =
         , textarea [ id "compose", placeholder placeholderText, value model.inputText, onInput InputText, onComposerKeyDown model.chatEnterSends ] []
         , div [ class "composer-footer" ]
             [ button [ class "btn secondary attach-btn", type_ "button", title "Attach files or images", onClick (BridgeEvent "pick_attachments" E.null) ] [ text "＋ Attach" ]
-            , small [ class "muted" ] [ text ("Paste images or attach files up to " ++ formatBytesShort model.uploadMaxBytes ++ ".") ]
+            , small [ class "muted" ] [ text "Paste images or attach files up to 250 MB." ]
             , button [ class "btn", disabled (String.isEmpty (String.trim model.inputText)), onClick SendMessage ] [ text "Send" ]
             ]
         ]

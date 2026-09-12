@@ -4,25 +4,11 @@
     base64url/1, base64url_decode/1, pbkdf2/2, verify_password/3,
     normalize_username/1, clean_text/2, int/1, bool/1, bin/1, json/1,
     read_json/1, read_json/2, ok_json/2, err_json/3, set_cookie/3, clear_cookie/1, cookie_value/2,
-    require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1, hex_binary/1,
-    upload_config/0
+    require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1, hex_binary/1
 ]).
 -ifdef(TEST).
 -export([constant_time/2]).
 -endif.
-
-%% single source of truth for upload limits: the enforcement code (pw_upload_hdl,
-%% pw_db) and the /api/config endpoint the frontend reads from all call this,
-%% so the UI can never drift from what is actually allowed.
--define(UPLOAD_HARD_MAX_BYTES, 262144000).
--define(UPLOAD_HARD_MAX_QUOTA_BYTES, 1073741824).
--define(UPLOAD_QUOTA_WINDOW_MS, 10800000).
-
-upload_config() ->
-    MaxBytes = min(?UPLOAD_HARD_MAX_BYTES, env_int("PLAINWIRE_UPLOAD_MAX_BYTES", ?UPLOAD_HARD_MAX_BYTES)),
-    QuotaBytes = min(?UPLOAD_HARD_MAX_QUOTA_BYTES,
-        max(?UPLOAD_HARD_MAX_BYTES, env_int("PLAINWIRE_UPLOAD_QUOTA_BYTES", ?UPLOAD_HARD_MAX_QUOTA_BYTES))),
-    #{max_bytes => MaxBytes, quota_bytes => QuotaBytes, quota_window_ms => ?UPLOAD_QUOTA_WINDOW_MS}.
 
 env_int(Name, Default) ->
     case os:getenv(Name) of

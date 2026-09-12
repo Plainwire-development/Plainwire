@@ -2,6 +2,8 @@
 -behaviour(cowboy_handler).
 -export([init/2]).
 
+-define(MAX_FILE, 262144000).
+
 init(Req0, _) ->
     case {cowboy_req:method(Req0), auth(Req0)} of
         {<<"POST">>, {ok, Session}} -> upload(Req0, Session);
@@ -10,12 +12,12 @@ init(Req0, _) ->
     end.
 
 upload(Req0, Session) ->
-    #{max_bytes := Max, quota_window_ms := QuotaWindowMs} = pw_util:upload_config(),
+    Max = min(?MAX_FILE, pw_client_config:upload_max_bytes()),
     Size = content_length(Req0),
     Uid = maps:get(id, maps:get(user, Session)),
     ValidSize = is_integer(Size) andalso Size > 0 andalso Size =< Max,
     case {pw_util:require_csrf(Req0, Session), ValidSize,
-          pw_rate:allow({upload, Uid}, 120, QuotaWindowMs)} of
+          pw_rate:allow({upload, Uid}, 120, 10800000)} of
         {false, _, _} -> pw_util:err_json(Req0, 403, <<"bad_csrf">>);
         {_, false, _} -> pw_util:err_json(Req0, 413, <<"file_too_large">>);
         {_, _, false} -> pw_util:err_json(Req0, 429, <<"rate_limited">>);

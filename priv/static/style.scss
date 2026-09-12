@@ -4017,3 +4017,584 @@ img { max-width: 100%; }
   .account-dialog-actions { flex-wrap: wrap; }
   .account-dialog-actions .btn { flex: 1 1 auto; }
 }
+
+/* 1.3.0 visual refresh pass */
+:root,
+[data-theme="dark"],
+[data-theme="light"] {
+  --bg1: var(--bg);
+  --panel: var(--bg2);
+  --border: var(--line);
+  --content-max: 1260px;
+}
+
+html, body {
+  background:
+    radial-gradient(circle at top, color-mix(in srgb, var(--accent), transparent 90%), transparent 34%),
+    linear-gradient(180deg, color-mix(in srgb, var(--bg4), #000 8%), var(--bg4));
+}
+
+.layout {
+  gap: 14px;
+  padding: 14px;
+  background: transparent;
+}
+
+.rail,
+.side,
+.main,
+.right,
+.settings-page {
+  min-height: 0;
+  border: 1px solid color-mix(in srgb, var(--line), transparent 18%);
+  box-shadow: 0 14px 42px rgba(0,0,0,.16);
+}
+
+.rail,
+.side,
+.right {
+  background: color-mix(in srgb, var(--bg2), var(--bg4) 12%);
+  backdrop-filter: blur(18px);
+}
+
+.rail {
+  width: 68px;
+  padding: 12px 0;
+  gap: 8px;
+  border-radius: 22px;
+}
+
+.mark {
+  width: 46px;
+  height: 46px;
+  margin-bottom: 10px;
+  border-radius: 15px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent), white 9%), var(--accent));
+  box-shadow: 0 10px 28px rgba(88,101,242,.28);
+  position: relative;
+}
+
+.mark::after {
+  content: "P";
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: -.03em;
+}
+
+.rail-btn {
+  width: 46px;
+  height: 46px;
+  border-radius: 15px;
+  background: transparent;
+  color: var(--text2);
+  transition: background .14s ease, color .14s ease, transform .14s ease, box-shadow .14s ease;
+}
+
+.rail-btn:hover,
+.rail-btn.active {
+  background: color-mix(in srgb, var(--accent), transparent 84%);
+  color: var(--text1);
+  transform: translateY(-1px);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent), transparent 55%);
+}
+
+.rail-btn::before {
+  left: 6px;
+  width: 3px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.rail-btn.active::before,
+.rail-btn:hover::before {
+  height: 22px;
+}
+
+.rail-btn .server-icon,
+.server-icon {
+  border-radius: 14px;
+}
+
+.server-icon {
+  background: color-mix(in srgb, var(--bg3), var(--bg) 42%);
+  color: var(--text1);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.035);
+}
+
+.side,
+.right {
+  border-radius: 24px;
+  overflow: hidden;
+}
+
+.side-head {
+  padding: 20px 18px 16px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line), transparent 24%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg3), transparent 6%), transparent);
+}
+
+.side-head h1 {
+  font-size: 18px;
+  color: var(--text1);
+}
+
+.side-head small {
+  display: block;
+  margin-top: 4px;
+  color: var(--text2);
+}
+
+.side-head .server-icon {
+  width: 58px;
+  height: 58px;
+  margin-bottom: 12px;
+  border-radius: 18px;
+}
+
+.nav-actions {
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.btn {
+  min-height: 38px;
+  padding: 0 15px;
+  border-radius: 11px;
+  font-weight: 700;
+  box-shadow: none;
+}
+
+.btn.secondary {
+  background: color-mix(in srgb, var(--bg3), transparent 6%);
+}
+
+.btn.secondary:hover {
+  background: var(--hover);
+}
+
+.search {
+  padding: 12px 14px 14px;
+}
+
+#globalSearch,
+.search-field input,
+.field input,
+.field textarea,
+.field select,
+.forum-search .forum-search-input,
+.invite-code-box .invite-code-input {
+  min-height: 44px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg3), transparent 10%);
+  border-color: color-mix(in srgb, var(--line), transparent 18%);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.025);
+}
+
+.field textarea {
+  min-height: 116px;
+}
+
+.side .list,
+.right .list {
+  padding: 10px;
+}
+
+.row {
+  gap: 12px;
+  min-height: 58px;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 15px;
+}
+
+.row:hover,
+.row.active {
+  background: color-mix(in srgb, var(--bg3), transparent 6%);
+  border-color: color-mix(in srgb, var(--line), transparent 24%);
+}
+
+.dm-row.unread {
+  background: color-mix(in srgb, var(--accent), transparent 92%);
+}
+
+.dm-row.active {
+  background: color-mix(in srgb, var(--accent), transparent 88%);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.topbar {
+  min-height: 68px;
+  padding: 0 22px;
+  background: color-mix(in srgb, var(--bg3), transparent 6%);
+  border: 1px solid color-mix(in srgb, var(--line), transparent 20%);
+  border-radius: 24px 24px 0 0;
+  border-bottom-width: 1px;
+  box-shadow: none;
+}
+
+.topbar h2 {
+  font-size: 21px;
+  font-weight: 750;
+  letter-spacing: -.02em;
+  color: var(--text1);
+}
+
+.main {
+  border-radius: 28px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--bg3), transparent 2%);
+}
+
+.content {
+  padding: 24px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--bg3), transparent 0%), color-mix(in srgb, var(--bg3), transparent 3%));
+}
+
+.home-page,
+.forum-page,
+.server-page,
+.thread-page,
+.dm-inbox {
+  width: min(var(--content-max), 100%);
+  margin-inline: auto;
+}
+
+.hero-card {
+  position: relative;
+  overflow: hidden;
+  padding: clamp(24px, 4vw, 34px);
+  border: 1px solid color-mix(in srgb, var(--accent), transparent 68%);
+  border-radius: 26px;
+  background:
+    radial-gradient(circle at top right, color-mix(in srgb, var(--accent), transparent 86%), transparent 28%),
+    linear-gradient(180deg, color-mix(in srgb, var(--bg2), transparent 2%), color-mix(in srgb, var(--bg2), transparent 10%));
+  box-shadow: 0 18px 60px rgba(0,0,0,.18);
+}
+
+.hero-card h1 {
+  max-width: 11ch;
+  font-size: clamp(34px, 4vw, 58px);
+  line-height: .96;
+  letter-spacing: -.05em;
+}
+
+.hero-card p {
+  max-width: 58ch;
+  font-size: 15px;
+  line-height: 1.62;
+}
+
+.hero-actions {
+  align-self: center;
+}
+
+.stat-grid,
+.home-columns,
+.forum-grid,
+.voice-participants,
+.account-action-grid {
+  gap: 14px;
+}
+
+.stat-card,
+.card,
+.forum-card,
+.reddit-thread,
+.settings-card,
+.group-members,
+.invite-card,
+.server-create-form,
+.server-create-intro,
+.chat-surface,
+.members-panel,
+.right,
+.voice-participant,
+.reddit-post,
+.thread-page > .composer {
+  border-radius: 20px;
+  background: color-mix(in srgb, var(--bg2), transparent 4%);
+  box-shadow: 0 12px 34px rgba(0,0,0,.12);
+}
+
+.stat-card {
+  min-height: 120px;
+  padding: 18px;
+  border-color: color-mix(in srgb, var(--line), transparent 12%);
+}
+
+.stat-value {
+  font-size: 34px;
+  letter-spacing: -.04em;
+}
+
+.section-head {
+  margin-bottom: 16px;
+}
+
+.chat-surface {
+  border-radius: 22px;
+  border-color: color-mix(in srgb, var(--line), transparent 18%);
+  background: color-mix(in srgb, var(--bg2), transparent 4%);
+}
+
+.chat-status,
+.chat-header,
+.join-call-banner,
+.dm-call-bar {
+  background: color-mix(in srgb, var(--bg3), transparent 8%);
+  border-bottom-color: color-mix(in srgb, var(--line), transparent 20%);
+}
+
+.chat-header {
+  padding: 16px 18px;
+}
+
+.chat-header .avatar {
+  width: 46px;
+  height: 46px;
+}
+
+.chat-header h2 {
+  font-size: 17px;
+}
+
+.messages {
+  padding: 16px 18px 12px;
+}
+
+.msg {
+  margin: 0;
+  padding: 9px 12px 8px 14px;
+  border-radius: 14px;
+}
+
+.msg:hover {
+  background: color-mix(in srgb, var(--accent), transparent 94%);
+}
+
+.msg.compact {
+  border-radius: 10px;
+}
+
+.msg-body {
+  color: var(--text);
+  line-height: 1.54;
+}
+
+.msg-actions {
+  top: -10px;
+  right: 12px;
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--bg2), transparent 2%);
+}
+
+.embed,
+.link-embed {
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--bg3), transparent 6%);
+}
+
+.composer {
+  padding: 14px 18px 18px;
+  border-top: 1px solid color-mix(in srgb, var(--line), transparent 22%);
+  background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--bg3), transparent 7%));
+}
+
+.composer textarea {
+  min-height: 52px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--bg3), transparent 4%);
+  border-color: color-mix(in srgb, var(--line), transparent 18%);
+}
+
+.composer .btn {
+  min-width: 92px;
+}
+
+.user-panel {
+  min-height: 66px;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--bg3), transparent 2%);
+  border-top-color: color-mix(in srgb, var(--line), transparent 22%);
+}
+
+.user-panel-actions button {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+}
+
+.settings-page {
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr);
+  overflow: hidden;
+  border-radius: 28px;
+  background: color-mix(in srgb, var(--bg3), transparent 3%);
+}
+
+.settings-sidebar {
+  padding: 22px 0;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg2), transparent 2%), color-mix(in srgb, var(--bg3), transparent 0%));
+}
+
+.settings-nav-label {
+  padding: 0 20px 12px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: .12em;
+}
+
+.settings-tab {
+  min-height: 44px;
+  margin: 0 12px 6px;
+  padding: 0 14px;
+  border-left-width: 0;
+  border-radius: 12px;
+  transition: background .14s ease, transform .14s ease, color .14s ease;
+}
+
+.settings-tab:hover {
+  transform: none;
+  background: color-mix(in srgb, var(--bg3), transparent 10%);
+}
+
+.settings-tab.active {
+  background: color-mix(in srgb, var(--accent), transparent 88%);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent), transparent 60%);
+}
+
+.settings-content {
+  background: transparent;
+}
+
+.settings-content-top {
+  min-height: 104px;
+  padding: 26px 32px 22px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg2), transparent 2%), transparent);
+}
+
+.settings-content-inner {
+  padding: 28px 32px 34px;
+}
+
+.settings-card {
+  width: min(900px, 100%);
+  border-radius: 22px;
+}
+
+.settings-card-head {
+  padding: 24px 0 18px;
+}
+
+.settings-panel {
+  padding: 0 24px 12px;
+}
+
+.setting-row {
+  gap: 18px;
+  padding: 15px 0;
+}
+
+.settings-action-card,
+.choice-card,
+.voice-mode-button {
+  border-radius: 16px;
+}
+
+.modal,
+.account-dialog-backdrop {
+  backdrop-filter: blur(6px);
+}
+
+.modal-card,
+.account-dialog,
+.action-modal,
+.user-popup-card {
+  border-radius: 18px;
+}
+
+.mobile-nav {
+  background: color-mix(in srgb, var(--bg4), transparent 6%);
+}
+
+.mobile-nav button.active {
+  background: color-mix(in srgb, var(--accent), transparent 84%);
+}
+
+@media (max-width: 1100px) {
+  .layout {
+    gap: 12px;
+    padding: 12px;
+  }
+
+  .settings-page {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .layout {
+    gap: 0;
+    padding: 0;
+  }
+
+  .main,
+  .side,
+  .right,
+  .settings-page {
+    border-radius: 0;
+    border-width: 0;
+    box-shadow: none;
+  }
+
+  .topbar {
+    min-height: 60px;
+    padding: 0 14px;
+    border-radius: 0;
+    border-left: 0;
+    border-right: 0;
+  }
+
+  .content {
+    padding: 14px 12px 18px;
+  }
+
+  .hero-card,
+  .stat-card,
+  .card,
+  .forum-card,
+  .chat-surface,
+  .settings-card,
+  .group-members,
+  .server-create-form,
+  .server-create-intro,
+  .reddit-thread,
+  .reddit-post,
+  .thread-page > .composer {
+    border-radius: 18px;
+    box-shadow: 0 8px 22px rgba(0,0,0,.12);
+  }
+
+  .settings-content-top {
+    padding: 18px 10px 14px;
+  }
+
+  .settings-content-inner {
+    padding: 16px 0 28px;
+  }
+
+  .settings-panel {
+    padding-inline: 16px;
+  }
+
+  .row {
+    min-height: 62px;
+  }
+}

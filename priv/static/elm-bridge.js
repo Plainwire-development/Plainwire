@@ -1,37 +1,8 @@
-(async () => {
+(() => {
   'use strict';
 
   const root = document.getElementById('app');
   if (!root || !window.Elm || !window.Elm.Main) return;
-
-  // upload limits come from the server's actual config (see pw_util:upload_config/0)
-  // so the UI text can't drift from what /api/uploads really enforces. If the
-  // fetch is slow or fails, fall back to the server's own hardcoded defaults
-  // rather than blocking boot indefinitely.
-  const defaultUploadConfig = { uploadMaxBytes: 262144000, uploadQuotaBytes: 1073741824, uploadQuotaWindowMs: 10800000 };
-  const uploadConfig = await (async () => {
-    try {
-      const res = await fetch('/api/config', { credentials: 'same-origin' });
-      const body = await res.json();
-      if (body && body.ok && body.data) {
-        return {
-          uploadMaxBytes: body.data.upload_max_bytes,
-          uploadQuotaBytes: body.data.upload_quota_bytes,
-          uploadQuotaWindowMs: body.data.upload_quota_window_ms
-        };
-      }
-    } catch (_) { /* fall through to defaults */ }
-    return defaultUploadConfig;
-  })();
-
-  const formatBytesShort = (bytes) => {
-    if (bytes >= 1073741824) return `${Math.round(bytes / 1073741824)} GB`;
-    return `${Math.round(bytes / 1048576)} MB`;
-  };
-  const formatQuotaWindow = (windowMs) => {
-    const hours = Math.round(windowMs / 3600000);
-    return hours === 1 ? '1 hour' : `${hours} hours`;
-  };
 
   const rawClientConfig = window.PLAINWIRE_CLIENT_CONFIG || {};
   const finiteInt = (value, fallback, min, max) => {
@@ -55,12 +26,7 @@
   });
   document.title = clientConfig.appName;
   if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false';
-  const app = window.Elm.Main.init({ node: root, flags: {
-    appName: clientConfig.appName,
-    uploadMaxBytes: uploadConfig.uploadMaxBytes,
-    uploadQuotaBytes: uploadConfig.uploadQuotaBytes,
-    uploadQuotaWindowMs: uploadConfig.uploadQuotaWindowMs
-  } });
+  const app = window.Elm.Main.init({ node: root, flags: clientConfig.appName });
   if (!clientConfig.registrationEnabled) {
     const hideRegistration = () => {
       const buttons = document.querySelectorAll('.auth-mode-switch .auth-mode-btn');
@@ -928,10 +894,10 @@
         send(app.ports.bridgeReceive, { tag: 'toast', data: `${safeName} ready to send` });
       } catch (error) {
         const messages = {
-          file_too_large: `Files can be up to ${formatBytesShort(uploadConfig.uploadMaxBytes)}.`,
+          file_too_large: `Files can be up to ${humanBytes(clientConfig.uploadMaxBytes)}.`,
           compression_failed: `Could not compress that file below ${humanBytes(clientConfig.uploadMaxBytes)}.`,
           compression_input_too_large: `That file is too large to compress safely in the browser. The compression limit is ${humanBytes(Math.min(Math.max(clientConfig.uploadMaxBytes * 2, clientConfig.uploadMaxBytes + 32 * 1024 * 1024), 512 * 1024 * 1024))}.`,
-          upload_quota_exceeded: `Upload limit reached: ${formatBytesShort(uploadConfig.uploadQuotaBytes)} every ${formatQuotaWindow(uploadConfig.uploadQuotaWindowMs)}.`,
+          upload_quota_exceeded: 'Upload quota reached. Try again later.',
           too_many_concurrent_uploads: 'Too many uploads are already in progress.',
           network_error: 'Upload connection interrupted.',
           network_timeout: 'Upload timed out. Try again on a steadier connection.',
