@@ -7,6 +7,9 @@
     require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1, hex_binary/1,
     upload_config/0
 ]).
+-ifdef(TEST).
+-export([constant_time/2]).
+-endif.
 
 %% single source of truth for upload limits: the enforcement code (pw_upload_hdl,
 %% pw_db) and the /api/config endpoint the frontend reads from all call this,
@@ -20,9 +23,6 @@ upload_config() ->
     QuotaBytes = min(?UPLOAD_HARD_MAX_QUOTA_BYTES,
         max(?UPLOAD_HARD_MAX_BYTES, env_int("PLAINWIRE_UPLOAD_QUOTA_BYTES", ?UPLOAD_HARD_MAX_QUOTA_BYTES))),
     #{max_bytes => MaxBytes, quota_bytes => QuotaBytes, quota_window_ms => ?UPLOAD_QUOTA_WINDOW_MS}.
--ifdef(TEST).
--export([constant_time/2]).
--endif.
 
 env_int(Name, Default) ->
     case os:getenv(Name) of

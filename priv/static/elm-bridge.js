@@ -33,10 +33,48 @@
     return hours === 1 ? '1 hour' : `${hours} hours`;
   };
 
-  const app = window.Elm.Main.init({ node: root, flags: uploadConfig });
+  const rawClientConfig = window.PLAINWIRE_CLIENT_CONFIG || {};
+  const finiteInt = (value, fallback, min, max) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
+  };
+  const clientConfig = Object.freeze({
+    appName: typeof rawClientConfig.app_name === 'string' && rawClientConfig.app_name.trim()
+      ? rawClientConfig.app_name.trim().slice(0, 48) : 'Plainwire',
+    defaultTheme: ['light', 'dark', 'system'].includes(rawClientConfig.default_theme)
+      ? rawClientConfig.default_theme : 'light',
+    registrationEnabled: rawClientConfig.registration_enabled !== false,
+    instanceDescription: typeof rawClientConfig.instance_description === 'string'
+      ? rawClientConfig.instance_description.trim().slice(0, 120) : '',
+    uploadMaxBytes: finiteInt(rawClientConfig.upload_max_bytes, 250 * 1024 * 1024, 1024 * 1024, 250 * 1024 * 1024),
+    profileImageMaxBytes: finiteInt(rawClientConfig.profile_image_max_bytes, 16 * 1024 * 1024, 256 * 1024, 16 * 1024 * 1024),
+    uploadMaxFiles: finiteInt(rawClientConfig.upload_max_files, 10, 1, 25),
+    idleTimeoutMs: finiteInt(rawClientConfig.idle_timeout_ms, 10 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
+    compressOversizeUploads: rawClientConfig.compress_oversize_uploads !== false,
+    maxImageDimension: finiteInt(rawClientConfig.max_image_dimension, 4096, 512, 8192)
+  });
+  document.title = clientConfig.appName;
+  if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false';
+  const app = window.Elm.Main.init({ node: root, flags: {
+    appName: clientConfig.appName,
+    uploadMaxBytes: uploadConfig.uploadMaxBytes,
+    uploadQuotaBytes: uploadConfig.uploadQuotaBytes,
+    uploadQuotaWindowMs: uploadConfig.uploadQuotaWindowMs
+  } });
+  if (!clientConfig.registrationEnabled) {
+    const hideRegistration = () => {
+      const buttons = document.querySelectorAll('.auth-mode-switch .auth-mode-btn');
+      if (buttons[1]) buttons[1].hidden = true;
+    };
+    hideRegistration();
+    new MutationObserver(hideRegistration).observe(root, { childList: true, subtree: true });
+  }
   let csrf = '';
   let ws = null;
   let wsQueue = [];
+  let wsReconnectTimer = null;
+  let wsReconnectAttempt = 0;
+  const WS_QUEUE_LIMIT = 512;
   let ringtoneTimer = null;
   let outgoingTimer = null;
   let audioCtx = null;
@@ -76,8 +114,8 @@
   const peerPromises = new Map();
   const signalQueues = new Map();
   const defaultRtcConfig = { iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }] };
-  const RTC_CONNECT_CHECK_MS = 8000;
-  const RTC_MAX_RECOVERY_ATTEMPTS = 4;
+  const RTC_CONNECT_CHECK_MS = 7000;
+  const RTC_MAX_RECOVERY_ATTEMPTS = 6;
   let rtcConfig = window.PLAINWIRE_RTC_CONFIG || defaultRtcConfig;
   let rtcConfigRequest = null;
   let rtcConfigFetchedAt = 0;
@@ -156,7 +194,7 @@
     }),
     setEnabled: (enabled) => { localStorage.setItem('plainwire_debug', enabled ? 'true' : 'false'); location.reload(); }
   };
-  debug('BOOT', 'bridge_initialized', { debug: debugEnabled, secure_context: window.isSecureContext, online: navigator.onLine });
+  debug('BOOT', 'bridge_initialized', { debug: debugEnabled, secure_context: window.isSecureContext, online: navigator.onLine, client_config: clientConfig });
 
   const loadRtcConfig = () => {
     if (window.PLAINWIRE_RTC_CONFIG) return Promise.resolve(rtcConfig);
@@ -211,7 +249,7 @@
   let effectiveStatus = null;         // visible status sent to the server
   let idle = false;
   let idleTimer = null;
-  const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+  const IDLE_TIMEOUT_MS = clientConfig.idleTimeoutMs;
 
   const normalizeDesiredStatus = (status) => {
     if (status === 'away' || status === 'busy' || status === 'invisible') return status;
@@ -294,12 +332,45 @@
     tag: 'sound_preference',
     data: localStorage.getItem('plainwire_sound_enabled') !== 'false'
   });
+  send(app.ports.bridgeReceive, {
+    tag: 'chat_enter_sends',
+    data: localStorage.getItem('plainwire_chat_enter_mode') !== 'newline'
+  });
+  send(app.ports.bridgeReceive, { tag: 'link_previews_enabled', data: localStorage.getItem('plainwire_link_previews') !== 'false' });
+  send(app.ports.bridgeReceive, { tag: 'animated_media_enabled', data: localStorage.getItem('plainwire_animated_media') !== 'false' });
+  send(app.ports.bridgeReceive, { tag: 'compact_messages', data: localStorage.getItem('plainwire_compact_messages') === 'true' });
+  send(app.ports.bridgeReceive, { tag: 'media_preload_enabled', data: localStorage.getItem('plainwire_media_preload') !== 'false' });
 
+  const syncThemeMeta = () => {
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (!meta) return;
+    const explicit = document.documentElement.dataset.theme;
+    const isDark = explicit === 'dark' || (!explicit && window.matchMedia?.('(prefers-color-scheme: dark)').matches);
+    meta.setAttribute('content', isDark ? '#1e1f22' : '#e3e5e8');
+  };
+  window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener?.('change', syncThemeMeta);
+  syncThemeMeta();
+
+  const accentPresets = Object.freeze({
+    blue: ['#5865f2', '#4752c4'],
+    teal: ['#16877a', '#116b61'],
+    green: ['#37854f', '#2c6b40'],
+    amber: ['#9a6716', '#7d5312'],
+    rose: ['#b64d6b', '#963e58']
+  });
   const applyUiPreferences = () => {
     const density = localStorage.getItem('plainwire_density') || 'comfortable';
     const reduceMotion = localStorage.getItem('plainwire_reduce_motion') === 'true';
+    const fontScale = localStorage.getItem('plainwire_font_scale') || 'default';
+    const cornerStyle = localStorage.getItem('plainwire_corner_style') || 'default';
+    const accentName = localStorage.getItem('plainwire_accent') || 'blue';
+    const accent = accentPresets[accentName] || accentPresets.blue;
     document.documentElement.dataset.density = density === 'compact' ? 'compact' : 'comfortable';
     document.documentElement.dataset.reduceMotion = reduceMotion ? 'true' : 'false';
+    document.documentElement.dataset.fontScale = ['small', 'large'].includes(fontScale) ? fontScale : 'default';
+    document.documentElement.dataset.cornerStyle = ['compact', 'rounded'].includes(cornerStyle) ? cornerStyle : 'default';
+    document.documentElement.style.setProperty('--accent', accent[0]);
+    document.documentElement.style.setProperty('--accent2', accent[1]);
   };
   applyUiPreferences();
 
@@ -311,7 +382,7 @@
   let historySentinel = null;
   let historyRoot = null;
   const mediaTime = (seconds) => {
-    if (!Number.isFinite(seconds) || seconds < 0) return '–:––';
+    if (!Number.isFinite(seconds) || seconds < 0) return '-:--';
     const whole = Math.floor(seconds);
     return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
   };
@@ -410,6 +481,104 @@
     });
   };
 
+  const embedCache = new Map();
+  const embedInFlight = new Map();
+  const EMBED_CACHE_LIMIT = 256;
+  const setEmbedCache = (url, value) => {
+    if (embedCache.has(url)) embedCache.delete(url);
+    embedCache.set(url, value);
+    while (embedCache.size > EMBED_CACHE_LIMIT) {
+      const oldest = embedCache.keys().next().value;
+      embedCache.delete(oldest);
+    }
+  };
+
+  const fetchEmbed = (url) => {
+    if (embedCache.has(url)) return Promise.resolve(embedCache.get(url));
+    if (embedInFlight.has(url)) return embedInFlight.get(url);
+    const request = fetch('/api/embed?url=' + encodeURIComponent(url), {
+      headers: { accept: 'application/json' },
+      credentials: 'same-origin'
+    })
+      .then((res) => res.ok ? res.json() : null)
+      .then((json) => {
+        const data = json?.ok && json.data ? json.data : null;
+        setEmbedCache(url, data);
+        return data;
+      })
+      .catch(() => {
+        setEmbedCache(url, null);
+        return null;
+      })
+      .finally(() => embedInFlight.delete(url));
+    embedInFlight.set(url, request);
+    return request;
+  };
+
+  const createEmbedCard = (meta) => {
+    const card = document.createElement('a');
+    card.className = 'link-embed';
+    card.href = meta.url;
+    card.target = '_blank';
+    card.rel = 'noopener noreferrer';
+
+    const copy = document.createElement('div');
+    copy.className = 'link-embed-copy';
+    if (meta.site_name) {
+      const site = document.createElement('div');
+      site.className = 'link-embed-site';
+      site.textContent = String(meta.site_name).slice(0, 200);
+      copy.appendChild(site);
+    }
+    if (meta.title) {
+      const title = document.createElement('div');
+      title.className = 'link-embed-title';
+      title.textContent = String(meta.title).slice(0, 300);
+      copy.appendChild(title);
+    }
+    if (meta.description) {
+      const desc = document.createElement('div');
+      desc.className = 'link-embed-description';
+      desc.textContent = String(meta.description).slice(0, 700);
+      copy.appendChild(desc);
+    }
+    card.appendChild(copy);
+    if (typeof meta.image === 'string' && meta.image.startsWith('/api/media/')) {
+      const image = document.createElement('img');
+      image.className = 'link-embed-image';
+      image.loading = 'lazy';
+      image.decoding = 'async';
+      image.alt = '';
+      image.src = meta.image;
+      image.addEventListener('error', () => image.remove(), { once: true });
+      card.appendChild(image);
+    }
+    return card;
+  };
+
+  const mountLinkEmbeds = () => {
+    document.querySelectorAll('.msg-body').forEach((body) => {
+      if (body.dataset.embedsMounted === 'true') return;
+      const links = Array.from(body.querySelectorAll('.message-link[data-embed-url]'))
+        .map((link) => ({ link, url: link.dataset.embedUrl || '' }))
+        .filter(({ url }) => /^https?:\/\//i.test(url))
+        .slice(0, 2);
+      body.dataset.embedsMounted = 'true';
+      links.forEach(({ url }) => {
+        fetchEmbed(url).then((meta) => {
+          const alreadyMounted = Array.from(body.querySelectorAll('[data-embed-card-for]'))
+            .some((node) => node.dataset.embedCardFor === url);
+          if (!meta || !body.isConnected || alreadyMounted) return;
+          const wrapper = document.createElement('div');
+          wrapper.className = 'link-embed-wrap';
+          wrapper.dataset.embedCardFor = url;
+          wrapper.appendChild(createEmbedCard(meta));
+          body.appendChild(wrapper);
+        });
+      });
+    });
+  };
+
   const trackMessageScroll = () => {
     const list = document.getElementById('messages');
     if (!list || list === messageListElement) return list;
@@ -455,7 +624,7 @@
 
   let messageDomFrame = 0;
   const messageDomObserver = new MutationObserver((records) => {
-    const relevantSelector = '#messages, #message-history-sentinel, .pw-media-player, .pw-live-call-timer';
+    const relevantSelector = '#messages, #message-history-sentinel, .pw-media-player, .pw-live-call-timer, .message-link, .msg-body';
     const relevant = records.some((record) => [...record.addedNodes, ...record.removedNodes].some((node) =>
       node.nodeType === Node.ELEMENT_NODE && (node.matches?.(relevantSelector) || node.querySelector?.(relevantSelector))
     ));
@@ -466,6 +635,7 @@
       trackMessageScroll();
       observeMessageHistory();
       mountMediaPlayers();
+      mountLinkEmbeds();
       updateCallTimers();
     });
   });
@@ -473,6 +643,7 @@
   trackMessageScroll();
   observeMessageHistory();
   mountMediaPlayers();
+  mountLinkEmbeds();
   updateCallTimers();
 
   const audioContext = () => {
@@ -603,12 +774,119 @@
     composer.focus();
   };
 
+  const humanBytes = (bytes) => {
+    const n = Number(bytes || 0);
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  };
+
+  const blobToFile = (blob, source, suffix = '') => new File(
+    [blob],
+    `${source.name || 'file'}${suffix}`,
+    { type: blob.type || source.type || 'application/octet-stream', lastModified: Date.now() }
+  );
+
+  const canvasBlob = (canvas, type, quality) => new Promise((resolve) => {
+    canvas.toBlob((blob) => resolve(blob), type, quality);
+  });
+
+  const compressImageForUpload = async (file, targetBytes) => {
+    if (!/^image\/(jpeg|png|webp|avif)$/i.test(file.type || '')) return null;
+    let bitmap;
+    try {
+      bitmap = await createImageBitmap(file);
+    } catch (_) {
+      return null;
+    }
+    try {
+      const originalMax = Math.max(bitmap.width, bitmap.height);
+      const targetMax = Math.min(clientConfig.maxImageDimension, originalMax);
+      const alphaSource = /png|webp|avif/i.test(file.type || '');
+      const outputType = alphaSource ? 'image/webp' : 'image/jpeg';
+      const qualitySteps = [0.9, 0.82, 0.74, 0.64, 0.54, 0.44, 0.34];
+      const scaleSteps = [1, 0.88, 0.76, 0.64, 0.52, 0.42, 0.34];
+      let smallest = null;
+      for (const scale of scaleSteps) {
+        const maxDim = Math.max(320, Math.floor(targetMax * scale));
+        const ratio = Math.min(1, maxDim / originalMax);
+        const width = Math.max(1, Math.round(bitmap.width * ratio));
+        const height = Math.max(1, Math.round(bitmap.height * ratio));
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d', { alpha: alphaSource });
+        if (!ctx) continue;
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(bitmap, 0, 0, width, height);
+        for (const quality of qualitySteps) {
+          const blob = await canvasBlob(canvas, outputType, quality);
+          if (!blob) continue;
+          if (!smallest || blob.size < smallest.size) smallest = blob;
+          if (blob.size <= targetBytes) {
+            const ext = outputType === 'image/webp' ? '.webp' : '.jpg';
+            const base = (file.name || 'image').replace(/\.[^.]+$/, '');
+            return new File([blob], `${base}${ext}`, { type: outputType, lastModified: Date.now() });
+          }
+        }
+      }
+      if (smallest && smallest.size < file.size && smallest.size <= targetBytes) {
+        return blobToFile(smallest, file, '.compressed');
+      }
+      return null;
+    } finally {
+      bitmap.close?.();
+    }
+  };
+
+  const gzipForUpload = async (file, targetBytes) => {
+    if (typeof CompressionStream !== 'function') return null;
+    try {
+      const gz = file.stream().pipeThrough(new CompressionStream('gzip'));
+      const blob = await new Response(gz).blob();
+      if (!blob.size || blob.size >= file.size || blob.size > targetBytes) return null;
+      return new File([blob], `${file.name || 'file'}.gz`, { type: 'application/gzip', lastModified: Date.now() });
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const prepareFileForUpload = async (file, targetBytes = clientConfig.uploadMaxBytes, { ask = true } = {}) => {
+    if (!file || file.size <= 0) throw new Error('empty_file');
+    if (file.size <= targetBytes) return file;
+    if (!clientConfig.compressOversizeUploads) throw new Error('file_too_large');
+    // Browser-side compression is intentionally bounded. Decoding or buffering a
+    // multi-gigabyte file just to discover it cannot fit would freeze the tab.
+    const compressionInputLimit = Math.min(Math.max(targetBytes * 2, targetBytes + 32 * 1024 * 1024), 512 * 1024 * 1024);
+    if (file.size > compressionInputLimit) throw new Error('compression_input_too_large');
+    if (ask) {
+      const accepted = window.confirm(
+        `${file.name || 'This file'} is ${humanBytes(file.size)}, above the ${humanBytes(targetBytes)} limit. Try to compress it before uploading?`
+      );
+      if (!accepted) throw new Error('upload_cancelled');
+    }
+    send(app.ports.bridgeReceive, { tag: 'toast', data: `Compressing ${file.name || 'file'}...` });
+    const image = await compressImageForUpload(file, targetBytes);
+    if (image) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: `Compressed to ${humanBytes(image.size)}.` });
+      return image;
+    }
+    const gzip = await gzipForUpload(file, targetBytes);
+    if (gzip) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: `Compressed to ${humanBytes(gzip.size)} as gzip.` });
+      return gzip;
+    }
+    throw new Error('compression_failed');
+  };
+
   const uploadOne = (file) => new Promise((resolve, reject) => {
     if (!file || file.size <= 0) return reject(new Error('empty_file'));
-    if (file.size > 250 * 1024 * 1024) return reject(new Error('file_too_large'));
+    if (file.size > clientConfig.uploadMaxBytes) return reject(new Error('file_too_large'));
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/api/uploads');
     xhr.responseType = 'json';
+    xhr.timeout = 10 * 60 * 1000;
     xhr.setRequestHeader('x-csrf-token', csrf);
     xhr.setRequestHeader('x-file-name', encodeURIComponent(file.name || 'pasted-image'));
     xhr.setRequestHeader('content-type', file.type || 'application/octet-stream');
@@ -621,7 +899,7 @@
       if (progress < 100 && progress - lastProgress < 5 && now - lastProgressAt < 250) return;
       lastProgressAt = now;
       lastProgress = progress;
-      send(app.ports.bridgeReceive, { tag: 'toast', data: `Uploading ${file.name || 'image'}… ${progress}%` });
+      send(app.ports.bridgeReceive, { tag: 'toast', data: `Uploading ${file.name || 'image'}... ${progress}%` });
     };
     xhr.onload = () => {
       const json = xhr.response;
@@ -629,13 +907,19 @@
       else reject(new Error(json?.error || 'upload_failed'));
     };
     xhr.onerror = () => reject(new Error('network_error'));
+    xhr.ontimeout = () => reject(new Error('network_timeout'));
     xhr.onabort = () => reject(new Error('upload_cancelled'));
     xhr.send(file);
   });
 
   const uploadFiles = async (files) => {
-    for (const file of Array.from(files || []).slice(0, 10)) {
+    const selected = Array.from(files || []);
+    if (selected.length > clientConfig.uploadMaxFiles) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: `Only the first ${clientConfig.uploadMaxFiles} files will be uploaded.` });
+    }
+    for (const sourceFile of selected.slice(0, clientConfig.uploadMaxFiles)) {
       try {
+        const file = await prepareFileForUpload(sourceFile);
         const uploaded = await uploadOne(file);
         const safeName = String(uploaded.name || 'file').replace(/[\]()[\r\n]/g, '_');
         const markup = String(uploaded.content_type || '').startsWith('image/')
@@ -645,8 +929,13 @@
       } catch (error) {
         const messages = {
           file_too_large: `Files can be up to ${formatBytesShort(uploadConfig.uploadMaxBytes)}.`,
+          compression_failed: `Could not compress that file below ${humanBytes(clientConfig.uploadMaxBytes)}.`,
+          compression_input_too_large: `That file is too large to compress safely in the browser. The compression limit is ${humanBytes(Math.min(Math.max(clientConfig.uploadMaxBytes * 2, clientConfig.uploadMaxBytes + 32 * 1024 * 1024), 512 * 1024 * 1024))}.`,
           upload_quota_exceeded: `Upload limit reached: ${formatBytesShort(uploadConfig.uploadQuotaBytes)} every ${formatQuotaWindow(uploadConfig.uploadQuotaWindowMs)}.`,
-          network_error: 'Upload connection interrupted.'
+          too_many_concurrent_uploads: 'Too many uploads are already in progress.',
+          network_error: 'Upload connection interrupted.',
+          network_timeout: 'Upload timed out. Try again on a steadier connection.',
+          upload_cancelled: 'Upload cancelled.'
         };
         send(app.ports.bridgeReceive, { tag: 'toast', data: messages[error.message] || 'File upload failed. Please try again.' });
       }
@@ -678,6 +967,8 @@
     debug('WS', 'connecting', { url, queued: wsQueue.length });
     ws = new WebSocket(url);
     ws.onopen = () => {
+      if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+      wsReconnectAttempt = 0;
       const queued = wsQueue;
       wsQueue = [];
       debug('WS', 'connected', { queued: queued.length, room });
@@ -706,12 +997,39 @@
     };
     ws.onerror = () => debug('WS', 'transport_error', { ready_state: ws?.readyState }, 'error');
     ws.onclose = (event) => {
-      debug('WS', 'closed', { code: event.code, reason: event.reason || '(none)', clean: event.wasClean, reconnect_ms: 800 }, 'warn');
       if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
       send(app.ports.bridgeReceive, { tag: 'ws_status', data: false });
       ws = null;
-      setTimeout(connectWs, 800);
+      wsReconnectAttempt = Math.min(wsReconnectAttempt + 1, 8);
+      const base = Math.min(15000, 500 * Math.pow(2, wsReconnectAttempt));
+      const delay = Math.max(500, Math.round(base * (0.75 + Math.random() * 0.5)));
+      debug('WS', 'closed', { code: event.code, reason: event.reason || '(none)', clean: event.wasClean, reconnect_ms: delay }, 'warn');
+      if (!wsReconnectTimer) {
+        wsReconnectTimer = setTimeout(() => {
+          wsReconnectTimer = null;
+          connectWs();
+        }, delay);
+      }
     };
+  };
+
+  const queueWs = (value) => {
+    if (!value || typeof value !== 'object') return;
+    if (value.type === 'ping') return;
+    if (value.type === 'presence_update' || value.type === 'presence_watch') {
+      for (let i = wsQueue.length - 1; i >= 0; i--) {
+        if (wsQueue[i]?.type === value.type) {
+          wsQueue[i] = value;
+          return;
+        }
+      }
+    }
+    if (wsQueue.length >= WS_QUEUE_LIMIT) {
+      const disposable = wsQueue.findIndex((item) => ['presence_update', 'presence_watch', 'voice_activity'].includes(item?.type));
+      if (disposable >= 0) wsQueue.splice(disposable, 1);
+      else wsQueue.shift();
+    }
+    wsQueue.push(value);
   };
 
   const sendWs = (value) => {
@@ -720,7 +1038,7 @@
       debug('WS', 'sent', { message: value });
       ws.send(JSON.stringify(value));
     } else {
-      wsQueue.push(value);
+      queueWs(value);
       debug('WS', 'queued', { type: value?.type, queue_length: wsQueue.length }, 'warn');
     }
   };
@@ -1177,57 +1495,92 @@
     vad.frame = setTimeout(sample, 0);
   };
 
-  // ---- Floating window system (draggable stage video + preview) ----
-  const floatWindows = new Map(); // id -> { wrapper, video, title }
+  // ---- Floating window system (draggable, resizable, remembered) ----
+  const floatWindows = new Map(); // id -> { wrapper, video, title, bar }
   let floatZIndex = 900;
-  const floatPositions = {}; // id -> { x, y }
+  const FLOAT_STATE_KEY = 'plainwire_float_windows_v2';
+  const loadFloatStates = () => {
+    try {
+      const value = JSON.parse(localStorage.getItem(FLOAT_STATE_KEY) || '{}');
+      return value && typeof value === 'object' ? value : {};
+    } catch (_) {
+      return {};
+    }
+  };
+  const floatPositions = loadFloatStates();
+  let floatSaveTimer = null;
+  const saveFloatStates = () => {
+    if (floatSaveTimer) clearTimeout(floatSaveTimer);
+    floatSaveTimer = setTimeout(() => {
+      floatSaveTimer = null;
+      try { localStorage.setItem(FLOAT_STATE_KEY, JSON.stringify(floatPositions)); } catch (_) {}
+    }, 120);
+  };
+  const clampFloatWindow = (wrapper) => {
+    const rect = wrapper.getBoundingClientRect();
+    const maxW = Math.max(220, window.innerWidth - 16);
+    const maxH = Math.max(160, window.innerHeight - 16);
+    if (rect.width > maxW) wrapper.style.width = maxW + 'px';
+    if (rect.height > maxH) wrapper.style.height = maxH + 'px';
+    const next = wrapper.getBoundingClientRect();
+    const x = Math.max(0, Math.min(Math.max(0, window.innerWidth - 80), next.left));
+    const y = Math.max(0, Math.min(Math.max(0, window.innerHeight - 40), next.top));
+    wrapper.style.left = x + 'px';
+    wrapper.style.top = y + 'px';
+    wrapper.style.right = 'auto';
+    wrapper.style.bottom = 'auto';
+    return { x, y, w: wrapper.offsetWidth, h: wrapper.offsetHeight };
+  };
 
-  const makeFloatWindow = (id, titleText, accentColor, opts = {}) => {
+  const makeFloatWindow = (id, titleText, _accentColor, opts = {}) => {
     const wrapper = document.createElement('div');
     wrapper.id = 'pw-float-' + id;
     wrapper.className = 'pw-float';
-    wrapper.style.cssText = 'position:fixed;z-index:' + (floatZIndex++) + ';display:none;width:min(560px,calc(100vw - 24px));max-width:calc(100vw - 16px);max-height:calc(100dvh - 24px);transition:box-shadow .15s';
+    wrapper.style.zIndex = String(floatZIndex++);
+    wrapper.style.width = 'min(560px, calc(100vw - 24px))';
+    wrapper.style.height = 'min(360px, calc(100dvh - 24px))';
+
     const saved = floatPositions[id];
-    if (saved) { wrapper.style.left = saved.x + 'px'; wrapper.style.top = saved.y + 'px'; }
-    else if (opts.right != null && opts.bottom != null) {
+    if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+      if (Number.isFinite(saved.w)) wrapper.style.width = Math.max(220, saved.w) + 'px';
+      if (Number.isFinite(saved.h)) wrapper.style.height = Math.max(160, saved.h) + 'px';
+      wrapper.style.left = saved.x + 'px';
+      wrapper.style.top = saved.y + 'px';
+    } else if (opts.right != null && opts.bottom != null) {
       wrapper.style.right = opts.right + 'px';
       wrapper.style.bottom = opts.bottom + 'px';
     }
 
     const bar = document.createElement('div');
     bar.className = 'pw-float-bar';
-    bar.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 8px;background:' + accentColor + ';border-radius:8px 8px 0 0;cursor:grab;user-select:none;min-width:180px';
 
     const title = document.createElement('span');
-    title.style.cssText = 'flex:1;color:#fff;font-size:11px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+    title.className = 'pw-float-title';
     title.textContent = titleText;
 
+    const btnFit = document.createElement('button');
+    btnFit.type = 'button';
+    btnFit.className = 'pw-float-btn pw-float-fit';
+    btnFit.title = 'Fit to screen';
+    btnFit.setAttribute('aria-label', 'Fit screen share window to screen');
+    btnFit.textContent = '▣';
+
     const btnFs = document.createElement('button');
+    btnFs.type = 'button';
     btnFs.className = 'pw-float-btn pw-float-fs';
     btnFs.title = 'Fullscreen';
+    btnFs.setAttribute('aria-label', 'Fullscreen screen share');
     btnFs.textContent = '⛶';
-    btnFs.style.cssText = 'background:rgba(255,255,255,.2);border:none;color:#fff;width:22px;height:22px;border-radius:4px;cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center;transition:background .1s';
-    btnFs.addEventListener('mouseenter', () => { btnFs.style.background = 'rgba(255,255,255,.35)'; });
-    btnFs.addEventListener('mouseleave', () => { btnFs.style.background = 'rgba(255,255,255,.2)'; });
-    btnFs.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const vid = wrapper.querySelector('video');
-      if (vid) {
-        if (vid.requestFullscreen) vid.requestFullscreen().catch(() => {});
-        else if (vid.webkitRequestFullscreen) vid.webkitRequestFullscreen();
-      }
-    });
 
     const btnClose = document.createElement('button');
+    btnClose.type = 'button';
     btnClose.className = 'pw-float-btn pw-float-close';
     btnClose.title = 'Close';
-    btnClose.textContent = '✕';
-    btnClose.style.cssText = 'background:rgba(255,255,255,.2);border:none;color:#fff;width:22px;height:22px;border-radius:4px;cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center;transition:background .1s';
-    btnClose.addEventListener('mouseenter', () => { btnClose.style.background = 'rgba(255,255,255,.35)'; });
-    btnClose.addEventListener('mouseleave', () => { btnClose.style.background = 'rgba(255,255,255,.2)'; });
-    if (opts.onClose) btnClose.addEventListener('click', (e) => { e.stopPropagation(); opts.onClose(); });
+    btnClose.setAttribute('aria-label', 'Close screen share window');
+    btnClose.textContent = '×';
 
     bar.appendChild(title);
+    bar.appendChild(btnFit);
     bar.appendChild(btnFs);
     bar.appendChild(btnClose);
 
@@ -1236,25 +1589,46 @@
     video.playsInline = true;
     video.muted = true;
     video.controls = false;
-    video.style.cssText = 'display:block;width:100%;height:auto;max-height:70vh;border-radius:0 0 8px 8px;background:#000;object-fit:contain';
 
     wrapper.appendChild(bar);
     wrapper.appendChild(video);
     document.body.appendChild(wrapper);
 
-    // keep this local. the old global listeners bred like rabbits.
-    let dragging = false, dragPointer = null, dragOffX = 0, dragOffY = 0;
-    const onMove = (clientX, clientY) => {
-      if (!dragging) return;
-      let nx = clientX - dragOffX, ny = clientY - dragOffY;
-      nx = Math.max(0, Math.min(window.innerWidth - 80, nx));
-      ny = Math.max(0, Math.min(window.innerHeight - 40, ny));
-      wrapper.style.left = nx + 'px';
-      wrapper.style.top = ny + 'px';
+    const bringForward = () => { wrapper.style.zIndex = String(++floatZIndex); };
+    wrapper.addEventListener('pointerdown', bringForward);
+
+    btnFs.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (video.requestFullscreen) video.requestFullscreen().catch(() => {});
+      else if (video.webkitRequestFullscreen) video.webkitRequestFullscreen();
+    });
+    btnClose.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (opts.onClose) opts.onClose();
+      else wrapper.style.display = 'none';
+    });
+
+    const fitToScreen = () => {
+      const w = Math.min(960, Math.max(300, window.innerWidth - 48));
+      const h = Math.min(620, Math.max(220, window.innerHeight - 120));
+      wrapper.style.width = w + 'px';
+      wrapper.style.height = h + 'px';
+      wrapper.style.left = Math.max(8, Math.round((window.innerWidth - w) / 2)) + 'px';
+      wrapper.style.top = Math.max(8, Math.round((window.innerHeight - h) / 2)) + 'px';
       wrapper.style.right = 'auto';
       wrapper.style.bottom = 'auto';
-      floatPositions[id] = { x: nx, y: ny };
+      floatPositions[id] = clampFloatWindow(wrapper);
+      saveFloatStates();
     };
+    btnFit.addEventListener('click', (e) => { e.stopPropagation(); fitToScreen(); });
+    bar.addEventListener('dblclick', (e) => {
+      if (!e.target.closest('.pw-float-btn')) fitToScreen();
+    });
+
+    let dragging = false;
+    let dragPointer = null;
+    let dragOffX = 0;
+    let dragOffY = 0;
     bar.addEventListener('pointerdown', (e) => {
       if (e.button !== 0 || e.target.closest('.pw-float-btn')) return;
       dragging = true;
@@ -1262,55 +1636,80 @@
       const rect = wrapper.getBoundingClientRect();
       dragOffX = e.clientX - rect.left;
       dragOffY = e.clientY - rect.top;
+      wrapper.style.left = rect.left + 'px';
+      wrapper.style.top = rect.top + 'px';
+      wrapper.style.right = 'auto';
+      wrapper.style.bottom = 'auto';
       bar.style.cursor = 'grabbing';
       bar.setPointerCapture?.(e.pointerId);
       e.preventDefault();
     });
     bar.addEventListener('pointermove', (e) => {
-      if (dragging && e.pointerId === dragPointer) onMove(e.clientX, e.clientY);
+      if (!dragging || e.pointerId !== dragPointer) return;
+      const nx = Math.max(0, Math.min(window.innerWidth - 80, e.clientX - dragOffX));
+      const ny = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - dragOffY));
+      wrapper.style.left = nx + 'px';
+      wrapper.style.top = ny + 'px';
+      floatPositions[id] = { ...floatPositions[id], x: nx, y: ny, w: wrapper.offsetWidth, h: wrapper.offsetHeight };
+      saveFloatStates();
     });
     const finishDrag = (e) => {
       if (!dragging || e.pointerId !== dragPointer) return;
       dragging = false;
       dragPointer = null;
       bar.style.cursor = 'grab';
+      floatPositions[id] = clampFloatWindow(wrapper);
+      saveFloatStates();
     };
     bar.addEventListener('pointerup', finishDrag);
     bar.addEventListener('pointercancel', finishDrag);
     bar.addEventListener('lostpointercapture', finishDrag);
 
-    // Resize handle (bottom-right corner)
-    let resizing = false, resizePointer = null, startW = 0, startX = 0;
-    const resizeGrip = document.createElement('div');
-    resizeGrip.style.cssText = 'position:absolute;bottom:0;right:0;width:16px;height:16px;cursor:nwse-resize;opacity:.4;z-index:1';
-    resizeGrip.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" style="position:absolute;bottom:2px;right:2px"><path d="M11 1L1 11M11 5L5 11M11 9L9 11" stroke="#fff" stroke-width="1.5" fill="none"/></svg>';
-    wrapper.appendChild(resizeGrip);
-    wrapper.style.overflow = 'visible';
-    resizeGrip.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
-      resizing = true;
-      resizePointer = e.pointerId;
-      startW = wrapper.offsetWidth;
-      startX = e.clientX;
-      resizeGrip.setPointerCapture?.(e.pointerId);
-      e.preventDefault();
-      e.stopPropagation();
-    });
-    resizeGrip.addEventListener('pointermove', (e) => {
-      if (!resizing || e.pointerId !== resizePointer) return;
-      const nw = Math.max(160, Math.min(window.innerWidth - 40, startW + (e.clientX - startX)));
-      const ratio = video.videoHeight / video.videoWidth || 0.56;
-      wrapper.style.width = nw + 'px';
-      video.style.height = Math.round(nw * ratio) + 'px';
-    });
-    const finishResize = (e) => {
-      if (!resizing || e.pointerId !== resizePointer) return;
-      resizing = false;
-      resizePointer = null;
+    // CSS resize gives the same resize-anywhere-at-the-corner interaction users
+    // expect from desktop chat apps. ResizeObserver persists and clamps the size.
+    let resizeObserved = false;
+    if ('ResizeObserver' in window) {
+      const observer = new ResizeObserver(() => {
+        if (wrapper.style.display === 'none') return;
+        const rect = wrapper.getBoundingClientRect();
+        const w = Math.min(Math.max(220, rect.width), Math.max(220, window.innerWidth - 16));
+        const h = Math.min(Math.max(160, rect.height), Math.max(160, window.innerHeight - 16));
+        if (Math.abs(w - rect.width) > 1) wrapper.style.width = w + 'px';
+        if (Math.abs(h - rect.height) > 1) wrapper.style.height = h + 'px';
+        floatPositions[id] = { ...floatPositions[id], x: rect.left, y: rect.top, w, h };
+        saveFloatStates();
+      });
+      observer.observe(wrapper);
+      resizeObserved = true;
+    }
+    if (!resizeObserved) {
+      wrapper.addEventListener('pointerup', () => {
+        floatPositions[id] = clampFloatWindow(wrapper);
+        saveFloatStates();
+      });
+    }
+
+    const onViewportResize = () => {
+      if (wrapper.style.display !== 'none') {
+        floatPositions[id] = clampFloatWindow(wrapper);
+        saveFloatStates();
+      }
     };
-    resizeGrip.addEventListener('pointerup', finishResize);
-    resizeGrip.addEventListener('pointercancel', finishResize);
-    resizeGrip.addEventListener('lostpointercapture', finishResize);
+    window.addEventListener('resize', onViewportResize, { passive: true });
+
+    // Resolve right/bottom positioning to pixels after first layout so later
+    // dragging and persistence never fight with opposing CSS anchors.
+    requestAnimationFrame(() => {
+      if (!saved) {
+        const rect = wrapper.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          wrapper.style.left = rect.left + 'px';
+          wrapper.style.top = rect.top + 'px';
+          wrapper.style.right = 'auto';
+          wrapper.style.bottom = 'auto';
+        }
+      }
+    });
 
     floatWindows.set(id, { wrapper, video, title, bar });
     return { wrapper, video, bar, title };
@@ -1578,6 +1977,7 @@
       if (pc._restartTimer) clearTimeout(pc._restartTimer);
       if (pc._connectTimer) clearTimeout(pc._connectTimer);
       if (pc._disconnectTimer) clearTimeout(pc._disconnectTimer);
+      if (pc._remoteMuteTimer) clearTimeout(pc._remoteMuteTimer);
       pc.close();
     }
     peers.delete(uid);
@@ -1698,8 +2098,8 @@
     }
   };
 
-  const restartPeerIce = (uid, pc, reason = 'network') => {
-    if (!pc || pc.signalingState === 'closed' || pc.connectionState === 'connected') return;
+  const restartPeerIce = (uid, pc, reason = 'network', { force = false } = {}) => {
+    if (!pc || pc.signalingState === 'closed' || (pc.connectionState === 'connected' && !force)) return;
     if (pc._restartTimer || Date.now() - (pc._lastRecoveryAt || 0) < 4500) return;
     if ((pc._reconnectAttempts || 0) >= RTC_MAX_RECOVERY_ATTEMPTS) {
       markPeerFailed(uid, pc, reason);
@@ -1766,8 +2166,14 @@
     if (peers.has(uid)) return peers.get(uid);
     const offerer = Number(meId) > Number(uid);
     const polite = !offerer;
-    const pc = new RTCPeerConnection(rtcConfig);
-    debug('RTC', 'peer_created', { peer_user_id: uid, offerer, polite, room, ice_server_count: rtcConfig.iceServers?.length || 0 });
+    const peerConfig = {
+      ...rtcConfig,
+      bundlePolicy: rtcConfig.bundlePolicy || 'max-bundle',
+      rtcpMuxPolicy: 'require',
+      iceCandidatePoolSize: Number.isFinite(rtcConfig.iceCandidatePoolSize) ? rtcConfig.iceCandidatePoolSize : 4
+    };
+    const pc = new RTCPeerConnection(peerConfig);
+    debug('RTC', 'peer_created', { peer_user_id: uid, offerer, polite, room, ice_server_count: peerConfig.iceServers?.length || 0 });
     pc._offerer = offerer;
     pc._polite = polite;
     pc._roomEpoch = epoch;
@@ -1783,10 +2189,21 @@
     // fixed transceivers make screen sharing a track swap, not a glare party.
     const audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
     const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
+    try {
+      const audioCaps = RTCRtpReceiver.getCapabilities?.('audio');
+      const codecs = audioCaps?.codecs || [];
+      const opus = codecs.filter((codec) => /audio\/opus/i.test(codec.mimeType || ''));
+      const rest = codecs.filter((codec) => !/audio\/opus/i.test(codec.mimeType || ''));
+      if (opus.length && typeof audioTransceiver.setCodecPreferences === 'function') {
+        audioTransceiver.setCodecPreferences([...opus, ...rest]);
+      }
+    } catch (error) {
+      debug('RTC', 'codec_preference_skipped', { peer_user_id: uid, error: error.message }, 'warn');
+    }
     const audioTrack = stream.getAudioTracks()[0];
     const videoTrack = stream.getVideoTracks()[0];
-    if (audioTrack) audioTransceiver.sender.replaceTrack(audioTrack);
-    if (videoTrack) videoTransceiver.sender.replaceTrack(videoTrack);
+    if (audioTrack) await audioTransceiver.sender.replaceTrack(audioTrack);
+    if (videoTrack) await videoTransceiver.sender.replaceTrack(videoTrack);
     pc._audioSender = audioTransceiver.sender;
     pc._videoSender = videoTransceiver.sender;
     pc.onnegotiationneeded = () => {
@@ -1805,29 +2222,50 @@
     pc.ontrack = (ev) => {
       debug('RTC', 'remote_track', { peer_user_id: uid, kind: ev.track.kind, muted: ev.track.muted, ready_state: ev.track.readyState, streams: ev.streams?.length || 0 });
       if (ev.track.kind === 'audio') {
+        const audio = remoteAudio(uid);
         const markMediaConnected = () => {
-          pc._mediaConnected = ev.track.readyState === 'live' && ev.track.muted !== true;
-          if (pc._mediaConnected) pc._publishConnectionState?.();
+          const healthy = ev.track.readyState === 'live' && ev.track.muted !== true;
+          pc._mediaConnected = healthy;
+          if (healthy) {
+            if (pc._remoteMuteTimer) clearTimeout(pc._remoteMuteTimer);
+            pc._remoteMuteTimer = null;
+            pc._publishConnectionState?.();
+            playRemoteAudio(audio);
+          }
         };
-        markMediaConnected();
+        const scheduleMutedRecovery = () => {
+          pc._mediaConnected = false;
+          if (pc._remoteMuteTimer) clearTimeout(pc._remoteMuteTimer);
+          pc._remoteMuteTimer = setTimeout(() => {
+            pc._remoteMuteTimer = null;
+            if (!room || pc._roomEpoch !== room.epoch || pc.signalingState === 'closed') return;
+            if (ev.track.readyState === 'live' && ev.track.muted === true) {
+              debug('RTC', 'remote_audio_stalled', { peer_user_id: uid }, 'warn');
+              restartPeerIce(uid, pc, 'remote_audio_stalled', { force: true });
+            }
+          }, 7000);
+        };
         ev.track.addEventListener?.('unmute', markMediaConnected);
+        ev.track.addEventListener?.('mute', scheduleMutedRecovery);
         ev.track.addEventListener?.('ended', () => {
           pc._mediaConnected = false;
           reportPeerConnection(uid, pc, false);
+          restartPeerIce(uid, pc, 'remote_audio_ended', { force: true });
         });
-        const audio = remoteAudio(uid);
-        if (ev.streams && ev.streams[0]) {
-          audio.srcObject = ev.streams[0];
-        } else {
-          const s = audio.srcObject instanceof MediaStream ? audio.srcObject : new MediaStream();
-          s.addTrack(ev.track);
-          audio.srcObject = s;
-        }
+        audio.srcObject = new MediaStream([ev.track]);
         audio.muted = deafened;
+        ['loadedmetadata', 'canplay', 'playing'].forEach((eventName) => {
+          audio.addEventListener(eventName, () => {
+            markMediaConnected();
+            if (!deafened) playRemoteAudio(audio);
+          }, { passive: true });
+        });
+        if (ev.track.muted) scheduleMutedRecovery();
+        else markMediaConnected();
         playRemoteAudio(audio);
         applySpeaker();
       } else if (ev.track.kind === 'video') {
-        // Store stream for later — stage video only shown for screen sharers
+        // Store stream for later  -  stage video only shown for screen sharers
         if (!pc._videoStreams) pc._videoStreams = new Map();
         const stream = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
         pc._videoStreams.set(ev.track.id, stream);
@@ -1964,7 +2402,7 @@
         if (pc._offerer) {
           if (pc._failureReported) pc._reconnectAttempts = 0;
           pc._lastRecoveryAt = 0;
-          restartPeerIce(uid, pc, 'peer_requested');
+          restartPeerIce(uid, pc, 'peer_requested', { force: true });
         }
       } else if (signal.kind === 'offer') {
         // offerers don't accept offers. yes, old cached clients try.
@@ -2216,7 +2654,7 @@
   recv(app.ports.setTitle, (title) => {
     document.title = title;
   });
-  recv(app.ports.notify, ({ title = 'Plainwire', body = '' } = {}) => {
+  recv(app.ports.notify, ({ title = clientConfig.appName, body = '' } = {}) => {
     if ('Notification' in window && Notification.permission === 'granted') {
       new Notification(title, { body });
     }
@@ -2247,28 +2685,33 @@
   });
   recv(app.ports.readFile, (id) => {
     const input = document.getElementById(id);
-    const file = input && input.files && input.files[0];
-    if (!file) return send(app.ports.fileInput, { id, data: null });
-    if (!/^image\/(jpeg|png|gif|webp|avif)$/i.test(file.type)) {
+    const sourceFile = input && input.files && input.files[0];
+    if (!sourceFile) return send(app.ports.fileInput, { id, data: null });
+    if (!/^image\/(jpeg|png|gif|webp|avif)$/i.test(sourceFile.type)) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Use a JPEG, PNG, GIF, WebP, or AVIF image.' });
       send(app.ports.fileInput, { id, data: null });
       return;
     }
-    if (file.size > 8 * 1024 * 1024) {
-      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Profile images and GIFs can be up to 8 MB.' });
-      send(app.ports.fileInput, { id, data: null });
-      return;
-    }
-    send(app.ports.bridgeReceive, { tag: 'toast', data: `Uploading ${file.name || 'image'}…` });
-    uploadOne(file)
+    const prepare = sourceFile.size > clientConfig.profileImageMaxBytes
+      ? prepareFileForUpload(sourceFile, clientConfig.profileImageMaxBytes, { ask: true })
+      : Promise.resolve(sourceFile);
+    prepare
+      .then((file) => {
+        send(app.ports.bridgeReceive, { tag: 'toast', data: `Uploading ${file.name || 'image'}...` });
+        return uploadOne(file);
+      })
       .then((uploaded) => {
         send(app.ports.fileInput, { id, data: uploaded.url || null });
-        send(app.ports.bridgeReceive, { tag: 'toast', data: `${file.name || 'Image'} ready — save your profile` });
+        const saveTarget = id === 'serverIconFile' || id === 'serverBannerFile' ? 'server' : 'profile';
+        send(app.ports.bridgeReceive, { tag: 'toast', data: `${sourceFile.name || 'Image'} ready. Save the ${saveTarget} to apply it.` });
       })
       .catch((error) => {
         debug('UPLOAD', 'profile_image_failed', { error: error.message }, 'error');
         send(app.ports.fileInput, { id, data: null });
-        send(app.ports.bridgeReceive, { tag: 'toast', data: `Image upload failed: ${error.message}` });
+        const message = error.message === 'compression_failed'
+          ? `That image could not be reduced below ${humanBytes(clientConfig.profileImageMaxBytes)}.`
+          : error.message === 'upload_cancelled' ? 'Image upload cancelled.' : `Image upload failed: ${error.message}`;
+        send(app.ports.bridgeReceive, { tag: 'toast', data: message });
       });
   });
   recv(app.ports.requestNotifyPermission, () => {
@@ -2276,6 +2719,167 @@
       Notification.requestPermission().catch(() => {});
     }
   });
+  const accountApi = async (method, path, body) => {
+    const headers = { accept: 'application/json', 'x-csrf-token': csrf };
+    const options = { method, headers, credentials: 'same-origin' };
+    if (body !== undefined) {
+      headers['content-type'] = 'application/json';
+      options.body = JSON.stringify(body);
+    }
+    const response = await fetch('/api' + path, options);
+    const json = await response.json().catch(() => ({ ok: false, error: 'bad_json' }));
+    if (!response.ok || !json.ok) throw new Error(json.error || 'request_failed');
+    return json.data;
+  };
+
+  const closeAccountDialog = () => document.querySelector('.account-dialog-backdrop')?.remove();
+
+  const showAccountDialog = ({ title, subtitle, content, actions = [] }) => {
+    closeAccountDialog();
+    const backdrop = document.createElement('div');
+    backdrop.className = 'account-dialog-backdrop';
+    const dialog = document.createElement('section');
+    dialog.className = 'account-dialog';
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    const head = document.createElement('div');
+    head.className = 'account-dialog-head';
+    const heading = document.createElement('div');
+    const h = document.createElement('h3');
+    h.textContent = title;
+    heading.appendChild(h);
+    if (subtitle) {
+      const p = document.createElement('p');
+      p.className = 'muted';
+      p.textContent = subtitle;
+      heading.appendChild(p);
+    }
+    const close = document.createElement('button');
+    close.className = 'btn icon-btn';
+    close.type = 'button';
+    close.textContent = '×';
+    close.setAttribute('aria-label', 'Close');
+    close.addEventListener('click', closeAccountDialog);
+    head.append(heading, close);
+    dialog.appendChild(head);
+    const body = document.createElement('div');
+    body.className = 'account-dialog-body';
+    if (content) body.appendChild(content);
+    dialog.appendChild(body);
+    if (actions.length) {
+      const footer = document.createElement('div');
+      footer.className = 'account-dialog-actions';
+      actions.forEach(({ label, className = 'btn secondary', onClick }) => {
+        const button = document.createElement('button');
+        button.className = className;
+        button.type = 'button';
+        button.textContent = label;
+        button.addEventListener('click', () => onClick(button, body));
+        footer.appendChild(button);
+      });
+      dialog.appendChild(footer);
+    }
+    backdrop.appendChild(dialog);
+    backdrop.addEventListener('mousedown', (event) => { if (event.target === backdrop) closeAccountDialog(); });
+    document.body.appendChild(backdrop);
+    requestAnimationFrame(() => dialog.querySelector('input,button')?.focus());
+    return { backdrop, dialog, body };
+  };
+
+  const openPasswordDialog = () => {
+    const content = document.createElement('div');
+    content.className = 'account-password-fields';
+    const makeField = (labelText, autocomplete) => {
+      const field = document.createElement('label');
+      field.className = 'field';
+      const label = document.createElement('span');
+      label.textContent = labelText;
+      const input = document.createElement('input');
+      input.type = 'password';
+      input.autocomplete = autocomplete;
+      input.maxLength = 256;
+      field.append(label, input);
+      content.appendChild(field);
+      return input;
+    };
+    const current = makeField('Current password', 'current-password');
+    const next = makeField('New password', 'new-password');
+    const confirm = makeField('Confirm new password', 'new-password');
+    const status = document.createElement('div');
+    status.className = 'account-dialog-status';
+    content.appendChild(status);
+    showAccountDialog({
+      title: 'Change password',
+      subtitle: 'Changing your password signs out every other session.',
+      content,
+      actions: [
+        { label: 'Cancel', onClick: closeAccountDialog },
+        { label: 'Update password', className: 'btn', onClick: async (button) => {
+          status.textContent = '';
+          if (next.value.length < 10) { status.textContent = 'Use at least 10 characters.'; return; }
+          if (next.value !== confirm.value) { status.textContent = 'The new passwords do not match.'; return; }
+          button.disabled = true;
+          try {
+            await accountApi('POST', '/password', { current_password: current.value, new_password: next.value });
+            closeAccountDialog();
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Password changed. Other sessions were signed out.' });
+          } catch (error) {
+            status.textContent = error.message === 'bad_password' ? 'Current password is incorrect.' : 'Could not change the password.';
+          } finally { button.disabled = false; }
+        } }
+      ]
+    });
+  };
+
+  const openSessionsDialog = async () => {
+    const content = document.createElement('div');
+    content.className = 'session-list';
+    content.textContent = 'Loading sessions...';
+    showAccountDialog({
+      title: 'Active sessions',
+      subtitle: 'Sessions are listed by activity time. Device fingerprints are intentionally not stored.',
+      content,
+      actions: [
+        { label: 'Close', onClick: closeAccountDialog },
+        { label: 'Log out other sessions', className: 'btn danger', onClick: async (button) => {
+          button.disabled = true;
+          try {
+            const data = await accountApi('POST', '/sessions/logout-others', {});
+            send(app.ports.bridgeReceive, { tag: 'toast', data: `${data?.revoked || 0} other session${data?.revoked === 1 ? '' : 's'} signed out.` });
+            closeAccountDialog();
+          } catch (_) {
+            button.disabled = false;
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not sign out other sessions.' });
+          }
+        } }
+      ]
+    });
+    try {
+      const sessions = await accountApi('GET', '/sessions');
+      content.textContent = '';
+      (Array.isArray(sessions) ? sessions : []).forEach((session) => {
+        const row = document.createElement('div');
+        row.className = 'session-row';
+        const copy = document.createElement('div');
+        const title = document.createElement('b');
+        title.textContent = session.current ? 'This browser' : 'Signed-in session';
+        const meta = document.createElement('small');
+        meta.className = 'muted';
+        const last = Number(session.last_seen || 0);
+        meta.textContent = last ? `Last active ${new Date(last).toLocaleString()}` : 'Activity time unavailable';
+        copy.append(title, meta);
+        const badge = document.createElement('span');
+        badge.className = 'pill';
+        badge.textContent = session.current ? 'Current' : 'Active';
+        row.append(copy, badge);
+        content.appendChild(row);
+      });
+      if (!content.children.length) content.textContent = 'No active sessions were returned.';
+    } catch (_) {
+      content.textContent = 'Could not load active sessions.';
+    }
+  };
+
   recv(app.ports.bridgeSend, ({ tag, data }) => {
     debug('ELM', 'command', { tag, data });
     switch (tag) {
@@ -2492,8 +3096,9 @@
         if (data === 'system') {
           document.documentElement.removeAttribute('data-theme');
         } else {
-          document.documentElement.setAttribute('data-theme', data);
+          document.documentElement.setAttribute('data-theme', data === 'dark' ? 'dark' : 'light');
         }
+        syncThemeMeta();
         break;
       case 'set_sound_preference':
         localStorage.setItem('plainwire_sound_enabled', data ? 'true' : 'false');
@@ -2508,6 +3113,74 @@
         localStorage.setItem('plainwire_reduce_motion', data ? 'true' : 'false');
         applyUiPreferences();
         send(app.ports.bridgeReceive, { tag: 'toast', data: data ? 'Reduced motion enabled' : 'Standard motion enabled' });
+        break;
+      case 'ui_font_scale':
+        localStorage.setItem('plainwire_font_scale', ['small', 'large'].includes(data) ? data : 'default');
+        applyUiPreferences();
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Text size updated' });
+        break;
+      case 'ui_corner_style':
+        localStorage.setItem('plainwire_corner_style', ['compact', 'rounded'].includes(data) ? data : 'default');
+        applyUiPreferences();
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Corner style updated' });
+        break;
+      case 'ui_accent':
+        localStorage.setItem('plainwire_accent', Object.hasOwn(accentPresets, data) ? data : 'blue');
+        applyUiPreferences();
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Accent updated' });
+        break;
+      case 'chat_enter_mode':
+        localStorage.setItem('plainwire_chat_enter_mode', data === 'newline' ? 'newline' : 'send');
+        break;
+      case 'chat_set_link_previews': {
+        const enabled = data === true;
+        localStorage.setItem('plainwire_link_previews', enabled ? 'true' : 'false');
+        document.querySelectorAll('.link-embed-wrap').forEach((node) => node.remove());
+        document.querySelectorAll('.msg-body').forEach((node) => delete node.dataset.embedsMounted);
+        if (enabled) mountLinkEmbeds();
+        send(app.ports.bridgeReceive, { tag: 'toast', data: enabled ? 'Link previews enabled' : 'Link previews disabled' });
+        break;
+      }
+      case 'chat_set_animated_media': {
+        const enabled = data === true;
+        localStorage.setItem('plainwire_animated_media', enabled ? 'true' : 'false');
+        applyUiPreferences();
+        send(app.ports.bridgeReceive, { tag: 'toast', data: enabled ? 'Animated media enabled' : 'Animated media paused' });
+        break;
+      }
+      case 'chat_set_compact_messages': {
+        const enabled = data === true;
+        localStorage.setItem('plainwire_compact_messages', enabled ? 'true' : 'false');
+        applyUiPreferences();
+        send(app.ports.bridgeReceive, { tag: 'toast', data: enabled ? 'Compact messages enabled' : 'Comfortable messages enabled' });
+        break;
+      }
+      case 'privacy_set_media_preload': {
+        const enabled = data === true;
+        localStorage.setItem('plainwire_media_preload', enabled ? 'true' : 'false');
+        applyUiPreferences();
+        send(app.ports.bridgeReceive, { tag: 'toast', data: enabled ? 'Media preloading enabled' : 'Media preloading reduced' });
+        break;
+      }
+      case 'privacy_clear_drafts':
+        Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i))
+          .filter((key) => key && (key.startsWith('plainwire_draft') || key.startsWith('draft:')))
+          .forEach((key) => localStorage.removeItem(key));
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Local drafts cleared' });
+        break;
+      case 'privacy_reset_device':
+        if (window.confirm('Reset Plainwire preferences stored in this browser?')) {
+          Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i))
+            .filter((key) => key && key.startsWith('plainwire_'))
+            .forEach((key) => localStorage.removeItem(key));
+          location.reload();
+        }
+        break;
+      case 'account_change_password':
+        openPasswordDialog();
+        break;
+      case 'account_sessions':
+        openSessionsDialog();
         break;
       case 'request_notifications':
         if ('Notification' in window) {
@@ -2587,14 +3260,15 @@
         }, Math.pow(2, retries) * 1000);
         return;
       }
-      target.removeAttribute('src');
-      target.removeAttribute('srcset');
-      delete target.dataset.avatarTries;
-      delete target.dataset.avatarSrc;
-      target.alt = fallback;
-      target.setAttribute('role', 'img');
-      target.setAttribute('aria-label', 'Avatar unavailable');
-      target.classList.add('image-failed');
+      const palette = ['#5865f2', '#3b82f6', '#16877a', '#37854f', '#9a6716', '#b64d6b', '#7c5bb5', '#a75432'];
+      const replacement = document.createElement('div');
+      replacement.className = target.className + ' image-failed';
+      replacement.textContent = String(fallback).slice(0, 1).toUpperCase();
+      replacement.style.backgroundColor = palette[(String(fallback).codePointAt(0) || 0) % palette.length];
+      replacement.style.color = '#fff';
+      replacement.setAttribute('role', 'img');
+      replacement.setAttribute('aria-label', 'Avatar unavailable');
+      target.replaceWith(replacement);
     } else {
       target.removeAttribute('src');
       target.removeAttribute('srcset');

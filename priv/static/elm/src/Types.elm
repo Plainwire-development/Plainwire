@@ -188,7 +188,7 @@ type alias ServerData =
 type alias Drafts = Dict String String
 
 type alias Model =
-    { me : Maybe User, csrf : String, serverTime : Int, timeZone : Time.Zone, absoluteTimestamps : Bool
+    { appName : String, me : Maybe User, csrf : String, serverTime : Int, timeZone : Time.Zone, absoluteTimestamps : Bool
     , forums : List Forum, threads : List ForumThread
     , currentThread : Maybe ForumThread, replies : List Reply
     , servers : List Server, convs : List Conversation
@@ -203,7 +203,7 @@ type alias Model =
     , drafts : Drafts, wsConnected : Bool, pageVisible : Bool, isLeader : Bool
     , tabId : String, subs : Set String
     , voice : VoiceState, callUI : CallUI, activeCalls : Dict Int ActiveCall, callMode : CallMode
-    , soundEnabled : Bool, replyTo : Maybe ReplyPreview
+    , soundEnabled : Bool, chatEnterSends : Bool, linkPreviewsEnabled : Bool, animatedMediaEnabled : Bool, compactMessages : Bool, mediaPreloadEnabled : Bool, replyTo : Maybe ReplyPreview
     , toast : Maybe String, modal : Maybe String
     , settingsTab : String, inputText : String
     , sidebarOpen : Bool, serversSheetOpen : Bool, ctxMenu : Maybe ContextMenu
@@ -336,6 +336,11 @@ type Msg
     | ServerDescription String
     | ToggleSound
     | SetSoundPreference Bool
+    | SetChatEnterSends Bool
+    | SetLinkPreviewsEnabled Bool
+    | SetAnimatedMediaEnabled Bool
+    | SetCompactMessages Bool
+    | SetMediaPreloadEnabled Bool
     | Logout
     | CloseCtx
     | CtxAction Int

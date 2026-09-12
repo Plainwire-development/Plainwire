@@ -44,11 +44,16 @@ parse_og(Html, Url) ->
     Desc = bounded(meta(Html, <<"og:description">>), 1000),
     Image = bounded(meta(Html, <<"og:image">>), 2048),
     Site = bounded(meta(Html, <<"og:site_name">>), 200),
+    AbsoluteImage = absolutize(Image, Url),
+    ProxiedImage = case AbsoluteImage of
+        <<>> -> <<>>;
+        _ -> pw_media:proxy_url(AbsoluteImage)
+    end,
     #{
         <<"url">> => Url,
         <<"title">> => pick(Title, bounded(title_tag(Html), 300), host_of(Url)),
         <<"description">> => pick(Desc, bounded(meta(Html, <<"description">>), 1000), <<>>),
-        <<"image">> => absolutize(Image, Url),
+        <<"image">> => ProxiedImage,
         <<"site_name">> => pick(Site, host_of(Url), <<>>)
     }.
 

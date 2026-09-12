@@ -23,6 +23,7 @@ http_listener_spec() ->
     Dispatch = cowboy_router:compile([
         {'_', [
             {"/ws", pw_ws, []},
+            {"/api/client-config", pw_client_config_hdl, []},
             {"/api/uploads", pw_upload_hdl, []},
             {"/api/files/[...]", pw_file_hdl, []},
             {"/api/media/[...]", pw_media_hdl, []},

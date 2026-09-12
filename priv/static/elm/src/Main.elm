@@ -89,6 +89,11 @@ bridgeDecoder = D.field "tag" D.string |> D.andThen (\tag ->
                 (D.field "muted" D.bool)
                 (D.field "deafened" D.bool)
         "sound_preference" -> D.map SetSoundPreference (D.field "data" D.bool)
+        "chat_enter_sends" -> D.map SetChatEnterSends (D.field "data" D.bool)
+        "link_previews_enabled" -> D.map SetLinkPreviewsEnabled (D.field "data" D.bool)
+        "animated_media_enabled" -> D.map SetAnimatedMediaEnabled (D.field "data" D.bool)
+        "compact_messages" -> D.map SetCompactMessages (D.field "data" D.bool)
+        "media_preload_enabled" -> D.map SetMediaPreloadEnabled (D.field "data" D.bool)
         _ -> D.succeed NoOp
     )
 
@@ -121,23 +126,26 @@ handleSyncData val = case D.decodeValue decodeSyncData val of
 -- FLAGS
 --
 -- Runtime limits come from the server's /api/config so the UI text never
--- drifts from what is actually enforced. Falls back to the server's own
--- defaults (see pw_util:upload_config/0) if flags are missing or malformed,
--- e.g. if the config fetch failed and elm-bridge.js passed null.
+-- drifts from what is actually enforced (see pw_util:upload_config/0), and
+-- the app name comes from the client config so the brand can be set per
+-- instance. Falls back to the server's own defaults if flags are missing or
+-- malformed, e.g. if elm-bridge.js passed a bad value.
 
 type alias Flags =
-    { uploadMaxBytes : Int
+    { appName : String
+    , uploadMaxBytes : Int
     , uploadQuotaBytes : Int
     , uploadQuotaWindowMs : Int
     }
 
 defaultFlags : Flags
 defaultFlags =
-    { uploadMaxBytes = 262144000, uploadQuotaBytes = 1073741824, uploadQuotaWindowMs = 10800000 }
+    { appName = "Plainwire", uploadMaxBytes = 262144000, uploadQuotaBytes = 1073741824, uploadQuotaWindowMs = 10800000 }
 
 decodeFlags : D.Decoder Flags
 decodeFlags =
-    D.map3 Flags
+    D.map4 Flags
+        (D.field "appName" D.string)
         (D.field "uploadMaxBytes" D.int)
         (D.field "uploadQuotaBytes" D.int)
         (D.field "uploadQuotaWindowMs" D.int)
@@ -166,7 +174,7 @@ init flagsValue url _ =
     let active = parseRoute (Maybe.withDefault "" url.fragment)
         flags = flagsFromValue flagsValue
     in
-    ( { me = Nothing, csrf = "", serverTime = 0, timeZone = Time.utc, absoluteTimestamps = False
+    ( { appName = flags.appName, me = Nothing, csrf = "", serverTime = 0, timeZone = Time.utc, absoluteTimestamps = False
       , forums = [], threads = [], currentThread = Nothing, replies = []
       , servers = [], convs = [], conversationMembers = Dict.empty, friends = [], notifs = []
       , searchUsers = [], searchThreads = []
@@ -180,7 +188,7 @@ init flagsValue url _ =
                 , muted = False, deafened = False, screenShare = False }
       , callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
       , activeCalls = Dict.empty
-      , callMode = Idle, soundEnabled = True, replyTo = Nothing
+      , callMode = Idle, soundEnabled = True, chatEnterSends = True, linkPreviewsEnabled = True, animatedMediaEnabled = True, compactMessages = False, mediaPreloadEnabled = True, replyTo = Nothing
       , toast = Nothing, modal = Nothing, settingsTab = "profile"
       , inputText = "", sidebarOpen = False, serversSheetOpen = False, ctxMenu = Nothing
       , threadReply = "", searchQuery = ""
@@ -192,7 +200,7 @@ init flagsValue url _ =
       , profileAvatarUrl = "", profileBannerUrl = ""
       , profileAvatarPreviewUrl = "", profileBannerPreviewUrl = ""
       , profileAvatarUploading = False, profileBannerUploading = False
-      , profileStatus = "online", profileTheme = "system"
+      , profileStatus = "online", profileTheme = "light"
       , modalTitle = "", modalBody = "", modalUserIds = ""
       , modalBannerUrl = "", modalAccentColor = "#5865f2"
       , friendsTab = "online", friendQuery = "", friendSearchAttempted = False
@@ -493,6 +501,31 @@ update msg model =
         SetSoundPreference enabled ->
             ( { model | soundEnabled = enabled }, Cmd.none )
 
+        SetChatEnterSends enabled ->
+            ( { model | chatEnterSends = enabled }
+            , bridgeSend (E.object [("tag", E.string "chat_enter_mode"), ("data", E.string (if enabled then "send" else "newline"))])
+            )
+
+        SetLinkPreviewsEnabled enabled ->
+            ( { model | linkPreviewsEnabled = enabled }
+            , bridgeSend (E.object [("tag", E.string "chat_set_link_previews"), ("data", E.bool enabled)])
+            )
+
+        SetAnimatedMediaEnabled enabled ->
+            ( { model | animatedMediaEnabled = enabled }
+            , bridgeSend (E.object [("tag", E.string "chat_set_animated_media"), ("data", E.bool enabled)])
+            )
+
+        SetCompactMessages enabled ->
+            ( { model | compactMessages = enabled }
+            , bridgeSend (E.object [("tag", E.string "chat_set_compact_messages"), ("data", E.bool enabled)])
+            )
+
+        SetMediaPreloadEnabled enabled ->
+            ( { model | mediaPreloadEnabled = enabled }
+            , bridgeSend (E.object [("tag", E.string "privacy_set_media_preload"), ("data", E.bool enabled)])
+            )
+
         Logout -> ( model, apiSend (encodeApiRequest (ApiPost "/logout" (Just (E.object [])))) )
 
         SetSettingsTab t ->
@@ -782,6 +815,10 @@ update msg model =
                         ( { model | profileAvatarUrl = data, profileAvatarPreviewUrl = data, profileAvatarUploading = False }, Cmd.none )
                     else if id == "profileBannerFile" then
                         ( { model | profileBannerUrl = data, profileBannerPreviewUrl = data, profileBannerUploading = False }, Cmd.none )
+                    else if id == "serverIconFile" then
+                        ( { model | modalUserIds = data }, Cmd.none )
+                    else if id == "serverBannerFile" then
+                        ( { model | modalBannerUrl = data }, Cmd.none )
                     else
                         ( model, Cmd.none )
                 Nothing ->
@@ -2262,7 +2299,7 @@ view : Model -> Browser.Document Msg
 view model =
     { title = titleText model
     , body =
-        [ if model.booting then div [ class "boot" ] [ text "Loading Plainwire…" ]
+        [ if model.booting then div [ class "boot" ] [ text ("Loading " ++ model.appName ++ "...") ]
           else case model.me of
             Nothing -> renderAuth model
             Just _ -> renderApp model
@@ -2274,7 +2311,7 @@ view model =
 titleText : Model -> String
 titleText model =
     let unread = List.length (List.filter (\n -> not n.seen) model.notifs)
-    in if unread > 0 then "(" ++ String.fromInt unread ++ ") Plainwire" else "Plainwire"
+    in if unread > 0 then "(" ++ String.fromInt unread ++ ") " ++ model.appName else model.appName
 
 
 renderToast : Model -> Html Msg
@@ -2455,8 +2492,22 @@ modalContent kind model =
         , div [ class "modal-body" ]
             [ div [ class "field" ] [ label [] [ text "Server name" ], input [ value model.modalTitle, maxlength 80, placeholder "Server name", onInput ModalTitle ] [] ]
             , div [ class "field" ] [ label [] [ text "Description" ], textarea [ value model.modalBody, maxlength 280, placeholder "What is this server for?", onInput ModalBody ] [] ]
-            , div [ class "field" ] [ label [] [ text "Icon URL" ], input [ value model.modalUserIds, placeholder "https://...", onInput ModalUserIds ] [] ]
-            , div [ class "field" ] [ label [] [ text "Banner URL" ], input [ value model.modalBannerUrl, placeholder "https://...", onInput ModalBannerUrl ] [] ]
+            , div [ class "field" ]
+                [ label [] [ text "Server icon" ]
+                , input [ value model.modalUserIds, placeholder "Upload an image or paste a URL", onInput ModalUserIds ] []
+                , div [ class "upload-actions" ]
+                    [ input [ id "serverIconFile", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverIconFile")) ] []
+                    , button [ class "btn secondary", type_ "button", onClick (ReadFile "serverIconFile") ] [ text "Upload icon" ]
+                    ]
+                ]
+            , div [ class "field" ]
+                [ label [] [ text "Server banner" ]
+                , input [ value model.modalBannerUrl, placeholder "Upload an image or paste a URL", onInput ModalBannerUrl ] []
+                , div [ class "upload-actions" ]
+                    [ input [ id "serverBannerFile", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverBannerFile")) ] []
+                    , button [ class "btn secondary", type_ "button", onClick (ReadFile "serverBannerFile") ] [ text "Upload banner" ]
+                    ]
+                ]
             , div [ class "field server-color-field" ]
                 [ label [] [ text "Accent color" ]
                 , div [ class "server-color-control" ]
@@ -2835,10 +2886,23 @@ renderCallUser model u =
         ]
 
 
+avatarColor : String -> String
+avatarColor name =
+    let
+        palette = [ "#5865f2", "#3b82f6", "#16877a", "#37854f", "#9a6716", "#b64d6b", "#7c5bb5", "#a75432" ]
+        code =
+            case String.uncons (String.toLower name) of
+                Just ( first, _ ) -> Char.toCode first
+                Nothing -> 0
+        index = modBy (List.length palette) code
+    in
+    listAt index palette |> Maybe.withDefault "#5865f2"
+
+
 avatarImg : String -> String -> String -> Html Msg
 avatarImg url name cls =
     if String.isEmpty url then
-        div [ class ("avatar " ++ cls) ]
+        div [ class ("avatar " ++ cls), style "background-color" (avatarColor name), style "color" "#ffffff" ]
             [ text (String.left 1 (String.toUpper name)) ]
     else
         img
@@ -2861,7 +2925,7 @@ presenceAvatar statuses userId url name cls =
             "busy" -> "Busy"
             "online" -> "Online"
             _ -> "Offline"
-    in div [ class "presence-avatar", title label, attribute "aria-label" (name ++ " — " ++ label) ]
+    in div [ class "presence-avatar", title label, attribute "aria-label" (name ++ "  -  " ++ label) ]
         [ avatarImg url name cls
         , span [ class ("avatar-presence-dot " ++ presence), attribute "aria-hidden" "true" ] []
         ]
@@ -2871,47 +2935,67 @@ presenceAvatar statuses userId url name cls =
 
 renderAuth : Model -> Html Msg
 renderAuth model =
-    div [ class "layout auth-layout" ]
-        [ div [] []
-        , main_ [ class "main" ]
-            [ div [ class "content" ]
-                [ div [ class "card pad auth-card" ]
-                    [ h1 [] [ text "Plainwire" ]
-                    , p [ class "muted" ] [ text "Chat with your friends and communities." ]
-                    , div [ class "tabs" ]
-                        [ button [ class "btn", onClick (AuthMode "login") ] [ text "Login" ]
-                        , button [ class "btn secondary", onClick (AuthMode "register") ] [ text "Register" ]
-                        ]
-                    , div []
-                        [ div [ class "field" ]
-                            [ label [] [ text "Username" ]
-                            , input [ id "u", type_ "text", attribute "autocomplete" "username"
-                                    , value model.authUsername, onInput AuthUsername ] []
-                            ]
-                        , if model.authMode == "register" then
-                            div [ class "field" ]
-                                [ label [] [ text "Display name" ]
-                                , input [ id "d", type_ "text", value model.authDisplayName, onInput AuthDisplayName ] []
-                                ]
-                          else text ""
-                        , div [ class "field" ]
-                            [ label [] [ text "Password" ]
-                            , input [ id "p", type_ "password", attribute "autocomplete" (if model.authMode == "login" then "current-password" else "new-password")
-                                    , value model.authPassword, onInput AuthPassword ] []
-                            ]
-                        , if model.authMode == "register" then
-                            p [ class "muted auth-hint" ] [ text "Username: 3-24 characters. Password: at least 8 characters." ]
-                          else text ""
-                        , case authValidationError { model | authBusy = False } of
-                            Just err -> p [ class "auth-error" ] [ text err ]
-                            Nothing -> text ""
-                        , button [ class "btn", disabled (model.authBusy || not (authReady model)), onClick DoAuth ]
-                            [ text (if model.authBusy then "Please wait..." else if model.authMode == "login" then "Login" else "Create account") ]
-                        ]
+    div [ class "auth-shell" ]
+        [ section [ class "auth-brand-panel" ]
+            [ div [ class "auth-brand-lockup" ] [ div [ class "auth-brand-mark" ] [], span [] [ text model.appName ] ]
+            , div [ class "auth-brand-copy" ]
+                [ span [ class "eyebrow" ] [ text "Self-hosted communication" ]
+                , h1 [] [ text "A calmer place for conversations that matter." ]
+                , p [] [ text "Messages, communities, calls, screen sharing, files, and forums in one fast interface." ]
+                ]
+            , div [ class "auth-feature-grid" ]
+                [ div [ class "auth-feature" ] [ b [] [ text "Real-time" ], span [] [ text "Responsive messaging and presence without page reloads." ] ]
+                , div [ class "auth-feature" ] [ b [] [ text "Voice" ], span [] [ text "Peer calls, voice rooms, and resizable screen sharing." ] ]
+                , div [ class "auth-feature" ] [ b [] [ text "Your server" ], span [] [ text "Instance branding and limits are controlled by deployment settings." ] ]
+                ]
+            ]
+        , main_ [ class "auth-form-panel" ]
+            [ div [ class "auth-form-wrap" ]
+                [ div [ class "auth-mobile-brand" ] [ div [ class "auth-brand-mark" ] [], b [] [ text model.appName ] ]
+                , div [ class "auth-heading" ]
+                    [ h2 [] [ text (if model.authMode == "login" then "Welcome back" else "Create your account") ]
+                    , p [ class "muted" ] [ text (if model.authMode == "login" then "Sign in to continue to your conversations." else "Set up an account on this Plainwire instance.") ]
                     ]
+                , div [ class "auth-mode-switch", attribute "role" "tablist" ]
+                    [ button [ class ("auth-mode-btn" ++ if model.authMode == "login" then " active" else ""), onClick (AuthMode "login") ] [ text "Sign in" ]
+                    , button [ class ("auth-mode-btn" ++ if model.authMode == "register" then " active" else ""), onClick (AuthMode "register") ] [ text "Register" ]
+                    ]
+                , div [ class "auth-fields" ]
+                    [ div [ class "field" ]
+                        [ label [ attribute "for" "u" ] [ text "Username" ]
+                        , input [ id "u", type_ "text", attribute "autocomplete" "username", attribute "autocapitalize" "none", attribute "spellcheck" "false", maxlength 24, placeholder "yourname", value model.authUsername, onInput AuthUsername ] []
+                        ]
+                    , if model.authMode == "register" then
+                        div [ class "field" ]
+                            [ label [ attribute "for" "d" ] [ text "Display name" ]
+                            , input [ id "d", type_ "text", attribute "autocomplete" "name", maxlength 48, placeholder "How people see you", value model.authDisplayName, onInput AuthDisplayName ] []
+                            ]
+                      else text ""
+                    , div [ class "field" ]
+                        [ label [ attribute "for" "p" ] [ text "Password" ]
+                        , input [ id "p", type_ "password", attribute "autocomplete" (if model.authMode == "login" then "current-password" else "new-password"), maxlength 256, value model.authPassword, onInput AuthPassword ] []
+                        ]
+                    , if model.authMode == "register" then
+                        div [ class "auth-password-meter" ]
+                            [ div [ class ("auth-password-bar strength-" ++ authPasswordStrength model.authPassword) ] []
+                            , small [ class "muted" ] [ text "Use at least 10 characters. A longer unique passphrase is best." ]
+                            ]
+                      else text ""
+                    , case authValidationError { model | authBusy = False } of
+                        Just err -> div [ class "auth-error", attribute "role" "alert" ] [ text err ]
+                        Nothing -> text ""
+                    , button [ class "btn auth-submit", disabled (model.authBusy || not (authReady model)), onClick DoAuth ]
+                        [ text (if model.authBusy then "Working..." else if model.authMode == "login" then "Sign in" else "Create account") ]
+                    ]
+                , p [ class "auth-footnote" ] [ text "This server controls registration, storage limits, and moderation policy." ]
                 ]
             ]
         ]
+
+authPasswordStrength : String -> String
+authPasswordStrength password =
+    let n = String.length password
+    in if n >= 16 then "strong" else if n >= 10 then "medium" else "weak"
 
 
 -- APP SHELL
@@ -2982,7 +3066,7 @@ serverSheetRow s model =
 renderRail : Model -> Html Msg
 renderRail model =
     nav [ class "rail" ]
-        ([ div [ class "mark", title "Plainwire" ] []
+        ([ div [ class "mark", title model.appName ] []
          , railBtn "⌂" (model.active == Home) (Go "#")
          , railBtn "F" (model.active == Forums) (Go "#forums")
          , railBtn "D" (isDmActive model) (Go "#dms")
@@ -3147,7 +3231,7 @@ renderMembersPanel userStatuses members =
 sideHead : Model -> Html Msg
 sideHead model =
     div [ class "side-head" ]
-        [ h1 [] [ text "Plainwire" ]
+        [ h1 [] [ text model.appName ]
         , small [] [ text "Chat app" ]
         , div [ class "nav-actions" ]
             [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "New server" ]
@@ -3357,7 +3441,7 @@ renderHomePage model =
     in div [ class "home-page" ]
         [ section [ class "hero-card" ]
             [ div []
-                [ span [ class "eyebrow" ] [ text "Plainwire" ]
+                [ span [ class "eyebrow" ] [ text model.appName ]
                 , h1 [] [ text "Chat, threads, DMs, and voice." ]
                 , p [] [ text "Talk with friends, join communities, and keep conversations organized." ]
                 ]
@@ -3738,7 +3822,7 @@ friendList : String -> String -> List Friend -> Dict String String -> Html Msg
 friendList heading description friends statuses =
     div []
         [ div [ class "friend-list-head" ]
-            [ div [] [ h3 [] [ text (heading ++ " — " ++ String.fromInt (List.length friends)) ], p [ class "muted" ] [ text description ] ] ]
+            [ div [] [ h3 [] [ text (heading ++ "  -  " ++ String.fromInt (List.length friends)) ], p [ class "muted" ] [ text description ] ] ]
         , div [ class "card friends-list" ]
             (if List.isEmpty friends then
                 [ friendEmpty (if heading == "Online" then "It's quiet for now" else "Nothing here yet") (if heading == "Online" then "Offline friends will still be waiting in All." else description) ]
@@ -3957,7 +4041,7 @@ renderVoicePage channelId model =
             , if hasScreenShare then
                 div [ class "voice-screen-banner" ]
                     [ span [ class "screen-pulse" ] []
-                    , text (String.fromInt shareCount ++ " sharing screen — look for the floating window")
+                    , text (String.fromInt shareCount ++ " sharing screen  -  look for the floating window")
                     ]
               else text ""
             , div [ class "voice-participants" ]
@@ -4058,8 +4142,10 @@ renderSettingsPage model =
                     [ div [ class "settings-nav-label" ] [ text "User settings" ]
                     , a [ class ("settings-tab" ++ if model.settingsTab == "profile" then " active" else ""), onClick (SetSettingsTab "profile") ] [ span [ class "settings-tab-icon" ] [ text "●" ], text "Profile" ]
                     , a [ class ("settings-tab" ++ if model.settingsTab == "appearance" then " active" else ""), onClick (SetSettingsTab "appearance") ] [ span [ class "settings-tab-icon" ] [ text "◐" ], text "Appearance" ]
+                    , a [ class ("settings-tab" ++ if model.settingsTab == "chat" then " active" else ""), onClick (SetSettingsTab "chat") ] [ span [ class "settings-tab-icon" ] [ text "#" ], text "Chat" ]
                     , a [ class ("settings-tab" ++ if model.settingsTab == "voice" then " active" else ""), onClick (SetSettingsTab "voice") ] [ span [ class "settings-tab-icon" ] [ text "◖" ], text "Voice & Video" ]
                     , a [ class ("settings-tab" ++ if model.settingsTab == "sound" then " active" else ""), onClick (SetSettingsTab "sound") ] [ span [ class "settings-tab-icon" ] [ text "◖" ], text "Notifications" ]
+                    , a [ class ("settings-tab" ++ if model.settingsTab == "privacy" then " active" else ""), onClick (SetSettingsTab "privacy") ] [ span [ class "settings-tab-icon" ] [ text "◇" ], text "Privacy & Safety" ]
                     , div [ class "settings-nav-separator" ] []
                     , a [ class ("settings-tab" ++ if model.settingsTab == "account" then " active" else ""), onClick (SetSettingsTab "account") ] [ span [ class "settings-tab-icon" ] [ text "⚙" ], text "Account" ]
                     ]
@@ -4071,8 +4157,10 @@ renderSettingsPage model =
                     , div [ class "settings-content-inner" ]
                         [ case model.settingsTab of
                             "appearance" -> renderAppearanceSettings model
+                            "chat" -> renderChatSettings model
                             "voice" -> renderVoiceSettings model
                             "sound" -> renderNotificationSettings model
+                            "privacy" -> renderPrivacySettings model
                             "account" -> renderAccountSettings u
                             _ -> renderProfileSettings u model
                         ]
@@ -4084,8 +4172,10 @@ settingsTitle : String -> String
 settingsTitle tab =
     case tab of
         "appearance" -> "Appearance"
+        "chat" -> "Chat"
         "voice" -> "Voice & Video"
         "sound" -> "Notifications"
+        "privacy" -> "Privacy & Safety"
         "account" -> "Account"
         _ -> "My Profile"
 
@@ -4103,12 +4193,61 @@ renderAccountSettings user =
                 ]
             , span [ class "pill" ] [ text "Signed in" ]
             ]
+        , div [ class "account-action-grid" ]
+            [ button [ class "settings-action-card", onClick (BridgeEvent "account_change_password" E.null) ]
+                [ b [] [ text "Change password" ], small [ class "muted" ] [ text "Update your password and sign out other sessions." ] ]
+            , button [ class "settings-action-card", onClick (BridgeEvent "account_sessions" E.null) ]
+                [ b [] [ text "Active sessions" ], small [ class "muted" ] [ text "Review where your account is currently signed in." ] ]
+            ]
         , div [ class "danger-zone" ]
             [ div []
                 [ b [] [ text "Log out" ]
                 , p [ class "muted" ] [ text "End this browser session." ]
                 ]
             , button [ class "btn danger", onClick Logout ] [ text "Log out" ]
+            ]
+        ]
+
+renderChatSettings : Model -> Html Msg
+renderChatSettings model =
+    div [ class "settings-card settings-panel" ]
+        [ div [ class "settings-card-head" ] [ h2 [] [ text "Chat" ], p [ class "muted" ] [ text "Tune message composition and media behavior on this device." ] ]
+        , div [ class "setting-row setting-row-stack" ]
+            [ div [] [ b [] [ text "Send message with Enter" ], small [ class "muted" ] [ text "Choose whether Enter sends or adds a new line." ] ]
+            , div [ class "segmented-control" ]
+                [ button [ class "btn secondary", onClick (SetChatEnterSends True) ] [ text "Enter sends" ]
+                , button [ class "btn secondary", onClick (SetChatEnterSends False) ] [ text "Ctrl/Cmd + Enter sends" ]
+                ]
+            ]
+        , div [ class "setting-row" ]
+            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "↗" ], div [] [ b [] [ text "Link previews" ], small [ class "muted" ] [ text "Show rich cards for supported links." ] ] ]
+            , button [ class ("settings-switch" ++ if model.linkPreviewsEnabled then " active" else ""), onClick (SetLinkPreviewsEnabled (not model.linkPreviewsEnabled)), attribute "role" "switch", attribute "aria-checked" (if model.linkPreviewsEnabled then "true" else "false"), title "Toggle link previews" ] [ span [ class "settings-switch-knob" ] [] ]
+            ]
+        , div [ class "setting-row" ]
+            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "GIF" ], div [] [ b [] [ text "Autoplay animated media" ], small [ class "muted" ] [ text "Control GIF and animated image playback." ] ] ]
+            , button [ class ("settings-switch" ++ if model.animatedMediaEnabled then " active" else ""), onClick (SetAnimatedMediaEnabled (not model.animatedMediaEnabled)), attribute "role" "switch", attribute "aria-checked" (if model.animatedMediaEnabled then "true" else "false"), title "Toggle animated media" ] [ span [ class "settings-switch-knob" ] [] ]
+            ]
+        , div [ class "setting-row" ]
+            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "Aa" ], div [] [ b [] [ text "Compact message spacing" ], small [ class "muted" ] [ text "Reduce vertical spacing between grouped messages." ] ] ]
+            , button [ class ("settings-switch" ++ if model.compactMessages then " active" else ""), onClick (SetCompactMessages (not model.compactMessages)), attribute "role" "switch", attribute "aria-checked" (if model.compactMessages then "true" else "false"), title "Toggle compact message spacing" ] [ span [ class "settings-switch-knob" ] [] ]
+            ]
+        ]
+
+renderPrivacySettings : Model -> Html Msg
+renderPrivacySettings model =
+    div [ class "settings-card settings-panel" ]
+        [ div [ class "settings-card-head" ] [ h2 [] [ text "Privacy & Safety" ], p [ class "muted" ] [ text "Control browser-side privacy behavior and review account security." ] ]
+        , div [ class "setting-row" ]
+            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "○" ], div [] [ b [] [ text "Media preloading" ], small [ class "muted" ] [ text "Preload remote images for smoother scrolling." ] ] ]
+            , button [ class ("settings-switch" ++ if model.mediaPreloadEnabled then " active" else ""), onClick (SetMediaPreloadEnabled (not model.mediaPreloadEnabled)), attribute "role" "switch", attribute "aria-checked" (if model.mediaPreloadEnabled then "true" else "false"), title "Toggle media preloading" ] [ span [ class "settings-switch-knob" ] [] ]
+            ]
+        , div [ class "setting-row" ]
+            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "□" ], div [] [ b [] [ text "Clear local drafts" ], small [ class "muted" ] [ text "Remove message drafts saved in this browser." ] ] ]
+            , button [ class "btn secondary settings-action", onClick (BridgeEvent "privacy_clear_drafts" E.null) ] [ text "Clear drafts" ]
+            ]
+        , div [ class "setting-row" ]
+            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "↻" ], div [] [ b [] [ text "Reset device preferences" ], small [ class "muted" ] [ text "Restore layout, chat, audio, and appearance settings on this device." ] ] ]
+            , button [ class "btn secondary settings-action", onClick (BridgeEvent "privacy_reset_device" E.null) ] [ text "Reset" ]
             ]
         ]
 
@@ -4129,6 +4268,32 @@ renderAppearanceSettings model =
             , div [ class "segmented-control" ]
                 [ button [ class "btn secondary", onClick (BridgeEvent "ui_density" (E.string "comfortable")) ] [ text "Comfortable" ]
                 , button [ class "btn secondary", onClick (BridgeEvent "ui_density" (E.string "compact")) ] [ text "Compact" ]
+                ]
+            ]
+        , div [ class "setting-row setting-row-stack" ]
+            [ div [] [ b [] [ text "Text size" ], small [ class "muted" ] [ text "Scale the interface without changing your browser zoom." ] ]
+            , div [ class "segmented-control" ]
+                [ button [ class "btn secondary", onClick (BridgeEvent "ui_font_scale" (E.string "small")) ] [ text "Small" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "ui_font_scale" (E.string "default")) ] [ text "Default" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "ui_font_scale" (E.string "large")) ] [ text "Large" ]
+                ]
+            ]
+        , div [ class "setting-row setting-row-stack" ]
+            [ div [] [ b [] [ text "Accent" ], small [ class "muted" ] [ text "Choose the main interface color on this device." ] ]
+            , div [ class "segmented-control" ]
+                [ button [ class "btn secondary", onClick (BridgeEvent "ui_accent" (E.string "blue")) ] [ text "Blue" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "ui_accent" (E.string "teal")) ] [ text "Teal" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "ui_accent" (E.string "green")) ] [ text "Green" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "ui_accent" (E.string "amber")) ] [ text "Amber" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "ui_accent" (E.string "rose")) ] [ text "Rose" ]
+                ]
+            ]
+        , div [ class "setting-row setting-row-stack" ]
+            [ div [] [ b [] [ text "Corners" ], small [ class "muted" ] [ text "Keep the interface tight or give panels a little more rounding." ] ]
+            , div [ class "segmented-control" ]
+                [ button [ class "btn secondary", onClick (BridgeEvent "ui_corner_style" (E.string "compact")) ] [ text "Compact" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "ui_corner_style" (E.string "default")) ] [ text "Default" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "ui_corner_style" (E.string "rounded")) ] [ text "Rounded" ]
                 ]
             ]
         , div [ class "setting-row setting-row-stack" ]
@@ -4597,7 +4762,7 @@ composerView key placeholderText model =
                     , button [ class "btn secondary", onClick CancelReply ] [ text "Cancel" ]
                     ]
             Nothing -> text ""
-        , textarea [ id "compose", placeholder placeholderText, value model.inputText, onInput InputText, onComposerKeyDown ] []
+        , textarea [ id "compose", placeholder placeholderText, value model.inputText, onInput InputText, onComposerKeyDown model.chatEnterSends ] []
         , div [ class "composer-footer" ]
             [ button [ class "btn secondary attach-btn", type_ "button", title "Attach files or images", onClick (BridgeEvent "pick_attachments" E.null) ] [ text "＋ Attach" ]
             , small [ class "muted" ] [ text ("Paste images or attach files up to " ++ formatBytesShort model.uploadMaxBytes ++ ".") ]
@@ -4626,7 +4791,7 @@ renderMessageBody body =
                             , div [ class "pw-media-timeline" ]
                                 [ span [ class "pw-media-time" ] [ text "0:00" ]
                                 , input [ class "pw-media-seek", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1000", step "1", attribute "aria-label" "Seek audio" ] []
-                                , span [ class "pw-media-duration" ] [ text "–:––" ]
+                                , span [ class "pw-media-duration" ] [ text "-:--" ]
                                 ]
                             ]
                         , button [ type_ "button", class "pw-media-mute", attribute "data-media-action" "mute", attribute "aria-label" "Mute audio" ] [ text "Sound" ]
@@ -4642,7 +4807,7 @@ renderMessageBody body =
                             [ button [ type_ "button", class "pw-media-play compact", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
                             , span [ class "pw-media-time" ] [ text "0:00" ]
                             , input [ class "pw-media-seek", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1000", step "1", attribute "aria-label" "Seek video" ] []
-                            , span [ class "pw-media-duration" ] [ text "–:––" ]
+                            , span [ class "pw-media-duration" ] [ text "-:--" ]
                             , button [ type_ "button", class "pw-media-mute compact", attribute "data-media-action" "mute", attribute "aria-label" "Mute video" ] [ text "Sound" ]
                             , input [ class "pw-media-volume", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1", step "0.02", attribute "aria-label" "Video volume" ] []
                             , button [ type_ "button", class "pw-media-fullscreen", attribute "data-media-action" "fullscreen", attribute "aria-label" "Fullscreen video" ] [ text "Full" ]
@@ -4656,11 +4821,61 @@ renderMessageBody body =
                     a [ class "message-file", href url, target "_blank", rel "noopener" ]
                         [ span [ class "message-file-icon" ] [ text "↧" ], span [] [ text name ] ]
                 Nothing ->
-                    if String.startsWith "https://" line || String.startsWith "http://" line then
-                        a [ class "message-link", href line, target "_blank", rel "noopener noreferrer" ] [ text line ]
-                    else
-                        span [] [ text line, if index < List.length lines - 1 then br [] [] else text "" ]
+                    renderTextLine index (List.length lines) line
         )
+
+renderTextLine : Int -> Int -> String -> Html Msg
+renderTextLine index lineCount line =
+    let
+        pieces =
+            String.split " " line
+                |> List.map renderMessageToken
+                |> List.intersperse (text " ")
+        ending =
+            if index < lineCount - 1 then
+                [ br [] [] ]
+            else
+                []
+    in
+    span [] (pieces ++ ending)
+
+renderMessageToken : String -> Html Msg
+renderMessageToken token =
+    let
+        url = stripUrlSuffix token
+        suffix = String.dropLeft (String.length url) token
+    in
+    if isHttpUrl url then
+        span [ class "message-link-wrap" ]
+            [ a
+                [ class "message-link"
+                , href url
+                , target "_blank"
+                , rel "noopener noreferrer"
+                , attribute "data-embed-url" url
+                ]
+                [ text url ]
+            , text suffix
+            ]
+    else
+        text token
+
+isHttpUrl : String -> Bool
+isHttpUrl value =
+    String.startsWith "https://" value || String.startsWith "http://" value
+
+stripUrlSuffix : String -> String
+stripUrlSuffix value =
+    case String.right 1 value of
+        "." -> stripUrlSuffix (String.dropRight 1 value)
+        "," -> stripUrlSuffix (String.dropRight 1 value)
+        "!" -> stripUrlSuffix (String.dropRight 1 value)
+        "?" -> stripUrlSuffix (String.dropRight 1 value)
+        ";" -> stripUrlSuffix (String.dropRight 1 value)
+        ":" -> stripUrlSuffix (String.dropRight 1 value)
+        ")" -> stripUrlSuffix (String.dropRight 1 value)
+        "]" -> stripUrlSuffix (String.dropRight 1 value)
+        _ -> value
 
 type AttachmentKind
     = AttachmentImage
@@ -4698,18 +4913,23 @@ attachmentMarkup line =
                 Just value -> Just value
                 Nothing -> parse fileKind "[" "/api/files/"
 
-onComposerKeyDown : Attribute Msg
-onComposerKeyDown =
+onComposerKeyDown : Bool -> Attribute Msg
+onComposerKeyDown enterSends =
     custom "keydown"
-        (D.map2
-            (\key shift ->
-                if key == "Enter" && not shift then
+        (D.map4
+            (\key shift ctrl meta ->
+                let shouldSend =
+                        key == "Enter" &&
+                        ((enterSends && not shift) || (not enterSends && (ctrl || meta)))
+                in if shouldSend then
                     { message = SendMessage, stopPropagation = True, preventDefault = True }
                 else
                     { message = NoOp, stopPropagation = False, preventDefault = False }
             )
             (D.field "key" D.string)
             (D.field "shiftKey" D.bool)
+            (D.field "ctrlKey" D.bool)
+            (D.field "metaKey" D.bool)
         )
 
 renderNotificationsPage : Model -> Html Msg
@@ -4835,6 +5055,7 @@ fmtErr err =
         "invalid_channel" -> "That invite channel does not belong to this server."
         "invalid_invite" -> "That invite is invalid, expired, or has been revoked."
         "bad_login" -> "Username or password is incorrect."
+        "registration_disabled" -> "Registration is disabled on this server."
         "invalid_json" -> "Could not send the form. Please try again."
         "database_unavailable" -> "The server database is temporarily unavailable."
         "database_timeout" -> "The server database timed out. Please try again."
@@ -4854,8 +5075,8 @@ authValidationError model =
         Just "Username must be at least 3 characters."
     else if String.length username > 24 then
         Just "Username must be 24 characters or less."
-    else if model.authMode == "register" && String.length password < 8 then
-        Just "Password must be at least 8 characters."
+    else if model.authMode == "register" && String.length password < 10 then
+        Just "Password must be at least 10 characters."
     else if model.authMode == "login" && String.isEmpty password then
         Just "Enter your password."
     else

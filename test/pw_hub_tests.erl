@@ -21,6 +21,24 @@ self_is_included_in_presence_watch_test() ->
         gen_server:stop(Hub)
     end.
 
+
+connect_seeds_own_presence_state_test() ->
+    stop_existing_hub(),
+    {ok, Hub} = pw_hub:start_link(),
+    try
+        pw_hub:connect(84, self(), <<"away">>),
+        _ = gen_server:call(pw_hub, sync),
+        receive
+            {hub_json, #{type := presence_state, online := Online, statuses := Statuses}} ->
+                ?assert(lists:member(84, Online)),
+                ?assertEqual(<<"away">>, maps:get(84, Statuses))
+        after 1000 ->
+            ?assert(false)
+        end
+    after
+        gen_server:stop(Hub)
+    end.
+
 call_accept_establishes_bidirectional_signaling_test() ->
     stop_existing_hub(),
     {ok, Hub} = pw_hub:start_link(),

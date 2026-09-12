@@ -123,7 +123,10 @@ handle_cast({connect, Uid, Pid, Status0}, St) ->
         false ->
             St#st.online
     end,
-    Pid ! {hub_json, #{type => presence_state, online => [], statuses => #{}}},
+    %% Seed the new socket with its own status immediately. This avoids the
+    %% hello/watch race that could make a signed-in user appear offline to
+    %% themselves until the next presence watch refresh.
+    Pid ! {hub_json, #{type => presence_state, online => [Uid], statuses => #{Uid => Status}}},
     send_active_calls(Pid, Uid, St#st.calls),
     log("client_connected", #{uid => Uid, sessions => length(maps:get(Uid, Users, [])), online_users => map_size(Online)}),
     {noreply, St#st{users = Users, pids = Pids, online = Online}};

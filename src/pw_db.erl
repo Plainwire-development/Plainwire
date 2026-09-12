@@ -3,7 +3,7 @@
 -export([
     start_link/0,
     health/0,
-    register/3, login/2, session/1, session_fast/1, logout/1, me/1, update_profile/3, update_theme/2,
+    register/3, login/2, session/1, session_fast/1, logout/1, sessions/2, logout_other_sessions/2, change_password/4, me/1, update_profile/3, update_theme/2,
     sync/2, users/1, profile/2,
     friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friend_unblock/2, friends/1,
     forums/1, create_forum/4, delete_forum/2, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, delete_thread/2, reply_thread/3, vote_thread/3,
@@ -153,6 +153,9 @@ register(U, D, P) -> call({register, U, D, P}).
 login(U, P) -> call({login, U, P}).
 session(T) -> call({session, T}).
 logout(T) -> call({logout, T}).
+sessions(Uid, Token) -> call({sessions, Uid, Token}).
+logout_other_sessions(Uid, Token) -> call({logout_other_sessions, Uid, Token}).
+change_password(Uid, Token, Current, New) -> call({change_password, Uid, Token, Current, New}).
 me(Uid) -> call({me, Uid}).
 update_profile(Uid, Display, Patch) -> call({update_profile, Uid, Display, Patch}).
 update_theme(Uid, Theme) -> call({update_theme, Uid, Theme}).
@@ -421,7 +424,7 @@ route({register, U0, D0, P0}, Conn) ->
     D0b = pw_util:clean_text(D0, 48),
     P = pw_util:clean_text(P0, 256),
     D = case D0b of <<>> -> U; _ -> D0b end,
-    case {byte_size(U) >= 3, byte_size(U) =< 24, byte_size(P) >= 8} of
+    case {byte_size(U) >= 3, byte_size(U) =< 24, byte_size(P) >= 10} of
         {true, true, true} ->
             case one(Conn, "SELECT id FROM users WHERE username = $1", [U]) of
                 {ok, undefined} ->
@@ -431,7 +434,7 @@ route({register, U0, D0, P0}, Conn) ->
                     {ok, Id} = insert_returning(Conn,
                         "INSERT INTO users(username,display_name,password_hash,password_salt,bio,avatar_url,banner_url,status,theme,created_at,updated_at,last_seen) "
                         "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",
-                        [U, D, Hash, Salt, <<>>, <<>>, <<>>, <<>>, <<"system">>, Now, Now, Now]),
+                        [U, D, Hash, Salt, <<>>, <<>>, <<>>, <<>>, <<"light">>, Now, Now, Now]),
                     {ok, make_session(Conn, Id)};
                 _ ->
                     {error, username_taken}
@@ -487,6 +490,43 @@ route({logout, Token}, Conn) ->
     _ = exec(Conn, "DELETE FROM sessions WHERE token_hash = $1", [H]),
     ets:delete(?SESSION_CACHE, H),
     ok;
+route({sessions, Uid, Token}, Conn) ->
+    CurrentHash = pw_util:sha256_hex(Token),
+    {ok, Rows} = rows(Conn,
+        "SELECT id, token_hash, created_at, last_seen, expires_at FROM sessions WHERE user_id = $1 AND expires_at > $2 ORDER BY last_seen DESC",
+        [Uid, pw_util:now_ms()]),
+    {ok, [#{id => Id, current => Hash =:= CurrentHash, created_at => Created, last_seen => Seen, expires_at => Expires}
+          || {Id, Hash, Created, Seen, Expires} <- Rows]};
+route({logout_other_sessions, Uid, Token}, Conn) ->
+    CurrentHash = pw_util:sha256_hex(Token),
+    {ok, Existing} = rows(Conn, "SELECT token_hash FROM sessions WHERE user_id = $1 AND token_hash <> $2", [Uid, CurrentHash]),
+    ok = exec(Conn, "DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2", [Uid, CurrentHash]),
+    [ets:delete(?SESSION_CACHE, Hash) || {Hash} <- Existing],
+    {ok, #{revoked => length(Existing)}};
+route({change_password, Uid, Token, Current0, New0}, Conn) ->
+    Current = pw_util:clean_text(Current0, 256),
+    New = pw_util:clean_text(New0, 256),
+    case byte_size(New) >= 10 andalso byte_size(New) =< 256 of
+        false -> {error, weak_password};
+        true ->
+            case one(Conn, "SELECT password_hash, password_salt FROM users WHERE id = $1", [Uid]) of
+                {ok, {Hash, Salt}} ->
+                    case pw_util:verify_password(Current, Salt, Hash) of
+                        false -> {error, bad_password};
+                        true ->
+                            NewSalt = pw_util:random_token(18),
+                            NewHash = pw_util:pbkdf2(New, NewSalt),
+                            Now = pw_util:now_ms(),
+                            ok = exec(Conn, "UPDATE users SET password_hash = $1, password_salt = $2, updated_at = $3 WHERE id = $4", [NewHash, NewSalt, Now, Uid]),
+                            CurrentHash = pw_util:sha256_hex(Token),
+                            {ok, Existing} = rows(Conn, "SELECT token_hash FROM sessions WHERE user_id = $1 AND token_hash <> $2", [Uid, CurrentHash]),
+                            ok = exec(Conn, "DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2", [Uid, CurrentHash]),
+                            [ets:delete(?SESSION_CACHE, SessionHash) || {SessionHash} <- Existing],
+                            {ok, #{changed => true, revoked_sessions => length(Existing)}}
+                    end;
+                _ -> {error, not_found}
+            end
+    end;
 route({me, Uid}, Conn) ->
     case one(Conn,
         "SELECT id, username, display_name, bio, avatar_url, banner_url, status, theme, created_at, last_seen "
@@ -501,7 +541,7 @@ route({update_profile, Uid, Display0, Patch}, Conn) ->
     Avatar = store_profile_image(maps:get(<<"avatar_url">>, Patch, <<>>), CurrentAvatar, Conn, Uid),
     Banner = store_profile_image(maps:get(<<"banner_url">>, Patch, <<>>), CurrentBanner, Conn, Uid),
     Status = pw_util:clean_text(maps:get(<<"status">>, Patch, <<>>), 100),
-    Theme = normalize_theme(maps:get(<<"theme">>, Patch, <<"system">>)),
+    Theme = normalize_theme(maps:get(<<"theme">>, Patch, <<"light">>)),
     Now = pw_util:now_ms(),
     ok = exec(Conn,
         "UPDATE users SET display_name = $1, bio = $2, avatar_url = $3, banner_url = $4, "
@@ -879,8 +919,10 @@ route({update_server, Uid, Sid0, Patch}, Conn) ->
             Accent = clean_accent(maps:get(<<"accent_color">>, Patch, <<>>)),
             HasDesc = maps:is_key(<<"description">>, Patch),
             %% /api/media is derived output. don't save it over the real source.
-            HasIcon = maps:is_key(<<"icon_url">>, Patch) andalso not derived_media_url(RawIcon),
-            HasBanner = maps:is_key(<<"banner_url">>, Patch) andalso not derived_media_url(RawBanner),
+            HasIcon = maps:is_key(<<"icon_url">>, Patch) andalso not derived_media_url(RawIcon)
+                andalso server_image_input_allowed(Conn, Uid, RawIcon),
+            HasBanner = maps:is_key(<<"banner_url">>, Patch) andalso not derived_media_url(RawBanner)
+                andalso server_image_input_allowed(Conn, Uid, RawBanner),
             HasAccent = maps:is_key(<<"accent_color">>, Patch) andalso Accent =/= undefined,
             case duplicate_server_name(Conn, Uid, Sid, Name) of
                 true ->
@@ -893,6 +935,8 @@ route({update_server, Uid, Sid0, Patch}, Conn) ->
                         "banner_url = CASE WHEN $6 THEN $7 ELSE banner_url END, "
                         "accent_color = CASE WHEN $8 THEN $9 ELSE accent_color END, updated_at = $10 WHERE id = $11",
                         [Name, Desc, HasDesc, HasIcon, Icon, HasBanner, Banner, HasAccent, Accent, Now, Sid]),
+                    case HasIcon of true -> insert_server_upload_ref(Conn, Sid, Icon); false -> ok end,
+                    case HasBanner of true -> insert_server_upload_ref(Conn, Sid, Banner); false -> ok end,
                     publish_server_event(Conn, Sid, #{type => server_updated, server_id => Sid}),
                     route({server, Uid, Sid}, Conn)
             end;
@@ -1535,7 +1579,7 @@ migrations() -> [
     {1, [
         "CREATE TABLE IF NOT EXISTS users(id serial PRIMARY KEY, username text UNIQUE NOT NULL, display_name text NOT NULL, "
         "password_hash text NOT NULL, password_salt text NOT NULL, bio text NOT NULL DEFAULT '', avatar_url text NOT NULL DEFAULT '', "
-        "banner_url text NOT NULL DEFAULT '', status text NOT NULL DEFAULT '', theme text NOT NULL DEFAULT 'system', "
+        "banner_url text NOT NULL DEFAULT '', status text NOT NULL DEFAULT '', theme text NOT NULL DEFAULT 'light', "
         "created_at bigint NOT NULL, updated_at bigint NOT NULL, last_seen bigint NOT NULL)",
         "CREATE TABLE IF NOT EXISTS sessions(token_hash text PRIMARY KEY, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
         "csrf text NOT NULL, created_at bigint NOT NULL, expires_at bigint NOT NULL, last_seen bigint NOT NULL)",
@@ -1663,6 +1707,22 @@ migrations() -> [
     {12, [
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS banner_url text NOT NULL DEFAULT ''",
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS accent_color text NOT NULL DEFAULT '#5865f2'"
+    ]},
+    {13, [
+        "ALTER TABLE upload_refs DROP CONSTRAINT IF EXISTS upload_refs_scope_check",
+        "ALTER TABLE upload_refs ADD CONSTRAINT upload_refs_scope_check CHECK(scope IN ('channel','direct','profile','server'))",
+        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
+        "SELECT up.id, 'server', s.id, 0 FROM servers s JOIN uploads up ON up.id = substring(s.icon_url from 12) "
+        "WHERE s.icon_url LIKE '/api/files/%' ON CONFLICT DO NOTHING",
+        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
+        "SELECT up.id, 'server', s.id, 0 FROM servers s JOIN uploads up ON up.id = substring(s.banner_url from 12) "
+        "WHERE s.banner_url LIKE '/api/files/%' ON CONFLICT DO NOTHING"
+    ]},
+    {14, [
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS id bigserial",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_id ON sessions(id)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_user_last_seen ON sessions(user_id, last_seen DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at)"
     ]}
 ].
 
@@ -1791,6 +1851,7 @@ upload_readable(Conn, Uid, Id, _OwnerId) ->
     end.
 
 upload_ref_grants(_Conn, _Uid, [<<"profile">>, _]) -> true;
+upload_ref_grants(_Conn, _Uid, [<<"server">>, _]) -> true;
 upload_ref_grants(Conn, Uid, [Scope, ScopeId]) when Scope =:= <<"channel">>; Scope =:= <<"direct">> ->
     can_read_messages(Conn, Uid, Scope, pw_util:int(ScopeId));
 upload_ref_grants(_Conn, _Uid, _Ref) -> false.
@@ -1835,6 +1896,19 @@ insert_profile_upload_ref(Conn, Uid, <<"/api/files/", Id/binary>>) ->
     end;
 insert_profile_upload_ref(_Conn, _Uid, _Url) -> ok.
 
+insert_server_upload_ref(Conn, Sid, <<"/api/files/", Id/binary>>) ->
+    case valid_file_id(Id) of
+        true ->
+            _ = try exec(Conn,
+                    "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
+                    "SELECT up.id, 'server', $2, $3 FROM uploads up WHERE up.id = $1 "
+                    "ON CONFLICT DO NOTHING", [Id, Sid, pw_util:now_ms()])
+                catch _:_ -> ok end,
+            ok;
+        false -> ok
+    end;
+insert_server_upload_ref(_Conn, _Sid, _Url) -> ok.
+
 %% pull file ids out before the body becomes ciphertext soup.
 extract_file_ids(Body) when is_binary(Body) ->
     lists:usort(collect_file_ids(Body, 0, []));
@@ -1861,6 +1935,15 @@ take_file_id(Bin, N) when N < byte_size(Bin) ->
     end;
 take_file_id(Bin, N) -> {binary:part(Bin, 0, N), <<>>}.
 
+server_image_input_allowed(_Conn, _Uid, <<>>) -> true;
+server_image_input_allowed(Conn, Uid, <<"/api/files/", Id/binary>>) ->
+    profile_upload_allowed(Conn, Uid, Id);
+server_image_input_allowed(_Conn, _Uid, <<"data:", _/binary>> = Url) ->
+    pw_util:safe_image_data_url(Url);
+server_image_input_allowed(_Conn, _Uid, <<"http://", _/binary>>) -> true;
+server_image_input_allowed(_Conn, _Uid, <<"https://", _/binary>>) -> true;
+server_image_input_allowed(_, _, _) -> false.
+
 current_profile_images(Conn, Uid) ->
     case one(Conn, "SELECT avatar_url, banner_url FROM users WHERE id = $1", [Uid]) of
         {ok, [Avatar, Banner]} -> {pw_util:bin(Avatar), pw_util:bin(Banner)};
@@ -1884,13 +1967,14 @@ store_profile_image(Url0, Current, Conn, Uid) ->
     end.
 
 profile_upload_allowed(Conn, Uid, Id) ->
+    MaxBytes = pw_client_config:profile_image_max_bytes(),
     case valid_file_id(Id) of
         false -> false;
         true ->
             case one(Conn,
                 "SELECT content_type,size,path FROM uploads "
                 "WHERE id = $1 AND user_id = $2 AND status = 'ready'", [Id, Uid]) of
-                {ok, [Type, Size, Path]} when is_integer(Size), Size > 0, Size =< 8388608 ->
+                {ok, [Type, Size, Path]} when is_integer(Size), Size > 0, Size =< MaxBytes ->
                     safe_profile_file(Type, Path);
                 _ -> false
             end
@@ -1924,7 +2008,8 @@ normalize_max_uses(_) -> 0.
 
 normalize_theme(<<"light">>) -> <<"light">>;
 normalize_theme(<<"dark">>) -> <<"dark">>;
-normalize_theme(_) -> <<"system">>.
+normalize_theme(<<"system">>) -> <<"system">>;
+normalize_theme(_) -> <<"light">>.
 
 forum_position(Conn) ->
     case one(Conn, "SELECT COALESCE(max(position), 0) + 1 FROM forums", []) of

@@ -31,22 +31,33 @@ auth_attempt_allowed(Kind, Req, Username0) ->
         pw_rate:allow({Kind, pair, Ip, Username}, 8, 600000).
 
 handle(<<"POST">>, [<<"register">>], Req0, _) ->
-    with_json_public(Req0, fun(M, Req) ->
-        U=maps:get(<<"username">>,M,<<>>), D=maps:get(<<"display_name">>,M,U), P=maps:get(<<"password">>,M,<<>>),
-        case auth_attempt_allowed(register, Req, U) of
-            false ->
-                pw_util:err_json(Req, 429, <<"rate_limited">>);
-            true ->
-                case pw_db:register(U,D,P) of
-                    {ok, #{token:=Token}=Data} -> pw_util:ok_json(pw_util:set_cookie(Req, <<"pw_session">>, Token), #{ok=>true,data=>maps:remove(token,Data)});
-                    {error, username_taken} -> pw_util:err_json(Req, 409, <<"username_taken">>);
-                    {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
-                    {error, database_busy} -> pw_util:err_json(Req, 503, <<"database_busy">>);
-                    {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
-                    {error,E} -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8))
+    case pw_util:env_bool("PLAINWIRE_REGISTRATION_ENABLED", true) of
+        false ->
+            pw_util:err_json(Req0, 403, <<"registration_disabled">>);
+        true ->
+            with_json_public(Req0, fun(M, Req) ->
+                U = maps:get(<<"username">>, M, <<>>),
+                D = maps:get(<<"display_name">>, M, U),
+                P = maps:get(<<"password">>, M, <<>>),
+                case auth_attempt_allowed(register, Req, U) of
+                    false ->
+                        pw_util:err_json(Req, 429, <<"rate_limited">>);
+                    true ->
+                        case pw_db:register(U, D, P) of
+                            {ok, #{token := Token} = Data} ->
+                                pw_util:ok_json(
+                                    pw_util:set_cookie(Req, <<"pw_session">>, Token),
+                                    #{ok => true, data => maps:remove(token, Data)}
+                                );
+                            {error, username_taken} -> pw_util:err_json(Req, 409, <<"username_taken">>);
+                            {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+                            {error, database_busy} -> pw_util:err_json(Req, 503, <<"database_busy">>);
+                            {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
+                            {error, E} -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8))
+                        end
                 end
-        end
-    end);
+            end)
+    end;
 handle(<<"POST">>, [<<"login">>], Req0, _) ->
     with_json_public(Req0, fun(M, Req) ->
         U = maps:get(<<"username">>,M,<<>>),
@@ -128,6 +139,17 @@ authed(<<"POST">>, [<<"logout">>], Req0, _, _) ->
     Token = pw_util:cookie_value(Req0, <<"pw_session">>),
     _ = case Token of undefined -> ok; _ -> pw_db:logout(Token) end,
     pw_util:ok_json(pw_util:clear_cookie(Req0), #{ok=>true});
+authed(<<"GET">>, [<<"sessions">>], Req, Session, _) ->
+    Token = pw_util:cookie_value(Req, <<"pw_session">>),
+    result(Req, pw_db:sessions(uid(Session), Token));
+authed(<<"POST">>, [<<"sessions">>, <<"logout-others">>], Req, Session, _) ->
+    Token = pw_util:cookie_value(Req, <<"pw_session">>),
+    result(Req, pw_db:logout_other_sessions(uid(Session), Token));
+authed(<<"POST">>, [<<"password">>], Req0, Session, _) ->
+    Token = pw_util:cookie_value(Req0, <<"pw_session">>),
+    with_json(Req0, fun(M, Req) ->
+        result(Req, pw_db:change_password(uid(Session), Token, maps:get(<<"current_password">>, M, <<>>), maps:get(<<"new_password">>, M, <<>>)))
+    end);
 authed(<<"GET">>, [<<"sync">>], Req, Session, _) -> result(Req, pw_db:sync(uid(Session), qs(Req, <<"since">>)));
 authed(<<"POST">>, [<<"profile">>], Req0, Session, _) -> with_json_large(Req0, fun(M, Req) -> result(Req, pw_db:update_profile(uid(Session), maps:get(<<"display_name">>, M, maps:get(display_name, maps:get(user,Session))), M)) end);
 authed(<<"POST">>, [<<"profile">>, <<"theme">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_theme(uid(Session), maps:get(<<"theme">>, M, <<"system">>))) end);
@@ -165,14 +187,19 @@ authed(<<"POST">>, [<<"channel">>, ChannelId, <<"move">>], Req0, Session, _) -> 
 authed(<<"POST">>, [<<"server">>, Id, <<"invites">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_invite(uid(Session), Id, maps:get(<<"channel_id">>,M,undefined), maps:get(<<"max_uses">>,M,0))) end);
 authed(<<"POST">>, [<<"invites">>, Code, <<"join">>], Req, Session, _) -> result(Req, pw_db:join_invite(uid(Session), Code));
 authed(<<"GET">>, [<<"invites">>, Code], Req, _, _) -> result(Req, pw_db:invite_preview(Code));
-authed(<<"GET">>, [<<"embed">>], Req, _, _) ->
+authed(<<"GET">>, [<<"embed">>], Req, Session, _) ->
     case qs(Req, <<"url">>) of
         undefined -> pw_util:err_json(Req, 400, <<"missing_url">>);
+        Url when byte_size(Url) > 2048 -> pw_util:err_json(Req, 414, <<"url_too_long">>);
         Url ->
-            case pw_embed:fetch(Url) of
-                {ok, Meta} -> pw_util:ok_json(Req, #{ok => true, data => Meta});
-                {error, blocked_url} -> pw_util:err_json(Req, 403, <<"blocked_url">>);
-                {error, _} -> pw_util:err_json(Req, 502, <<"embed_failed">>)
+            case pw_rate:allow({embed, uid(Session)}, 60, 60000) of
+                false -> pw_util:err_json(Req, 429, <<"embed_rate_limited">>);
+                true ->
+                    case pw_embed:fetch(Url) of
+                        {ok, Meta} -> pw_util:ok_json(Req, #{ok => true, data => Meta});
+                        {error, blocked_url} -> pw_util:err_json(Req, 403, <<"blocked_url">>);
+                        {error, _} -> pw_util:err_json(Req, 502, <<"embed_failed">>)
+                    end
             end
     end;
 authed(<<"GET">>, [<<"messages">>], Req, Session, _) -> result(Req, pw_db:messages(uid(Session), qs(Req, <<"scope">>), qs(Req, <<"scope_id">>), qs(Req, <<"before">>), qs(Req, <<"after">>)));
