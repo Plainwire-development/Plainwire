@@ -1,7 +1,7 @@
 -module(pw_util).
 -export([
     env_int/2, env_bool/2, env_str/2, now_ms/0, random_token/1, sha256_hex/1,
-    base64url/1, base64url_decode/1, pbkdf2/2, verify_password/3,
+    base64url/1, base64url_decode/1, pbkdf2/2, verify_password/3, password_needs_rehash/1,
     normalize_username/1, clean_text/2, int/1, bool/1, bin/1, json/1,
     read_json/1, read_json/2, ok_json/2, err_json/3, set_cookie/3, clear_cookie/1, cookie_value/2,
     require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1, hex_binary/1
@@ -19,11 +19,18 @@ env_int(Name, Default) ->
 env_bool(Name, Default) ->
     case os:getenv(Name) of
         false -> Default;
-        "1" -> true;
-        "true" -> true;
-        "TRUE" -> true;
-        "yes" -> true;
-        _ -> false
+        V ->
+            case string:lowercase(string:trim(V)) of
+                "1" -> true;
+                "true" -> true;
+                "yes" -> true;
+                "on" -> true;
+                "0" -> false;
+                "false" -> false;
+                "no" -> false;
+                "off" -> false;
+                _ -> Default
+            end
     end.
 
 env_str(Name, Default) ->
@@ -58,9 +65,26 @@ base64url_decode(Bin0) ->
 sha256_hex(Bin0) -> hex(crypto:hash(sha256, bin(Bin0))).
 
 pbkdf2(Pass, Salt) ->
-    Iter = env_int("PLAINWIRE_PBKDF2_ITERS", 160000),
+    %% Treat the environment as untrusted configuration. A typo such as a
+    %% negative or gigantic iteration count should never crash a scheduler or
+    %% turn one login into a CPU denial of service.
+    Iter = password_iterations(),
     Hash = crypto:pbkdf2_hmac(sha256, bin(Pass), bin(Salt), Iter, 32),
     iolist_to_binary([integer_to_binary(Iter), <<"$">>, hex(Hash)]).
+
+password_needs_rehash(Stored0) ->
+    Stored = bin(Stored0),
+    case binary:split(Stored, <<"$">>, [global]) of
+        [IterBin, Hex] when byte_size(Hex) =:= 64 ->
+            case int(IterBin) of
+                Iter when is_integer(Iter), Iter >= 1 -> Iter < password_iterations();
+                _ -> true
+            end;
+        _ -> true
+    end.
+
+password_iterations() ->
+    clamp(env_int("PLAINWIRE_PBKDF2_ITERS", 160000), 10000, 2000000).
 
 verify_password(Pass, Salt, Stored) ->
     Parts = binary:split(bin(Stored), <<"$">>, [global]),
@@ -171,6 +195,9 @@ decode_json_body(Body, Req) ->
         _ -> {error, invalid_json, Req}
     end.
 
+clamp(N, Min, Max) when is_integer(N) -> erlang:min(Max, erlang:max(Min, N));
+clamp(_, Min, _Max) -> Min.
+
 safe_list_to_integer(V) ->
     try list_to_integer(V) catch _:_ -> undefined end.
 
@@ -203,18 +230,18 @@ security_headers() ->
     end,
     Csp = <<"default-src 'self'; ", ScriptPolicy/binary,
         "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; ",
-        "connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'">>,
+        "connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'">>,
     #{
         <<"cache-control">> => <<"no-store">>,
         <<"x-content-type-options">> => <<"nosniff">>,
-        <<"x-frame-options">> => <<"SAMEORIGIN">>,
+        <<"x-frame-options">> => <<"DENY">>,
         <<"cross-origin-resource-policy">> => <<"same-origin">>,
         <<"referrer-policy">> => <<"same-origin">>,
         <<"cross-origin-opener-policy">> => <<"same-origin">>,
         <<"x-permitted-cross-domain-policies">> => <<"none">>,
         <<"strict-transport-security">> => <<"max-age=31536000; includeSubDomains">>,
         <<"content-security-policy">> => Csp,
-        <<"permissions-policy">> => <<"camera=(), microphone=(self), geolocation=(), payment=(), usb=(), browsing-topics=()">>
+        <<"permissions-policy">> => <<"camera=(), microphone=(self), display-capture=(self), fullscreen=(self), geolocation=(), payment=(), usb=(), browsing-topics=()">>
     }.
 
 proxied_image(Url0) ->
@@ -243,19 +270,19 @@ set_cookie(Req, Name, Value) ->
         secure => Secure,
         same_site => lax,
         path => <<"/">>,
-        max_age => 2592000
+        max_age => session_cookie_max_age()
     }).
 
+session_cookie_max_age() ->
+    Days = clamp(env_int("PLAINWIRE_SESSION_DAYS", 30), 1, 365),
+    Days * 86400.
+
 cookie_secure_default() ->
-    case os:getenv("COOKIE_SECURE") of
-        false ->
-            case os:getenv("PLAINWIRE_PUBLIC_URL") of
-                "https://" ++ _ -> true;
-                _ -> false
-            end;
-        V ->
-            env_bool("COOKIE_SECURE", V =:= "1" orelse V =:= "true" orelse V =:= "TRUE" orelse V =:= "yes")
-    end.
+    Default = case os:getenv("PLAINWIRE_PUBLIC_URL") of
+        "https://" ++ _ -> true;
+        _ -> false
+    end,
+    env_bool("COOKIE_SECURE", Default).
 
 clear_cookie(Req) ->
     cowboy_req:set_resp_cookie(<<"pw_session">>, <<>>, Req, #{http_only=>true, secure=>cookie_secure_default(), same_site=>lax, path=><<"/">>, max_age=>0}).

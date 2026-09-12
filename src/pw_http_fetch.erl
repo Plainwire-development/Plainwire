@@ -2,7 +2,7 @@
 -export([get/2]).
 
 get(Url, MaxBytes) when is_binary(Url), is_integer(MaxBytes), MaxBytes > 0 ->
-    Headers = [{"user-agent", "PlainwireRelay/1.1"}, {"accept-encoding", "identity"}],
+    Headers = [{"user-agent", "PlainwireRelay/1.4"}, {"accept-encoding", "identity"}],
     %% no redirects here; they sidestep the SSRF check. rude.
     HttpOptions = [{timeout, 15000}, {connect_timeout, 5000}, {autoredirect, false}],
     Options = [{sync, false}, {stream, {self, once}}],

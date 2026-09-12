@@ -69,3 +69,17 @@ share_capacity_is_positive_test() ->
     Cap = pw_hub:share_capacity(),
     ?assert(Cap >= 1),
     ?assert(Cap =< 8).
+
+security_headers_deny_embedding_test() ->
+    Headers = pw_util:security_headers(),
+    ?assertEqual(<<"DENY">>, maps:get(<<"x-frame-options">>, Headers)),
+    Csp = maps:get(<<"content-security-policy">>, Headers),
+    ?assert(binary:match(Csp, <<"frame-ancestors 'none'">>) =/= nomatch),
+    ?assert(binary:match(Csp, <<"form-action 'self'">>) =/= nomatch).
+
+security_headers_allow_first_party_media_permissions_test() ->
+    Headers = pw_util:security_headers(),
+    Policy = maps:get(<<"permissions-policy">>, Headers),
+    ?assert(binary:match(Policy, <<"microphone=(self)">>) =/= nomatch),
+    ?assert(binary:match(Policy, <<"display-capture=(self)">>) =/= nomatch),
+    ?assert(binary:match(Policy, <<"camera=()">>) =/= nomatch).

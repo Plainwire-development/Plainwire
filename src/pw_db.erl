@@ -325,6 +325,8 @@ transient_db_reason(_) -> false.
 read_msg({register, _, _, _}) -> false;
 read_msg({login, _, _}) -> false;
 read_msg({logout, _}) -> false;
+read_msg({logout_other_sessions, _, _}) -> false;
+read_msg({change_password, _, _, _, _}) -> false;
 read_msg({update_profile, _, _, _}) -> false;
 read_msg({update_theme, _, _}) -> false;
 read_msg({friend_request, _, _}) -> false;
@@ -332,13 +334,22 @@ read_msg({friend_accept, _, _}) -> false;
 read_msg({friend_remove, _, _}) -> false;
 read_msg({friend_block, _, _}) -> false;
 read_msg({friend_unblock, _, _}) -> false;
+read_msg({create_forum, _, _, _, _}) -> false;
+read_msg({join_forum, _, _}) -> false;
+read_msg({leave_forum, _, _}) -> false;
 read_msg({create_thread, _, _, _, _}) -> false;
 read_msg({delete_thread, _, _}) -> false;
 read_msg({delete_forum, _, _}) -> false;
 read_msg({reply_thread, _, _, _}) -> false;
+read_msg({vote_thread, _, _, _}) -> false;
 read_msg({create_server, _, _, _}) -> false;
 read_msg({update_server, _, _, _}) -> false;
 read_msg({create_channel, _, _, _, _, _}) -> false;
+read_msg({create_category, _, _, _}) -> false;
+read_msg({update_category, _, _, _, _}) -> false;
+read_msg({reorder_categories, _, _, _}) -> false;
+read_msg({delete_category, _, _, _}) -> false;
+read_msg({move_channel, _, _, _, _}) -> false;
 read_msg({create_invite, _, _, _, _}) -> false;
 read_msg({join_invite, _, _}) -> false;
 read_msg({post_channel_message, _, _, _, _}) -> false;
@@ -347,6 +358,7 @@ read_msg({create_conversation, _, _, _}) -> false;
 read_msg({create_conversation_usernames, _, _, _}) -> false;
 read_msg({update_conversation, _, _, _, _}) -> false;
 read_msg({add_conversation_members, _, _, _}) -> false;
+read_msg({add_conversation_members_locked, _, _, _}) -> false;
 read_msg({add_conversation_members_usernames, _, _, _}) -> false;
 read_msg({close_conversation, _, _}) -> false;
 read_msg({leave_conversation, _, _}) -> false;
@@ -369,6 +381,10 @@ safe_log_msg({register, _, _, _}) -> {register, redacted};
 safe_log_msg({login, _, _}) -> {login, redacted};
 safe_log_msg({session, _}) -> {session, redacted};
 safe_log_msg({logout, _}) -> {logout, redacted};
+safe_log_msg({logout_other_sessions, Uid, _}) -> {logout_other_sessions, Uid, redacted};
+safe_log_msg({change_password, Uid, _, _, _}) -> {change_password, Uid, redacted};
+safe_log_msg({update_profile, Uid, _, _}) -> {update_profile, Uid, redacted};
+safe_log_msg({update_server, Uid, ServerId, _}) -> {update_server, Uid, ServerId, redacted};
 safe_log_msg({post_channel_message, Uid, ChannelId, _, ReplyTo}) ->
     {post_channel_message, Uid, ChannelId, redacted, ReplyTo};
 safe_log_msg({post_direct_message, Uid, Cid, _, ReplyTo}) ->
@@ -401,13 +417,19 @@ connect() ->
 configure_connection(Conn) ->
     StatementMs = clamp_timeout(pw_util:env_int("PLAINWIRE_DB_STATEMENT_TIMEOUT_MS", 15000)),
     TxMs = clamp_timeout(pw_util:env_int("PLAINWIRE_DB_IDLE_TX_TIMEOUT_MS", 15000)),
+    LockMs = clamp_lock_timeout(pw_util:env_int("PLAINWIRE_DB_LOCK_TIMEOUT_MS", 5000)),
     _ = epgsql:squery(Conn, "SET statement_timeout = " ++ integer_to_list(StatementMs)),
     _ = epgsql:squery(Conn, "SET idle_in_transaction_session_timeout = " ++ integer_to_list(TxMs)),
+    _ = epgsql:squery(Conn, "SET lock_timeout = " ++ integer_to_list(LockMs)),
     ok.
 
 clamp_timeout(N) when is_integer(N), N >= 1000, N =< 120000 -> N;
 clamp_timeout(N) when is_integer(N), N < 1000 -> 1000;
 clamp_timeout(_) -> 15000.
+
+clamp_lock_timeout(N) when is_integer(N), N >= 250, N =< 30000 -> N;
+clamp_lock_timeout(N) when is_integer(N), N < 250 -> 250;
+clamp_lock_timeout(_) -> 5000.
 
 connect_with_retry(Attempts, DelayMs) ->
     case connect() of
@@ -419,6 +441,21 @@ connect_with_retry(Attempts, DelayMs) ->
         Error -> Error
     end.
 
+maybe_upgrade_password_hash(Conn, Uid, Password, StoredHash) ->
+    case pw_util:password_needs_rehash(StoredHash) of
+        false -> ok;
+        true ->
+            Salt = pw_util:random_token(18),
+            Hash = pw_util:pbkdf2(Password, Salt),
+            %% Compare the old hash in the UPDATE so concurrent successful
+            %% logins cannot overwrite a newer password hash.
+            _ = exec(Conn,
+                "UPDATE users SET password_hash = $1, password_salt = $2, updated_at = $3 "
+                "WHERE id = $4 AND password_hash = $5",
+                [Hash, Salt, pw_util:now_ms(), Uid, StoredHash]),
+            ok
+    end.
+
 route({register, U0, D0, P0}, Conn) ->
     U = pw_util:normalize_username(U0),
     D0b = pw_util:clean_text(D0, 48),
@@ -426,18 +463,18 @@ route({register, U0, D0, P0}, Conn) ->
     D = case D0b of <<>> -> U; _ -> D0b end,
     case {byte_size(U) >= 3, byte_size(U) =< 24, byte_size(P) >= 10} of
         {true, true, true} ->
-            case one(Conn, "SELECT id FROM users WHERE username = $1", [U]) of
-                {ok, undefined} ->
-                    Salt = pw_util:random_token(18),
-                    Hash = pw_util:pbkdf2(P, Salt),
-                    Now = pw_util:now_ms(),
-                    {ok, Id} = insert_returning(Conn,
-                        "INSERT INTO users(username,display_name,password_hash,password_salt,bio,avatar_url,banner_url,status,theme,created_at,updated_at,last_seen) "
-                        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",
-                        [U, D, Hash, Salt, <<>>, <<>>, <<>>, <<>>, <<"light">>, Now, Now, Now]),
-                    {ok, make_session(Conn, Id)};
-                _ ->
-                    {error, username_taken}
+            Salt = pw_util:random_token(18),
+            Hash = pw_util:pbkdf2(P, Salt),
+            Now = pw_util:now_ms(),
+            %% Let PostgreSQL arbitrate the unique username. A SELECT followed by
+            %% INSERT races under simultaneous registrations for the same name.
+            case rows(Conn,
+                "INSERT INTO users(username,display_name,password_hash,password_salt,bio,avatar_url,banner_url,status,theme,created_at,updated_at,last_seen) "
+                "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (username) DO NOTHING RETURNING id",
+                [U, D, Hash, Salt, <<>>, <<>>, <<>>, <<>>, <<"system">>, Now, Now, Now]) of
+                {ok, [[Id]]} -> {ok, make_session(Conn, Id)};
+                {ok, []} -> {error, username_taken};
+                {error, Reason} -> erlang:error({sql_error, Reason})
             end;
         _ ->
             {error, invalid_registration}
@@ -448,13 +485,15 @@ route({login, U0, P0}, Conn) ->
     case one(Conn, "SELECT id, password_hash, password_salt FROM users WHERE username = $1", [U]) of
         {ok, [Id, Hash, Salt]} ->
             case pw_util:verify_password(P, Salt, Hash) of
-                true -> {ok, make_session(Conn, Id)};
+                true ->
+                    maybe_upgrade_password_hash(Conn, Id, P, Hash),
+                    {ok, make_session(Conn, Id)};
                 false -> {error, bad_login}
             end;
         _ ->
             _ = pw_util:pbkdf2(P, <<"plainwire-login-timing-pad">>),
             {error, bad_login}
-    end;
+end;
 route({prune_sessions, Now}, Conn) ->
     ok = exec(Conn,
         "DELETE FROM sessions WHERE token_hash IN "
@@ -496,12 +535,11 @@ route({sessions, Uid, Token}, Conn) ->
         "SELECT id, token_hash, created_at, last_seen, expires_at FROM sessions WHERE user_id = $1 AND expires_at > $2 ORDER BY last_seen DESC",
         [Uid, pw_util:now_ms()]),
     {ok, [#{id => Id, current => Hash =:= CurrentHash, created_at => Created, last_seen => Seen, expires_at => Expires}
-          || {Id, Hash, Created, Seen, Expires} <- Rows]};
+          || [Id, Hash, Created, Seen, Expires] <- Rows]};
 route({logout_other_sessions, Uid, Token}, Conn) ->
     CurrentHash = pw_util:sha256_hex(Token),
-    {ok, Existing} = rows(Conn, "SELECT token_hash FROM sessions WHERE user_id = $1 AND token_hash <> $2", [Uid, CurrentHash]),
-    ok = exec(Conn, "DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2", [Uid, CurrentHash]),
-    [ets:delete(?SESSION_CACHE, Hash) || {Hash} <- Existing],
+    {ok, Existing} = rows(Conn, "DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2 RETURNING token_hash", [Uid, CurrentHash]),
+    [ets:delete(?SESSION_CACHE, Hash) || [Hash] <- Existing],
     {ok, #{revoked => length(Existing)}};
 route({change_password, Uid, Token, Current0, New0}, Conn) ->
     Current = pw_util:clean_text(Current0, 256),
@@ -509,22 +547,27 @@ route({change_password, Uid, Token, Current0, New0}, Conn) ->
     case byte_size(New) >= 10 andalso byte_size(New) =< 256 of
         false -> {error, weak_password};
         true ->
-            case one(Conn, "SELECT password_hash, password_salt FROM users WHERE id = $1", [Uid]) of
-                {ok, {Hash, Salt}} ->
-                    case pw_util:verify_password(Current, Salt, Hash) of
-                        false -> {error, bad_password};
-                        true ->
-                            NewSalt = pw_util:random_token(18),
-                            NewHash = pw_util:pbkdf2(New, NewSalt),
-                            Now = pw_util:now_ms(),
-                            ok = exec(Conn, "UPDATE users SET password_hash = $1, password_salt = $2, updated_at = $3 WHERE id = $4", [NewHash, NewSalt, Now, Uid]),
-                            CurrentHash = pw_util:sha256_hex(Token),
-                            {ok, Existing} = rows(Conn, "SELECT token_hash FROM sessions WHERE user_id = $1 AND token_hash <> $2", [Uid, CurrentHash]),
-                            ok = exec(Conn, "DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2", [Uid, CurrentHash]),
-                            [ets:delete(?SESSION_CACHE, SessionHash) || {SessionHash} <- Existing],
-                            {ok, #{changed => true, revoked_sessions => length(Existing)}}
-                    end;
-                _ -> {error, not_found}
+            CurrentHash = pw_util:sha256_hex(Token),
+            case with_tx(Conn, fun() ->
+                case one(Conn, "SELECT password_hash, password_salt FROM users WHERE id = $1 FOR UPDATE", [Uid]) of
+                    {ok, [Hash, Salt]} ->
+                        case pw_util:verify_password(Current, Salt, Hash) of
+                            false -> {error, bad_password};
+                            true ->
+                                NewSalt = pw_util:random_token(18),
+                                NewHash = pw_util:pbkdf2(New, NewSalt),
+                                Now = pw_util:now_ms(),
+                                ok = exec(Conn, "UPDATE users SET password_hash = $1, password_salt = $2, updated_at = $3 WHERE id = $4", [NewHash, NewSalt, Now, Uid]),
+                                {ok, Existing} = rows(Conn, "DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2 RETURNING token_hash", [Uid, CurrentHash]),
+                                {ok, Existing}
+                        end;
+                    _ -> {error, not_found}
+                end
+            end) of
+                {ok, Existing} ->
+                    [ets:delete(?SESSION_CACHE, SessionHash) || [SessionHash] <- Existing],
+                    {ok, #{changed => true, revoked_sessions => length(Existing)}};
+                Error -> Error
             end
     end;
 route({me, Uid}, Conn) ->
@@ -541,7 +584,7 @@ route({update_profile, Uid, Display0, Patch}, Conn) ->
     Avatar = store_profile_image(maps:get(<<"avatar_url">>, Patch, <<>>), CurrentAvatar, Conn, Uid),
     Banner = store_profile_image(maps:get(<<"banner_url">>, Patch, <<>>), CurrentBanner, Conn, Uid),
     Status = pw_util:clean_text(maps:get(<<"status">>, Patch, <<>>), 100),
-    Theme = normalize_theme(maps:get(<<"theme">>, Patch, <<"light">>)),
+    Theme = normalize_theme(maps:get(<<"theme">>, Patch, <<"system">>)),
     Now = pw_util:now_ms(),
     ok = exec(Conn,
         "UPDATE users SET display_name = $1, bio = $2, avatar_url = $3, banner_url = $4, "
@@ -575,12 +618,17 @@ route({sync, Uid, Since0}, Conn) ->
           servers => Servers, friends => Friends}};
 route({users, Q0}, Conn) ->
     Q = pw_util:clean_text(Q0, 80),
-    Like = <<"%", Q/binary, "%">>,
-    {ok, Rows} = rows(Conn,
-        "SELECT id, username, display_name, bio, avatar_url, banner_url, status, theme, created_at, last_seen "
-        "FROM users WHERE username ILIKE $1 OR display_name ILIKE $2 "
-        "ORDER BY last_seen DESC LIMIT 40", [Like, Like]),
-    {ok, [user_map(R) || R <- Rows]};
+    case byte_size(Q) >= 2 of
+        false ->
+            {ok, []};
+        true ->
+            Like = <<"%", Q/binary, "%">>,
+            {ok, Rows} = rows(Conn,
+                "SELECT id, username, display_name, bio, avatar_url, banner_url, status, theme, created_at, last_seen "
+                "FROM users WHERE username ILIKE $1 OR display_name ILIKE $2 "
+                "ORDER BY last_seen DESC LIMIT 40", [Like, Like]),
+            {ok, [user_map(R) || R <- Rows]}
+    end;
 route({profile, Viewer, UserId0}, Conn) ->
     UserId = pw_util:int(UserId0),
     case route({me, UserId}, Conn) of
@@ -1547,13 +1595,33 @@ make_session(Conn, Uid) ->
     Csrf = pw_util:random_token(24),
     H = pw_util:sha256_hex(Token),
     Now = pw_util:now_ms(),
-    Expires = Now + 30 * 24 * 60 * 60 * 1000,
+    SessionDays = clamp_session_days(pw_util:env_int("PLAINWIRE_SESSION_DAYS", 30)),
+    Expires = Now + SessionDays * 24 * 60 * 60 * 1000,
+    %% Opportunistically prune this account before adding another session. This
+    %% keeps compromised credentials or automated logins from growing the table
+    %% forever while still allowing normal multi-device use.
+    _ = exec(Conn, "DELETE FROM sessions WHERE user_id = $1 AND expires_at <= $2", [Uid, Now]),
     ok = exec(Conn, "INSERT INTO sessions(token_hash, user_id, csrf, created_at, expires_at, last_seen) VALUES($1,$2,$3,$4,$5,$6)",
         [H, Uid, Csrf, Now, Expires, Now]),
+    MaxSessions = clamp_max_sessions(pw_util:env_int("PLAINWIRE_MAX_SESSIONS_PER_USER", 32)),
+    {ok, Evicted} = rows(Conn,
+        "DELETE FROM sessions WHERE token_hash IN ("
+        "SELECT token_hash FROM sessions WHERE user_id = $1 AND token_hash <> $2 "
+        "ORDER BY last_seen DESC, created_at DESC OFFSET $3) RETURNING token_hash",
+        [Uid, H, MaxSessions - 1]),
+    [ets:delete(?SESSION_CACHE, OldHash) || [OldHash] <- Evicted],
     {ok, User} = route({me, Uid}, Conn),
     Session = #{token => Token, csrf => Csrf, user => User, server_time => Now},
     ets:insert(?SESSION_CACHE, {H, maps:remove(token, Session), session_cache_expiry(Now, Expires)}),
     Session.
+
+clamp_session_days(N) when is_integer(N), N >= 1, N =< 365 -> N;
+clamp_session_days(N) when is_integer(N), N < 1 -> 1;
+clamp_session_days(_) -> 30.
+
+clamp_max_sessions(N) when is_integer(N), N >= 4, N =< 128 -> N;
+clamp_max_sessions(N) when is_integer(N), N < 4 -> 4;
+clamp_max_sessions(_) -> 32.
 
 migrate(Conn) ->
     ensure_schema_table(Conn),
@@ -1579,7 +1647,7 @@ migrations() -> [
     {1, [
         "CREATE TABLE IF NOT EXISTS users(id serial PRIMARY KEY, username text UNIQUE NOT NULL, display_name text NOT NULL, "
         "password_hash text NOT NULL, password_salt text NOT NULL, bio text NOT NULL DEFAULT '', avatar_url text NOT NULL DEFAULT '', "
-        "banner_url text NOT NULL DEFAULT '', status text NOT NULL DEFAULT '', theme text NOT NULL DEFAULT 'light', "
+        "banner_url text NOT NULL DEFAULT '', status text NOT NULL DEFAULT '', theme text NOT NULL DEFAULT 'system', "
         "created_at bigint NOT NULL, updated_at bigint NOT NULL, last_seen bigint NOT NULL)",
         "CREATE TABLE IF NOT EXISTS sessions(token_hash text PRIMARY KEY, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
         "csrf text NOT NULL, created_at bigint NOT NULL, expires_at bigint NOT NULL, last_seen bigint NOT NULL)",
@@ -1723,6 +1791,16 @@ migrations() -> [
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_id ON sessions(id)",
         "CREATE INDEX IF NOT EXISTS idx_sessions_user_last_seen ON sessions(user_id, last_seen DESC)",
         "CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at)"
+    ]},
+    {15, [
+        "ALTER TABLE users ALTER COLUMN theme SET DEFAULT 'system'"
+    ]},
+    {16, [
+        "CREATE INDEX IF NOT EXISTS idx_friendships_low_updated ON friendships(user_low, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_friendships_high_updated ON friendships(user_high, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_upload_refs_scope_lookup ON upload_refs(scope, scope_id, upload_id)",
+        "CREATE INDEX IF NOT EXISTS idx_direct_members_thread_request ON direct_members(thread_id, request_state, user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_server_members_server_role ON server_members(server_id, role, user_id)"
     ]}
 ].
 
@@ -2009,7 +2087,7 @@ normalize_max_uses(_) -> 0.
 normalize_theme(<<"light">>) -> <<"light">>;
 normalize_theme(<<"dark">>) -> <<"dark">>;
 normalize_theme(<<"system">>) -> <<"system">>;
-normalize_theme(_) -> <<"light">>.
+normalize_theme(_) -> <<"system">>.
 
 forum_position(Conn) ->
     case one(Conn, "SELECT COALESCE(max(position), 0) + 1 FROM forums", []) of

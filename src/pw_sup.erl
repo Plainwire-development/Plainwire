@@ -17,9 +17,9 @@ init([]) ->
     {ok, {{one_for_one, 20, 10}, Children}}.
 
 http_listener_spec() ->
-    Port = pw_util:env_int("PORT", 8080),
-    Acceptors = pw_util:env_int("PLAINWIRE_HTTP_ACCEPTORS", 100),
-    MaxConnections = pw_util:env_int("PLAINWIRE_HTTP_MAX_CONNECTIONS", 100000),
+    Port = env_range("PORT", 8080, 1, 65535),
+    Acceptors = env_range("PLAINWIRE_HTTP_ACCEPTORS", 100, 1, 1024),
+    MaxConnections = env_range("PLAINWIRE_HTTP_MAX_CONNECTIONS", 100000, 100, 500000),
     Dispatch = cowboy_router:compile([
         {'_', [
             {"/ws", pw_ws, []},
@@ -43,11 +43,15 @@ http_listener_spec() ->
     ProtocolOpts = #{
         connection_type => supervisor,
         env => #{dispatch => Dispatch},
-        idle_timeout => pw_util:env_int("PLAINWIRE_HTTP_IDLE_TIMEOUT_MS", 60000),
-        request_timeout => pw_util:env_int("PLAINWIRE_HTTP_REQUEST_TIMEOUT_MS", 30000),
-        max_keepalive => pw_util:env_int("PLAINWIRE_HTTP_MAX_KEEPALIVE", 1000),
-        stream_handlers => [cowboy_stream_h]
+        idle_timeout => env_range("PLAINWIRE_HTTP_IDLE_TIMEOUT_MS", 60000, 5000, 300000),
+        request_timeout => env_range("PLAINWIRE_HTTP_REQUEST_TIMEOUT_MS", 30000, 5000, 120000),
+        max_keepalive => env_range("PLAINWIRE_HTTP_MAX_KEEPALIVE", 1000, 1, 10000),
+        stream_handlers => [cowboy_compress_h, cowboy_stream_h]
     },
     logger:notice("[plainwire] listening port=~p acceptors=~p max_connections=~p schedulers=~p",
         [Port, Acceptors, MaxConnections, erlang:system_info(schedulers_online)]),
     ranch:child_spec(plainwire_http, ranch_tcp, TransportOpts, cowboy_clear, ProtocolOpts).
+
+env_range(Name, Default, Min, Max) ->
+    Value = pw_util:env_int(Name, Default),
+    erlang:min(Max, erlang:max(Min, Value)).

@@ -188,7 +188,12 @@ type alias ServerData =
 type alias Drafts = Dict String String
 
 type alias Model =
-    { appName : String, uploadMaxBytes : Int, me : Maybe User, csrf : String, serverTime : Int, timeZone : Time.Zone, absoluteTimestamps : Bool
+    { appName : String
+    , uploadMaxBytes : Int
+    , registrationEnabled : Bool
+    , instanceDescription : String
+    , clientVersion : String
+    , me : Maybe User, csrf : String, serverTime : Int, timeZone : Time.Zone, absoluteTimestamps : Bool
     , forums : List Forum, threads : List ForumThread
     , currentThread : Maybe ForumThread, replies : List Reply
     , servers : List Server, convs : List Conversation
@@ -203,13 +208,14 @@ type alias Model =
     , drafts : Drafts, wsConnected : Bool, pageVisible : Bool, isLeader : Bool
     , tabId : String, subs : Set String
     , voice : VoiceState, callUI : CallUI, activeCalls : Dict Int ActiveCall, callMode : CallMode
-    , soundEnabled : Bool, chatEnterSends : Bool, linkPreviewsEnabled : Bool, animatedMediaEnabled : Bool, compactMessages : Bool, mediaPreloadEnabled : Bool, replyTo : Maybe ReplyPreview
+    , soundEnabled : Bool, chatEnterSends : Bool, linkPreviewsEnabled : Bool, animatedMediaEnabled : Bool, compactMessages : Bool, mediaPreloadEnabled : Bool
+    , uiDensity : String, uiFontScale : String, uiAccent : String, uiCornerStyle : String, reduceMotion : Bool, replyTo : Maybe ReplyPreview
     , toast : Maybe String, modal : Maybe String
     , settingsTab : String, inputText : String
     , sidebarOpen : Bool, serversSheetOpen : Bool, ctxMenu : Maybe ContextMenu
     , threadReply : String, searchQuery : String
     , authMode : String, authUsername : String, authBusy : Bool
-    , authDisplayName : String, authPassword : String
+    , authDisplayName : String, authPassword : String, authPasswordConfirm : String, authPasswordVisible : Bool
     , profileDisplayName : String, profileBio : String
     , profileAvatarUrl : String, profileBannerUrl : String
     , profileAvatarPreviewUrl : String, profileBannerPreviewUrl : String
@@ -258,26 +264,23 @@ type alias CtxItem =
 
 type Msg
     = NoOp
-    | BootComplete
     | SetRoute String
     | AuthMode String
     | AuthUsername String
     | AuthDisplayName String
     | AuthPassword String
+    | AuthPasswordConfirm String
+    | ToggleAuthPasswordVisibility
     | DoAuth
     | ApiSuccess String String E.Value
     | ApiError String String String
     | WsEvent E.Value
     | BridgeEvent String E.Value
-    | Subscribe String
-    | UnsubscribeAll
-    | SendWs E.Value
     | Go String
     | ToggleSidebar
     | CloseSidebar
     | ToggleServersSheet
     | CloseServersSheet
-    | OpenDM Int
     | ShowUserPopup Int
     | CloseModal
     | Toast String
@@ -316,12 +319,10 @@ type Msg
     | ModalAccentColor String
     | SetModalChoice String String
     | SubmitModal
-    | CreateThread Int String String
     | JoinForum Int
     | LeaveForum Int
     | VoteThread Int Int
     | CreateServer String String
-    | CreateChannel Int String String
     | ProfileDisplayName String
     | ProfileBio String
     | ProfileAvatarUrl String
@@ -338,6 +339,7 @@ type Msg
     | SetAnimatedMediaEnabled Bool
     | SetCompactMessages Bool
     | SetMediaPreloadEnabled Bool
+    | UiPreferences E.Value
     | Logout
     | CloseCtx
     | CtxAction Int
@@ -356,7 +358,6 @@ type Msg
     | ClearNotifs
     | SearchQuery String
     | DoSearch
-    | UpdateDraft String String
     | AddPeopleModal Int
     | JoinCall Int
     | StartCall Int

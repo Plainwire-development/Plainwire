@@ -6,7 +6,7 @@
     voice_join/4, voice_leave/3, voice_state/5, voice_signal/5, voice_activity/5,
     call_ring/5, call_decline/2, call_cancel/3, call_accept/5,
     call_join/5, call_leave/3, call_state/5, call_signal/5,
-    room_capacity/0, share_capacity/0
+    room_capacity/0, share_capacity/0, status_update/3
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -18,7 +18,7 @@
 room_capacity() -> min(32, max(2, pw_util:env_int("PLAINWIRE_VOICE_MAX_PARTICIPANTS", 8))).
 share_capacity() -> min(8, max(1, pw_util:env_int("PLAINWIRE_VOICE_MAX_SHARES", 2))).
 
--record(st, {users = #{}, pids = #{}, subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}, watches = #{}, watchers = #{}}).
+-record(st, {users = #{}, pids = #{}, pid_statuses = #{}, subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}, watches = #{}, watchers = #{}}).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 connect(Uid, Pid) -> connect(Uid, Pid, <<"online">>).
@@ -29,7 +29,8 @@ unsubscribe_all(Pid) -> gen_server:cast(?MODULE, {unsubscribe_all, Pid}).
 watch_presence(Pid, Uids) -> gen_server:cast(?MODULE, {watch_presence, Pid, Uids}).
 notify_user(Uid, Event) -> gen_server:cast(?MODULE, {notify_user, Uid, Event}).
 broadcast(Key, Event) -> gen_server:cast(?MODULE, {broadcast, Key, Event}).
-status_update(Uid, Status) -> gen_server:cast(?MODULE, {status_update, Uid, Status}).
+status_update(Uid, Status) -> gen_server:cast(?MODULE, {status_update, Uid, undefined, Status}).
+status_update(Uid, Pid, Status) -> gen_server:cast(?MODULE, {status_update, Uid, Pid, Status}).
 %% join must answer before the browser starts grabbing media.
 voice_join(ChannelId, Uid, Pid, Profile) -> join_call({voice_join, ChannelId, Uid, Pid, Profile}).
 voice_leave(ChannelId, Uid, Pid) -> gen_server:cast(?MODULE, {voice_leave, ChannelId, Uid, Pid}).
@@ -109,27 +110,20 @@ handle_cast({connect, Uid, Pid, Status0}, St) ->
     monitor(process, Pid),
     Users = add_to_set(Uid, Pid, St#st.users),
     Pids = maps:put(Pid, Uid, St#st.pids),
-    WasOffline = not maps:is_key(Uid, St#st.online),
     Status = normalize_status(Status0),
-    Online = case WasOffline of
-        true ->
-            case visible_status(Status) of
-                true ->
-                    send_presence_watchers(St#st.watchers, Uid, #{type => presence_online, user_id => Uid, status => Status}, Pid),
-                    maps:put(Uid, Status, St#st.online);
-                false ->
-                    St#st.online
-            end;
-        false ->
-            St#st.online
-    end,
-    %% Seed the new socket with its own status immediately. This avoids the
-    %% hello/watch race that could make a signed-in user appear offline to
-    %% themselves until the next presence watch refresh.
-    Pid ! {hub_json, #{type => presence_state, online => [Uid], statuses => #{Uid => Status}}},
+    PidStatuses = maps:put(Pid, Status, St#st.pid_statuses),
+    Prev = maps:get(Uid, St#st.online, undefined),
+    Effective = effective_status(Uid, Users, PidStatuses),
+    Online = update_presence(Uid, Prev, Effective, St#st.watchers, Pid, St#st.online),
+    %% Seed the new socket with the account-wide effective status immediately.
+    %% A second tab being idle or invisible must not make an active tab look
+    %% offline to itself or to other presence watchers.
+    Visible = case visible_status(Effective) of true -> [Uid]; false -> [] end,
+    Statuses = case Visible of [] -> #{}; _ -> #{Uid => Effective} end,
+    Pid ! {hub_json, #{type => presence_state, online => Visible, statuses => Statuses}},
     send_active_calls(Pid, Uid, St#st.calls),
     log("client_connected", #{uid => Uid, sessions => length(maps:get(Uid, Users, [])), online_users => map_size(Online)}),
-    {noreply, St#st{users = Users, pids = Pids, online = Online}};
+    {noreply, St#st{users = Users, pids = Pids, pid_statuses = PidStatuses, online = Online}};
 handle_cast({disconnect, Pid}, St) ->
     log("client_disconnected", #{uid => maps:get(Pid, St#st.pids, undefined)}),
     {noreply, remove_pid(Pid, St)};
@@ -261,25 +255,25 @@ handle_cast({call_signal, ConversationId, From, FromPid, To, Signal}, St) ->
     Room = maps:get(Key, St#st.calls, #{}),
     relay_signal(Room, From, FromPid, To, #{type => call_signal, conversation_id => ConversationId, from_user_id => From, signal => Signal}),
     {noreply, St};
-handle_cast({status_update, Uid, Status0}, St) ->
+handle_cast({status_update, Uid, Pid0, Status0}, St) ->
     Status = normalize_status(Status0),
-    Online0 = St#st.online,
-    WasVisible = maps:is_key(Uid, Online0),
-    IsConnected = maps:is_key(Uid, St#st.users),
-    case {IsConnected, WasVisible, visible_status(Status)} of
-        {false, _, _} ->
+    Pid = case Pid0 of
+        P when is_pid(P) ->
+            case maps:get(P, St#st.pids, undefined) of
+                Uid -> P;
+                _ -> first_user_pid(Uid, St#st.users)
+            end;
+        _ -> first_user_pid(Uid, St#st.users)
+    end,
+    case Pid of
+        undefined ->
             {noreply, St};
-        {true, true, false} ->
-            send_presence_watchers(St#st.watchers, Uid, #{type => presence_offline, user_id => Uid, status => Status}, undefined),
-            {noreply, St#st{online = maps:remove(Uid, Online0)}};
-        {true, false, true} ->
-            send_presence_watchers(St#st.watchers, Uid, #{type => presence_online, user_id => Uid, status => Status}, undefined),
-            {noreply, St#st{online = maps:put(Uid, Status, Online0)}};
-        {true, true, true} ->
-            send_presence_watchers(St#st.watchers, Uid, #{type => presence_status, user_id => Uid, status => Status}, undefined),
-            {noreply, St#st{online = maps:put(Uid, Status, Online0)}};
-        {true, false, false} ->
-            {noreply, St}
+        _ ->
+            Prev = maps:get(Uid, St#st.online, undefined),
+            PidStatuses = maps:put(Pid, Status, St#st.pid_statuses),
+            Effective = effective_status(Uid, St#st.users, PidStatuses),
+            Online = update_presence(Uid, Prev, Effective, St#st.watchers, undefined, St#st.online),
+            {noreply, St#st{pid_statuses = PidStatuses, online = Online}}
     end;
 handle_cast(_, St) -> {noreply, St}.
 
@@ -543,20 +537,13 @@ remove_pid(Pid, St0) ->
     Uid = maps:get(Pid, St0#st.pids, undefined),
     Users = case Uid of undefined -> St0#st.users; _ -> update_set(Uid, Pid, St0#st.users) end,
     Pids = maps:remove(Pid, St0#st.pids),
+    PidStatuses = maps:remove(Pid, St0#st.pid_statuses),
     Online = case Uid of
         undefined -> St0#st.online;
         _ ->
-            case maps:find(Uid, Users) of
-                error -> % no longer any PIDs for this user
-                    case maps:find(Uid, St0#st.online) of
-                        {ok, PrevStatus} ->
-                            send_presence_watchers(St0#st.watchers, Uid, #{type => presence_offline, user_id => Uid, status => PrevStatus}, Pid);
-                        error ->
-                            ok
-                    end,
-                    maps:remove(Uid, St0#st.online);
-                _ -> St0#st.online
-            end
+            Prev = maps:get(Uid, St0#st.online, undefined),
+            Effective = effective_status(Uid, Users, PidStatuses),
+            update_presence(Uid, Prev, Effective, St0#st.watchers, Pid, St0#st.online)
     end,
     Subs = remove_from_all(Pid, St0#st.subs),
     Voices = detach_pid_from_rooms(Pid, St0#st.voices, voice, Users),
@@ -565,7 +552,50 @@ remove_pid(Pid, St0) ->
     OldWatches = maps:get(Pid, St0#st.watches, []),
     Watchers = lists:foldl(fun(WatchedUid, Acc) -> update_set(WatchedUid, Pid, Acc) end, St0#st.watchers, OldWatches),
     Watches = maps:remove(Pid, St0#st.watches),
-    St0#st{users = Users, pids = Pids, online = Online, subs = Subs, voices = Voices, calls = Calls, rings = Rings, watches = Watches, watchers = Watchers}.
+    St0#st{users = Users, pids = Pids, pid_statuses = PidStatuses, online = Online, subs = Subs, voices = Voices, calls = Calls, rings = Rings, watches = Watches, watchers = Watchers}.
+
+
+first_user_pid(Uid, Users) ->
+    case maps:get(Uid, Users, []) of
+        [Pid | _] when is_pid(Pid) -> Pid;
+        _ -> undefined
+    end.
+
+effective_status(Uid, Users, PidStatuses) ->
+    Statuses = [normalize_status(maps:get(Pid, PidStatuses, <<"online">>)) || Pid <- maps:get(Uid, Users, [])],
+    case Statuses of
+        [] -> <<"invisible">>;
+        _ ->
+            case lists:member(<<"busy">>, Statuses) of
+                true -> <<"busy">>;
+                false ->
+                    case lists:member(<<"online">>, Statuses) of
+                        true -> <<"online">>;
+                        false ->
+                            case lists:member(<<"away">>, Statuses) of
+                                true -> <<"away">>;
+                                false -> <<"invisible">>
+                            end
+                    end
+            end
+    end.
+
+update_presence(Uid, Prev, Effective, Watchers, Skip, Online0) ->
+    Visible = visible_status(Effective),
+    case {Prev, Visible} of
+        {undefined, false} -> Online0;
+        {undefined, true} ->
+            send_presence_watchers(Watchers, Uid, #{type => presence_online, user_id => Uid, status => Effective}, Skip),
+            maps:put(Uid, Effective, Online0);
+        {_, false} ->
+            send_presence_watchers(Watchers, Uid, #{type => presence_offline, user_id => Uid, status => Effective}, Skip),
+            maps:remove(Uid, Online0);
+        {Effective, true} ->
+            Online0;
+        {_, true} ->
+            send_presence_watchers(Watchers, Uid, #{type => presence_status, user_id => Uid, status => Effective}, Skip),
+            maps:put(Uid, Effective, Online0)
+    end.
 
 update_set(Key, Pid, Map) ->
     L = lists:delete(Pid, maps:get(Key, Map, [])),

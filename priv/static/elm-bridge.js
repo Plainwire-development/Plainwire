@@ -10,10 +10,12 @@
     return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
   };
   const clientConfig = Object.freeze({
+    version: typeof rawClientConfig.version === 'string' ? rawClientConfig.version.slice(0, 32) : '1.5.0',
+    assetVersion: typeof rawClientConfig.asset_version === 'string' ? rawClientConfig.asset_version.slice(0, 64) : '1.5.0',
     appName: typeof rawClientConfig.app_name === 'string' && rawClientConfig.app_name.trim()
       ? rawClientConfig.app_name.trim().slice(0, 48) : 'Plainwire',
     defaultTheme: ['light', 'dark', 'system'].includes(rawClientConfig.default_theme)
-      ? rawClientConfig.default_theme : 'light',
+      ? rawClientConfig.default_theme : 'system',
     registrationEnabled: rawClientConfig.registration_enabled !== false,
     instanceDescription: typeof rawClientConfig.instance_description === 'string'
       ? rawClientConfig.instance_description.trim().slice(0, 120) : '',
@@ -25,8 +27,19 @@
     maxImageDimension: finiteInt(rawClientConfig.max_image_dimension, 4096, 512, 8192)
   });
   document.title = clientConfig.appName;
-  if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false';
-  const app = window.Elm.Main.init({ node: root, flags: { appName: clientConfig.appName, uploadMaxBytes: clientConfig.uploadMaxBytes } });
+if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false';
+  document.documentElement.dataset.plainwireVersion = clientConfig.version;
+  const app = window.Elm.Main.init({
+    node: root,
+    flags: {
+      appName: clientConfig.appName,
+      uploadMaxBytes: clientConfig.uploadMaxBytes,
+      registrationEnabled: clientConfig.registrationEnabled,
+      instanceDescription: clientConfig.instanceDescription,
+      defaultTheme: clientConfig.defaultTheme,
+      version: clientConfig.version
+    }
+  });
   if (!clientConfig.registrationEnabled) {
     const hideRegistration = () => {
       const buttons = document.querySelectorAll('.auth-mode-switch .auth-mode-btn');
@@ -312,13 +325,119 @@
     if (!meta) return;
     const explicit = document.documentElement.dataset.theme;
     const isDark = explicit === 'dark' || (!explicit && window.matchMedia?.('(prefers-color-scheme: dark)').matches);
-    meta.setAttribute('content', isDark ? '#1e1f22' : '#e3e5e8');
+    meta.setAttribute('content', isDark ? '#121418' : '#eef0f3');
   };
   window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener?.('change', syncThemeMeta);
   syncThemeMeta();
 
+  // Mobile browsers resize the visual viewport when the software keyboard opens.
+  // Mark that state so the fixed bottom navigation gets out of the composer's way.
+  let mobileViewportBaseline = 0;
+  const syncMobileViewport = () => {
+    const viewport = window.visualViewport;
+    const visibleHeight = viewport?.height || window.innerHeight;
+    const compact = window.innerWidth <= 760;
+    if (!compact) {
+      mobileViewportBaseline = 0;
+    } else if (document.documentElement.dataset.mobileKeyboard !== 'open') {
+      mobileViewportBaseline = Math.max(mobileViewportBaseline, window.innerHeight, visibleHeight);
+    }
+    const focused = document.activeElement;
+    const editing = focused instanceof HTMLInputElement || focused instanceof HTMLTextAreaElement || focused instanceof HTMLSelectElement;
+    const keyboardHeight = Math.max(0, mobileViewportBaseline - visibleHeight);
+    const keyboardOpen = compact && editing && keyboardHeight > 140;
+    document.documentElement.dataset.mobileKeyboard = keyboardOpen ? 'open' : 'closed';
+    document.documentElement.style.setProperty('--pw-visual-height', `${Math.round(visibleHeight)}px`);
+  };
+  window.visualViewport?.addEventListener('resize', syncMobileViewport, { passive: true });
+  window.visualViewport?.addEventListener('scroll', syncMobileViewport, { passive: true });
+  document.addEventListener('focusin', syncMobileViewport, { passive: true });
+  document.addEventListener('focusout', () => requestAnimationFrame(syncMobileViewport), { passive: true });
+  window.addEventListener('orientationchange', () => {
+    mobileViewportBaseline = 0;
+    setTimeout(syncMobileViewport, 180);
+  }, { passive: true });
+  window.addEventListener('resize', syncMobileViewport, { passive: true });
+  window.addEventListener('pageshow', syncMobileViewport, { passive: true });
+  document.addEventListener('visibilitychange', syncMobileViewport, { passive: true });
+  syncMobileViewport();
+
+  const resizeComposer = (textarea) => {
+    if (!(textarea instanceof HTMLTextAreaElement) || textarea.id !== 'compose') return;
+    textarea.style.height = 'auto';
+    const visibleHeight = window.visualViewport?.height || window.innerHeight || 720;
+    const mobileLimit = Math.max(104, Math.min(176, Math.round(visibleHeight * 0.28)));
+    const limit = window.innerWidth <= 760 ? mobileLimit : 180;
+    textarea.style.height = `${Math.min(limit, Math.max(48, textarea.scrollHeight))}px`;
+    textarea.style.overflowY = textarea.scrollHeight > limit ? 'auto' : 'hidden';
+  };
+  document.addEventListener('input', (event) => resizeComposer(event.target), { passive: true });
+  document.addEventListener('focusin', (event) => {
+    resizeComposer(event.target);
+    if (window.innerWidth <= 760 && event.target instanceof HTMLElement) {
+      // Let the keyboard finish opening before asking the browser to reveal the
+      // focused control. This prevents iOS/Android from leaving a field under
+      // the browser chrome after viewport resize.
+      setTimeout(() => event.target?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }), 90);
+    }
+  }, { passive: true });
+
+  // Touch screens do not have hover. A tap on message whitespace reveals its
+  // actions without permanently filling every message with buttons.
+  let touchActionMessage = null;
+  const closeTouchMessageActions = () => {
+    if (touchActionMessage?.isConnected) delete touchActionMessage.dataset.touchActions;
+    touchActionMessage = null;
+  };
+  document.addEventListener('pointerup', (event) => {
+    if (event.pointerType !== 'touch') return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target || target.closest('a, button, input, textarea, select, video, audio')) return;
+    const message = target.closest('.msg');
+    if (!message) {
+      closeTouchMessageActions();
+      return;
+    }
+    if (touchActionMessage === message) {
+      closeTouchMessageActions();
+      return;
+    }
+    closeTouchMessageActions();
+    message.dataset.touchActions = 'open';
+    touchActionMessage = message;
+  }, { passive: true });
+  document.addEventListener('scroll', (event) => {
+    if (touchActionMessage && event.target instanceof Element && event.target.closest?.('.messages')) {
+      closeTouchMessageActions();
+    }
+  }, { capture: true, passive: true });
+
+  // Native-feeling drawer dismissal on phones. Only the close gesture is
+  // captured so we do not fight the browser's edge-swipe back navigation.
+  let drawerSwipeStart = null;
+  document.addEventListener('touchstart', (event) => {
+    if (window.innerWidth > 760 || event.touches.length !== 1) return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target?.closest('.side.open')) return;
+    const touch = event.touches[0];
+    drawerSwipeStart = { x: touch.clientX, y: touch.clientY };
+  }, { passive: true });
+  document.addEventListener('touchend', (event) => {
+    if (!drawerSwipeStart || event.changedTouches.length !== 1) {
+      drawerSwipeStart = null;
+      return;
+    }
+    const touch = event.changedTouches[0];
+    const dx = touch.clientX - drawerSwipeStart.x;
+    const dy = touch.clientY - drawerSwipeStart.y;
+    drawerSwipeStart = null;
+    if (dx < -56 && Math.abs(dx) > Math.abs(dy) * 1.25) {
+      document.querySelector('.drawer-overlay.open')?.click();
+    }
+  }, { passive: true });
+
   const accentPresets = Object.freeze({
-    blue: ['#5865f2', '#4752c4'],
+    blue: ['#5267d7', '#4458bc'],
     teal: ['#16877a', '#116b61'],
     green: ['#37854f', '#2c6b40'],
     amber: ['#9a6716', '#7d5312'],
@@ -337,6 +456,16 @@
     document.documentElement.dataset.cornerStyle = ['compact', 'rounded'].includes(cornerStyle) ? cornerStyle : 'default';
     document.documentElement.style.setProperty('--accent', accent[0]);
     document.documentElement.style.setProperty('--accent2', accent[1]);
+    send(app.ports.bridgeReceive, {
+      tag: 'ui_preferences',
+      data: {
+        density: density === 'compact' ? 'compact' : 'comfortable',
+        reduce_motion: reduceMotion,
+        font_scale: ['small', 'large'].includes(fontScale) ? fontScale : 'default',
+        corner_style: ['compact', 'rounded'].includes(cornerStyle) ? cornerStyle : 'default',
+        accent: accentPresets[accentName] ? accentName : 'blue'
+      }
+    });
   };
   applyUiPreferences();
 
@@ -677,9 +806,14 @@
     }
   };
 
+  const debugApiBody = (path, body) => {
+    if (path === '/login' || path === '/register' || path === '/password') return '[redacted]';
+    return body;
+  };
+
   const performApi = async ({ method = 'GET', path, body }) => {
     const requestStarted = performance.now();
-    debug('API', 'request', { method, path, body });
+    debug('API', 'request', { method, path, body: debugApiBody(path, body) });
     const headers = { accept: 'application/json', 'x-csrf-token': csrf };
     const options = { method, headers };
     if (body !== null && body !== undefined) {
@@ -1474,6 +1608,7 @@
     }
   };
   const floatPositions = loadFloatStates();
+  const isCompactFloatLayout = () => window.matchMedia?.('(max-width: 760px)').matches === true;
   let floatSaveTimer = null;
   const saveFloatStates = () => {
     if (floatSaveTimer) clearTimeout(floatSaveTimer);
@@ -1503,16 +1638,19 @@
     wrapper.id = 'pw-float-' + id;
     wrapper.className = 'pw-float';
     wrapper.style.zIndex = String(floatZIndex++);
-    wrapper.style.width = 'min(560px, calc(100vw - 24px))';
-    wrapper.style.height = 'min(360px, calc(100dvh - 24px))';
+    const compactAtCreation = isCompactFloatLayout();
+    if (!compactAtCreation) {
+      wrapper.style.width = 'min(560px, calc(100vw - 24px))';
+      wrapper.style.height = 'min(360px, calc(100dvh - 24px))';
+    }
 
-    const saved = floatPositions[id];
+    const saved = compactAtCreation ? null : floatPositions[id];
     if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
       if (Number.isFinite(saved.w)) wrapper.style.width = Math.max(220, saved.w) + 'px';
       if (Number.isFinite(saved.h)) wrapper.style.height = Math.max(160, saved.h) + 'px';
       wrapper.style.left = saved.x + 'px';
       wrapper.style.top = saved.y + 'px';
-    } else if (opts.right != null && opts.bottom != null) {
+    } else if (!compactAtCreation && opts.right != null && opts.bottom != null) {
       wrapper.style.right = opts.right + 'px';
       wrapper.style.bottom = opts.bottom + 'px';
     }
@@ -1520,35 +1658,45 @@
     const bar = document.createElement('div');
     bar.className = 'pw-float-bar';
 
+    const titleWrap = document.createElement('div');
+    titleWrap.className = 'pw-float-title-wrap';
+
     const title = document.createElement('span');
     title.className = 'pw-float-title';
     title.textContent = titleText;
 
-    const btnFit = document.createElement('button');
-    btnFit.type = 'button';
-    btnFit.className = 'pw-float-btn pw-float-fit';
-    btnFit.title = 'Fit to screen';
-    btnFit.setAttribute('aria-label', 'Fit screen share window to screen');
-    btnFit.textContent = '▣';
+    const state = document.createElement('span');
+    state.className = 'pw-float-state';
+    state.innerHTML = '<span class="pw-float-state-dot" aria-hidden="true"></span><span>Live</span>';
 
-    const btnFs = document.createElement('button');
-    btnFs.type = 'button';
-    btnFs.className = 'pw-float-btn pw-float-fs';
-    btnFs.title = 'Fullscreen';
-    btnFs.setAttribute('aria-label', 'Fullscreen screen share');
-    btnFs.textContent = '⛶';
+    titleWrap.appendChild(title);
+    titleWrap.appendChild(state);
 
-    const btnClose = document.createElement('button');
-    btnClose.type = 'button';
-    btnClose.className = 'pw-float-btn pw-float-close';
-    btnClose.title = 'Close';
-    btnClose.setAttribute('aria-label', 'Close screen share window');
-    btnClose.textContent = '×';
+    const controls = document.createElement('div');
+    controls.className = 'pw-float-controls';
 
-    bar.appendChild(title);
-    bar.appendChild(btnFit);
-    bar.appendChild(btnFs);
-    bar.appendChild(btnClose);
+    const makeWindowButton = (className, titleText, iconClass) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'pw-float-btn ' + className;
+      button.title = titleText;
+      button.setAttribute('aria-label', titleText);
+      const icon = document.createElement('span');
+      icon.className = 'pw-float-window-icon ' + iconClass;
+      icon.setAttribute('aria-hidden', 'true');
+      button.appendChild(icon);
+      return button;
+    };
+
+    const btnFit = makeWindowButton('pw-float-fit', 'Center and fit window', 'fit');
+    const btnFs = makeWindowButton('pw-float-fs', 'Fullscreen screen share', 'fullscreen');
+    const btnClose = makeWindowButton('pw-float-close', 'Close screen share', 'close');
+
+    controls.appendChild(btnFit);
+    controls.appendChild(btnFs);
+    controls.appendChild(btnClose);
+    bar.appendChild(titleWrap);
+    bar.appendChild(controls);
 
     const video = document.createElement('video');
     video.autoplay = true;
@@ -1561,10 +1709,16 @@
     document.body.appendChild(wrapper);
 
     const bringForward = () => { wrapper.style.zIndex = String(++floatZIndex); };
+    let fitRestore = null;
+    let fitted = false;
     wrapper.addEventListener('pointerdown', bringForward);
 
     btnFs.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (video.requestFullscreen) video.requestFullscreen().catch(() => {});
+      else if (video.webkitRequestFullscreen) video.webkitRequestFullscreen();
+    });
+    video.addEventListener('dblclick', () => {
       if (video.requestFullscreen) video.requestFullscreen().catch(() => {});
       else if (video.webkitRequestFullscreen) video.webkitRequestFullscreen();
     });
@@ -1575,14 +1729,43 @@
     });
 
     const fitToScreen = () => {
-      const w = Math.min(960, Math.max(300, window.innerWidth - 48));
-      const h = Math.min(620, Math.max(220, window.innerHeight - 120));
-      wrapper.style.width = w + 'px';
-      wrapper.style.height = h + 'px';
-      wrapper.style.left = Math.max(8, Math.round((window.innerWidth - w) / 2)) + 'px';
-      wrapper.style.top = Math.max(8, Math.round((window.innerHeight - h) / 2)) + 'px';
-      wrapper.style.right = 'auto';
-      wrapper.style.bottom = 'auto';
+      if (isCompactFloatLayout()) {
+        wrapper.style.removeProperty('left');
+        wrapper.style.removeProperty('top');
+        wrapper.style.removeProperty('right');
+        wrapper.style.removeProperty('bottom');
+        wrapper.style.removeProperty('width');
+        wrapper.style.removeProperty('height');
+        return;
+      }
+
+      if (fitted && fitRestore) {
+        wrapper.style.width = Math.max(220, fitRestore.w) + 'px';
+        wrapper.style.height = Math.max(160, fitRestore.h) + 'px';
+        wrapper.style.left = fitRestore.x + 'px';
+        wrapper.style.top = fitRestore.y + 'px';
+        wrapper.style.right = 'auto';
+        wrapper.style.bottom = 'auto';
+        fitted = false;
+        btnFit.classList.remove('active');
+        btnFit.title = 'Center and fit window';
+        btnFit.setAttribute('aria-label', 'Center and fit screen share window');
+      } else {
+        const current = wrapper.getBoundingClientRect();
+        fitRestore = { x: current.left, y: current.top, w: current.width, h: current.height };
+        const w = Math.min(960, Math.max(300, window.innerWidth - 48));
+        const h = Math.min(620, Math.max(220, window.innerHeight - 120));
+        wrapper.style.width = w + 'px';
+        wrapper.style.height = h + 'px';
+        wrapper.style.left = Math.max(8, Math.round((window.innerWidth - w) / 2)) + 'px';
+        wrapper.style.top = Math.max(8, Math.round((window.innerHeight - h) / 2)) + 'px';
+        wrapper.style.right = 'auto';
+        wrapper.style.bottom = 'auto';
+        fitted = true;
+        btnFit.classList.add('active');
+        btnFit.title = 'Restore window size';
+        btnFit.setAttribute('aria-label', 'Restore screen share window size');
+      }
       floatPositions[id] = clampFloatWindow(wrapper);
       saveFloatStates();
     };
@@ -1596,7 +1779,11 @@
     let dragOffX = 0;
     let dragOffY = 0;
     bar.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0 || e.target.closest('.pw-float-btn')) return;
+      if (isCompactFloatLayout() || e.button !== 0 || e.target.closest('.pw-float-btn')) return;
+      fitted = false;
+      btnFit.classList.remove('active');
+      btnFit.title = 'Center and fit window';
+      btnFit.setAttribute('aria-label', 'Center and fit screen share window');
       dragging = true;
       dragPointer = e.pointerId;
       const rect = wrapper.getBoundingClientRect();
@@ -1636,7 +1823,7 @@
     let resizeObserved = false;
     if ('ResizeObserver' in window) {
       const observer = new ResizeObserver(() => {
-        if (wrapper.style.display === 'none') return;
+        if (wrapper.style.display === 'none' || isCompactFloatLayout()) return;
         const rect = wrapper.getBoundingClientRect();
         const w = Math.min(Math.max(220, rect.width), Math.max(220, window.innerWidth - 16));
         const h = Math.min(Math.max(160, rect.height), Math.max(160, window.innerHeight - 16));
@@ -1656,17 +1843,25 @@
     }
 
     const onViewportResize = () => {
-      if (wrapper.style.display !== 'none') {
-        floatPositions[id] = clampFloatWindow(wrapper);
-        saveFloatStates();
+      if (wrapper.style.display === 'none') return;
+      if (isCompactFloatLayout()) {
+        wrapper.style.removeProperty('left');
+        wrapper.style.removeProperty('top');
+        wrapper.style.removeProperty('right');
+        wrapper.style.removeProperty('bottom');
+        wrapper.style.removeProperty('width');
+        wrapper.style.removeProperty('height');
+        return;
       }
+      floatPositions[id] = clampFloatWindow(wrapper);
+      saveFloatStates();
     };
     window.addEventListener('resize', onViewportResize, { passive: true });
 
     // Resolve right/bottom positioning to pixels after first layout so later
     // dragging and persistence never fight with opposing CSS anchors.
     requestAnimationFrame(() => {
-      if (!saved) {
+      if (!saved && !isCompactFloatLayout()) {
         const rect = wrapper.getBoundingClientRect();
         if (rect.width > 0 && rect.height > 0) {
           wrapper.style.left = rect.left + 'px';
@@ -1688,7 +1883,7 @@
 
   // ---- Stage video for screenshare viewers ----
   const showStageVideo = (uid, stream) => {
-    const { wrapper, video } = ensureFloatWindow('stage-' + uid, 'Screen Share', 'var(--accent,#5865f2)', {
+    const { wrapper, video } = ensureFloatWindow('stage-' + uid, 'Screen share', 'var(--accent,#5865f2)', {
       right: 16, bottom: 80,
       onClose: () => { wrapper.style.display = 'none'; video.srcObject = null; }
     });
@@ -1716,7 +1911,7 @@
 
   // ---- Local screen share preview ----
   const showLocalScreenPreview = (stream) => {
-    const { wrapper, video } = ensureFloatWindow('local-preview', 'Your Screen Share', 'var(--ok,#23a55a)', {
+    const { wrapper, video } = ensureFloatWindow('local-preview', 'Your screen', 'var(--ok,#23a55a)', {
       right: 16, bottom: 80,
       onClose: () => { stopScreenShare(); }
     });
@@ -1944,6 +2139,7 @@
       if (pc._connectTimer) clearTimeout(pc._connectTimer);
       if (pc._disconnectTimer) clearTimeout(pc._disconnectTimer);
       if (pc._remoteMuteTimer) clearTimeout(pc._remoteMuteTimer);
+      if (pc._mediaTimer) clearTimeout(pc._mediaTimer);
       pc.close();
     }
     peers.delete(uid);
@@ -2077,12 +2273,12 @@
     reportPeerFailure(uid, pc, false);
     reportPeerConnection(uid, pc, false);
     debug('RTC', 'peer_recovery_scheduled', {
-      peer_user_id: uid, reason, attempt: pc._reconnectAttempts,
+      peer_user_id: uid, reason, attempt: pc._reconnectAttempts, force,
       offerer: pc._offerer, signaling: pc.signalingState
     });
     pc._restartTimer = setTimeout(async () => {
       pc._restartTimer = null;
-      if (!room || pc._roomEpoch !== room.epoch || pc.signalingState === 'closed' || pc.connectionState === 'connected') return;
+      if (!room || pc._roomEpoch !== room.epoch || pc.signalingState === 'closed' || (pc.connectionState === 'connected' && !force)) return;
       try {
         if (!pc._offerer) {
           // answerer asks; offerer restarts.
@@ -2152,6 +2348,8 @@
     pc._negotiated = false;
     pc._reconnectAttempts = 0;
     pc._failureReported = false;
+    pc._mediaConnected = false;
+    pc._remoteAudioSeen = false;
     // fixed transceivers make screen sharing a track swap, not a glare party.
     const audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
     const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
@@ -2188,19 +2386,23 @@
     pc.ontrack = (ev) => {
       debug('RTC', 'remote_track', { peer_user_id: uid, kind: ev.track.kind, muted: ev.track.muted, ready_state: ev.track.readyState, streams: ev.streams?.length || 0 });
       if (ev.track.kind === 'audio') {
+        pc._remoteAudioSeen = true;
         const audio = remoteAudio(uid);
         const markMediaConnected = () => {
           const healthy = ev.track.readyState === 'live' && ev.track.muted !== true;
           pc._mediaConnected = healthy;
           if (healthy) {
             if (pc._remoteMuteTimer) clearTimeout(pc._remoteMuteTimer);
+            if (pc._mediaTimer) clearTimeout(pc._mediaTimer);
             pc._remoteMuteTimer = null;
+            pc._mediaTimer = null;
             pc._publishConnectionState?.();
             playRemoteAudio(audio);
           }
         };
         const scheduleMutedRecovery = () => {
           pc._mediaConnected = false;
+          pc._publishConnectionState?.();
           if (pc._remoteMuteTimer) clearTimeout(pc._remoteMuteTimer);
           pc._remoteMuteTimer = setTimeout(() => {
             pc._remoteMuteTimer = null;
@@ -2215,7 +2417,7 @@
         ev.track.addEventListener?.('mute', scheduleMutedRecovery);
         ev.track.addEventListener?.('ended', () => {
           pc._mediaConnected = false;
-          reportPeerConnection(uid, pc, false);
+          pc._publishConnectionState?.(true);
           restartPeerIce(uid, pc, 'remote_audio_ended', { force: true });
         });
         audio.srcObject = new MediaStream([ev.track]);
@@ -2241,7 +2443,10 @@
       }
     };
     const publishConnectionState = (force = false) => {
-      const connected = pc._mediaConnected === true || pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
+      const transportConnected = pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
+      // A WebRTC transport can be connected while the remote audio path is dead.
+      // Only expose a healthy call once a live remote audio track has actually arrived.
+      const connected = transportConnected && pc._mediaConnected === true;
       if (!force && pc._reportedConnected === connected) return;
       const firstConnection = connected && pc._reportedConnected !== true;
       pc._reportedConnected = connected;
@@ -2261,10 +2466,26 @@
       }
     };
     pc._publishConnectionState = publishConnectionState;
+    const armMediaWatchdog = () => {
+      if (pc._mediaConnected === true || pc._mediaTimer || pc.signalingState === 'closed') return;
+      pc._mediaTimer = setTimeout(() => {
+        pc._mediaTimer = null;
+        if (!room || pc._roomEpoch !== room.epoch || pc.signalingState === 'closed' || pc._mediaConnected === true) return;
+        debug('RTC', 'remote_audio_missing', {
+          peer_user_id: uid,
+          remote_audio_seen: pc._remoteAudioSeen === true,
+          connection: pc.connectionState,
+          ice: pc.iceConnectionState
+        }, 'warn');
+        restartPeerIce(uid, pc, 'remote_audio_missing', { force: true });
+        if ((pc._reconnectAttempts || 0) < RTC_MAX_RECOVERY_ATTEMPTS) armMediaWatchdog();
+      }, 10000);
+    };
     pc.onconnectionstatechange = () => {
       debug('RTC', 'connection_state', { peer_user_id: uid, state: pc.connectionState });
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') pc._mediaConnected = false;
       publishConnectionState();
+      if (pc.connectionState === 'connected' && pc._mediaConnected !== true) armMediaWatchdog();
       if (pc.connectionState === 'disconnected') {
         if (pc._disconnectTimer) clearTimeout(pc._disconnectTimer);
         pc._disconnectTimer = setTimeout(() => {
@@ -2280,6 +2501,7 @@
       debug('RTC', 'ice_connection_state', { peer_user_id: uid, state: pc.iceConnectionState });
       if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') pc._mediaConnected = false;
       publishConnectionState();
+      if ((pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') && pc._mediaConnected !== true) armMediaWatchdog();
       if (pc.iceConnectionState === 'failed') restartPeerIce(uid, pc, 'ice_failed');
     };
     pc.onicegatheringstatechange = () => debug('RTC', 'ice_gathering_state', { peer_user_id: uid, state: pc.iceGatheringState });
@@ -2289,7 +2511,8 @@
     publishConnectionState(true);
     const checkConnection = () => {
       pc._connectTimer = setTimeout(() => {
-        if (pc.connectionState === 'connected' || pc.connectionState === 'closed') return;
+        if (pc.connectionState === 'closed' || pc._mediaConnected === true) return;
+        const transportConnected = pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
         debug('RTC', 'check_connection', {
           peer_user_id: uid,
           connection: pc.connectionState,
@@ -2302,11 +2525,12 @@
           markPeerFailed(uid, pc);
           return;
         }
-        restartPeerIce(uid, pc, 'connection_timeout');
+        restartPeerIce(uid, pc, transportConnected ? 'remote_audio_timeout' : 'connection_timeout', { force: transportConnected });
         checkConnection();
       }, RTC_CONNECT_CHECK_MS);
     };
     checkConnection();
+    armMediaWatchdog();
     // nudge the offerer, don't invent a second offer.
     if (!offerer) {
       setTimeout(() => {
@@ -2561,53 +2785,159 @@
   };
 
   const enableDrag = () => {
+    const key = 'plainwire_call_window_v2';
+    let saved = null;
+    try {
+      const parsed = JSON.parse(localStorage.getItem(key) || 'null');
+      if (parsed && Number.isFinite(parsed.x) && Number.isFinite(parsed.y)) saved = parsed;
+    } catch (_) {}
+
     let drag = null;
-    let position = null;
     let suppressClick = false;
-    const selector = '.call-bar.compact, .call-overlay.expanded, .call-popup';
-    document.addEventListener('pointerdown', (ev) => {
-      if (window.matchMedia('(max-width: 700px)').matches || ev.button !== 0) return;
-      const card = ev.target.closest?.(selector);
-      if (!card || ev.target.closest('button, input, select, a')) return;
-      if (position) {
-        card.style.position = 'fixed';
-        card.style.left = position.x + 'px';
-        card.style.top = position.y + 'px';
-        card.style.right = 'auto';
-        card.style.bottom = 'auto';
+    let raf = 0;
+    const desktop = () => window.matchMedia?.('(min-width: 701px)').matches === true;
+
+    const layer = () => document.querySelector('.call-layer');
+    const clamp = (node, x, y) => {
+      const rect = node.getBoundingClientRect();
+      const margin = 10;
+      const maxX = Math.max(margin, window.innerWidth - rect.width - margin);
+      const maxY = Math.max(margin, window.innerHeight - rect.height - margin);
+      return {
+        x: Math.max(margin, Math.min(maxX, x)),
+        y: Math.max(margin, Math.min(maxY, y))
+      };
+    };
+
+    const setLayerPosition = (node, pos, persist = false) => {
+      if (!node || !desktop() || !pos) return;
+      const next = clamp(node, pos.x, pos.y);
+      node.style.left = next.x + 'px';
+      node.style.top = next.y + 'px';
+      node.style.right = 'auto';
+      node.style.bottom = 'auto';
+      node.classList.add('detached');
+      saved = next;
+      if (persist) {
+        try { localStorage.setItem(key, JSON.stringify(next)); } catch (_) {}
       }
-      const rect = card.getBoundingClientRect();
-      drag = { card, pointerId: ev.pointerId, startX: ev.clientX, startY: ev.clientY,
-        dx: ev.clientX - rect.left, dy: ev.clientY - rect.top, moved: false };
-      card.setPointerCapture?.(ev.pointerId);
-    });
-    document.addEventListener('pointermove', (ev) => {
-      if (!drag || drag.pointerId !== ev.pointerId) return;
-      if (!drag.moved && Math.hypot(ev.clientX - drag.startX, ev.clientY - drag.startY) < 5) return;
-      drag.moved = true;
-      drag.card.style.position = 'fixed';
-      const x = Math.max(8, Math.min(window.innerWidth - drag.card.offsetWidth - 8, ev.clientX - drag.dx));
-      const y = Math.max(8, Math.min(window.innerHeight - drag.card.offsetHeight - 8, ev.clientY - drag.dy));
-      drag.card.style.left = x + 'px';
-      drag.card.style.top = y + 'px';
-      drag.card.style.right = 'auto';
-      drag.card.style.bottom = 'auto';
-      drag.card.classList.add('dragging');
-      position = { x, y };
+    };
+
+    const resetLayerPosition = (node, persist = true) => {
+      if (!node) return;
+      node.style.removeProperty('left');
+      node.style.removeProperty('top');
+      node.style.removeProperty('right');
+      node.style.removeProperty('bottom');
+      node.style.removeProperty('transform');
+      node.classList.remove('detached', 'dragging');
+      saved = null;
+      if (persist) {
+        try { localStorage.removeItem(key); } catch (_) {}
+      }
+    };
+
+    const applySaved = () => {
+      const node = layer();
+      if (!node) return;
+      if (!desktop()) {
+        resetLayerPosition(node, false);
+        return;
+      }
+      if (saved) requestAnimationFrame(() => setLayerPosition(node, saved, false));
+    };
+
+    document.addEventListener('pointerdown', (ev) => {
+      if (!desktop() || ev.button !== 0) return;
+      const handle = ev.target.closest?.('[data-call-drag-handle="true"]');
+      if (!handle || ev.target.closest('button, input, select, a')) return;
+      const node = handle.closest('.call-layer') || layer();
+      if (!node) return;
+      const rect = node.getBoundingClientRect();
+      node.style.left = rect.left + 'px';
+      node.style.top = rect.top + 'px';
+      node.style.right = 'auto';
+      node.style.bottom = 'auto';
+      node.classList.add('detached');
+      drag = {
+        node,
+        pointerId: ev.pointerId,
+        startX: ev.clientX,
+        startY: ev.clientY,
+        originX: rect.left,
+        originY: rect.top,
+        nextX: rect.left,
+        nextY: rect.top,
+        moved: false
+      };
+      handle.setPointerCapture?.(ev.pointerId);
       ev.preventDefault();
     });
-    document.addEventListener('pointerup', (ev) => {
+
+    document.addEventListener('pointermove', (ev) => {
       if (!drag || drag.pointerId !== ev.pointerId) return;
-      suppressClick = drag.moved;
-      drag.card.classList.remove('dragging');
+      const dx = ev.clientX - drag.startX;
+      const dy = ev.clientY - drag.startY;
+      if (!drag.moved && Math.hypot(dx, dy) < 4) return;
+      drag.moved = true;
+      const next = clamp(drag.node, drag.originX + dx, drag.originY + dy);
+      drag.nextX = next.x;
+      drag.nextY = next.y;
+      if (!raf) {
+        raf = requestAnimationFrame(() => {
+          raf = 0;
+          if (!drag) return;
+          drag.node.style.transform = `translate3d(${drag.nextX - drag.originX}px, ${drag.nextY - drag.originY}px, 0)`;
+          drag.node.classList.add('dragging');
+        });
+      }
+      ev.preventDefault();
+    }, { passive: false });
+
+    const finish = (ev) => {
+      if (!drag || drag.pointerId !== ev.pointerId) return;
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      const finished = drag;
       drag = null;
+      finished.node.style.removeProperty('transform');
+      finished.node.classList.remove('dragging');
+      if (finished.moved) {
+        suppressClick = true;
+        setLayerPosition(finished.node, { x: finished.nextX, y: finished.nextY }, true);
+      }
+    };
+    document.addEventListener('pointerup', finish);
+    document.addEventListener('pointercancel', finish);
+
+    document.addEventListener('dblclick', (ev) => {
+      if (!desktop()) return;
+      const handle = ev.target.closest?.('[data-call-drag-handle="true"]');
+      if (!handle || ev.target.closest('button, input, select, a')) return;
+      const node = handle.closest('.call-layer') || layer();
+      resetLayerPosition(node, true);
+      ev.preventDefault();
     });
+
     document.addEventListener('click', (ev) => {
-      if (!suppressClick || !ev.target.closest?.(selector)) return;
+      if (!suppressClick || !ev.target.closest?.('.call-layer')) return;
       suppressClick = false;
       ev.preventDefault();
       ev.stopImmediatePropagation();
     }, true);
+
+    window.addEventListener('resize', () => {
+      const node = layer();
+      if (!node) return;
+      if (!desktop()) {
+        resetLayerPosition(node, false);
+      } else if (saved) {
+        setLayerPosition(node, saved, true);
+      }
+    }, { passive: true });
+
+    const observer = new MutationObserver(() => applySaved());
+    observer.observe(document.body, { childList: true, subtree: true });
+    applySaved();
   };
 
   recv(app.ports.apiSend, api);
@@ -2844,6 +3174,122 @@
     } catch (_) {
       content.textContent = 'Could not load active sessions.';
     }
+  };
+
+  const openDiagnosticsDialog = async () => {
+    const content = document.createElement('div');
+    content.className = 'diagnostics-panel';
+    const status = document.createElement('div');
+    status.className = 'account-dialog-status';
+    const list = document.createElement('div');
+    list.className = 'diagnostics-list';
+    content.append(list, status);
+
+    let reportText = '';
+    const socketName = () => ws ? ['Connecting', 'Open', 'Closing', 'Closed'][ws.readyState] || 'Unknown' : 'Not started';
+    const valueRow = (labelText, valueText, tone = '') => {
+      const row = document.createElement('div');
+      row.className = 'diagnostics-row';
+      const label = document.createElement('span');
+      label.textContent = labelText;
+      const value = document.createElement('b');
+      value.textContent = valueText;
+      if (tone) value.className = `diagnostics-value ${tone}`;
+      row.append(label, value);
+      return row;
+    };
+
+    const refresh = async () => {
+      status.textContent = '';
+      list.textContent = '';
+      list.append(
+        valueRow('Plainwire', clientConfig.version || 'unknown'),
+        valueRow('Browser network', navigator.onLine ? 'Online' : 'Offline', navigator.onLine ? 'good' : 'bad'),
+        valueRow('WebSocket', socketName(), ws?.readyState === WebSocket.OPEN ? 'good' : 'warn'),
+        valueRow('Secure context', window.isSecureContext ? 'Yes' : 'No', window.isSecureContext ? 'good' : 'bad'),
+        valueRow('WebRTC', typeof RTCPeerConnection === 'function' ? 'Supported' : 'Unavailable', typeof RTCPeerConnection === 'function' ? 'good' : 'bad')
+      );
+
+      let healthText = 'Unavailable';
+      let databaseText = 'Unknown';
+      let serverVersion = 'Unavailable';
+      let serverAssetVersion = 'Unavailable';
+      try {
+        const [health, version] = await Promise.all([
+          accountApi('GET', '/health'),
+          accountApi('GET', '/version')
+        ]);
+        healthText = health?.app === 'ok' ? 'Healthy' : 'Degraded';
+        databaseText = health?.database === 'ok' ? 'Healthy' : String(health?.database || 'Unknown');
+        serverVersion = String(version?.version || 'Unknown');
+        serverAssetVersion = String(version?.asset_version || 'Unknown');
+      } catch (_) {
+        healthText = 'Unavailable';
+      }
+      const versionMatches = serverVersion === clientConfig.version;
+      const assetsMatch = serverAssetVersion === clientConfig.assetVersion;
+      list.append(
+        valueRow('Backend', healthText, healthText === 'Healthy' ? 'good' : 'bad'),
+        valueRow('Database', databaseText, databaseText === 'Healthy' ? 'good' : 'warn'),
+        valueRow('Server version', serverVersion, versionMatches ? 'good' : 'warn'),
+        valueRow('Asset fingerprint', assetsMatch ? 'Matched' : 'Mismatch', assetsMatch ? 'good' : 'warn')
+      );
+
+      let turnReady = false;
+      let iceCount = 0;
+      try {
+        const config = await loadRtcConfig();
+        const servers = Array.isArray(config?.iceServers) ? config.iceServers : [];
+        iceCount = servers.length;
+        turnReady = servers.some((server) => {
+          const urls = Array.isArray(server?.urls) ? server.urls : [server?.urls];
+          return urls.some((url) => typeof url === 'string' && (url.startsWith('turn:') || url.startsWith('turns:')));
+        });
+      } catch (_) {}
+      list.append(
+        valueRow('ICE servers', String(iceCount), iceCount > 0 ? 'good' : 'warn'),
+        valueRow('TURN relay', turnReady ? 'Configured' : 'Not detected', turnReady ? 'good' : 'warn')
+      );
+
+      reportText = [
+        `Plainwire ${clientConfig.version || 'unknown'}`,
+        `Browser network: ${navigator.onLine ? 'online' : 'offline'}`,
+        `WebSocket: ${socketName()}`,
+        `Secure context: ${window.isSecureContext ? 'yes' : 'no'}`,
+        `WebRTC: ${typeof RTCPeerConnection === 'function' ? 'supported' : 'unavailable'}`,
+        `Backend: ${healthText}`,
+        `Database: ${databaseText}`,
+        `Server version: ${serverVersion}`,
+        `Client version: ${clientConfig.version}`,
+        `Asset fingerprint: ${assetsMatch ? 'matched' : 'mismatch'}`,
+        `ICE servers: ${iceCount}`,
+        `TURN relay: ${turnReady ? 'configured' : 'not detected'}`
+      ].join('\n');
+    };
+
+    showAccountDialog({
+      title: 'Connection diagnostics',
+      subtitle: 'A quick local check. Credentials and session tokens are never included.',
+      content,
+      actions: [
+        { label: 'Close', onClick: closeAccountDialog },
+        { label: 'Refresh', onClick: async (button) => {
+          button.disabled = true;
+          try { await refresh(); } finally { button.disabled = false; }
+        } },
+        { label: 'Copy report', className: 'btn', onClick: async (button) => {
+          if (!reportText) return;
+          button.disabled = true;
+          try {
+            await navigator.clipboard?.writeText(reportText);
+            status.textContent = 'Diagnostic report copied.';
+          } catch (_) {
+            status.textContent = 'Clipboard access was not available.';
+          } finally { button.disabled = false; }
+        } }
+      ]
+    });
+    await refresh();
   };
 
   recv(app.ports.bridgeSend, ({ tag, data }) => {
@@ -3148,6 +3594,9 @@
       case 'account_sessions':
         openSessionsDialog();
         break;
+      case 'account_diagnostics':
+        openDiagnosticsDialog();
+        break;
       case 'request_notifications':
         if ('Notification' in window) {
           Notification.requestPermission().then((permission) => {
@@ -3198,7 +3647,11 @@
     }
   });
 
-  window.addEventListener('hashchange', () => send(app.ports.onHashChange, location.hash));
+  window.addEventListener('hashchange', () => {
+    closeTouchMessageActions();
+    syncMobileViewport();
+    send(app.ports.onHashChange, location.hash);
+  });
   window.addEventListener('online', () => debug('NETWORK', 'browser_online'));
   window.addEventListener('offline', () => debug('NETWORK', 'browser_offline', {}, 'warn'));
   window.addEventListener('unhandledrejection', (event) => debug('ERROR', 'unhandled_promise_rejection', { error: event.reason?.message || String(event.reason) }, 'error'));

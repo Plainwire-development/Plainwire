@@ -94,6 +94,7 @@ bridgeDecoder = D.field "tag" D.string |> D.andThen (\tag ->
         "animated_media_enabled" -> D.map SetAnimatedMediaEnabled (D.field "data" D.bool)
         "compact_messages" -> D.map SetCompactMessages (D.field "data" D.bool)
         "media_preload_enabled" -> D.map SetMediaPreloadEnabled (D.field "data" D.bool)
+        "ui_preferences" -> D.map UiPreferences (D.field "data" D.value)
         _ -> D.succeed NoOp
     )
 
@@ -117,7 +118,13 @@ handleSyncData val = case D.decodeValue decodeSyncData val of
 -- MAIN
 
 type alias Flags =
-    { appName : String, uploadMaxBytes : Int }
+    { appName : String
+    , uploadMaxBytes : Int
+    , registrationEnabled : Bool
+    , instanceDescription : String
+    , defaultTheme : String
+    , version : String
+    }
 
 main : Program Flags Model Msg
 main = Browser.application
@@ -131,11 +138,16 @@ main = Browser.application
 
 init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init flags url _ =
-    let active = parseRoute (Maybe.withDefault "" url.fragment)
-        appName = flags.appName
+    let
+        active = parseRoute (Maybe.withDefault "" url.fragment)
+        appName = if String.isEmpty (String.trim flags.appName) then "Plainwire" else String.left 48 (String.trim flags.appName)
+        defaultTheme = if List.member flags.defaultTheme [ "system", "light", "dark" ] then flags.defaultTheme else "system"
     in
-    ( { appName = if String.isEmpty (String.trim appName) then "Plainwire" else String.left 48 (String.trim appName)
+    ( { appName = appName
       , uploadMaxBytes = if flags.uploadMaxBytes > 0 then flags.uploadMaxBytes else 262144000
+      , registrationEnabled = flags.registrationEnabled
+      , instanceDescription = String.left 120 (String.trim flags.instanceDescription)
+      , clientVersion = String.left 32 (String.trim flags.version)
       , me = Nothing, csrf = "", serverTime = 0, timeZone = Time.utc, absoluteTimestamps = False
       , forums = [], threads = [], currentThread = Nothing, replies = []
       , servers = [], convs = [], conversationMembers = Dict.empty, friends = [], notifs = []
@@ -150,19 +162,20 @@ init flags url _ =
                 , muted = False, deafened = False, screenShare = False }
       , callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
       , activeCalls = Dict.empty
-      , callMode = Idle, soundEnabled = True, chatEnterSends = True, linkPreviewsEnabled = True, animatedMediaEnabled = True, compactMessages = False, mediaPreloadEnabled = True, replyTo = Nothing
+      , callMode = Idle, soundEnabled = True, chatEnterSends = True, linkPreviewsEnabled = True, animatedMediaEnabled = True, compactMessages = False, mediaPreloadEnabled = True
+      , uiDensity = "comfortable", uiFontScale = "default", uiAccent = "blue", uiCornerStyle = "default", reduceMotion = False, replyTo = Nothing
       , toast = Nothing, modal = Nothing, settingsTab = "profile"
       , inputText = "", sidebarOpen = False, serversSheetOpen = False, ctxMenu = Nothing
       , threadReply = "", searchQuery = ""
       , authMode = "login", authUsername = "", authBusy = False, authDisplayName = ""
-      , authPassword = "", serverName = "", serverDescription = "", booting = True, userStatuses = Dict.empty
+      , authPassword = "", authPasswordConfirm = "", authPasswordVisible = False, serverName = "", serverDescription = "", booting = True, userStatuses = Dict.empty
       , failedMsgIds = Set.empty, currentProfileRelationship = "none", currentProfileBlockedByMe = False
       , pendingMessages = Dict.empty
       , profileDisplayName = "", profileBio = ""
       , profileAvatarUrl = "", profileBannerUrl = ""
       , profileAvatarPreviewUrl = "", profileBannerPreviewUrl = ""
       , profileAvatarUploading = False, profileBannerUploading = False
-      , profileStatus = "online", profileTheme = "light"
+      , profileStatus = "online", profileTheme = defaultTheme
       , modalTitle = "", modalBody = "", modalUserIds = ""
       , modalBannerUrl = "", modalAccentColor = "#5865f2"
       , friendsTab = "online", friendQuery = "", friendSearchAttempted = False
@@ -228,10 +241,12 @@ update msg model =
                     ]
                )
 
-        AuthMode m -> ( { model | authMode = m }, Cmd.none )
+        AuthMode m -> ( { model | authMode = m, authPasswordConfirm = "", authPasswordVisible = False }, Cmd.none )
         AuthUsername s -> ( { model | authUsername = s }, Cmd.none )
         AuthDisplayName s -> ( { model | authDisplayName = s }, Cmd.none )
         AuthPassword s -> ( { model | authPassword = s }, Cmd.none )
+        AuthPasswordConfirm s -> ( { model | authPasswordConfirm = s }, Cmd.none )
+        ToggleAuthPasswordVisibility -> ( { model | authPasswordVisible = not model.authPasswordVisible }, Cmd.none )
         ServerName s -> ( { model | serverName = s }, Cmd.none )
         ServerDescription s -> ( { model | serverDescription = s }, Cmd.none )
 
@@ -483,6 +498,24 @@ update msg model =
         SetMediaPreloadEnabled enabled ->
             ( { model | mediaPreloadEnabled = enabled }
             , bridgeSend (E.object [("tag", E.string "privacy_set_media_preload"), ("data", E.bool enabled)])
+            )
+
+        UiPreferences value ->
+            let
+                stringField name fallback =
+                    D.decodeValue (D.field name D.string) value |> Result.withDefault fallback
+
+                boolField name fallback =
+                    D.decodeValue (D.field name D.bool) value |> Result.withDefault fallback
+            in
+            ( { model
+                | uiDensity = stringField "density" model.uiDensity
+                , uiFontScale = stringField "font_scale" model.uiFontScale
+                , uiAccent = stringField "accent" model.uiAccent
+                , uiCornerStyle = stringField "corner_style" model.uiCornerStyle
+                , reduceMotion = boolField "reduce_motion" model.reduceMotion
+              }
+            , Cmd.none
             )
 
         Logout -> ( model, apiSend (encodeApiRequest (ApiPost "/logout" (Just (E.object [])))) )
@@ -796,16 +829,31 @@ update msg model =
 
         PresenceState val ->
             case D.decodeValue (D.dict D.string) val of
-                Ok statuses -> ( { model | userStatuses = statuses }, Cmd.none )
+                Ok statuses ->
+                    let merged =
+                            case model.me of
+                                Just user -> Dict.insert (String.fromInt user.id) model.profileStatus statuses
+                                Nothing -> statuses
+                    in ( { model | userStatuses = merged }, Cmd.none )
                 Err _ -> ( model, Cmd.none )
         PresenceOnline uid status ->
             ( { model | userStatuses = Dict.insert (String.fromInt uid) status model.userStatuses }, Cmd.none )
         PresenceOffline uid ->
-            ( { model | userStatuses = Dict.remove (String.fromInt uid) model.userStatuses }, Cmd.none )
+            let isSelf = Maybe.map (\user -> user.id == uid) model.me |> Maybe.withDefault False
+                statuses =
+                    if isSelf && model.wsConnected then
+                        Dict.insert (String.fromInt uid) model.profileStatus model.userStatuses
+                    else
+                        Dict.remove (String.fromInt uid) model.userStatuses
+            in ( { model | userStatuses = statuses }, Cmd.none )
         PresenceStatus uid status ->
             ( { model | userStatuses = Dict.insert (String.fromInt uid) status model.userStatuses }, Cmd.none )
         SetMyStatus status ->
-            ( { model | profileStatus = status }, Cmd.none )
+            let statuses =
+                    case model.me of
+                        Just user -> Dict.insert (String.fromInt user.id) status model.userStatuses
+                        Nothing -> model.userStatuses
+            in ( { model | profileStatus = status, userStatuses = statuses }, Cmd.none )
         RtcJoinFailed _ ->
             ( { model | voice = clearVoice model.voice, callMode = Idle, callUI = { incoming = model.callUI.incoming, outgoing = Nothing, active = Nothing } }, Cmd.none )
         AudioDevices val ->
@@ -897,43 +945,46 @@ update msg model =
                     ( { model | loadingOlderMessages = True }, Cmd.batch [ bridgeSend (E.object [("tag", E.string "preserve_message_scroll"), ("data", E.null)]), apiSend (encodeApiRequest (ApiGet ("/messages?scope=channel&scope_id=" ++ String.fromInt id ++ "&before=" ++ String.fromInt firstMsg.id))) ] )
                 _ -> ( model, Cmd.none )
 
-        _ -> ( model, Cmd.none )
-
 
 handleMe : E.Value -> Model -> ( Model, Cmd Msg )
 handleMe val model =
     case D.decodeValue decodeUser (fromApiField "user" val) of
-                    Ok user ->
-                        let
-                            userValue = fromApiField "user" val
-                            avatarSource = D.decodeValue (D.field "avatar_source_url" D.string) userValue |> Result.withDefault user.avatarUrl
-                            bannerSource = D.decodeValue (D.field "banner_source_url" D.string) userValue |> Result.withDefault user.bannerUrl
-                        in
-                                ( { model | me = Just user
-                                    , csrf = fromApiFieldStr "csrf" val
-                                    , serverTime = fromApiFieldInt "server_time" val
-                                    , booting = False
-                                    , authBusy = False
-                                    , profileDisplayName = user.displayName
-                                    , profileBio = user.bio
-                                    , profileAvatarUrl = avatarSource
-                                    , profileBannerUrl = bannerSource
-                                    , profileAvatarPreviewUrl = user.avatarUrl
-                                    , profileBannerPreviewUrl = user.bannerUrl
-                                    , profileAvatarUploading = False
-                                    , profileBannerUploading = False
-                                    , profileStatus = statusPreference (statusToString user.status)
-                                    , profileTheme = user.theme
-                                    }
-                                , Cmd.batch
-                                    [ bridgeSend (E.object [("tag", E.string "connect_ws"), ("data", E.null)])
-                                    , bridgeSend (E.object [("tag", E.string "presence_update"), ("data", E.string (statusPreference (statusToString user.status)))])
-                                    , bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string user.theme)])
-                                    , apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
-                                    , routeCmd model.active
-                                    ]
-                                )
-                    Err _ -> ( model, Cmd.none )
+        Ok user ->
+            let
+                userValue = fromApiField "user" val
+                avatarSource = D.decodeValue (D.field "avatar_source_url" D.string) userValue |> Result.withDefault user.avatarUrl
+                bannerSource = D.decodeValue (D.field "banner_source_url" D.string) userValue |> Result.withDefault user.bannerUrl
+                presence = statusPreference (statusToString user.status)
+            in
+            ( { model
+                | me = Just user
+                , csrf = fromApiFieldStr "csrf" val
+                , serverTime = fromApiFieldInt "server_time" val
+                , booting = False
+                , authBusy = False
+                , profileDisplayName = user.displayName
+                , profileBio = user.bio
+                , profileAvatarUrl = avatarSource
+                , profileBannerUrl = bannerSource
+                , profileAvatarPreviewUrl = user.avatarUrl
+                , profileBannerPreviewUrl = user.bannerUrl
+                , profileAvatarUploading = False
+                , profileBannerUploading = False
+                , profileStatus = presence
+                , profileTheme = user.theme
+                , userStatuses = Dict.insert (String.fromInt user.id) presence model.userStatuses
+              }
+            , Cmd.batch
+                [ bridgeSend (E.object [("tag", E.string "connect_ws"), ("data", E.null)])
+                , bridgeSend (E.object [("tag", E.string "presence_update"), ("data", E.string presence)])
+                , bridgeSend (E.object [("tag", E.string "set_theme"), ("data", E.string user.theme)])
+                , apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+                , routeCmd model.active
+                ]
+            )
+
+        Err _ ->
+            ( model, Cmd.none )
 
 
 handleSync : E.Value -> Model -> ( Model, Cmd Msg )
@@ -2278,7 +2329,7 @@ renderToast model = case model.toast of
     Just msg ->
         div [ class "toast toast-visible" ]
             [ span [ class "toast-text" ] [ text msg ]
-            , button [ class "toast-close", onClick DismissToast ] [ text "✕" ]
+            , button [ class "toast-close", onClick DismissToast ] [ callIcon "close" ]
             ]
     Nothing -> text ""
 
@@ -2371,8 +2422,8 @@ modalContent kind model =
             , div [ class "field" ]
                 [ label [] [ text "Type" ]
                 , div [ class "choice-grid two" ]
-                    [ choiceCard (model.modalBody == "text") "#" "Text channel" "Messages, files, and media." (SetModalChoice "body" "text")
-                    , choiceCard (model.modalBody == "voice") "♪" "Voice channel" "Drop-in audio and screen sharing." (SetModalChoice "body" "voice")
+                    [ choiceCard (model.modalBody == "text") "T" "Text channel" "Messages, files, and media." (SetModalChoice "body" "text")
+                    , choiceCard (model.modalBody == "voice") "V" "Voice channel" "Drop-in audio and screen sharing." (SetModalChoice "body" "voice")
                     ]
                 ]
             , if List.isEmpty categories then
@@ -2418,7 +2469,7 @@ modalContent kind model =
                         )
             selectedChannel = String.toInt (String.trim model.modalUserIds)
             channelChoices =
-                choiceCard (selectedChannel == Nothing) "◎" "Server home" "Let friends choose where to begin." (SetModalChoice "user_ids" "")
+                choiceCard (selectedChannel == Nothing) "S" "Server home" "Let friends choose where to begin." (SetModalChoice "user_ids" "")
                     :: List.map
                         (\channel ->
                             choiceCard
@@ -2454,17 +2505,19 @@ modalContent kind model =
             , div [ class "field" ]
                 [ label [] [ text "Server icon" ]
                 , input [ value model.modalUserIds, placeholder "Upload an image or paste a URL", onInput ModalUserIds ] []
-                , div [ class "upload-actions" ]
-                    [ input [ id "serverIconFile", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverIconFile")) ] []
-                    , button [ class "btn secondary", type_ "button", onClick (ReadFile "serverIconFile") ] [ text "Upload icon" ]
+                , div [ class "file-picker-row" ]
+                    [ input [ id "serverIconFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverIconFile")) ] []
+                    , label [ class "btn secondary file-picker-button", attribute "for" "serverIconFile" ] [ text "Choose icon" ]
+                    , small [ class "muted" ] [ text "JPEG, PNG, GIF, WebP, or AVIF" ]
                     ]
                 ]
             , div [ class "field" ]
                 [ label [] [ text "Server banner" ]
                 , input [ value model.modalBannerUrl, placeholder "Upload an image or paste a URL", onInput ModalBannerUrl ] []
-                , div [ class "upload-actions" ]
-                    [ input [ id "serverBannerFile", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverBannerFile")) ] []
-                    , button [ class "btn secondary", type_ "button", onClick (ReadFile "serverBannerFile") ] [ text "Upload banner" ]
+                , div [ class "file-picker-row" ]
+                    [ input [ id "serverBannerFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverBannerFile")) ] []
+                    , label [ class "btn secondary file-picker-button", attribute "for" "serverBannerFile" ] [ text "Choose banner" ]
+                    , small [ class "muted" ] [ text "JPEG, PNG, GIF, WebP, or AVIF" ]
                     ]
                 ]
             , div [ class "field server-color-field" ]
@@ -2587,7 +2640,26 @@ choiceCard selected icon heading copy msg =
             [ b [] [ text heading ]
             , small [ class "muted" ] [ text copy ]
             ]
-        , span [ class "choice-card-check" ] [ text (if selected then "✓" else "") ]
+        , span [ class "choice-card-check", attribute "aria-hidden" "true" ] []
+        ]
+
+themeChoiceCard : Bool -> String -> String -> String -> Msg -> Html Msg
+themeChoiceCard selected theme heading copy msg =
+    button
+        [ type_ "button"
+        , class ("choice-card theme-choice" ++ if selected then " selected" else "")
+        , onClick msg
+        , attribute "aria-pressed" (if selected then "true" else "false")
+        ]
+        [ span [ class ("theme-preview theme-preview-" ++ theme), attribute "aria-hidden" "true" ]
+            [ span [ class "theme-preview-rail" ] []
+            , span [ class "theme-preview-panel" ] []
+            ]
+        , span [ class "choice-card-copy" ]
+            [ b [] [ text heading ]
+            , small [ class "muted" ] [ text copy ]
+            ]
+        , span [ class "choice-card-check", attribute "aria-hidden" "true" ] []
         ]
 
 choicePill : Bool -> String -> Msg -> Html Msg
@@ -2704,8 +2776,6 @@ renderCallLayer model =
 renderCallPopup : String -> CallPopup -> Model -> Html Msg
 renderCallPopup kind popup model =
     let avatarHtml = avatarImg popup.avatarUrl popup.displayName "big"
-        ringHtml = if kind == "incoming" then
-            div [] [ div [ class "call-ring" ] [], div [ class "call-ring delay" ] [] ] else div [] []
         actions = case kind of
             "incoming" ->
                 div [ class "call-popup-actions" ]
@@ -2718,9 +2788,9 @@ renderCallPopup kind popup model =
                     ]
             _ -> text ""
     in div [ class ("call-popup " ++ kind) ]
-        [ div [ class "call-popup-head" ]
+        [ div [ class "call-popup-head", attribute "data-call-drag-handle" "true" ]
             [ div [ class "call-avatar-wrap" ]
-                [ avatarHtml, ringHtml ]
+                [ avatarHtml ]
             , div []
                 [ p [ class "call-popup-title" ] [ text popup.displayName ]
                 , p [ class "call-popup-sub" ] [ text (if kind == "incoming" then "Incoming call" else "Calling...") ]
@@ -2749,30 +2819,42 @@ renderCompactCallBar active model =
         userAvatars = List.take 3 active.users
             |> List.map (\u -> avatarImg u.avatarUrl u.displayName "small")
         overflow = count - 3
-    in div [ class "call-bar compact", onClick ToggleCallOverlay ]
-        [ div [ class "call-bar-icon" ] [ text "♪" ]
-        , div [ class "call-bar-info" ]
-            [ span [ class "call-bar-title" ] [ text "In Call" ]
-            , span [ class "call-bar-sub" ] [ text countText ]
+    in div [ class "call-bar compact" ]
+        [ div
+            [ class "call-bar-drag-area"
+            , attribute "data-call-drag-handle" "true"
+            , title "Open call details"
+            , onClick ToggleCallOverlay
             ]
-        , div [ class "call-bar-avatars" ] (userAvatars ++
-            (if overflow > 0 then [ div [ class "avatar small" ] [ text ("+" ++ String.fromInt overflow) ] ] else [])
-          )
-        , div [ class "call-bar-controls" ]
-            [ button [ class ("btn icon-btn" ++ if model.voice.muted then " call-muted" else ""), title "Toggle mute", onClickStop (BridgeEvent "toggle_mute" E.null) ]
-                [ text (if model.voice.muted then "🔇" else "🎤") ]
-            , button [ class ("btn icon-btn" ++ if model.voice.deafened then " call-muted" else ""), title "Toggle deafen", onClickStop (BridgeEvent "toggle_deafen" E.null) ]
-                [ text (if model.voice.deafened then "🔇" else "🔊") ]
+            [ div [ class "call-bar-icon" ] [ callIcon "audio" ]
+            , div [ class "call-bar-info" ]
+                [ span [ class "call-bar-title" ] [ text "Voice call" ]
+                , span [ class "call-bar-sub" ] [ text countText ]
+                ]
+            , div [ class "call-bar-avatars" ] (userAvatars ++
+                (if overflow > 0 then [ div [ class "avatar small" ] [ text ("+" ++ String.fromInt overflow) ] ] else [])
+              )
+            ]
+        , div [ class "call-bar-controls", attribute "aria-label" "Call controls" ]
+            [ button [ class ("btn icon-btn" ++ if model.voice.muted then " call-muted" else ""), title (if model.voice.muted then "Unmute" else "Mute"), onClickStop (BridgeEvent "toggle_mute" E.null) ]
+                [ callIcon (if model.voice.muted then "mic off" else "mic") ]
+            , button [ class ("btn icon-btn" ++ if model.voice.deafened then " call-muted" else ""), title (if model.voice.deafened then "Undeafen" else "Deafen"), onClickStop (BridgeEvent "toggle_deafen" E.null) ]
+                [ callIcon (if model.voice.deafened then "audio off" else "audio") ]
             , if model.voice.screenShare then
-                button [ class "btn icon-btn share-active", title "Stop screen share", onClickStop StopScreenShare ]
-                    [ text "🖥" ]
+                button [ class "btn icon-btn share-active", title "Stop sharing", onClickStop StopScreenShare ]
+                    [ callIcon "screen off" ]
               else
                 button [ class "btn icon-btn", title "Share screen", onClickStop StartScreenShare ]
-                    [ text "📺" ]
+                    [ callIcon "screen" ]
             , button [ class "btn icon-btn call-decline", title "Leave call", onClickStop EndCall ]
-                [ text "✕" ]
+                [ callIcon "close" ]
             ]
         ]
+
+callIcon : String -> Html Msg
+callIcon kind =
+    span [ class ("call-icon call-icon-" ++ String.replace " " " call-icon-" kind), attribute "aria-hidden" "true" ] []
+
 
 renderExpandedCallOverlay : ActiveCall -> Model -> Html Msg
 renderExpandedCallOverlay active model =
@@ -2781,31 +2863,51 @@ renderExpandedCallOverlay active model =
         seconds = String.fromInt (modBy 60 duration) |> String.padLeft 2 '0'
         timerText = minutes ++ ":" ++ seconds
     in div [ class "call-overlay expanded" ]
-        [ div [ class "call-overlay-header" ]
-            [ div [ class "call-overlay-title" ]
-                [ span [ class "call-overlay-icon" ] [ text "♪" ]
-                , span [] [ text "In Call" ]
-                , span
-                    [ class "call-overlay-timer pw-live-call-timer"
-                    , attribute "data-call-start" (String.fromInt active.startTime)
+        [ div [ class "call-overlay-header", attribute "data-call-drag-handle" "true" ]
+            [ div [ class "call-overlay-heading" ]
+                [ div [ class "call-overlay-title" ]
+                    [ span [ class "call-overlay-icon" ] [ callIcon "audio" ]
+                    , span [] [ text "Voice call" ]
                     ]
-                    [ text timerText ]
+                , div [ class "call-overlay-meta" ]
+                    [ span [ class "call-connection-dot", attribute "aria-hidden" "true" ] []
+                    , span [] [ text (String.fromInt (List.length active.users) ++ " participants") ]
+                    , span [ attribute "aria-hidden" "true" ] [ text "·" ]
+                    , span
+                        [ class "call-overlay-timer pw-live-call-timer"
+                        , attribute "data-call-start" (String.fromInt active.startTime)
+                        ]
+                        [ text timerText ]
+                    ]
                 ]
-            , button [ class "btn icon-btn", title "Minimize", onClick ToggleCallOverlay ] [ text "─" ]
+            , button [ class "btn icon-btn call-minimize", title "Minimize call", onClick ToggleCallOverlay ]
+                [ span [ class "call-minimize-icon", attribute "aria-hidden" "true" ] [] ]
             ]
+        , if model.voice.screenShare then
+            div [ class "call-sharing-row" ]
+                [ callIcon "screen"
+                , span [] [ text "You are sharing your screen" ]
+                , button [ class "btn ghost", onClick StopScreenShare ] [ text "Stop" ]
+                ]
+          else
+            text ""
         , div [ class "call-overlay-users" ]
             (if List.isEmpty active.users then
                 [ div [ class "call-empty" ] [ text "Connecting audio..." ] ]
              else
                 List.map (renderCallUser model) active.users)
-        , div [ class "call-overlay-controls" ]
-            [ button [ class ("btn" ++ if model.voice.muted then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_mute" E.null) ]
-                [ text (if model.voice.muted then "🔇 Unmute" else "🎤 Mute") ]
-            , button [ class ("btn" ++ if model.voice.deafened then " call-muted" else " secondary"), onClick (BridgeEvent "toggle_deafen" E.null) ]
-                [ text (if model.voice.deafened then "🔇 Undeafen" else "🔊 Deafen") ]
-            , button [ class "btn secondary", onClick (BridgeEvent "unlock_audio" E.null) ] [ text "Enable audio" ]
-            , button [ class "btn secondary", onClick (BridgeEvent "toggle_speaker" E.null) ] [ text "🔈 Speaker" ]
-            , button [ class "btn call-decline", onClick EndCall ] [ text "✕" ]
+        , div [ class "call-overlay-controls", attribute "aria-label" "Call controls" ]
+            [ button [ class ("call-control" ++ if model.voice.muted then " active danger" else ""), onClick (BridgeEvent "toggle_mute" E.null) ]
+                [ callIcon (if model.voice.muted then "mic off" else "mic"), span [] [ text (if model.voice.muted then "Unmute" else "Mute") ] ]
+            , button [ class ("call-control" ++ if model.voice.deafened then " active danger" else ""), onClick (BridgeEvent "toggle_deafen" E.null) ]
+                [ callIcon (if model.voice.deafened then "audio off" else "audio"), span [] [ text (if model.voice.deafened then "Undeafen" else "Deafen") ] ]
+            , if model.voice.screenShare then
+                button [ class "call-control active", onClick StopScreenShare ] [ callIcon "screen off", span [] [ text "Stop share" ] ]
+              else
+                button [ class "call-control", onClick StartScreenShare ] [ callIcon "screen", span [] [ text "Share" ] ]
+            , button [ class "call-control", onClick (BridgeEvent "unlock_audio" E.null) ] [ callIcon "audio", span [] [ text "Resume audio" ] ]
+            , button [ class "call-control", onClick (BridgeEvent "toggle_speaker" E.null) ] [ callIcon "audio", span [] [ text "Speaker" ] ]
+            , button [ class "call-control danger leave", onClick EndCall ] [ callIcon "close", span [] [ text "Leave" ] ]
             ]
         ]
 
@@ -2898,28 +3000,33 @@ renderAuth model =
         [ section [ class "auth-brand-panel" ]
             [ div [ class "auth-brand-lockup" ] [ div [ class "auth-brand-mark" ] [], span [] [ text model.appName ] ]
             , div [ class "auth-brand-copy" ]
-                [ span [ class "eyebrow" ] [ text "Self-hosted communication" ]
-                , h1 [] [ text "A calmer place for conversations that matter." ]
-                , p [] [ text "Messages, communities, calls, screen sharing, files, and forums in one fast interface." ]
+                [ span [ class "eyebrow" ] [ text "Plainwire" ]
+                , h1 [] [ text "Talk without the clutter." ]
+                , p [] [ text (if String.isEmpty model.instanceDescription then "Messages, calls, communities, and files on one self-hosted server." else model.instanceDescription) ]
                 ]
-            , div [ class "auth-feature-grid" ]
-                [ div [ class "auth-feature" ] [ b [] [ text "Real-time" ], span [] [ text "Responsive messaging and presence without page reloads." ] ]
-                , div [ class "auth-feature" ] [ b [] [ text "Voice" ], span [] [ text "Peer calls, voice rooms, and resizable screen sharing." ] ]
-                , div [ class "auth-feature" ] [ b [] [ text "Your server" ], span [] [ text "Instance branding and limits are controlled by deployment settings." ] ]
+            , div [ class "auth-capabilities", attribute "aria-label" "Plainwire features" ]
+                [ span [] [ text "Messages" ]
+                , span [] [ text "Voice" ]
+                , span [] [ text "Screen sharing" ]
+                , span [] [ text "Forums" ]
+                , span [] [ text "Files" ]
                 ]
             ]
         , main_ [ class "auth-form-panel" ]
             [ div [ class "auth-form-wrap" ]
                 [ div [ class "auth-mobile-brand" ] [ div [ class "auth-brand-mark" ] [], b [] [ text model.appName ] ]
                 , div [ class "auth-heading" ]
-                    [ h2 [] [ text (if model.authMode == "login" then "Welcome back" else "Create your account") ]
+                    [ h2 [] [ text (if model.authMode == "login" then "Sign in to " ++ model.appName else "Create your account") ]
                     , p [ class "muted" ] [ text (if model.authMode == "login" then "Sign in to continue to your conversations." else "Set up an account on this Plainwire instance.") ]
                     ]
-                , div [ class "auth-mode-switch", attribute "role" "tablist" ]
+                , div [ class ("auth-mode-switch" ++ if model.registrationEnabled then "" else " single"), attribute "role" "tablist" ]
                     [ button [ class ("auth-mode-btn" ++ if model.authMode == "login" then " active" else ""), onClick (AuthMode "login") ] [ text "Sign in" ]
-                    , button [ class ("auth-mode-btn" ++ if model.authMode == "register" then " active" else ""), onClick (AuthMode "register") ] [ text "Register" ]
+                    , if model.registrationEnabled then
+                        button [ class ("auth-mode-btn" ++ if model.authMode == "register" then " active" else ""), onClick (AuthMode "register") ] [ text "Register" ]
+                      else
+                        text ""
                     ]
-                , div [ class "auth-fields" ]
+                , Html.form [ class "auth-fields", onSubmit DoAuth ]
                     [ div [ class "field" ]
                         [ label [ attribute "for" "u" ] [ text "Username" ]
                         , input [ id "u", type_ "text", attribute "autocomplete" "username", attribute "autocapitalize" "none", attribute "spellcheck" "false", maxlength 24, placeholder "yourname", value model.authUsername, onInput AuthUsername ] []
@@ -2932,7 +3039,23 @@ renderAuth model =
                       else text ""
                     , div [ class "field" ]
                         [ label [ attribute "for" "p" ] [ text "Password" ]
-                        , input [ id "p", type_ "password", attribute "autocomplete" (if model.authMode == "login" then "current-password" else "new-password"), maxlength 256, value model.authPassword, onInput AuthPassword ] []
+                        , div [ class "auth-password-field" ]
+                            [ input
+                                [ id "p"
+                                , type_ (if model.authPasswordVisible then "text" else "password")
+                                , attribute "autocomplete" (if model.authMode == "login" then "current-password" else "new-password")
+                                , maxlength 256
+                                , value model.authPassword
+                                , onInput AuthPassword
+                                ] []
+                            , button
+                                [ type_ "button"
+                                , class "auth-password-toggle"
+                                , onClick ToggleAuthPasswordVisibility
+                                , attribute "aria-label" (if model.authPasswordVisible then "Hide password" else "Show password")
+                                ]
+                                [ text (if model.authPasswordVisible then "Hide" else "Show") ]
+                            ]
                         ]
                     , if model.authMode == "register" then
                         div [ class "auth-password-meter" ]
@@ -2940,13 +3063,32 @@ renderAuth model =
                             , small [ class "muted" ] [ text "Use at least 10 characters. A longer unique passphrase is best." ]
                             ]
                       else text ""
+                    , if model.authMode == "register" then
+                        div [ class "field" ]
+                            [ label [ attribute "for" "pc" ] [ text "Confirm password" ]
+                            , input
+                                [ id "pc"
+                                , type_ (if model.authPasswordVisible then "text" else "password")
+                                , attribute "autocomplete" "new-password"
+                                , maxlength 256
+                                , value model.authPasswordConfirm
+                                , onInput AuthPasswordConfirm
+                                ] []
+                            ]
+                      else text ""
                     , case authValidationError { model | authBusy = False } of
                         Just err -> div [ class "auth-error", attribute "role" "alert" ] [ text err ]
                         Nothing -> text ""
-                    , button [ class "btn auth-submit", disabled (model.authBusy || not (authReady model)), onClick DoAuth ]
+                    , button [ type_ "submit", class "btn auth-submit", disabled (model.authBusy || not (authReady model)) ]
                         [ text (if model.authBusy then "Working..." else if model.authMode == "login" then "Sign in" else "Create account") ]
                     ]
-                , p [ class "auth-footnote" ] [ text "This server controls registration, storage limits, and moderation policy." ]
+                , p [ class "auth-footnote" ]
+                    [ text (if model.registrationEnabled then "This is a self-hosted Plainwire server." else "Registration is closed on this server. Sign in with an existing account.") ]
+                , div [ class "auth-instance-meta" ]
+                    [ span [] [ text ("Plainwire " ++ model.clientVersion) ]
+                    , span [ attribute "aria-hidden" "true" ] [ text "·" ]
+                    , span [] [ text "Web client" ]
+                    ]
                 ]
             ]
         ]
@@ -2961,10 +3103,10 @@ authPasswordStrength password =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout" ]
+    div [ class "layout", attribute "data-ui-version" "1.5.0" ]
         [ renderRail model
         , renderSideForRoute model
-        , main_ [ class "main" ]
+        , main_ [ class (mainClass model.active) ]
             [ renderTopbar model
             , div [ class (contentClass model.active) ] [ renderPage model ]
             ]
@@ -2979,6 +3121,15 @@ renderApp model =
         ]
 
 
+
+mainClass : ActiveRoute -> String
+mainClass active =
+    case active of
+        DmView _ -> "main route-chat"
+        ChannelView _ -> "main route-chat"
+        Settings -> "main route-settings"
+        _ -> "main"
+
 contentClass : ActiveRoute -> String
 contentClass active =
     case active of
@@ -2991,16 +3142,23 @@ renderServersSheet model =
     if not model.serversSheetOpen then text "" else
     div [ class "servers-sheet", onClick CloseServersSheet ]
         [ div [ class "servers-sheet-card", stopClick ]
-            [ h3 [] [ text "Servers" ]
-            , if List.isEmpty model.servers then
-                p [ class "muted" ] [ text "No servers yet." ]
-              else
-                div [] (List.map (\s -> serverSheetRow s model) model.servers)
-            , div [ style "margin-top" "12px", class "nav-actions" ]
-                [ button [ class "btn", onClick (Go "#new-server") ] [ text "New Server" ]
-                , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Use Invite" ]
+            [ div [ class "servers-sheet-head" ]
+                [ div []
+                    [ h3 [] [ text "Servers" ]
+                    , small [ class "muted" ] [ text (String.fromInt (List.length model.servers) ++ " joined") ]
+                    ]
+                , button [ class "sheet-close", type_ "button", onClick CloseServersSheet, attribute "aria-label" "Close servers" ]
+                    [ span [ class "call-icon call-icon-close", attribute "aria-hidden" "true" ] [] ]
                 ]
-            , button [ class "btn secondary", style "margin-top" "8px", onClick CloseServersSheet ] [ text "Close" ]
+            , div [ class "servers-sheet-list" ]
+                (if List.isEmpty model.servers then
+                    [ div [ class "empty" ] [ text "You have not joined a server yet." ] ]
+                 else
+                    List.map (\s -> serverSheetRow s model) model.servers)
+            , div [ class "servers-sheet-actions" ]
+                [ button [ class "btn", onClick (Go "#new-server") ] [ text "Create server" ]
+                , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with invite" ]
+                ]
             ]
         ]
 
@@ -3011,9 +3169,11 @@ serverSheetRow s model =
             ChannelView _ -> Maybe.map (.id << .server) model.currentServer == Just s.id
             VoiceChannelView _ -> Maybe.map (.id << .server) model.currentServer == Just s.id
             _ -> False
-    in div [ class ("server-sheet-row" ++ if isActive then " active" else "")
-           , onClick (Go ("#server/" ++ String.fromInt s.id))
-           ]
+    in button [ type_ "button"
+              , class ("server-sheet-row" ++ if isActive then " active" else "")
+              , onClick (Go ("#server/" ++ String.fromInt s.id))
+              , attribute "aria-current" (if isActive then "page" else "false")
+              ]
         [ serverIcon s
         , div [ class "grow" ]
             [ b [] [ text s.name ]
@@ -3024,22 +3184,34 @@ serverSheetRow s model =
 
 renderRail : Model -> Html Msg
 renderRail model =
-    nav [ class "rail" ]
-        ([ div [ class "mark", title model.appName ] []
-         , railBtn "⌂" (model.active == Home) (Go "#")
-         , railBtn "◫" (model.active == Forums) (Go "#forums")
-         , railBtn "✉" (isDmActive model) (Go "#dms")
-         , railBtn "☺" (model.active == Friends) (Go "#friends")
-         , div [ class "rail-spacer" ] []
-         ] ++ List.map (\s -> renderServerIcon s model) (List.take 8 model.servers)
-         ++ [ railBtn "⚙" (model.active == Settings) (Go "#settings") ])
+    let
+        serverButtons = List.map (\server -> renderServerIcon server model) (List.take 8 model.servers)
+        moreServers =
+            if List.length model.servers > 8 then
+                [ railBtn "servers" "More servers" model.serversSheetOpen ToggleServersSheet ]
+            else
+                []
+    in
+    nav [ class "rail", attribute "aria-label" "Main navigation" ]
+        ([ div [ class "mark", title model.appName, attribute "aria-label" model.appName ] []
+         , railBtn "home" "Home" (model.active == Home) (Go "#")
+         , railBtn "messages" "Direct messages" (isDmActive model) (Go "#dms")
+         , railBtn "forums" "Forums" (model.active == Forums) (Go "#forums")
+         , railBtn "friends" "Friends" (model.active == Friends) (Go "#friends")
+         , div [ class "rail-divider", attribute "aria-hidden" "true" ] []
+         ] ++ serverButtons ++ moreServers
+         ++ [ div [ class "rail-spacer" ] []
+            , railBtn "settings" "Settings" (model.active == Settings) (Go "#settings")
+            ])
 
-railBtn : String -> Bool -> Msg -> Html Msg
-railBtn label active msg =
+railBtn : String -> String -> Bool -> Msg -> Html Msg
+railBtn icon label active msg =
     button [ class ("rail-btn" ++ if active then " active" else "")
            , onClick msg
+           , title label
+           , attribute "aria-label" label
            ]
-        [ text label ]
+        [ span [ class ("rail-glyph ui-icon ui-icon-" ++ icon), attribute "aria-hidden" "true" ] [] ]
 
 isDmActive : Model -> Bool
 isDmActive model = case model.active of
@@ -3053,6 +3225,8 @@ renderServerIcon s model =
     in button [ class ("rail-btn" ++ if isActive then " active" else "")
               , onClick (Go ("#server/" ++ String.fromInt s.id))
               , title s.name
+              , attribute "aria-label" s.name
+              , attribute "aria-current" (if isActive then "page" else "false")
               ]
         [ serverIcon s ]
 
@@ -3080,8 +3254,8 @@ renderSide model =
         , div [ class "list" ]
             ([ notifRow model
              , friendsRow model
-             ] ++ List.map (\s -> serverRow s model) model.servers
-             ++ [ dmHeader model ]
+             , dmHeader model
+             ]
              ++ (let requestCount = List.length (List.filter (\c -> c.requestState == "pending") model.convs)
                  in if requestCount == 0 then [] else [ messageRequestsNav requestCount ])
              ++ List.map (\c -> convRow c model) (List.filter (\c -> c.requestState /= "pending") model.convs))
@@ -3126,10 +3300,18 @@ renderServerSide model data =
         canManage = data.server.role == "owner" || data.server.role == "admin"
     in
     aside [ class ("side" ++ if model.sidebarOpen then " open" else "") ]
-        [ div [ class "side-head" ]
-            [ serverIcon data.server
-            , h1 [] [ text data.server.name ]
-            , small [] [ text data.server.description ]
+        [ div [ class "side-head server-side-head" ]
+            [ div [ class "side-title-row" ]
+                [ div [ class "server-side-identity" ]
+                    [ serverIcon data.server
+                    , div [ class "side-title-copy" ]
+                        [ h1 [] [ text data.server.name ]
+                        , small [] [ text (if String.isEmpty data.server.description then "Server" else data.server.description) ]
+                        ]
+                    ]
+                , button [ class "side-close", type_ "button", onClick CloseSidebar, attribute "aria-label" "Close navigation" ]
+                    [ span [ class "call-icon call-icon-close", attribute "aria-hidden" "true" ] [] ]
+                ]
             , div [ class "nav-actions" ]
                 (if canManage then
                     [ button [ class "btn secondary", onClick (InviteModal data.server.id) ] [ text "Invite" ]
@@ -3190,8 +3372,14 @@ renderMembersPanel userStatuses members =
 sideHead : Model -> Html Msg
 sideHead model =
     div [ class "side-head" ]
-        [ h1 [] [ text model.appName ]
-        , small [] [ text "Communities, direct messages, and calls" ]
+        [ div [ class "side-title-row" ]
+            [ div [ class "side-title-copy" ]
+                [ h1 [] [ text model.appName ]
+                , small [] [ text "Communities, direct messages, and calls" ]
+                ]
+            , button [ class "side-close", type_ "button", onClick CloseSidebar, attribute "aria-label" "Close navigation" ]
+                [ span [ class "call-icon call-icon-close", attribute "aria-hidden" "true" ] [] ]
+            ]
         , div [ class "nav-actions" ]
             [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "Create server" ]
             , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with invite" ]
@@ -3212,22 +3400,23 @@ searchBox _ =
 notifRow : Model -> Html Msg
 notifRow model =
     let unread = List.length (List.filter (\n -> not n.seen) model.notifs)
-    in a [ class "row", onClick (Go "#notifications") ]
-        [ span [ class "badge", if unread == 0 then attribute "data-zero" "1" else attribute "data-zero" "0" ]
-            [ if unread > 0 then text (String.fromInt unread) else text "" ]
+    in a [ class "row", href "#notifications", onClick (Go "#notifications") ]
+        [ span [ class "nav-symbol", attribute "aria-hidden" "true" ] [ span [ class "ui-icon ui-icon-notifications" ] [] ]
         , div [ class "grow" ]
             [ b [] [ text "Notifications" ]
-            , small [ class "muted" ] [ text "live updates" ]
+            , small [ class "muted" ] [ text "Mentions and activity" ]
             ]
+        , span [ class "badge", if unread == 0 then attribute "data-zero" "1" else attribute "data-zero" "0" ]
+            [ if unread > 0 then text (String.fromInt unread) else text "" ]
         ]
 
 friendsRow : Model -> Html Msg
 friendsRow model =
     let pending = List.length (List.filter (\f -> f.incoming) model.friends)
-    in a [ class "row", onClick (Go "#friends") ]
-        [ span [ class "server-icon" ] [ text "☻" ]
+    in a [ class "row", href "#friends", onClick (Go "#friends") ]
+        [ span [ class "nav-symbol", attribute "aria-hidden" "true" ] [ span [ class "ui-icon ui-icon-friends" ] [] ]
         , div [ class "grow" ]
-            [ b [] [ text "Friends" ], small [ class "muted" ] [ text "requests and contacts" ] ]
+            [ b [] [ text "Friends" ], small [ class "muted" ] [ text "Requests and contacts" ] ]
         , if pending > 0 then span [ class "badge" ] [ text (String.fromInt pending) ] else text ""
         ]
 
@@ -3237,6 +3426,7 @@ serverRow s model =
             ServerView id -> id == s.id
             _ -> False
     in a [ class ("row" ++ if isActive then " active" else "")
+          , href ("#server/" ++ String.fromInt s.id)
           , onClick (Go ("#server/" ++ String.fromInt s.id))
           ]
         [ serverIcon s
@@ -3248,9 +3438,9 @@ serverRow s model =
 
 dmHeader : Model -> Html Msg
 dmHeader model =
-    div [ class "row" ]
+    div [ class "side-section-heading" ]
         [ div [ class "grow" ]
-            [ b [] [ text "Direct Messages" ]
+            [ b [] [ text "Direct messages" ]
             , small [ class "muted" ] [ text "private and group chats" ]
             ]
         , button [ class "btn secondary", onClick NewDmModal ] [ text "New" ]
@@ -3258,9 +3448,9 @@ dmHeader model =
 
 messageRequestsNav : Int -> Html Msg
 messageRequestsNav count =
-    a [ class "row message-requests-nav", onClick (Go "#dms") ]
-        [ span [ class "server-icon" ] [ text "?" ]
-        , div [ class "grow" ] [ b [] [ text "Message Requests" ], small [ class "muted" ] [ text "Review before replying" ] ]
+    a [ class "row message-requests-nav", href "#dms", onClick (Go "#dms") ]
+        [ span [ class "nav-symbol", attribute "aria-hidden" "true" ] [ span [ class "ui-icon ui-icon-messages" ] [] ]
+        , div [ class "grow" ] [ b [] [ text "Message requests" ], small [ class "muted" ] [ text "Review before replying" ] ]
         , span [ class "badge" ] [ text (String.fromInt count) ]
         ]
 
@@ -3271,6 +3461,7 @@ convRow c model =
             _ -> False
         lastText = Maybe.withDefault "No messages yet" c.lastBody
     in a [ class ("row dm-row" ++ (if isActive then " active" else "") ++ (if c.unread > 0 then " unread" else ""))
+         , href ("#dm/" ++ String.fromInt c.id)
          , onClick (Go ("#dm/" ++ String.fromInt c.id))
          , onContextMenu (OpenConvCtx c)
          ]
@@ -3302,45 +3493,82 @@ convAvatar model c =
         div [ class "avatar group-avatar" ] [ text (String.fromInt c.memberCount) ]
 
 userPanel : Model -> Html Msg
-userPanel model = case model.me of
-    Just u ->
-        div [ class "user-panel" ]
-            [ presenceAvatar model.userStatuses u.id u.avatarUrl u.displayName ""
-            , div [ class "grow" ]
-                [ b [] [ text u.displayName ]
-                , small [] [ text (statusToString u.status) ]
+userPanel model =
+    case model.me of
+        Just u ->
+            let
+                liveStatus =
+                    Dict.get (String.fromInt u.id) model.userStatuses
+                        |> Maybe.withDefault (if model.wsConnected then model.profileStatus else "offline")
+            in
+            div [ class "user-panel" ]
+                [ div [ class "presence-avatar", title (statusDisplayName liveStatus), attribute "aria-label" (u.displayName ++ "  -  " ++ statusDisplayName liveStatus) ]
+                    [ avatarImg u.avatarUrl u.displayName ""
+                    , span [ class ("avatar-presence-dot " ++ liveStatus), attribute "aria-hidden" "true" ] []
+                    ]
+                , div [ class "grow" ]
+                    [ b [] [ text u.displayName ]
+                    , small [] [ text (statusDisplayName liveStatus) ]
+                    ]
+                , div [ class "user-panel-actions" ]
+                    [ button [ title "Settings", attribute "aria-label" "Settings", onClick (Go "#settings") ] [ span [ class "ui-icon ui-icon-settings", attribute "aria-hidden" "true" ] [] ] ]
                 ]
-            , div [ class "user-panel-actions" ]
-                [ button [ title "Settings", onClick (Go "#settings") ] [ text "⚙" ] ]
-            ]
-    Nothing -> text ""
+        Nothing ->
+            text ""
+
+statusDisplayName : String -> String
+statusDisplayName status =
+    case status of
+        "online" -> "Online"
+        "away" -> "Away"
+        "busy" -> "Do not disturb"
+        "invisible" -> "Invisible"
+        _ -> "Offline"
 
 
 renderMobileNav : Model -> Html Msg
 renderMobileNav model =
-    nav [ class "mobile-nav" ]
-        [ mobileBtn "⌂" "Home" (model.active == Home) (Go "#")
-        , mobileBtn "◫" "Forums" (model.active == Forums) (Go "#forums")
-        , mobileBtn "✉" "DMs" (isDmActive model) (Go "#dms")
-        , mobileBtn "☺" "Friends" (model.active == Friends) (Go "#friends")
-        , mobileBtn "≡" "Servers" model.serversSheetOpen ToggleServersSheet
-        , mobileBtn "⚙" "You" (model.active == Settings) (Go "#settings")
-        , if List.isEmpty model.servers then text "" else
-            div [ class "mobile-server-dots" ]
-                (List.map (\s ->
-                    span [ class ("mobile-server-dot" ++ if serverIsActive s model then " active" else "")
-                         , onClick (Go ("#server/" ++ String.fromInt s.id))
-                         , title s.name
-                         ] [ text (String.left 1 s.name) ]
-                ) (List.take 4 model.servers))
+    let
+        unreadDms = List.sum (List.map .unread model.convs)
+        unreadNotifs = List.length (List.filter (\notification -> not notification.seen) model.notifs)
+        pendingFriends = List.length (List.filter .incoming model.friends)
+    in
+    nav [ class "mobile-nav", attribute "aria-label" "Primary navigation" ]
+        [ mobileBtn "home" "Home" (model.active == Home) (Go "#") unreadNotifs
+        , mobileBtn "messages" "Messages" (isDmActive model) (Go "#dms") unreadDms
+        , mobileBtn "servers" "Servers" (model.serversSheetOpen || isServerRoute model.active) ToggleServersSheet 0
+        , mobileBtn "friends" "Friends" (model.active == Friends) (Go "#friends") pendingFriends
+        , mobileBtn "profile" "You" (model.active == Settings || isProfileRoute model.active) (Go "#settings") 0
         ]
 
-mobileBtn : String -> String -> Bool -> Msg -> Html Msg
-mobileBtn icon label active msg =
+isServerRoute : ActiveRoute -> Bool
+isServerRoute route =
+    case route of
+        ServerView _ -> True
+        ChannelView _ -> True
+        VoiceChannelView _ -> True
+        _ -> False
+
+isProfileRoute : ActiveRoute -> Bool
+isProfileRoute route =
+    case route of
+        ProfileView _ -> True
+        _ -> False
+
+mobileBtn : String -> String -> Bool -> Msg -> Int -> Html Msg
+mobileBtn icon label active msg badgeCount =
     button [ class ("mobile-nav-btn" ++ if active then " active" else "")
            , onClick msg
+           , attribute "aria-label" (label ++ if badgeCount > 0 then ", " ++ String.fromInt badgeCount ++ " new" else "")
            ]
-        [ span [ class "mobile-nav-icon" ] [ text icon ]
+        [ span [ class "mobile-nav-icon-wrap" ]
+            [ span [ class ("mobile-nav-icon ui-icon ui-icon-" ++ icon), attribute "aria-hidden" "true" ] []
+            , if badgeCount > 0 then
+                span [ class "mobile-nav-badge", attribute "aria-hidden" "true" ]
+                    [ text (if badgeCount > 99 then "99+" else String.fromInt badgeCount) ]
+              else
+                text ""
+            ]
         , span [ class "mobile-nav-label" ] [ text label ]
         ]
 
@@ -3348,9 +3576,41 @@ mobileBtn icon label active msg =
 renderTopbar : Model -> Html Msg
 renderTopbar model =
     div [ class "topbar" ]
-        [ button [ class "sidebar-toggle", onClick ToggleSidebar ] [ text "☰" ]
-        , h2 [] [ text (topbarTitle model) ]
+        [ button [ class "sidebar-toggle", onClick ToggleSidebar, attribute "aria-label" "Open navigation" ]
+            [ span [ class "ui-icon ui-icon-menu", attribute "aria-hidden" "true" ] [] ]
+        , div [ class "topbar-title" ]
+            [ h2 [] [ text (topbarTitle model) ]
+            , small [ class "muted" ] [ text (topbarSubtitle model) ]
+            ]
+        , if model.wsConnected then
+            text ""
+          else
+            div [ class "topbar-connection reconnecting", attribute "role" "status" ]
+                [ span [ class "topbar-connection-dot", attribute "aria-hidden" "true" ] []
+                , span [] [ text "Reconnecting" ]
+                ]
         ]
+
+topbarSubtitle : Model -> String
+topbarSubtitle model =
+    case model.active of
+        Home -> "Overview"
+        Forums -> "Community discussions"
+        ForumView _ -> "Community"
+        ThreadView _ -> "Discussion"
+        Dms -> "Private conversations"
+        DmView _ -> "Direct conversation"
+        Friends -> "Contacts and requests"
+        ProfileView _ -> "User profile"
+        Settings -> "Preferences"
+        NewServer -> "New community"
+        ServerView _ -> "Server overview"
+        ChannelView _ -> "Text channel"
+        VoiceChannelView _ -> "Voice channel"
+        InviteView _ -> "Server invite"
+        Notifications -> "Mentions and activity"
+        SearchView _ -> "Search results"
+
 
 topbarTitle : Model -> String
 topbarTitle model = case model.active of
@@ -3394,48 +3654,81 @@ renderPage model = case model.active of
 
 renderHomePage : Model -> Html Msg
 renderHomePage model =
-    let unreadNotifs = List.length (List.filter (\n -> not n.seen) model.notifs)
+    let
+        unreadNotifs = List.length (List.filter (\n -> not n.seen) model.notifs)
         unreadDms = List.sum (List.map (\c -> c.unread) model.convs)
-        recentConvs = List.take 4 (sortConvs model.convs)
-    in div [ class "home-page" ]
-        [ section [ class "hero-card" ]
-            [ div []
-                [ span [ class "eyebrow" ] [ text model.appName ]
-                , h1 [] [ text "Chat, threads, DMs, and voice." ]
-                , p [] [ text "Talk with friends, join communities, and keep conversations organized." ]
+        recentConvs = List.take 5 (sortConvs model.convs)
+        displayName =
+            case model.me of
+                Just user -> user.displayName
+                Nothing -> "there"
+    in
+    div [ class "home-page home-dashboard" ]
+        [ section [ class "home-welcome" ]
+            [ div [ class "home-welcome-copy" ]
+                [ span [ class "eyebrow" ] [ text "Home" ]
+                , h1 [] [ text ("Welcome back, " ++ displayName) ]
+                , p [] [ text "Pick up a conversation, check your communities, or start something new." ]
                 ]
-            , div [ class "hero-actions" ]
-                [ button [ class "btn", onClick (Go "#forums") ] [ text "Browse threads" ]
-                , button [ class "btn secondary", onClick (Go "#new-server") ] [ text "Create server" ]
+            , div [ class "home-primary-actions" ]
+                [ button [ class "btn secondary", onClick NewDmModal ] [ text "New message" ]
+                , button [ class "btn", onClick (Go "#new-server") ] [ text "Create server" ]
                 ]
             ]
-        , div [ class "stat-grid" ]
-            [ statCard "Servers" (String.fromInt (List.length model.servers)) "joined" (Go "#")
-            , statCard "DM unread" (String.fromInt unreadDms) "private messages" (Go "#dms")
+        , div [ class "stat-grid home-stat-grid" ]
+            [ statCard "Servers" (String.fromInt (List.length model.servers)) "communities" (Go "#")
+            , statCard "Unread messages" (String.fromInt unreadDms) "direct messages" (Go "#dms")
             , statCard "Notifications" (String.fromInt unreadNotifs) "new activity" (Go "#notifications")
             ]
         , div [ class "home-columns" ]
-            [ div [ class "card pad" ]
+            [ section [ class "card pad home-panel" ]
                 [ div [ class "section-head" ]
-                    [ h2 [] [ text "Recent DMs" ]
-                    , button [ class "btn ghost", onClick NewDmModal ] [ text "New" ]
+                    [ div []
+                        [ h2 [] [ text "Recent messages" ]
+                        , p [ class "muted" ] [ text "Your latest direct conversations." ]
+                        ]
+                    , button [ class "btn ghost", onClick (Go "#dms") ] [ text "View all" ]
                     ]
-                , div []
+                , div [ class "home-recent-list" ]
                     (if List.isEmpty recentConvs then
-                        [ div [ class "empty" ] [ text "No direct messages yet." ] ]
+                        [ div [ class "empty home-empty" ] [ text "No direct messages yet. Start one when you are ready." ] ]
                      else
                         List.map (\c -> convRow c model) recentConvs)
                 ]
-            , div [ class "card pad" ]
-                [ div [ class "section-head" ] [ h2 [] [ text "Getting started" ] ]
-                , ul [ class "check-list" ]
-                    [ li [] [ text "Create or join a server." ]
-                    , li [] [ text "Start a thread for longer conversations." ]
-                    , li [] [ text "Message people directly." ]
+            , section [ class "card pad home-panel home-activity" ]
+                [ div [ class "section-head" ]
+                    [ div []
+                        [ h2 [] [ text "Recent activity" ]
+                        , p [ class "muted" ] [ text "Mentions, replies, and requests that need your attention." ]
+                        ]
+                    , button [ class "btn ghost", onClick (Go "#notifications") ] [ text "View all" ]
+                    ]
+                , div [ class "home-activity-list" ]
+                    (if List.isEmpty model.notifs then
+                        [ div [ class "empty home-empty" ] [ text "Nothing new right now." ] ]
+                     else
+                        List.map (homeNotificationView model.serverTime) (List.take 5 model.notifs))
+                , div [ class "home-quick-links" ]
+                    [ button [ class "btn secondary", onClick (Go "#forums") ] [ text "Browse forums" ]
+                    , button [ class "btn secondary", onClick (Go "#friends") ] [ text "Friends" ]
                     ]
                 ]
             ]
         ]
+
+homeNotificationView : Int -> Notification -> Html Msg
+homeNotificationView now notification =
+    button
+        [ class ("home-activity-row" ++ if notification.seen then "" else " unseen")
+        , onClick (Go notification.url)
+        ]
+        [ span [ class "home-activity-mark", attribute "aria-hidden" "true" ] []
+        , span [ class "home-activity-copy" ]
+            [ b [] [ text notification.body ]
+            , small [ class "muted" ] [ text (notification.kind ++ " · " ++ relativeTime now notification.createdAt) ]
+            ]
+        ]
+
 
 statCard : String -> String -> String -> Msg -> Html Msg
 statCard label value sub msg =
@@ -3480,7 +3773,7 @@ renderForumsPage model =
                     if k == "Enter" then D.succeed DoSearch else D.fail "no")
                     (D.field "key" D.string))
                 ] []
-            , span [ class "forum-search-icon" ] [ text "🔍" ]
+            , span [ class "forum-search-icon", attribute "aria-hidden" "true" ] [ span [ class "ui-icon ui-icon-search" ] [] ]
             ]
         , if List.isEmpty filtered then
             div [ class "empty" ] [ text (if String.isEmpty model.searchQuery then "No communities yet." else "No communities match your search.") ]
@@ -3592,8 +3885,8 @@ threadRow model t =
               else
                 p [ class "thread-excerpt" ] [ text (ellipsize 240 t.body) ]
             , div [ class "thread-actions" ]
-                [ span [ class "thread-action primary" ] [ text ("▣  " ++ String.fromInt t.replyCount ++ " replies") ]
-                , span [ class "thread-action" ] [ text ("◉  " ++ String.fromInt t.views ++ " views") ]
+                [ span [ class "thread-action primary" ] [ text (String.fromInt t.replyCount ++ " replies") ]
+                , span [ class "thread-action" ] [ text (String.fromInt t.views ++ " views") ]
                 , span [ class "thread-action" ] [ text ("updated " ++ ago model.serverTime t.updatedAt ++ " ago") ]
                 ]
             ]
@@ -3688,30 +3981,55 @@ renderDmsPage model =
     let
         requests = List.filter (\c -> c.requestState == "pending") model.convs
         conversations = List.filter (\c -> c.requestState /= "pending") model.convs
-    in div [ class "dm-inbox" ]
-        [ div [ class "section-head" ]
+        unread = List.sum (List.map .unread conversations)
+    in
+    div [ class "dm-inbox page-stack" ]
+        [ div [ class "page-heading" ]
             [ div []
-                [ h2 [] [ text "Direct Messages" ]
-                , p [ class "muted" ] [ text "Private chats and groups." ]
-                ]
-            , button [ class "btn", onClick NewDmModal ] [ text "New DM" ]
-            ]
-        , if List.isEmpty requests then text "" else
-            div [ class "dm-request-section" ]
-                [ h3 [ class "list-section-title" ] [ text ("Message requests · " ++ String.fromInt (List.length requests)) ]
-                , div [ class "card dm-list-card" ] (List.map (messageRequestRow model) requests)
-                ]
-        , h3 [ class "list-section-title" ] [ text "Messages" ]
-        , div [ class "card dm-list-card" ]
-            (if List.isEmpty conversations then
-                [ div [ class "empty dm-empty" ]
-                    [ h2 [] [ text "No messages yet" ]
-                    , p [] [ text "Start a conversation from Friends or New DM." ]
+                [ span [ class "eyebrow" ] [ text "Messages" ]
+                , h1 [] [ text "Direct messages" ]
+                , p [ class "muted" ]
+                    [ text
+                        (if unread > 0 then
+                            String.fromInt unread ++ " unread across " ++ String.fromInt (List.length conversations) ++ " conversations."
+                         else
+                            String.fromInt (List.length conversations) ++ " conversations, all caught up."
+                        )
                     ]
                 ]
-             else
-                List.map (\c -> convRow c model) conversations
-            )
+            , button [ class "btn", onClick NewDmModal ] [ text "New message" ]
+            ]
+        , if List.isEmpty requests then
+            text ""
+          else
+            section [ class "dm-request-section" ]
+                [ div [ class "section-head compact-section-head" ]
+                    [ div []
+                        [ h2 [] [ text "Message requests" ]
+                        , p [ class "muted" ] [ text (String.fromInt (List.length requests) ++ " waiting for review") ]
+                        ]
+                    ]
+                , div [ class "card dm-list-card" ] (List.map (messageRequestRow model) requests)
+                ]
+        , section [ class "dm-message-section" ]
+            [ div [ class "section-head compact-section-head" ]
+                [ div []
+                    [ h2 [] [ text "Conversations" ]
+                    , p [ class "muted" ] [ text "Private and group chats." ]
+                    ]
+                ]
+            , div [ class "card dm-list-card" ]
+                (if List.isEmpty conversations then
+                    [ div [ class "empty dm-empty" ]
+                        [ h2 [] [ text "No messages yet" ]
+                        , p [] [ text "Start a conversation from Friends or create a new message." ]
+                        , button [ class "btn", onClick NewDmModal ] [ text "Start a conversation" ]
+                        ]
+                    ]
+                 else
+                    List.map (\c -> convRow c model) conversations
+                )
+            ]
         ]
 
 messageRequestRow : Model -> Conversation -> Html Msg
@@ -3798,22 +4116,22 @@ addFriendPanel model =
             |> List.filter (\user -> Just user.id /= Maybe.map .id model.me)
     in div [ class "add-friend-panel" ]
         [ div [ class "add-friend-intro" ]
-            [ span [ class "add-friend-icon" ] [ text "+" ]
+            [ span [ class "add-friend-icon", attribute "aria-hidden" "true" ] [ span [ class "ui-icon ui-icon-friends" ] [] ]
             , div []
                 [ h3 [] [ text "Add Friend" ]
                 , p [ class "muted" ] [ text "Find someone by their username or display name." ]
                 ]
             ]
         , Html.form [ class "add-friend-form", onSubmit FindFriends ]
-            [ span [ class "add-friend-search-icon", attribute "aria-hidden" "true" ] [ text "⌕" ]
+            [ span [ class "add-friend-search-icon", attribute "aria-hidden" "true" ] [ span [ class "ui-icon ui-icon-search" ] [] ]
             , input [ value model.friendQuery, onInput FriendQuery, placeholder "Search for a friend", attribute "aria-label" "Friend username", attribute "autocomplete" "off" ] []
-            , button [ class "btn add-friend-submit", type_ "submit", disabled (String.length (String.trim model.friendQuery) < 2) ] [ text "Send Search" ]
+            , button [ class "btn add-friend-submit", type_ "submit", disabled (String.length (String.trim model.friendQuery) < 2) ] [ text "Search" ]
             ]
         , if String.isEmpty (String.trim model.friendQuery) then
             div [ class "friend-discovery-hint" ]
-                [ span [ class "discovery-art", attribute "aria-hidden" "true" ] [ text "☺" ]
-                , b [] [ text "Friends make everything better" ]
-                , p [] [ text "Search above to find people. You can use only part of their display name." ]
+                [ span [ class "discovery-art", attribute "aria-hidden" "true" ] [ span [ class "ui-icon ui-icon-friends" ] [] ]
+                , b [] [ text "Find people you know" ]
+                , p [] [ text "Search by username or display name. Partial names work too." ]
                 ]
           else if List.isEmpty candidates && model.friendSearchAttempted then
             div [ class "friend-discovery-hint compact friend-not-found" ]
@@ -3821,7 +4139,7 @@ addFriendPanel model =
                 , p [] [ text "Try again or check the spelling." ]
                 ]
           else if List.isEmpty candidates then
-            div [ class "friend-discovery-hint compact" ] [ b [] [ text "Ready to search" ], p [] [ text "Results will appear here after you press Send Search." ] ]
+            div [ class "friend-discovery-hint compact" ] [ b [] [ text "Ready to search" ], p [] [ text "Results will appear here after you press Search." ] ]
           else
             div [ class "card friends-list friend-results" ]
                 (candidates |> List.map (friendCandidateRow model))
@@ -3881,10 +4199,15 @@ renderServerPage : Model -> Html Msg
 renderServerPage model =
     case model.currentServer of
         Just data ->
-            let canManage = data.server.role == "owner" || data.server.role == "admin"
-            in div [ class "server-page" ]
-                [ div
-                    [ class "card pad server-hero"
+            let
+                canManage = data.server.role == "owner" || data.server.role == "admin"
+                textChannels = List.filter (\c -> c.kind /= "voice") data.channels
+                voiceChannels = List.filter (\c -> c.kind == "voice") data.channels
+                bannerClass = if String.isEmpty data.server.bannerUrl then "server-hero" else "server-hero has-banner"
+            in
+            div [ class "server-page page-stack" ]
+                [ section
+                    [ class ("card " ++ bannerClass)
                     , style "--server-accent" data.server.accentColor
                     , style "background-image"
                         (if String.isEmpty data.server.bannerUrl then
@@ -3893,36 +4216,62 @@ renderServerPage model =
                             "url('" ++ data.server.bannerUrl ++ "')"
                         )
                     ]
-                    [ serverIcon data.server
-                    , div []
-                        [ h2 [] [ text data.server.name ]
-                        , p [ class "muted" ] [ text (if String.isEmpty data.server.description then "No description yet." else data.server.description) ]
-                , if canManage then
-                    div [ class "nav-actions server-hero-actions" ]
-                        [ button [ class "btn", onClick (InviteModal data.server.id) ] [ text "Invite people" ]
-                        , button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Add channel" ]
-                        , button [ class "btn secondary", onClick (EditServerModal data.server) ] [ text "Customize" ]
+                    [ div [ class "server-hero-main" ]
+                        [ serverIcon data.server
+                        , div [ class "server-hero-copy" ]
+                            [ span [ class "eyebrow" ] [ text "Server" ]
+                            , h1 [] [ text data.server.name ]
+                            , p [] [ text (if String.isEmpty data.server.description then "A Plainwire community." else data.server.description) ]
+                            ]
                         ]
-                  else
-                    text ""
+                    , div [ class "server-meta" ]
+                        [ span [ class "server-meta-item" ] [ b [] [ text (String.fromInt (List.length data.members)) ], text " members" ]
+                        , span [ class "server-meta-item" ] [ b [] [ text (String.fromInt (List.length textChannels)) ], text " text" ]
+                        , span [ class "server-meta-item" ] [ b [] [ text (String.fromInt (List.length voiceChannels)) ], text " voice" ]
+                        , span [ class "server-role-badge" ] [ text data.server.role ]
+                        ]
+                    , if canManage then
+                        div [ class "server-hero-actions" ]
+                            [ button [ class "btn", onClick (InviteModal data.server.id) ] [ text "Invite people" ]
+                            , button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Add channel" ]
+                            , button [ class "btn secondary", onClick (EditServerModal data.server) ] [ text "Customize" ]
+                            ]
+                      else
+                        text ""
+                    ]
+                , div [ class "server-overview-grid" ]
+                    [ section [ class "card server-overview-panel server-channel-panel" ]
+                        [ div [ class "section-head compact-section-head" ]
+                            [ div []
+                                [ h2 [] [ text "Channels" ]
+                                , p [ class "muted" ] [ text "Jump into text or voice." ]
+                                ]
+                            , if canManage then button [ class "btn ghost", onClick (ChannelModal data.server.id) ] [ text "Add" ] else text ""
+                            ]
+                        , div [ class "server-channel-card" ]
+                            (channelGroup "Text channels" textChannels
+                             ++ channelGroup "Voice channels" voiceChannels)
+                        ]
+                    , section [ class "card server-overview-panel server-member-panel" ]
+                        [ div [ class "section-head compact-section-head" ]
+                            [ div []
+                                [ h2 [] [ text "Members" ]
+                                , p [ class "muted" ] [ text (String.fromInt (List.length data.members) ++ " people in this server") ]
+                                ]
+                            ]
+                        , div [ class "server-member-list" ] (List.map (\m -> memberRow model.userStatuses m) data.members)
                         ]
                     ]
-                , h3 [ class "server-section-title" ] [ text "Channels" ]
-                , div [ class "card server-channel-card" ]
-                    (channelGroup "Text channels" (List.filter (\c -> c.kind /= "voice") data.channels)
-                     ++ channelGroup "Voice channels" (List.filter (\c -> c.kind == "voice") data.channels))
-                , h3 [ class "server-section-title" ] [ text "Members" ]
-                , div [ class "card" ] (List.map (\m -> memberRow model.userStatuses m) data.members)
                 ]
-        Nothing -> div [ class "empty" ] [ text "Loading server..." ]
+        Nothing ->
+            div [ class "page-loading" ] [ span [ class "loading-dot" ] [], text "Loading server" ]
 
 channelRow : Channel -> Html Msg
 channelRow c =
     let target = if c.kind == "voice" then "#voice/" else "#channel/"
-        icon = if c.kind == "voice" then "♪" else "#"
-    in a [ class "row", onClick (Go (target ++ String.fromInt c.id)) ]
-        [ span [ class "server-icon" ] [ text icon ]
-        , div [ class "grow" ] [ b [] [ text c.name ], small [ class "muted" ] [ text c.kind ] ]
+    in a [ class "row channel-link", href (target ++ String.fromInt c.id), onClick (Go (target ++ String.fromInt c.id)) ]
+        [ span [ class ("channel-glyph " ++ if c.kind == "voice" then "voice" else "text"), attribute "aria-hidden" "true" ] []
+        , div [ class "grow" ] [ b [] [ text c.name ], small [ class "muted" ] [ text (if c.kind == "voice" then "Voice channel" else "Text channel") ] ]
         ]
 
 
@@ -3930,7 +4279,6 @@ managedChannelRow : Bool -> List Category -> Channel -> Html Msg
 managedChannelRow canManage categories channel =
     let
         target = if channel.kind == "voice" then "#voice/" else "#channel/"
-        icon = if channel.kind == "voice" then "♪" else "#"
         selectedCategory = Maybe.map String.fromInt channel.categoryId |> Maybe.withDefault ""
         moveTarget raw = MoveChannelToCategory channel.id (if String.isEmpty raw then Nothing else String.toInt raw)
         categoryOptions =
@@ -3938,8 +4286,8 @@ managedChannelRow canManage categories channel =
                 :: List.map (\category -> option [ value (String.fromInt category.id) ] [ text category.name ]) categories
     in
     div [ class "row", onClick (Go (target ++ String.fromInt channel.id)) ]
-        [ span [ class "server-icon" ] [ text icon ]
-        , div [ class "grow" ] [ b [] [ text channel.name ], small [ class "muted" ] [ text channel.kind ] ]
+        [ span [ class ("channel-glyph " ++ if channel.kind == "voice" then "voice" else "text"), attribute "aria-hidden" "true" ] []
+        , div [ class "grow" ] [ b [] [ text channel.name ], small [ class "muted" ] [ text (if channel.kind == "voice" then "Voice channel" else "Text channel") ] ]
         , if canManage then
             select
                 [ class "channel-category-select"
@@ -4030,11 +4378,11 @@ voiceParticipantRow members vu =
             else if vu.muted || vu.deafened then "voice-state-pill muted"
             else "voice-state-pill live"
         pillText =
-            if vu.reconnecting then "↻ Rejoining"
-            else if vu.screen then "🖥 Share"
-            else if vu.deafened then "🔇"
-            else if vu.muted then "🔇 Muted"
-            else "● Live"
+            if vu.reconnecting then "Rejoining"
+            else if vu.screen then "Sharing"
+            else if vu.deafened then "Deafened"
+            else if vu.muted then "Muted"
+            else "Live"
     in
     div [ class ("row voice-participant" ++ if vu.screen then " screen-sharing" else "") ]
         [ avatarImg avatarUrl name "small"
@@ -4056,57 +4404,78 @@ renderProfilePage model =
                 activityText =
                     case liveStatus of
                         Just "away" -> "Away"
-                        Just "busy" -> "Busy"
+                        Just "busy" -> "Do not disturb"
+                        Just "invisible" -> "Offline"
                         Just _ -> "Online"
                         Nothing ->
                             let elapsed = agoAt model.serverTime u.lastSeen
                             in if elapsed == "never" then "Offline"
                                else if elapsed == "now" || elapsed == "1s" then "Last seen just now"
                                else "Last seen " ++ elapsed ++ " ago"
-            in div [ class "card profile" ]
-                [ div [ class "banner", style "background-image" (if String.isEmpty u.bannerUrl then "none" else "url('" ++ u.bannerUrl ++ "')") ] []
-                , div [ class "profile-body" ]
-                    [ presenceAvatar model.userStatuses u.id u.avatarUrl u.displayName "big"
-                    , div []
-                        [ h1 [] [ text u.displayName ]
-                        , p [ class "muted profile-identity" ]
-                            [ text ("@" ++ u.username ++ " · ")
-                            , span [ class ("presence-text " ++ presence) ] [ text activityText ]
+            in
+            article [ class "card profile profile-page-card" ]
+                [ div
+                    [ class ("banner profile-cover" ++ if String.isEmpty u.bannerUrl then " empty" else "")
+                    , style "background-image" (if String.isEmpty u.bannerUrl then "none" else "url('" ++ u.bannerUrl ++ "')")
+                    ] []
+                , div [ class "profile-body profile-layout" ]
+                    [ div [ class "profile-avatar-column" ]
+                        [ presenceAvatar model.userStatuses u.id u.avatarUrl u.displayName "big" ]
+                    , div [ class "profile-copy" ]
+                        [ div [ class "profile-title-row" ]
+                            [ div []
+                                [ h1 [] [ text u.displayName ]
+                                , p [ class "muted profile-identity" ] [ text ("@" ++ u.username) ]
+                                ]
+                            , span [ class ("presence-pill profile-presence " ++ presence) ]
+                                [ span [ class ("status-dot " ++ presence) ] [], text activityText ]
                             ]
-                        , p [] [ text (if String.isEmpty u.bio then "No bio set." else u.bio) ]
-                        , p [] [ span [ class ("pill presence-pill " ++ presence) ] [ span [ class ("status-dot " ++ presence) ] [], text activityText ] ]
-                        , div [ class "nav-actions" ]
+                        , div [ class "profile-bio" ]
+                            [ span [ class "profile-section-label" ] [ text "About" ]
+                            , p [] [ text (if String.isEmpty (String.trim u.bio) then "No bio set yet." else u.bio) ]
+                            ]
+                        , div [ class "profile-actions" ]
                             [ if viewingSelf then button [ class "btn", onClick (Go "#settings") ] [ text "Edit profile" ] else text ""
+                            , if not viewingSelf && model.currentProfileRelationship /= "blocked" then button [ class "btn", onClick (BridgeEvent "dm_user" (E.int u.id)) ] [ text "Message" ] else text ""
                             , if not viewingSelf && model.currentProfileRelationship /= "blocked" then button [ class "btn secondary", onClick (BridgeEvent "call_user" (E.int u.id)) ] [ text "Call" ] else text ""
-                            , if not viewingSelf && model.currentProfileRelationship /= "blocked" then button [ class "btn secondary", onClick (BridgeEvent "dm_user" (E.int u.id)) ] [ text "Message" ] else text ""
                             , if not viewingSelf && model.currentProfileRelationship == "blocked" && model.currentProfileBlockedByMe then
                                 button [ class "btn danger", onClick (BridgeEvent "unblock_user" (E.int u.id)) ] [ text "Unblock" ]
                               else if not viewingSelf && model.currentProfileRelationship == "blocked" then
                                 button [ class "btn secondary", disabled True ] [ text "Unavailable" ]
                               else if not viewingSelf then
-                                button [ class "btn danger", onClick (BridgeEvent "block_user" (E.int u.id)) ] [ text "Block" ]
+                                button [ class "btn ghost profile-more-action", onClick (BridgeEvent "block_user" (E.int u.id)) ] [ text "Block" ]
                               else text ""
                             ]
                         ]
                     ]
                 ]
-        Nothing -> div [ class "empty" ] [ text "Loading profile..." ]
+        Nothing ->
+            div [ class "page-loading" ] [ span [ class "loading-dot" ] [], text "Loading profile" ]
 
 renderSettingsPage : Model -> Html Msg
 renderSettingsPage model =
     case model.me of
         Just u ->
             div [ class "settings-page" ]
-                [ aside [ class "settings-sidebar" ]
+                [ nav [ class "settings-mobile-nav", attribute "aria-label" "Settings sections" ]
+                    [ settingsMobileTab model.settingsTab "profile" "Profile"
+                    , settingsMobileTab model.settingsTab "appearance" "Appearance"
+                    , settingsMobileTab model.settingsTab "chat" "Chat"
+                    , settingsMobileTab model.settingsTab "voice" "Voice"
+                    , settingsMobileTab model.settingsTab "sound" "Alerts"
+                    , settingsMobileTab model.settingsTab "privacy" "Privacy"
+                    , settingsMobileTab model.settingsTab "account" "Account"
+                    ]
+                , aside [ class "settings-sidebar" ]
                     [ div [ class "settings-nav-label" ] [ text "User settings" ]
-                    , a [ class ("settings-tab" ++ if model.settingsTab == "profile" then " active" else ""), onClick (SetSettingsTab "profile") ] [ span [ class "settings-tab-icon" ] [ text "●" ], text "Profile" ]
-                    , a [ class ("settings-tab" ++ if model.settingsTab == "appearance" then " active" else ""), onClick (SetSettingsTab "appearance") ] [ span [ class "settings-tab-icon" ] [ text "◐" ], text "Appearance" ]
-                    , a [ class ("settings-tab" ++ if model.settingsTab == "chat" then " active" else ""), onClick (SetSettingsTab "chat") ] [ span [ class "settings-tab-icon" ] [ text "#" ], text "Chat" ]
-                    , a [ class ("settings-tab" ++ if model.settingsTab == "voice" then " active" else ""), onClick (SetSettingsTab "voice") ] [ span [ class "settings-tab-icon" ] [ text "◖" ], text "Voice & Video" ]
-                    , a [ class ("settings-tab" ++ if model.settingsTab == "sound" then " active" else ""), onClick (SetSettingsTab "sound") ] [ span [ class "settings-tab-icon" ] [ text "◖" ], text "Notifications" ]
-                    , a [ class ("settings-tab" ++ if model.settingsTab == "privacy" then " active" else ""), onClick (SetSettingsTab "privacy") ] [ span [ class "settings-tab-icon" ] [ text "◇" ], text "Privacy & Safety" ]
+                    , button [ type_ "button", class ("settings-tab" ++ if model.settingsTab == "profile" then " active" else ""), onClick (SetSettingsTab "profile") ] [ text "Profile" ]
+                    , button [ type_ "button", class ("settings-tab" ++ if model.settingsTab == "appearance" then " active" else ""), onClick (SetSettingsTab "appearance") ] [ text "Appearance" ]
+                    , button [ type_ "button", class ("settings-tab" ++ if model.settingsTab == "chat" then " active" else ""), onClick (SetSettingsTab "chat") ] [ text "Chat" ]
+                    , button [ type_ "button", class ("settings-tab" ++ if model.settingsTab == "voice" then " active" else ""), onClick (SetSettingsTab "voice") ] [ text "Voice & Video" ]
+                    , button [ type_ "button", class ("settings-tab" ++ if model.settingsTab == "sound" then " active" else ""), onClick (SetSettingsTab "sound") ] [ text "Notifications" ]
+                    , button [ type_ "button", class ("settings-tab" ++ if model.settingsTab == "privacy" then " active" else ""), onClick (SetSettingsTab "privacy") ] [ text "Privacy & Safety" ]
                     , div [ class "settings-nav-separator" ] []
-                    , a [ class ("settings-tab" ++ if model.settingsTab == "account" then " active" else ""), onClick (SetSettingsTab "account") ] [ span [ class "settings-tab-icon" ] [ text "⚙" ], text "Account" ]
+                    , button [ type_ "button", class ("settings-tab" ++ if model.settingsTab == "account" then " active" else ""), onClick (SetSettingsTab "account") ] [ text "Account" ]
                     ]
                 , div [ class "settings-content" ]
                     [ div [ class "settings-content-top" ]
@@ -4120,12 +4489,23 @@ renderSettingsPage model =
                             "voice" -> renderVoiceSettings model
                             "sound" -> renderNotificationSettings model
                             "privacy" -> renderPrivacySettings model
-                            "account" -> renderAccountSettings u
+                            "account" -> renderAccountSettings u model
                             _ -> renderProfileSettings u model
                         ]
                     ]
                 ]
         Nothing -> text ""
+
+settingsMobileTab : String -> String -> String -> Html Msg
+settingsMobileTab current key label =
+    button
+        [ type_ "button"
+        , class ("settings-mobile-tab" ++ if current == key then " active" else "")
+        , onClick (SetSettingsTab key)
+        , attribute "aria-current" (if current == key then "page" else "false")
+        ]
+        [ text label ]
+
 
 settingsTitle : String -> String
 settingsTitle tab =
@@ -4138,8 +4518,8 @@ settingsTitle tab =
         "account" -> "Account"
         _ -> "My Profile"
 
-renderAccountSettings : User -> Html Msg
-renderAccountSettings user =
+renderAccountSettings : User -> Model -> Html Msg
+renderAccountSettings user model =
     div [ class "settings-card settings-panel" ]
         [ div [ class "settings-card-head" ]
             [ h2 [] [ text "Account" ]
@@ -4157,6 +4537,12 @@ renderAccountSettings user =
                 [ b [] [ text "Change password" ], small [ class "muted" ] [ text "Update your password and sign out other sessions." ] ]
             , button [ class "settings-action-card", onClick (BridgeEvent "account_sessions" E.null) ]
                 [ b [] [ text "Active sessions" ], small [ class "muted" ] [ text "Review where your account is currently signed in." ] ]
+            , button [ class "settings-action-card", onClick (BridgeEvent "account_diagnostics" E.null) ]
+                [ b [] [ text "Connection diagnostics" ], small [ class "muted" ] [ text "Check WebSocket, database, browser, and TURN readiness." ] ]
+            ]
+        , div [ class "setting-row settings-about-row" ]
+            [ div [] [ b [] [ text "Plainwire" ], small [ class "muted" ] [ text ("Version " ++ model.clientVersion) ] ]
+            , span [ class "pill" ] [ text "Web client" ]
             ]
         , div [ class "danger-zone" ]
             [ div []
@@ -4174,20 +4560,20 @@ renderChatSettings model =
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Send message with Enter" ], small [ class "muted" ] [ text "Choose whether Enter sends or adds a new line." ] ]
             , div [ class "segmented-control" ]
-                [ button [ class "btn secondary", onClick (SetChatEnterSends True) ] [ text "Enter sends" ]
-                , button [ class "btn secondary", onClick (SetChatEnterSends False) ] [ text "Ctrl/Cmd + Enter sends" ]
+                [ button [ class ("btn secondary" ++ if model.chatEnterSends then " active-choice" else ""), onClick (SetChatEnterSends True) ] [ text "Enter sends" ]
+                , button [ class ("btn secondary" ++ if not model.chatEnterSends then " active-choice" else ""), onClick (SetChatEnterSends False) ] [ text "Ctrl/Cmd + Enter sends" ]
                 ]
             ]
         , div [ class "setting-row" ]
-            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "↗" ], div [] [ b [] [ text "Link previews" ], small [ class "muted" ] [ text "Show rich cards for supported links." ] ] ]
+            [ div [ class "setting-copy" ] [ div [] [ b [] [ text "Link previews" ], small [ class "muted" ] [ text "Show rich cards for supported links." ] ] ]
             , button [ class ("settings-switch" ++ if model.linkPreviewsEnabled then " active" else ""), onClick (SetLinkPreviewsEnabled (not model.linkPreviewsEnabled)), attribute "role" "switch", attribute "aria-checked" (if model.linkPreviewsEnabled then "true" else "false"), title "Toggle link previews" ] [ span [ class "settings-switch-knob" ] [] ]
             ]
         , div [ class "setting-row" ]
-            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "GIF" ], div [] [ b [] [ text "Autoplay animated media" ], small [ class "muted" ] [ text "Control GIF and animated image playback." ] ] ]
+            [ div [ class "setting-copy" ] [ div [] [ b [] [ text "Autoplay animated media" ], small [ class "muted" ] [ text "Control GIF and animated image playback." ] ] ]
             , button [ class ("settings-switch" ++ if model.animatedMediaEnabled then " active" else ""), onClick (SetAnimatedMediaEnabled (not model.animatedMediaEnabled)), attribute "role" "switch", attribute "aria-checked" (if model.animatedMediaEnabled then "true" else "false"), title "Toggle animated media" ] [ span [ class "settings-switch-knob" ] [] ]
             ]
         , div [ class "setting-row" ]
-            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "Aa" ], div [] [ b [] [ text "Compact message spacing" ], small [ class "muted" ] [ text "Reduce vertical spacing between grouped messages." ] ] ]
+            [ div [ class "setting-copy" ] [ div [] [ b [] [ text "Compact message spacing" ], small [ class "muted" ] [ text "Reduce vertical spacing between grouped messages." ] ] ]
             , button [ class ("settings-switch" ++ if model.compactMessages then " active" else ""), onClick (SetCompactMessages (not model.compactMessages)), attribute "role" "switch", attribute "aria-checked" (if model.compactMessages then "true" else "false"), title "Toggle compact message spacing" ] [ span [ class "settings-switch-knob" ] [] ]
             ]
         ]
@@ -4197,15 +4583,15 @@ renderPrivacySettings model =
     div [ class "settings-card settings-panel" ]
         [ div [ class "settings-card-head" ] [ h2 [] [ text "Privacy & Safety" ], p [ class "muted" ] [ text "Control browser-side privacy behavior and review account security." ] ]
         , div [ class "setting-row" ]
-            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "○" ], div [] [ b [] [ text "Media preloading" ], small [ class "muted" ] [ text "Preload remote images for smoother scrolling." ] ] ]
+            [ div [ class "setting-copy" ] [ div [] [ b [] [ text "Media preloading" ], small [ class "muted" ] [ text "Preload remote images for smoother scrolling." ] ] ]
             , button [ class ("settings-switch" ++ if model.mediaPreloadEnabled then " active" else ""), onClick (SetMediaPreloadEnabled (not model.mediaPreloadEnabled)), attribute "role" "switch", attribute "aria-checked" (if model.mediaPreloadEnabled then "true" else "false"), title "Toggle media preloading" ] [ span [ class "settings-switch-knob" ] [] ]
             ]
         , div [ class "setting-row" ]
-            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "□" ], div [] [ b [] [ text "Clear local drafts" ], small [ class "muted" ] [ text "Remove message drafts saved in this browser." ] ] ]
+            [ div [ class "setting-copy" ] [ div [] [ b [] [ text "Clear local drafts" ], small [ class "muted" ] [ text "Remove message drafts saved in this browser." ] ] ]
             , button [ class "btn secondary settings-action", onClick (BridgeEvent "privacy_clear_drafts" E.null) ] [ text "Clear drafts" ]
             ]
         , div [ class "setting-row" ]
-            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "↻" ], div [] [ b [] [ text "Reset device preferences" ], small [ class "muted" ] [ text "Restore layout, chat, audio, and appearance settings on this device." ] ] ]
+            [ div [ class "setting-copy" ] [ div [] [ b [] [ text "Reset device preferences" ], small [ class "muted" ] [ text "Restore layout, chat, audio, and appearance settings on this device." ] ] ]
             , button [ class "btn secondary settings-action", onClick (BridgeEvent "privacy_reset_device" E.null) ] [ text "Reset" ]
             ]
         ]
@@ -4217,49 +4603,49 @@ renderAppearanceSettings model =
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Theme" ], small [ class "muted" ] [ text "Use your system colors or choose a theme." ] ]
             , div [ class "appearance-choice-grid" ]
-                [ choiceCard (model.profileTheme == "system") "◐" "System" "Follow this device." (ProfileTheme "system")
-                , choiceCard (model.profileTheme == "dark") "●" "Dark" "Dim, focused surfaces." (ProfileTheme "dark")
-                , choiceCard (model.profileTheme == "light") "○" "Light" "Bright and clean." (ProfileTheme "light")
+                [ themeChoiceCard (model.profileTheme == "system") "system" "System" "Follow this device." (ProfileTheme "system")
+                , themeChoiceCard (model.profileTheme == "dark") "dark" "Dark" "Dim, focused surfaces." (ProfileTheme "dark")
+                , themeChoiceCard (model.profileTheme == "light") "light" "Light" "Bright and clean." (ProfileTheme "light")
                 ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Interface density" ], small [ class "muted" ] [ text "Compact mode fits more channels and messages on screen." ] ]
             , div [ class "segmented-control" ]
-                [ button [ class "btn secondary", onClick (BridgeEvent "ui_density" (E.string "comfortable")) ] [ text "Comfortable" ]
-                , button [ class "btn secondary", onClick (BridgeEvent "ui_density" (E.string "compact")) ] [ text "Compact" ]
+                [ button [ class ("btn secondary" ++ if model.uiDensity == "comfortable" then " active-choice" else ""), onClick (BridgeEvent "ui_density" (E.string "comfortable")) ] [ text "Comfortable" ]
+                , button [ class ("btn secondary" ++ if model.uiDensity == "compact" then " active-choice" else ""), onClick (BridgeEvent "ui_density" (E.string "compact")) ] [ text "Compact" ]
                 ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Text size" ], small [ class "muted" ] [ text "Scale the interface without changing your browser zoom." ] ]
             , div [ class "segmented-control" ]
-                [ button [ class "btn secondary", onClick (BridgeEvent "ui_font_scale" (E.string "small")) ] [ text "Small" ]
-                , button [ class "btn secondary", onClick (BridgeEvent "ui_font_scale" (E.string "default")) ] [ text "Default" ]
-                , button [ class "btn secondary", onClick (BridgeEvent "ui_font_scale" (E.string "large")) ] [ text "Large" ]
+                [ button [ class ("btn secondary" ++ if model.uiFontScale == "small" then " active-choice" else ""), onClick (BridgeEvent "ui_font_scale" (E.string "small")) ] [ text "Small" ]
+                , button [ class ("btn secondary" ++ if model.uiFontScale == "default" then " active-choice" else ""), onClick (BridgeEvent "ui_font_scale" (E.string "default")) ] [ text "Default" ]
+                , button [ class ("btn secondary" ++ if model.uiFontScale == "large" then " active-choice" else ""), onClick (BridgeEvent "ui_font_scale" (E.string "large")) ] [ text "Large" ]
                 ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Accent" ], small [ class "muted" ] [ text "Choose the main interface color on this device." ] ]
             , div [ class "segmented-control" ]
-                [ button [ class "btn secondary", onClick (BridgeEvent "ui_accent" (E.string "blue")) ] [ text "Blue" ]
-                , button [ class "btn secondary", onClick (BridgeEvent "ui_accent" (E.string "teal")) ] [ text "Teal" ]
-                , button [ class "btn secondary", onClick (BridgeEvent "ui_accent" (E.string "green")) ] [ text "Green" ]
-                , button [ class "btn secondary", onClick (BridgeEvent "ui_accent" (E.string "amber")) ] [ text "Amber" ]
-                , button [ class "btn secondary", onClick (BridgeEvent "ui_accent" (E.string "rose")) ] [ text "Rose" ]
+                [ button [ class ("btn secondary" ++ if model.uiAccent == "blue" then " active-choice" else ""), onClick (BridgeEvent "ui_accent" (E.string "blue")) ] [ text "Blue" ]
+                , button [ class ("btn secondary" ++ if model.uiAccent == "teal" then " active-choice" else ""), onClick (BridgeEvent "ui_accent" (E.string "teal")) ] [ text "Teal" ]
+                , button [ class ("btn secondary" ++ if model.uiAccent == "green" then " active-choice" else ""), onClick (BridgeEvent "ui_accent" (E.string "green")) ] [ text "Green" ]
+                , button [ class ("btn secondary" ++ if model.uiAccent == "amber" then " active-choice" else ""), onClick (BridgeEvent "ui_accent" (E.string "amber")) ] [ text "Amber" ]
+                , button [ class ("btn secondary" ++ if model.uiAccent == "rose" then " active-choice" else ""), onClick (BridgeEvent "ui_accent" (E.string "rose")) ] [ text "Rose" ]
                 ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Corners" ], small [ class "muted" ] [ text "Keep the interface tight or give panels a little more rounding." ] ]
             , div [ class "segmented-control" ]
-                [ button [ class "btn secondary", onClick (BridgeEvent "ui_corner_style" (E.string "compact")) ] [ text "Compact" ]
-                , button [ class "btn secondary", onClick (BridgeEvent "ui_corner_style" (E.string "default")) ] [ text "Default" ]
-                , button [ class "btn secondary", onClick (BridgeEvent "ui_corner_style" (E.string "rounded")) ] [ text "Rounded" ]
+                [ button [ class ("btn secondary" ++ if model.uiCornerStyle == "compact" then " active-choice" else ""), onClick (BridgeEvent "ui_corner_style" (E.string "compact")) ] [ text "Compact" ]
+                , button [ class ("btn secondary" ++ if model.uiCornerStyle == "default" then " active-choice" else ""), onClick (BridgeEvent "ui_corner_style" (E.string "default")) ] [ text "Default" ]
+                , button [ class ("btn secondary" ++ if model.uiCornerStyle == "rounded" then " active-choice" else ""), onClick (BridgeEvent "ui_corner_style" (E.string "rounded")) ] [ text "Rounded" ]
                 ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Motion" ], small [ class "muted" ] [ text "Reduce interface animation when you prefer less movement." ] ]
             , div [ class "segmented-control" ]
-                [ button [ class "btn secondary", onClick (BridgeEvent "reduce_motion" (E.bool False)) ] [ text "Standard" ]
-                , button [ class "btn secondary", onClick (BridgeEvent "reduce_motion" (E.bool True)) ] [ text "Reduced" ]
+                [ button [ class ("btn secondary" ++ if not model.reduceMotion then " active-choice" else ""), onClick (BridgeEvent "reduce_motion" (E.bool False)) ] [ text "Standard" ]
+                , button [ class ("btn secondary" ++ if model.reduceMotion then " active-choice" else ""), onClick (BridgeEvent "reduce_motion" (E.bool True)) ] [ text "Reduced" ]
                 ]
             ]
         ]
@@ -4269,14 +4655,14 @@ renderNotificationSettings model =
     div [ class "settings-card settings-panel" ]
         [ div [ class "settings-card-head" ] [ h2 [] [ text "Notifications" ], p [ class "muted" ] [ text "Control alerts on this device." ] ]
         , div [ class "setting-row" ]
-            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "♫" ], div [] [ b [] [ text "Sound effects" ], small [ class "muted" ] [ text "Play sounds for messages, calls, and important activity." ] ] ]
+            [ div [ class "setting-copy" ] [ div [] [ b [] [ text "Sound effects" ], small [ class "muted" ] [ text "Play sounds for messages, calls, and important activity." ] ] ]
             , button
                 [ class ("settings-switch" ++ if model.soundEnabled then " active" else "")
                 , onClick ToggleSound, attribute "role" "switch", attribute "aria-checked" (if model.soundEnabled then "true" else "false"), title "Toggle sound effects"
                 ] [ span [ class "settings-switch-knob" ] [] ]
             ]
         , div [ class "setting-row" ]
-            [ div [ class "setting-copy" ] [ span [ class "setting-icon" ] [ text "◉" ], div [] [ b [] [ text "Desktop notifications" ], small [ class "muted" ] [ text "Get alerts while Plainwire is open in the background." ] ] ]
+            [ div [ class "setting-copy" ] [ div [] [ b [] [ text "Desktop notifications" ], small [ class "muted" ] [ text "Get alerts while Plainwire is open in the background." ] ] ]
             , button [ class "btn secondary settings-action", onClick (BridgeEvent "request_notifications" E.null) ] [ text "Review permission" ]
             ]
         , div [ class "notification-sound-preview" ]
@@ -4383,17 +4769,19 @@ renderProfileSettings u model =
         , div [ class "field" ]
             [ label [] [ text "Avatar URL" ]
             , input [ value model.profileAvatarUrl, placeholder "https://...", onInput ProfileAvatarUrl ] []
-            , div [ class "file-upload-row" ]
-                [ input [ id "profileAvatarFile", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "profileAvatarFile")) ] []
-                , button [ class "btn secondary", onClick (ReadFile "profileAvatarFile"), disabled model.profileAvatarUploading ] [ text "Upload file" ]
+            , div [ class "file-picker-row" ]
+                [ input [ id "profileAvatarFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "profileAvatarFile")) ] []
+                , label [ class ("btn secondary file-picker-button" ++ if model.profileAvatarUploading then " disabled" else ""), attribute "for" "profileAvatarFile", attribute "aria-disabled" (if model.profileAvatarUploading then "true" else "false") ] [ text (if model.profileAvatarUploading then "Uploading..." else "Choose avatar") ]
+                , small [ class "muted" ] [ text "JPEG, PNG, GIF, WebP, or AVIF" ]
                 ]
             ]
         , div [ class "field" ]
             [ label [] [ text "Banner URL" ]
             , input [ value model.profileBannerUrl, placeholder "https://...", onInput ProfileBannerUrl ] []
-            , div [ class "file-upload-row" ]
-                [ input [ id "profileBannerFile", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "profileBannerFile")) ] []
-                , button [ class "btn secondary", onClick (ReadFile "profileBannerFile"), disabled model.profileBannerUploading ] [ text "Upload file" ]
+            , div [ class "file-picker-row" ]
+                [ input [ id "profileBannerFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "profileBannerFile")) ] []
+                , label [ class ("btn secondary file-picker-button" ++ if model.profileBannerUploading then " disabled" else ""), attribute "for" "profileBannerFile", attribute "aria-disabled" (if model.profileBannerUploading then "true" else "false") ] [ text (if model.profileBannerUploading then "Uploading..." else "Choose banner") ]
+                , small [ class "muted" ] [ text "JPEG, PNG, GIF, WebP, or AVIF" ]
                 ]
             ]
         , div [ class "field" ]
@@ -4405,14 +4793,6 @@ renderProfileSettings u model =
                 , option [ value "invisible" ] [ text "Invisible" ]
                 ]
             , small [ class "muted" ] [ text "Online turns to away automatically when you stop using Plainwire. Invisible shows you as offline." ]
-            ]
-        , div [ class "field" ]
-            [ label [] [ text "Theme" ]
-            , select [ value model.profileTheme, onInput ProfileTheme ]
-                [ option [ value "system" ] [ text "System" ]
-                , option [ value "light" ] [ text "Light" ]
-                , option [ value "dark" ] [ text "Dark" ]
-                ]
             ]
         , div [ class "nav-actions" ]
             [ button
@@ -4451,8 +4831,8 @@ renderNewServerPage model =
             [ div [ class "field" ] [ label [] [ text "Server name" ], input [ value model.serverName, maxlength 80, placeholder "Weekend crew", onInput ServerName ] [] ]
             , div [ class "field" ] [ label [] [ text "What is it for?" ], textarea [ value model.serverDescription, maxlength 280, placeholder "Games, projects, hanging out…", onInput ServerDescription ] [] ]
             , div [ class "server-create-defaults" ]
-                [ div [] [ span [ class "server-default-icon" ] [ text "#" ], span [] [ b [] [ text "general" ], small [ class "muted" ] [ text "Text channel" ] ] ]
-                , div [] [ span [ class "server-default-icon" ] [ text "♪" ], span [] [ b [] [ text "Lounge" ], small [ class "muted" ] [ text "Voice ready" ] ] ]
+                [ div [] [ span [ class "server-default-icon" ] [ text "T" ], span [] [ b [] [ text "general" ], small [ class "muted" ] [ text "Text channel" ] ] ]
+                , div [] [ span [ class "server-default-icon" ] [ text "V" ], span [] [ b [] [ text "Lounge" ], small [ class "muted" ] [ text "Voice ready" ] ] ]
                 ]
             , div [ class "modal-actions server-create-actions" ]
                 [ button [ class "btn secondary", onClick (Go "#") ] [ text "Cancel" ]
@@ -4555,21 +4935,23 @@ renderChatHeader model =
                     let hasCall = callForConversation id model /= Nothing
                         joinedCall = isJoinedCall id model
                     in div [ class "chat-header" ]
-                        [ convAvatar model c
+                        [ button [ class "chat-mobile-menu", type_ "button", onClick ToggleSidebar, attribute "aria-label" "Open navigation" ] [ span [ class "ui-icon ui-icon-menu", attribute "aria-hidden" "true" ] [] ]
+                        , convAvatar model c
                         , div [ class "grow" ]
                             [ h2 [] [ text (convName c) ]
                             , small [ class "muted" ] [ text (if c.memberCount > 2 then String.fromInt c.memberCount ++ " people" else "Direct message") ]
                             ]
+                        , chatConnectionBadge model
                         , if joinedCall then
-                            button [ class "btn call-decline", onClick EndCall ] [ text "Leave Call" ]
+                            button [ class "btn call-decline chat-call-action", onClick EndCall ] [ span [ class "ui-icon ui-icon-call-end", attribute "aria-hidden" "true" ] [], span [ class "chat-call-label" ] [ text "Leave" ] ]
                           else if hasCall then
-                            button [ class "btn call-accept", onClick (JoinCall id) ] [ text "Join Call" ]
+                            button [ class "btn call-accept chat-call-action", onClick (JoinCall id) ] [ span [ class "ui-icon ui-icon-call", attribute "aria-hidden" "true" ] [], span [ class "chat-call-label" ] [ text "Join" ] ]
                           else
-                            button [ class "btn", onClick (BridgeEvent "start_call" (E.int id)) ] [ text "Call" ]
+                            button [ class "btn chat-call-action", onClick (BridgeEvent "start_call" (E.int id)), attribute "aria-label" "Start call" ] [ span [ class "ui-icon ui-icon-call", attribute "aria-hidden" "true" ] [], span [ class "chat-call-label" ] [ text "Call" ] ]
                         ]
-                [] -> chatOnlineHeader
-        ChannelView _ -> chatOnlineHeader
-        _ -> chatOnlineHeader
+                [] -> chatOnlineHeader model
+        ChannelView channelId -> channelChatHeader channelId model
+        _ -> chatOnlineHeader model
 
 isJoinedCall : Int -> Model -> Bool
 isJoinedCall conversationId model =
@@ -4598,7 +4980,7 @@ renderDmCallBar active model =
         seconds = String.fromInt (modBy 60 duration) |> String.padLeft 2 '0'
     in div [ class "dm-call-bar" ]
         [ div [ class "dm-call-bar-main" ]
-            [ span [ class "dm-call-bar-icon" ] [ text "♪" ]
+            [ span [ class "dm-call-bar-icon" ] [ span [ class "live-dot", attribute "aria-hidden" "true" ] [] ]
             , span [ class "dm-call-bar-title" ] [ text (if joinedCall then "In Call" else "Call active") ]
             , span
                 ([ class ("dm-call-bar-timer" ++ if joinedCall then " pw-live-call-timer" else "") ]
@@ -4610,24 +4992,58 @@ renderDmCallBar active model =
         , div [ class "dm-call-bar-controls" ]
             (if joinedCall then
                 [ button [ class ("btn icon-btn" ++ if model.voice.muted then " call-muted" else ""), onClick (BridgeEvent "toggle_mute" E.null) ]
-                    [ text (if model.voice.muted then "🔇" else "🎤") ]
+                    [ callIcon (if model.voice.muted then "mic off" else "mic") ]
                 , button [ class ("btn icon-btn" ++ if model.voice.deafened then " call-muted" else ""), onClick (BridgeEvent "toggle_deafen" E.null) ]
-                    [ text (if model.voice.deafened then "🔇" else "🔊") ]
+                    [ callIcon (if model.voice.deafened then "audio off" else "audio") ]
                 , button [ class "btn icon-btn", onClick (BridgeEvent "toggle_speaker" E.null) ]
-                    [ text "🔈" ]
+                    [ callIcon "audio" ]
                 , button [ class "btn call-decline", onClick EndCall ]
-                    [ text "✕ Leave" ]
+                    [ text "Leave" ]
                 ]
              else
                 [ button [ class "btn call-accept", onClick (JoinCall active.conversationId) ] [ text "Join Call" ] ]
             )
         ]
 
-chatOnlineHeader : Html Msg
-chatOnlineHeader =
+channelChatHeader : Int -> Model -> Html Msg
+channelChatHeader channelId model =
+    let
+        channel =
+            model.currentServer
+                |> Maybe.andThen (\data -> data.channels |> List.filter (\item -> item.id == channelId) |> List.head)
+
+        channelName = channel |> Maybe.map .name |> Maybe.withDefault "Channel"
+        channelTopic = channel |> Maybe.map .topic |> Maybe.withDefault ""
+    in
+    div [ class "chat-header channel-chat-header" ]
+        [ button [ class "chat-mobile-menu", type_ "button", onClick ToggleSidebar, attribute "aria-label" "Open navigation" ] [ span [ class "ui-icon ui-icon-menu", attribute "aria-hidden" "true" ] [] ]
+        , span [ class "channel-header-mark", attribute "aria-hidden" "true" ] [ text "#" ]
+        , div [ class "grow" ]
+            [ h2 [] [ text channelName ]
+            , if String.isEmpty (String.trim channelTopic) then
+                small [ class "muted" ] [ text "Text channel" ]
+              else
+                small [ class "muted" ] [ text channelTopic ]
+            ]
+        , chatConnectionBadge model
+        ]
+
+chatConnectionBadge : Model -> Html Msg
+chatConnectionBadge model =
+    if model.wsConnected then
+        text ""
+    else
+        span [ class "chat-connection-badge", attribute "role" "status" ]
+            [ span [ class "chat-connection-dot", attribute "aria-hidden" "true" ] []
+            , text "Reconnecting"
+            ]
+
+chatOnlineHeader : Model -> Html Msg
+chatOnlineHeader model =
     div [ class "chat-status" ]
-        [ span [ class "live-dot" ] []
-        , span [] [ text "Online" ]
+        [ button [ class "chat-mobile-menu", type_ "button", onClick ToggleSidebar, attribute "aria-label" "Open navigation" ] [ span [ class "ui-icon ui-icon-menu", attribute "aria-hidden" "true" ] [] ]
+        , span [ class "live-dot" ] []
+        , span [] [ text (if model.wsConnected then "Online" else "Reconnecting") ]
         ]
 
 groupedMessageViews : Model -> List Message -> List (Html Msg)
@@ -4723,9 +5139,15 @@ composerView key placeholderText model =
             Nothing -> text ""
         , textarea [ id "compose", placeholder placeholderText, value model.inputText, onInput InputText, onComposerKeyDown model.chatEnterSends ] []
         , div [ class "composer-footer" ]
-            [ button [ class "btn secondary attach-btn", type_ "button", title "Attach files or images", onClick (BridgeEvent "pick_attachments" E.null) ] [ text "＋ Attach" ]
-            , small [ class "muted" ] [ text ("Paste images or attach files up to " ++ formatBytesShort model.uploadMaxBytes ++ ".") ]
-            , button [ class "btn", disabled (String.isEmpty (String.trim model.inputText)), onClick SendMessage ] [ text "Send" ]
+            [ button [ class "btn secondary attach-btn composer-action", type_ "button", title "Attach files or images", attribute "aria-label" "Attach files or images", onClick (BridgeEvent "pick_attachments" E.null) ]
+                [ span [ class "ui-icon ui-icon-attach", attribute "aria-hidden" "true" ] []
+                , span [ class "composer-action-label" ] [ text "Attach" ]
+                ]
+            , small [ class "muted composer-hint" ] [ text ("Paste images or attach files up to " ++ formatBytesShort model.uploadMaxBytes ++ ".") ]
+            , button [ class "btn composer-send composer-action", disabled (String.isEmpty (String.trim model.inputText)), onClick SendMessage, attribute "aria-label" "Send message" ]
+                [ span [ class "composer-action-label" ] [ text "Send" ]
+                , span [ class "ui-icon ui-icon-send", attribute "aria-hidden" "true" ] []
+                ]
             ]
         ]
 
@@ -4893,15 +5315,26 @@ onComposerKeyDown enterSends =
 
 renderNotificationsPage : Model -> Html Msg
 renderNotificationsPage model =
-    div [ class "notifications-page" ]
-        [ div [ class "section-head notifications-head" ]
-            [ div [] [ h2 [] [ text "Notifications" ], p [ class "muted" ] [ text "Mentions, replies, requests, and messages." ] ]
-            , div [ class "nav-actions" ]
-                [ button [ class "btn secondary", onClick ClearNotifs, disabled (List.isEmpty model.notifs) ] [ text "Clear all" ] ]
+    let unseen = List.length (List.filter (\n -> not n.seen) model.notifs)
+    in
+    div [ class "notifications-page page-stack" ]
+        [ div [ class "page-heading notifications-head" ]
+            [ div []
+                [ span [ class "eyebrow" ] [ text "Inbox" ]
+                , h1 [] [ text "Notifications" ]
+                , p [ class "muted" ]
+                    [ text (if unseen == 0 then "You're caught up." else String.fromInt unseen ++ " unread item" ++ (if unseen == 1 then "." else "s.")) ]
+                ]
+            , button [ class "btn secondary", onClick ClearNotifs, disabled (List.isEmpty model.notifs) ] [ text "Clear all" ]
             ]
         , div [ class "card notifications-list" ]
             (if List.isEmpty model.notifs then
-                [ div [ class "empty" ] [ text "No notifications." ] ]
+                [ div [ class "empty notifications-empty" ]
+                    [ span [ class "ui-icon ui-icon-notifications", attribute "aria-hidden" "true" ] []
+                    , h2 [] [ text "Nothing new" ]
+                    , p [] [ text "Mentions, replies, requests, and messages will appear here." ]
+                    ]
+                ]
              else
                 List.map (notificationView model.serverTime) model.notifs
             )
@@ -4909,12 +5342,15 @@ renderNotificationsPage model =
 
 notificationView : Int -> Notification -> Html Msg
 notificationView now n =
-    a [ class ("row notif" ++ if n.seen then "" else " unseen"), onClick (Go n.url) ]
-        [ div [ class "grow" ]
-            [ b [] [ text n.kind ]
-            , small [] [ text n.body ]
+    a [ class ("notification-row" ++ if n.seen then "" else " unseen"), href n.url, onClick (Go n.url) ]
+        [ span [ class "notification-mark", attribute "aria-hidden" "true" ] []
+        , div [ class "notification-copy" ]
+            [ div [ class "notification-title-row" ]
+                [ b [] [ text n.kind ]
+                , span [ class "muted notif-time" ] [ text (relativeTime now n.createdAt) ]
+                ]
+            , p [] [ text n.body ]
             ]
-        , span [ class "muted notif-time" ] [ text (relativeTime now n.createdAt) ]
         ]
 
 relativeTime : Int -> Int -> String
@@ -4926,21 +5362,38 @@ relativeTime now timestamp =
 
 renderSearchPage : String -> Model -> Html Msg
 renderSearchPage q model =
-    div []
-        [ h3 [] [ text ("Users matching " ++ q) ]
-        , div [ class "card" ]
-            (if List.isEmpty model.searchUsers then
-                [ div [ class "empty" ] [ text "No users." ] ]
-             else
-                List.map searchUserView model.searchUsers
-            )
-        , h3 [] [ text "Threads" ]
-        , div [ class "card" ]
-            (if List.isEmpty model.searchThreads then
-                [ div [ class "empty" ] [ text "No threads." ] ]
-             else
-                List.map searchThreadView model.searchThreads
-            )
+    let
+        userCount = List.length model.searchUsers
+        threadCount = List.length model.searchThreads
+    in
+    div [ class "search-page page-stack" ]
+        [ div [ class "page-heading" ]
+            [ div []
+                [ span [ class "eyebrow" ] [ text "Search" ]
+                , h1 [] [ text ("Results for “" ++ q ++ "”") ]
+                , p [ class "muted" ] [ text (String.fromInt userCount ++ " people and " ++ String.fromInt threadCount ++ " discussions") ]
+                ]
+            ]
+        , div [ class "search-result-grid" ]
+            [ section [ class "card search-result-section" ]
+                [ div [ class "search-result-head" ] [ h2 [] [ text "People" ], span [ class "pill" ] [ text (String.fromInt userCount) ] ]
+                , div []
+                    (if List.isEmpty model.searchUsers then
+                        [ div [ class "empty" ] [ text "No people matched this search." ] ]
+                     else
+                        List.map searchUserView model.searchUsers
+                    )
+                ]
+            , section [ class "card search-result-section" ]
+                [ div [ class "search-result-head" ] [ h2 [] [ text "Discussions" ], span [ class "pill" ] [ text (String.fromInt threadCount) ] ]
+                , div []
+                    (if List.isEmpty model.searchThreads then
+                        [ div [ class "empty" ] [ text "No discussions matched this search." ] ]
+                     else
+                        List.map searchThreadView model.searchThreads
+                    )
+                ]
+            ]
         ]
 
 searchUserView : User -> Html Msg
@@ -5005,7 +5458,7 @@ compareConvs a b =
 fmtErr : String -> String
 fmtErr err =
     case err of
-        "invalid_registration" -> "Username must be 3-24 characters and password must be at least 8 characters."
+        "invalid_registration" -> "Username must be 3-24 characters and password must be at least 10 characters."
         "username_taken" -> "That username is already taken."
         "server_exists" -> "You already have a server with that name."
         "channel_exists" -> "A channel with that name already exists in this server."
@@ -5036,6 +5489,8 @@ authValidationError model =
         Just "Username must be 24 characters or less."
     else if model.authMode == "register" && String.length password < 10 then
         Just "Password must be at least 10 characters."
+    else if model.authMode == "register" && model.authPasswordConfirm /= password then
+        Just "Passwords do not match."
     else if model.authMode == "login" && String.isEmpty password then
         Just "Enter your password."
     else

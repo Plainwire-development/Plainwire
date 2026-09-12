@@ -42,9 +42,16 @@ begin_upload(Req0, Uid, Size) ->
                 {ok, Req1, Hash} ->
                     case file:rename(Tmp, Path) of
                         ok ->
-                            ok = pw_db:finish_upload(Uid, Id, Hash),
-                            pw_util:ok_json(Req1, #{ok => true, data => #{id => Id, name => Name,
-                                content_type => Type, size => Size, url => <<"/api/files/", Id/binary>>}});
+                            case pw_db:finish_upload(Uid, Id, Hash) of
+                                ok ->
+                                    pw_util:ok_json(Req1, #{ok => true, data => #{id => Id, name => Name,
+                                        content_type => Type, size => Size, url => <<"/api/files/", Id/binary>>}});
+                                {error, _} ->
+                                    %% The database write can be ambiguous if a connection dies after
+                                    %% PostgreSQL commits. Keep the finalized file in place so either the
+                                    %% ready row remains usable or the stale-upload sweeper removes it.
+                                    pw_util:err_json(Req1, 503, <<"upload_finalize_unavailable">>)
+                            end;
                         {error, _} -> fail_upload(Uid, Id, Tmp, Req1)
                     end;
                 {error, Req1} -> fail_upload(Uid, Id, Tmp, Req1)
@@ -64,13 +71,24 @@ stream_to_file(Req0, Tmp, Expected) ->
 
 stream_chunks(Req0, Io, Expected, Read, Ctx) ->
     case cowboy_req:read_body(Req0, #{length => 1048576, period => 30000}) of
-        {more, Data, Req1} when Read + byte_size(Data) =< Expected ->
-            ok = file:write(Io, Data),
-            stream_chunks(Req1, Io, Expected, Read + byte_size(Data), crypto:hash_update(Ctx, Data));
-        {ok, Data, Req1} when Read + byte_size(Data) =:= Expected ->
-            ok = file:write(Io, Data),
-            {ok, Req1, pw_util:hex_binary(crypto:hash_final(crypto:hash_update(Ctx, Data)))};
-        _ -> {error, Req0}
+        {more, Data, Req1} ->
+            Total = Read + byte_size(Data),
+            case Total =< Expected of
+                true ->
+                    ok = file:write(Io, Data),
+                    stream_chunks(Req1, Io, Expected, Total, crypto:hash_update(Ctx, Data));
+                false ->
+                    {error, Req1}
+            end;
+        {ok, Data, Req1} ->
+            Total = Read + byte_size(Data),
+            case Total =:= Expected of
+                true ->
+                    ok = file:write(Io, Data),
+                    {ok, Req1, pw_util:hex_binary(crypto:hash_final(crypto:hash_update(Ctx, Data)))};
+                false ->
+                    {error, Req1}
+            end
     end.
 
 fail_upload(Uid, Id, Tmp, Req) ->

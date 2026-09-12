@@ -23,6 +23,8 @@ rebar3 get-deps
 rebar3 compile
 ```
 
+For a quick source audit, run `./scripts/verify-source.sh`. Before publishing a release, run `./scripts/release-check.sh`; it is deliberately strict and requires the native Elm compiler, Erlang, rebar3, Node.js, and npm so a source-only check cannot be mistaken for a release build. Sass is installed from the locked npm dependencies.
+
 Create a PostgreSQL database, then run:
 
 ```sh
@@ -72,7 +74,7 @@ PLAINWIRE_DB_PASS=change-me
 PLAINWIRE_DB_NAME=plainwire
 
 PLAINWIRE_APP_NAME=Plainwire
-PLAINWIRE_DEFAULT_THEME=light
+PLAINWIRE_DEFAULT_THEME=system
 PLAINWIRE_REGISTRATION_ENABLED=true
 PLAINWIRE_INSTANCE_DESCRIPTION="A fast, self-hosted place to talk."
 PLAINWIRE_UPLOAD_MAX_BYTES=262144000
@@ -81,6 +83,8 @@ PLAINWIRE_PROFILE_IMAGE_MAX_BYTES=16777216
 PLAINWIRE_COMPRESS_OVERSIZE_UPLOADS=true
 PLAINWIRE_UPLOAD_IMAGE_MAX_DIMENSION=4096
 PLAINWIRE_IDLE_TIMEOUT_MS=600000
+PLAINWIRE_SESSION_DAYS=30
+PLAINWIRE_MAX_SESSIONS_PER_USER=32
 ```
 
 For production voice calls, configure coturn:
@@ -99,9 +103,35 @@ PLAINWIRE_MEDIA_ALLOWED_HOSTS=cdn.example.com,images.example.net
 
 Keep this list narrow on public deployments.
 
+## Release and deployment
+
+The default theme is `system`, so a new account follows the operating system light or dark preference until the user chooses an explicit theme.
+
+After updating a checked-out production install, use the release updater rather than restarting an old release directory:
+
+```sh
+sudo ./scripts/update-openrc-release.sh
+```
+
+The updater rebuilds HAML, SCSS, and Elm, runs the Erlang tests, packages the release, restarts the service, and verifies both the running backend version and refreshed frontend fingerprint. You can also check a deployment directly:
+
+```sh
+curl -fsS https://chat.example.com/api/version
+```
+
+Frontend assets are versioned from the server release so browsers do not stay pinned to an old `app.js` or `app.css` after an upgrade.
+
+To produce both a tested Erlang release archive and a source archive that includes the freshly compiled frontend, run:
+
+```sh
+./scripts/package-release.sh
+```
+
+It runs the strict release gate first and writes SHA-256 files beside both archives in `dist/`.
+
 ## Account security
 
-Plainwire now exposes active-session management and password rotation from User Settings. Password changes verify the current password and invalidate every other session. Session tokens remain hashed in PostgreSQL and are never returned by the session-management API.
+Plainwire exposes active-session management and password rotation from User Settings. Password changes verify the current password and invalidate every other session. Session tokens remain hashed in PostgreSQL and are never returned by the session-management API. Session lifetime and the per-account session cap can be tuned with `PLAINWIRE_SESSION_DAYS` and `PLAINWIRE_MAX_SESSIONS_PER_USER`.
 
 For public instances, set `PLAINWIRE_REGISTRATION_ENABLED=false` after creating the accounts you need if you do not want open sign-ups.
 

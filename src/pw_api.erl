@@ -74,6 +74,13 @@ handle(<<"POST">>, [<<"login">>], Req0, _) ->
                 end
         end
     end);
+handle(<<"GET">>, [<<"version">>], Req0, _) ->
+    pw_util:ok_json(Req0, #{ok => true, data => #{
+        name => <<"Plainwire">>,
+        version => pw_client_config:version(),
+        asset_version => pw_client_config:asset_version(),
+        api_version => 1
+    }});
 %% public gets alive/dead; signed-in users get the nerdy bits.
 handle(<<"GET">>, [<<"health">>], Req0, _) ->
     case pw_db:health() of
@@ -136,10 +143,15 @@ authed(<<"POST">>, [<<"sessions">>, <<"logout-others">>], Req, Session, _) ->
     Token = pw_util:cookie_value(Req, <<"pw_session">>),
     result(Req, pw_db:logout_other_sessions(uid(Session), Token));
 authed(<<"POST">>, [<<"password">>], Req0, Session, _) ->
-    Token = pw_util:cookie_value(Req0, <<"pw_session">>),
-    with_json(Req0, fun(M, Req) ->
-        result(Req, pw_db:change_password(uid(Session), Token, maps:get(<<"current_password">>, M, <<>>), maps:get(<<"new_password">>, M, <<>>)))
-    end);
+    Uid = uid(Session),
+    case pw_rate:allow({password_change, Uid}, 8, 600000) of
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+        true ->
+            Token = pw_util:cookie_value(Req0, <<"pw_session">>),
+            with_json(Req0, fun(M, Req) ->
+                result(Req, pw_db:change_password(Uid, Token, maps:get(<<"current_password">>, M, <<>>), maps:get(<<"new_password">>, M, <<>>)))
+            end)
+    end;
 authed(<<"GET">>, [<<"sync">>], Req, Session, _) -> result(Req, pw_db:sync(uid(Session), qs(Req, <<"since">>)));
 authed(<<"POST">>, [<<"profile">>], Req0, Session, _) -> with_json_large(Req0, fun(M, Req) -> result(Req, pw_db:update_profile(uid(Session), maps:get(<<"display_name">>, M, maps:get(display_name, maps:get(user,Session))), M)) end);
 authed(<<"POST">>, [<<"profile">>, <<"theme">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_theme(uid(Session), maps:get(<<"theme">>, M, <<"system">>))) end);

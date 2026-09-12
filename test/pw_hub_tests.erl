@@ -39,6 +39,47 @@ connect_seeds_own_presence_state_test() ->
         gen_server:stop(Hub)
     end.
 
+
+multi_session_presence_prefers_visible_session_test() ->
+    stop_existing_hub(),
+    {ok, Hub} = pw_hub:start_link(),
+    P1 = spawn(fun idle_socket/0),
+    P2 = spawn(fun idle_socket/0),
+    try
+        pw_hub:connect(7, P1, <<"online">>),
+        pw_hub:connect(7, P2, <<"away">>),
+        pw_hub:connect(9, self(), <<"online">>),
+        _ = gen_server:call(pw_hub, sync),
+        flush_hub_messages(),
+        pw_hub:watch_presence(self(), [7]),
+        _ = gen_server:call(pw_hub, sync),
+        receive
+            {hub_json, #{type := presence_state, statuses := Initial}} ->
+                ?assertEqual(<<"online">>, maps:get(7, Initial))
+        after 1000 ->
+            ?assert(false)
+        end,
+
+        %% Making one tab invisible must not hide the account while another
+        %% connected tab is still visible.
+        pw_hub:status_update(7, P1, <<"invisible">>),
+        _ = gen_server:call(pw_hub, sync),
+        ?assertEqual(<<"away">>, await_presence_status(7)),
+
+        %% Only when every connected session is invisible does the account go
+        %% offline. Bringing any session back makes it visible again.
+        pw_hub:status_update(7, P2, <<"invisible">>),
+        _ = gen_server:call(pw_hub, sync),
+        ?assertEqual(offline, await_presence_status(7)),
+        pw_hub:status_update(7, P1, <<"online">>),
+        _ = gen_server:call(pw_hub, sync),
+        ?assertEqual(<<"online">>, await_presence_status(7))
+    after
+        exit(P1, kill),
+        exit(P2, kill),
+        gen_server:stop(Hub)
+    end.
+
 call_accept_establishes_bidirectional_signaling_test() ->
     stop_existing_hub(),
     {ok, Hub} = pw_hub:start_link(),
@@ -263,6 +304,43 @@ assert_no_inactive_call(Tag, Id) ->
         {socket_event, Tag, _Other} -> assert_no_inactive_call(Tag, Id)
     after 80 ->
         ok
+    end.
+
+
+idle_socket() ->
+    receive
+        stop -> ok;
+        _ -> idle_socket()
+    end.
+
+flush_hub_messages() ->
+    receive
+        {hub_json, _} -> flush_hub_messages();
+        {hub_text, _, _} -> flush_hub_messages()
+    after 0 ->
+        ok
+    end.
+
+await_presence_status(Uid) ->
+    receive
+        {hub_text, Payload, Type} when Type =:= presence_status; Type =:= presence_online; Type =:= presence_offline ->
+            Json = jsx:decode(Payload, [return_maps]),
+            case maps:get(<<"user_id">>, Json, undefined) of
+                Uid ->
+                    case Type of
+                        presence_offline -> offline;
+                        _ -> maps:get(<<"status">>, Json)
+                    end;
+                _ -> await_presence_status(Uid)
+            end;
+        {hub_json, #{type := Type, user_id := Uid} = Event}
+                when Type =:= presence_status; Type =:= presence_online ->
+            maps:get(status, Event);
+        {hub_json, #{type := presence_offline, user_id := Uid}} ->
+            offline;
+        _ -> await_presence_status(Uid)
+    after 1000 ->
+        ?assert(false)
     end.
 
 restore_env(Name, false) -> os:unsetenv(Name);

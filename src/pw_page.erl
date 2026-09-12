@@ -9,6 +9,8 @@ init(Req0, State) ->
         _ -> <<"Plainwire: index.html missing">>
     end,
     Req = cowboy_req:reply(200, maps:merge(pw_util:security_headers(), #{
-        <<"content-type">> => <<"text/html; charset=utf-8">>
+        <<"content-type">> => <<"text/html; charset=utf-8">>,
+        <<"cache-control">> => <<"no-cache, no-store, must-revalidate">>,
+        <<"pragma">> => <<"no-cache">>
     }), Body, Req0),
     {ok, Req, State}.

@@ -37,23 +37,26 @@ production_env() ->
 
 secure_cookie_configured() ->
     case os:getenv("COOKIE_SECURE") of
+        false ->
+            %% This matches pw_util:cookie_secure_default/0: HTTPS public URLs
+            %% default to secure cookies when COOKIE_SECURE is not set.
+            case os:getenv("PLAINWIRE_PUBLIC_URL") of
+                "https://" ++ _ -> true;
+                _ -> erlang:error({insecure_production_config, cookie_secure})
+            end;
         "1" -> true;
         "true" -> true;
         "TRUE" -> true;
         "yes" -> true;
-        _ ->
-            case os:getenv("PLAINWIRE_PUBLIC_URL") of
-                "https://" ++ _ -> true;
-                _ -> erlang:error({insecure_production_config, cookie_secure})
-            end
+        _ -> erlang:error({insecure_production_config, cookie_secure})
     end.
 
 db_password_configured() ->
     case os:getenv("PLAINWIRE_DB_PASS") of
         false -> erlang:error({insecure_production_config, db_password});
         "plainwire" -> erlang:error({insecure_production_config, db_password});
-        "" -> erlang:error({insecure_production_config, db_password});
-        _ -> true
+        Password when length(Password) >= 16 -> true;
+        _ -> erlang:error({insecure_production_config, db_password_too_short})
     end.
 
 db_ssl_configured() ->

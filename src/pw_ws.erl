@@ -173,7 +173,7 @@ handle_msg(#{<<"type">> := <<"voice_activity">>, <<"active">> := Active0}=Msg, S
     {ok, State};
 handle_msg(#{<<"type">> := <<"presence_update">>, <<"status">> := Status0}, #{uid:=Uid}=State) ->
     Status = clean_status(Status0),
-    pw_hub:status_update(Uid, Status),
+    pw_hub:status_update(Uid, self(), Status),
     {ok, State#{status => Status}};
 handle_msg(_, State) -> {ok, State}.
 

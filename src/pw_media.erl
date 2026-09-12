@@ -32,6 +32,7 @@ cache_data_url(<<"data:", Rest/binary>> = DataUrl) ->
             case safe_data_url_parse(Rest) of
                 {ok, ContentType, Body} ->
                     ets:insert(?CACHE, {Key, Body, ContentType, Now + ?TTL_MS}),
+                    prune_cache(Now),
                     proxy_url(SynthUrl);
                 error ->
                     DataUrl
@@ -42,18 +43,29 @@ cache_data_url(Url) -> Url.
 safe_data_url_parse(Rest) ->
     case binary:split(Rest, <<",">>) of
         [Meta, BodyB64] ->
-            ContentType = case binary:split(Meta, <<";">>) of
-                [CT | _] -> CT;
-                _ -> Meta
+            ContentType0 = case binary:split(Meta, <<";">>) of
+                [CT | _] -> string:lowercase(string:trim(CT));
+                _ -> string:lowercase(string:trim(Meta))
             end,
-            try base64:decode(BodyB64) of
-                Body when byte_size(Body) =< ?MAX_SERVE_BYTES ->
-                    {ok, ContentType, Body};
-                _ -> error
-            catch _:_ -> error
+            case safe_data_image_type(ContentType0) of
+                false -> error;
+                true ->
+                    try base64:decode(BodyB64) of
+                        Body when byte_size(Body) =< ?MAX_SERVE_BYTES ->
+                            {ok, ContentType0, Body};
+                        _ -> error
+                    catch _:_ -> error
+                    end
             end;
         _ -> error
     end.
+
+safe_data_image_type(<<"image/jpeg">>) -> true;
+safe_data_image_type(<<"image/png">>) -> true;
+safe_data_image_type(<<"image/gif">>) -> true;
+safe_data_image_type(<<"image/webp">>) -> true;
+safe_data_image_type(<<"image/avif">>) -> true;
+safe_data_image_type(_) -> false.
 
 fetch(Uid, Token) ->
     %% fetch outside the gen_server. one slow avatar once held up the lot.
