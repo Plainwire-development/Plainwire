@@ -1,10 +1,39 @@
-(() => {
+(async () => {
   'use strict';
 
   const root = document.getElementById('app');
   if (!root || !window.Elm || !window.Elm.Main) return;
 
-  const app = window.Elm.Main.init({ node: root, flags: null });
+  // upload limits come from the server's actual config (see pw_util:upload_config/0)
+  // so the UI text can't drift from what /api/uploads really enforces. If the
+  // fetch is slow or fails, fall back to the server's own hardcoded defaults
+  // rather than blocking boot indefinitely.
+  const defaultUploadConfig = { uploadMaxBytes: 262144000, uploadQuotaBytes: 1073741824, uploadQuotaWindowMs: 10800000 };
+  const uploadConfig = await (async () => {
+    try {
+      const res = await fetch('/api/config', { credentials: 'same-origin' });
+      const body = await res.json();
+      if (body && body.ok && body.data) {
+        return {
+          uploadMaxBytes: body.data.upload_max_bytes,
+          uploadQuotaBytes: body.data.upload_quota_bytes,
+          uploadQuotaWindowMs: body.data.upload_quota_window_ms
+        };
+      }
+    } catch (_) { /* fall through to defaults */ }
+    return defaultUploadConfig;
+  })();
+
+  const formatBytesShort = (bytes) => {
+    if (bytes >= 1073741824) return `${Math.round(bytes / 1073741824)} GB`;
+    return `${Math.round(bytes / 1048576)} MB`;
+  };
+  const formatQuotaWindow = (windowMs) => {
+    const hours = Math.round(windowMs / 3600000);
+    return hours === 1 ? '1 hour' : `${hours} hours`;
+  };
+
+  const app = window.Elm.Main.init({ node: root, flags: uploadConfig });
   let csrf = '';
   let ws = null;
   let wsQueue = [];
@@ -614,7 +643,11 @@
         appendToComposer(markup);
         send(app.ports.bridgeReceive, { tag: 'toast', data: `${safeName} ready to send` });
       } catch (error) {
-        const messages = { file_too_large: 'Files can be up to 250 MB.', upload_quota_exceeded: 'Upload limit reached: 1 GB every 3 hours.', network_error: 'Upload connection interrupted.' };
+        const messages = {
+          file_too_large: `Files can be up to ${formatBytesShort(uploadConfig.uploadMaxBytes)}.`,
+          upload_quota_exceeded: `Upload limit reached: ${formatBytesShort(uploadConfig.uploadQuotaBytes)} every ${formatQuotaWindow(uploadConfig.uploadQuotaWindowMs)}.`,
+          network_error: 'Upload connection interrupted.'
+        };
         send(app.ports.bridgeReceive, { tag: 'toast', data: messages[error.message] || 'File upload failed. Please try again.' });
       }
     }

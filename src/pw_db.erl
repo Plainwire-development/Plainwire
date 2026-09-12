@@ -1386,8 +1386,8 @@ route({mark_url_seen, Uid, Url}, Conn) ->
     {ok, #{seen => true}};
 route({begin_upload, Uid, Id, Name, Type, Size, Path}, Conn) ->
     Now = pw_util:now_ms(),
-    WindowStart = Now - 10800000,
-    Quota = min(1073741824, max(262144000, pw_util:env_int("PLAINWIRE_UPLOAD_QUOTA_BYTES", 1073741824))),
+    #{quota_bytes := Quota, quota_window_ms := QuotaWindowMs} = pw_util:upload_config(),
+    WindowStart = Now - QuotaWindowMs,
     with_tx(Conn, fun() ->
         _ = rows(Conn, "SELECT pg_advisory_xact_lock($1)", [Uid]),
         {ok, [UsedRaw]} = one(Conn,

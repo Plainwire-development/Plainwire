@@ -63,6 +63,16 @@ handle(<<"POST">>, [<<"login">>], Req0, _) ->
                 end
         end
     end);
+%% public, non-sensitive runtime limits the frontend renders into copy
+%% (upload size, quota) so the UI never hardcodes a number that drifts
+%% from what the server actually enforces.
+handle(<<"GET">>, [<<"config">>], Req0, _) ->
+    #{max_bytes := MaxBytes, quota_bytes := QuotaBytes, quota_window_ms := QuotaWindowMs} = pw_util:upload_config(),
+    pw_util:ok_json(Req0, #{ok=>true, data=>#{
+        upload_max_bytes => MaxBytes,
+        upload_quota_bytes => QuotaBytes,
+        upload_quota_window_ms => QuotaWindowMs
+    }});
 %% public gets alive/dead; signed-in users get the nerdy bits.
 handle(<<"GET">>, [<<"health">>], Req0, _) ->
     case pw_db:health() of

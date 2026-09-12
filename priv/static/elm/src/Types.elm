@@ -237,6 +237,9 @@ type alias Model =
     , micTesting : Bool
     , micTestLevel : Int
     , micMonitoring : Bool
+    , uploadMaxBytes : Int
+    , uploadQuotaBytes : Int
+    , uploadQuotaWindowMs : Int
     }
 
 type alias InvitePreview =
