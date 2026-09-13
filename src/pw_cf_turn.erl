@@ -155,7 +155,10 @@ parse_credential_response(RespBody) ->
 
 fetch_usage_bytes() ->
     {DateFrom, DateTo} = current_month_range(),
-    Query = <<"query GetTurnUsage($accountId: String!, $dateFrom: DateTime!, $dateTo: DateTime!) { "
+    %% the dataset's date_geq/date_leq filters take a plain 'YYYY-MM-DD' Date,
+    %% not a DateTime — confirmed against Cloudflare's actual API, which
+    %% rejected a full ISO-8601 timestamp here with a parse error.
+    Query = <<"query GetTurnUsage($accountId: String!, $dateFrom: Date!, $dateTo: Date!) { "
               "viewer { accounts(filter: { accountTag: $accountId }) { "
               "callsTurnUsageAdaptiveGroups(limit: 10000, filter: { date_geq: $dateFrom, date_leq: $dateTo }) { "
               "sum { egressBytes } } } } }">>,
@@ -189,10 +192,9 @@ to_int(N) when is_float(N) -> round(N);
 to_int(_) -> 0.
 
 current_month_range() ->
-    {{Y, M, _}, _} = calendar:universal_time(),
-    {{Y2, M2, D2}, {H2, Mi2, S2}} = calendar:universal_time(),
-    From = iolist_to_binary(io_lib:format("~4..0B-~2..0B-01T00:00:00Z", [Y, M])),
-    To = iolist_to_binary(io_lib:format("~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0BZ", [Y2, M2, D2, H2, Mi2, S2])),
+    {{Y, M, D}, _} = calendar:universal_time(),
+    From = iolist_to_binary(io_lib:format("~4..0B-~2..0B-01", [Y, M])),
+    To = iolist_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B", [Y, M, D])),
     {From, To}.
 
 %% --- shared HTTP helper (inets/httpc, same client pw_http_fetch uses) ---
