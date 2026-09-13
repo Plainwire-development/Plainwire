@@ -8,17 +8,36 @@ get() -> ?MODULE:get(undefined).
 
 get(UserId) ->
     StunUrls = urls("PLAINWIRE_STUN_URLS", [?DEFAULT_STUN], stun),
-    TurnUrls = urls("PLAINWIRE_TURN_URLS", [], turn),
     IceServers0 = maybe_server(StunUrls, []),
-    IceServers = case TurnUrls of
-        [] -> IceServers0;
-        _ -> IceServers0 ++ [turn_server(TurnUrls, UserId)]
+    {TurnEntry, LimitReached} = turn_entry(UserId),
+    IceServers = case TurnEntry of
+        undefined -> IceServers0;
+        _ -> IceServers0 ++ [TurnEntry]
     end,
     Policy = case pw_util:env_str("PLAINWIRE_ICE_TRANSPORT_POLICY", <<"all">>) of
         <<"relay">> -> <<"relay">>;
         _ -> <<"all">>
     end,
-    #{iceServers => IceServers, iceTransportPolicy => Policy}.
+    #{iceServers => IceServers, iceTransportPolicy => Policy, turnLimitReached => LimitReached}.
+
+%% Cloudflare Realtime takes priority when configured — it mints its own
+%% credentials and enforces its own usage-based hard stop (pw_cf_turn).
+%% Otherwise falls back to the legacy self-hosted-secret / static-credential
+%% modes, which have no usage limiting of their own.
+turn_entry(UserId) ->
+    case pw_cf_turn:configured() of
+        true ->
+            case pw_cf_turn:ice_entry() of
+                {ok, Entry} -> {Entry, false};
+                {error, over_limit} -> {undefined, true};
+                {error, _} -> {undefined, false}
+            end;
+        false ->
+            case urls("PLAINWIRE_TURN_URLS", [], turn) of
+                [] -> {undefined, false};
+                TurnUrls -> {turn_server(TurnUrls, UserId), false}
+            end
+    end.
 
 voice_processing() ->
     Enabled = pw_util:env_bool("PLAINWIRE_KRISP_ENABLED", false),
@@ -31,17 +50,24 @@ voice_processing() ->
     }.
 
 validate(Production) ->
-    TurnUrls = urls("PLAINWIRE_TURN_URLS", [], turn),
-    RequireTurn = pw_util:env_bool("PLAINWIRE_REQUIRE_TURN", Production),
-    SecretReady = byte_size(pw_util:env_str("PLAINWIRE_TURN_SECRET", <<>>)) >= 32,
-    StaticAllowed = not Production orelse pw_util:env_bool("PLAINWIRE_ALLOW_STATIC_TURN_CREDENTIALS", false),
-    CredentialsReady = SecretReady orelse (StaticAllowed andalso credentials_configured()),
-    case {RequireTurn, TurnUrls, CredentialsReady} of
-        {true, [], _} -> {error, turn_urls_required};
-        {true, _, false} -> {error, turn_credentials_required};
-        {false, [], _} -> ok;
-        {false, _, false} -> {error, turn_credentials_required};
-        _ -> ok
+    case pw_cf_turn:configured() of
+        %% self-contained: pw_cf_turn mints its own credentials against
+        %% Cloudflare's API rather than reading PLAINWIRE_TURN_URLS/SECRET,
+        %% so none of the legacy checks below apply.
+        true -> ok;
+        false ->
+            TurnUrls = urls("PLAINWIRE_TURN_URLS", [], turn),
+            RequireTurn = pw_util:env_bool("PLAINWIRE_REQUIRE_TURN", Production),
+            SecretReady = byte_size(pw_util:env_str("PLAINWIRE_TURN_SECRET", <<>>)) >= 32,
+            StaticAllowed = not Production orelse pw_util:env_bool("PLAINWIRE_ALLOW_STATIC_TURN_CREDENTIALS", false),
+            CredentialsReady = SecretReady orelse (StaticAllowed andalso credentials_configured()),
+            case {RequireTurn, TurnUrls, CredentialsReady} of
+                {true, [], _} -> {error, turn_urls_required};
+                {true, _, false} -> {error, turn_credentials_required};
+                {false, [], _} -> ok;
+                {false, _, false} -> {error, turn_credentials_required};
+                _ -> ok
+            end
     end.
 
 krisp_assets_ready() ->

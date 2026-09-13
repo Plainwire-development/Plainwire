@@ -90,6 +90,7 @@ bridgeDecoder = D.field "tag" D.string |> D.andThen (\tag ->
                 (D.field "deafened" D.bool)
         "sound_preference" -> D.map SetSoundPreference (D.field "data" D.bool)
         "chat_enter_sends" -> D.map SetChatEnterSends (D.field "data" D.bool)
+        "turn_limit_reached" -> D.map SetTurnLimitReached (D.field "data" D.bool)
         "link_previews_enabled" -> D.map SetLinkPreviewsEnabled (D.field "data" D.bool)
         "animated_media_enabled" -> D.map SetAnimatedMediaEnabled (D.field "data" D.bool)
         "compact_messages" -> D.map SetCompactMessages (D.field "data" D.bool)
@@ -145,6 +146,7 @@ init flags url _ =
     in
     ( { appName = appName
       , uploadMaxBytes = if flags.uploadMaxBytes > 0 then flags.uploadMaxBytes else 262144000
+      , turnLimitReached = False
       , registrationEnabled = flags.registrationEnabled
       , instanceDescription = String.left 120 (String.trim flags.instanceDescription)
       , clientVersion = String.left 32 (String.trim flags.version)
@@ -479,6 +481,9 @@ update msg model =
             ( { model | chatEnterSends = enabled }
             , bridgeSend (E.object [("tag", E.string "chat_enter_mode"), ("data", E.string (if enabled then "send" else "newline"))])
             )
+
+        SetTurnLimitReached reached ->
+            ( { model | turnLimitReached = reached }, Cmd.none )
 
         SetLinkPreviewsEnabled enabled ->
             ( { model | linkPreviewsEnabled = enabled }
@@ -2883,6 +2888,13 @@ renderExpandedCallOverlay active model =
             , button [ class "btn icon-btn call-minimize", title "Minimize call", onClick ToggleCallOverlay ]
                 [ span [ class "call-minimize-icon", attribute "aria-hidden" "true" ] [] ]
             ]
+        , if model.turnLimitReached then
+            div [ class "call-turn-limit-row" ]
+                [ callIcon "audio off"
+                , span [] [ text "GB limit reached, TURN disabled until next month." ]
+                ]
+          else
+            text ""
         , if model.voice.screenShare then
             div [ class "call-sharing-row" ]
                 [ callIcon "screen"
