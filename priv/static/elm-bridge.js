@@ -1,6 +1,13 @@
 (() => {
   'use strict';
 
+  const storage = {
+    getItem(key) { try { return window.localStorage.getItem(key); } catch (_) { return null; } },
+    setItem(key, value) { try { window.localStorage.setItem(key, value); } catch (_) {} },
+    removeItem(key) { try { window.localStorage.removeItem(key); } catch (_) {} },
+    key(index) { try { return window.localStorage.key(index); } catch (_) { return null; } },
+    get length() { try { return window.localStorage.length; } catch (_) { return 0; } }
+  };
   const root = document.getElementById('app');
   if (!root || !window.Elm || !window.Elm.Main) return;
 
@@ -10,8 +17,8 @@
     return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
   };
   const clientConfig = Object.freeze({
-    version: typeof rawClientConfig.version === 'string' ? rawClientConfig.version.slice(0, 32) : '1.5.0',
-    assetVersion: typeof rawClientConfig.asset_version === 'string' ? rawClientConfig.asset_version.slice(0, 64) : '1.5.0',
+    version: typeof rawClientConfig.version === 'string' ? rawClientConfig.version.slice(0, 32) : '1.6.0',
+    assetVersion: typeof rawClientConfig.asset_version === 'string' ? rawClientConfig.asset_version.slice(0, 64) : '1.6.0',
     appName: typeof rawClientConfig.app_name === 'string' && rawClientConfig.app_name.trim()
       ? rawClientConfig.app_name.trim().slice(0, 48) : 'Plainwire',
     defaultTheme: ['light', 'dark', 'system'].includes(rawClientConfig.default_theme)
@@ -27,27 +34,17 @@
     maxImageDimension: finiteInt(rawClientConfig.max_image_dimension, 4096, 512, 8192)
   });
   document.title = clientConfig.appName;
-if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false';
   document.documentElement.dataset.plainwireVersion = clientConfig.version;
   const app = window.Elm.Main.init({
     node: root,
     flags: {
       appName: clientConfig.appName,
-      uploadMaxBytes: clientConfig.uploadMaxBytes,
       registrationEnabled: clientConfig.registrationEnabled,
       instanceDescription: clientConfig.instanceDescription,
       defaultTheme: clientConfig.defaultTheme,
       version: clientConfig.version
     }
   });
-  if (!clientConfig.registrationEnabled) {
-    const hideRegistration = () => {
-      const buttons = document.querySelectorAll('.auth-mode-switch .auth-mode-btn');
-      if (buttons[1]) buttons[1].hidden = true;
-    };
-    hideRegistration();
-    new MutationObserver(hideRegistration).observe(root, { childList: true, subtree: true });
-  }
   let csrf = '';
   let ws = null;
   let wsQueue = [];
@@ -71,10 +68,10 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
   let speakerOn = true;
   let micMuted = false;
   let deafened = false;
-  let selectedInputId = localStorage.getItem('plainwire_audio_input') || '';
-  let selectedOutputId = localStorage.getItem('plainwire_audio_output') || '';
+  let selectedInputId = storage.getItem('plainwire_audio_input') || '';
+  let selectedOutputId = storage.getItem('plainwire_audio_output') || '';
   const normalizeProcessingMode = (value) => ['noise', 'studio', 'krisp'].includes(value) ? value : 'noise';
-  let voiceProcessingMode = normalizeProcessingMode(localStorage.getItem('plainwire_voice_processing') || 'noise');
+  let voiceProcessingMode = normalizeProcessingMode(storage.getItem('plainwire_voice_processing') || 'noise');
   let voiceProcessingConfig = {
     krisp_available: false,
     sdk_url: '/assets/krisp/krispsdk.mjs',
@@ -110,7 +107,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
   let syncQueued = false;
   const screenSharers = new Set();
   // very noisy. off unless somebody actually asks for it.
-  const debugEnabled = window.PLAINWIRE_DEBUG === true || localStorage.getItem('plainwire_debug') === 'true';
+  const debugEnabled = window.PLAINWIRE_DEBUG === true || storage.getItem('plainwire_debug') === 'true';
   const startedAt = performance.now();
   const readRtcIntent = () => {
     try {
@@ -171,7 +168,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
         failed: pc._failureReported === true
       }))
     }),
-    setEnabled: (enabled) => { localStorage.setItem('plainwire_debug', enabled ? 'true' : 'false'); location.reload(); }
+    setEnabled: (enabled) => { storage.setItem('plainwire_debug', enabled ? 'true' : 'false'); location.reload(); }
   };
   debug('BOOT', 'bridge_initialized', { debug: debugEnabled, secure_context: window.isSecureContext, online: navigator.onLine, client_config: clientConfig });
 
@@ -211,7 +208,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
         }
         if (voiceProcessingMode === 'krisp' && !voiceProcessingConfig.krisp_available) {
           voiceProcessingMode = 'noise';
-          localStorage.setItem('plainwire_voice_processing', voiceProcessingMode);
+          storage.setItem('plainwire_voice_processing', voiceProcessingMode);
         }
         debug('MEDIA', 'voice_processing_config_loaded', { krisp_available: voiceProcessingConfig.krisp_available });
         return voiceProcessingConfig;
@@ -309,16 +306,16 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
   };
   send(app.ports.bridgeReceive, {
     tag: 'sound_preference',
-    data: localStorage.getItem('plainwire_sound_enabled') !== 'false'
+    data: storage.getItem('plainwire_sound_enabled') !== 'false'
   });
   send(app.ports.bridgeReceive, {
     tag: 'chat_enter_sends',
-    data: localStorage.getItem('plainwire_chat_enter_mode') !== 'newline'
+    data: storage.getItem('plainwire_chat_enter_mode') !== 'newline'
   });
-  send(app.ports.bridgeReceive, { tag: 'link_previews_enabled', data: localStorage.getItem('plainwire_link_previews') !== 'false' });
-  send(app.ports.bridgeReceive, { tag: 'animated_media_enabled', data: localStorage.getItem('plainwire_animated_media') !== 'false' });
-  send(app.ports.bridgeReceive, { tag: 'compact_messages', data: localStorage.getItem('plainwire_compact_messages') === 'true' });
-  send(app.ports.bridgeReceive, { tag: 'media_preload_enabled', data: localStorage.getItem('plainwire_media_preload') !== 'false' });
+  send(app.ports.bridgeReceive, { tag: 'link_previews_enabled', data: storage.getItem('plainwire_link_previews') !== 'false' });
+  send(app.ports.bridgeReceive, { tag: 'animated_media_enabled', data: storage.getItem('plainwire_animated_media') !== 'false' });
+  send(app.ports.bridgeReceive, { tag: 'compact_messages', data: storage.getItem('plainwire_compact_messages') === 'true' });
+  send(app.ports.bridgeReceive, { tag: 'media_preload_enabled', data: storage.getItem('plainwire_media_preload') !== 'false' });
 
   const syncThemeMeta = () => {
     const meta = document.querySelector('meta[name="theme-color"]');
@@ -437,18 +434,18 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
   }, { passive: true });
 
   const accentPresets = Object.freeze({
-    blue: ['#5267d7', '#4458bc'],
+    blue: ['#326b98', '#28597f'],
     teal: ['#16877a', '#116b61'],
     green: ['#37854f', '#2c6b40'],
     amber: ['#9a6716', '#7d5312'],
     rose: ['#b64d6b', '#963e58']
   });
   const applyUiPreferences = () => {
-    const density = localStorage.getItem('plainwire_density') || 'comfortable';
-    const reduceMotion = localStorage.getItem('plainwire_reduce_motion') === 'true';
-    const fontScale = localStorage.getItem('plainwire_font_scale') || 'default';
-    const cornerStyle = localStorage.getItem('plainwire_corner_style') || 'default';
-    const accentName = localStorage.getItem('plainwire_accent') || 'blue';
+    const density = storage.getItem('plainwire_density') || 'comfortable';
+    const reduceMotion = storage.getItem('plainwire_reduce_motion') === 'true';
+    const fontScale = storage.getItem('plainwire_font_scale') || 'default';
+    const cornerStyle = storage.getItem('plainwire_corner_style') || 'default';
+    const accentName = storage.getItem('plainwire_accent') || 'blue';
     const accent = accentPresets[accentName] || accentPresets.blue;
     document.documentElement.dataset.density = density === 'compact' ? 'compact' : 'comfortable';
     document.documentElement.dataset.reduceMotion = reduceMotion ? 'true' : 'false';
@@ -497,7 +494,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
       player.dataset.playerReady = 'true';
       let scrubbing = false;
       let resumeAfterScrub = false;
-      const savedVolume = Number(localStorage.getItem('plainwire_media_volume'));
+      const savedVolume = Number(storage.getItem('plainwire_media_volume'));
       media.volume = Number.isFinite(savedVolume) ? Math.max(0, Math.min(1, savedVolume)) : 0.85;
       seek.value = '0';
       if (volume) volume.value = String(media.volume);
@@ -560,7 +557,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
         const next = Math.max(0, Math.min(1, Number(volume.value)));
         media.volume = next;
         media.muted = false;
-        localStorage.setItem('plainwire_media_volume', String(next));
+        storage.setItem('plainwire_media_volume', String(next));
         update();
       });
       mute?.addEventListener('click', () => { media.muted = !media.muted; update(); });
@@ -734,7 +731,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
       updateCallTimers();
     });
   });
-  messageDomObserver.observe(root, { childList: true, subtree: true });
+  messageDomObserver.observe(document.body, { childList: true, subtree: true });
   trackMessageScroll();
   observeMessageHistory();
   mountMediaPlayers();
@@ -811,11 +808,14 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
     return body;
   };
 
-  const performApi = async ({ method = 'GET', path, body }) => {
+  const performApi = async ({ method = 'GET', path, body, request_id = null }) => {
+    const requestRoute = location.hash;
     const requestStarted = performance.now();
     debug('API', 'request', { method, path, body: debugApiBody(path, body) });
     const headers = { accept: 'application/json', 'x-csrf-token': csrf };
-    const options = { method, headers };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    const options = { method, headers, signal: controller.signal, cache: 'no-store' };
     if (body !== null && body !== undefined) {
       headers['content-type'] = 'application/json';
       options.body = JSON.stringify(body);
@@ -825,21 +825,25 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
       const res = await fetch('/api' + path, options);
       const json = await res.json().catch(() => ({ ok: false, error: 'bad_json' }));
       debug('API', 'response', { method, path, status: res.status, ok: !!json.ok, duration_ms: Math.round(performance.now() - requestStarted), error: json.error });
+      if (method === 'GET' && /^\/(messages\?|thread\/|threads\?|profile\/|server\/|users\?)/.test(path) && requestRoute !== location.hash) return null;
       if (json.ok && json.data && json.data.csrf) csrf = json.data.csrf;
       if (json.ok && json.data && json.data.user && json.data.user.id) meId = json.data.user.id;
       if (json.ok && json.data) updatePresenceWatch(json.data);
       send(app.ports.apiReceive, {
         path,
         method,
-        ok: !!json.ok,
+        request_id,
+        ok: res.ok && !!json.ok,
         data: json.data || null,
         error: json.error || (json.ok ? null : 'request_failed')
       });
       return json.ok ? json.data : null;
     } catch (error) {
       debug('API', 'request_failed', { method, path, duration_ms: Math.round(performance.now() - requestStarted), error: error.message }, 'error');
-      send(app.ports.apiReceive, { path, method, ok: false, data: null, error: 'request_failed' });
+      send(app.ports.apiReceive, { path, method, request_id, ok: false, data: null, error: error.name === 'AbortError' ? 'request_timeout' : 'request_failed' });
       return null;
+    } finally {
+      clearTimeout(timeout);
     }
   };
 
@@ -1014,6 +1018,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
 
   const uploadFiles = async (files) => {
     const selected = Array.from(files || []);
+    const uploadRoute = location.hash;
     if (selected.length > clientConfig.uploadMaxFiles) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: `Only the first ${clientConfig.uploadMaxFiles} files will be uploaded.` });
     }
@@ -1024,7 +1029,8 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
         const safeName = String(uploaded.name || 'file').replace(/[\]()[\r\n]/g, '_');
         const markup = String(uploaded.content_type || '').startsWith('image/')
           ? `![${safeName}](${uploaded.url})` : `[${safeName}](${uploaded.url})`;
-        appendToComposer(markup);
+        if (location.hash === uploadRoute) appendToComposer(markup);
+        else send(app.ports.bridgeReceive, { tag: 'attachment_ready', route: uploadRoute, data: markup });
         send(app.ports.bridgeReceive, { tag: 'toast', data: `${safeName} ready to send` });
       } catch (error) {
         const messages = {
@@ -1066,6 +1072,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
     const url = proto + location.host + '/ws';
     debug('WS', 'connecting', { url, queued: wsQueue.length });
     ws = new WebSocket(url);
+    const socket = ws;
     ws.onopen = () => {
       if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
       wsReconnectAttempt = 0;
@@ -1097,6 +1104,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
     };
     ws.onerror = () => debug('WS', 'transport_error', { ready_state: ws?.readyState }, 'error');
     ws.onclose = (event) => {
+      if (ws !== socket) return;
       if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
       send(app.ports.bridgeReceive, { tag: 'ws_status', data: false });
       ws = null;
@@ -1421,13 +1429,13 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
   const replaceMicrophone = async (deviceId) => {
     const previousId = selectedInputId;
     selectedInputId = String(deviceId || '');
-    localStorage.setItem('plainwire_audio_input', selectedInputId);
+    storage.setItem('plainwire_audio_input', selectedInputId);
     try {
       const changed = await rebuildLocalMicrophone();
       if (changed) send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone changed' });
     } catch (error) {
       selectedInputId = previousId;
-      localStorage.setItem('plainwire_audio_input', selectedInputId);
+      storage.setItem('plainwire_audio_input', selectedInputId);
       debug('MEDIA', 'microphone_change_failed', { error: error.message }, 'error');
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not switch microphones.' });
     }
@@ -1444,13 +1452,13 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
     const previousMode = voiceProcessingMode;
     if (nextMode === previousMode) return publishAudioDevices();
     voiceProcessingMode = nextMode;
-    localStorage.setItem('plainwire_voice_processing', voiceProcessingMode);
+    storage.setItem('plainwire_voice_processing', voiceProcessingMode);
     try {
       const changed = await rebuildLocalMicrophone();
       if (changed) send(app.ports.bridgeReceive, { tag: 'toast', data: nextMode === 'studio' ? 'Studio microphone enabled' : nextMode === 'krisp' ? 'Krisp noise cancellation enabled' : 'Noise cancellation enabled' });
     } catch (error) {
       voiceProcessingMode = previousMode;
-      localStorage.setItem('plainwire_voice_processing', voiceProcessingMode);
+      storage.setItem('plainwire_voice_processing', voiceProcessingMode);
       debug('MEDIA', 'voice_processing_change_failed', { requested_mode: nextMode, error: error.message }, 'error');
       send(app.ports.bridgeReceive, { tag: 'toast', data: nextMode === 'krisp' ? 'Krisp could not start in this browser.' : 'Could not change microphone processing.' });
     }
@@ -1601,7 +1609,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
   const FLOAT_STATE_KEY = 'plainwire_float_windows_v2';
   const loadFloatStates = () => {
     try {
-      const value = JSON.parse(localStorage.getItem(FLOAT_STATE_KEY) || '{}');
+      const value = JSON.parse(storage.getItem(FLOAT_STATE_KEY) || '{}');
       return value && typeof value === 'object' ? value : {};
     } catch (_) {
       return {};
@@ -1614,7 +1622,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
     if (floatSaveTimer) clearTimeout(floatSaveTimer);
     floatSaveTimer = setTimeout(() => {
       floatSaveTimer = null;
-      try { localStorage.setItem(FLOAT_STATE_KEY, JSON.stringify(floatPositions)); } catch (_) {}
+      try { storage.setItem(FLOAT_STATE_KEY, JSON.stringify(floatPositions)); } catch (_) {}
     }, 120);
   };
   const clampFloatWindow = (wrapper) => {
@@ -2788,7 +2796,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
     const key = 'plainwire_call_window_v2';
     let saved = null;
     try {
-      const parsed = JSON.parse(localStorage.getItem(key) || 'null');
+      const parsed = JSON.parse(storage.getItem(key) || 'null');
       if (parsed && Number.isFinite(parsed.x) && Number.isFinite(parsed.y)) saved = parsed;
     } catch (_) {}
 
@@ -2819,7 +2827,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
       node.classList.add('detached');
       saved = next;
       if (persist) {
-        try { localStorage.setItem(key, JSON.stringify(next)); } catch (_) {}
+        try { storage.setItem(key, JSON.stringify(next)); } catch (_) {}
       }
     };
 
@@ -2833,7 +2841,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
       node.classList.remove('detached', 'dragging');
       saved = null;
       if (persist) {
-        try { localStorage.removeItem(key); } catch (_) {}
+        try { storage.removeItem(key); } catch (_) {}
       }
     };
 
@@ -2935,7 +2943,14 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
       }
     }, { passive: true });
 
-    const observer = new MutationObserver(() => applySaved());
+    let positionFrame = 0;
+    const observer = new MutationObserver((records) => {
+      const selector = '.call-layer, .call-overlay, .call-compact-bar, .call-popup';
+      const changed = records.some((record) => [...record.addedNodes, ...record.removedNodes].some((node) =>
+        node.nodeType === Node.ELEMENT_NODE && (node.matches?.(selector) || node.querySelector?.(selector))));
+      if (!changed || positionFrame || drag) return;
+      positionFrame = requestAnimationFrame(() => { positionFrame = 0; applySaved(); });
+    });
     observer.observe(document.body, { childList: true, subtree: true });
     applySaved();
   };
@@ -2959,10 +2974,10 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
     if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
   });
   recv(app.ports.localStorageGet, ({ key }) => {
-    send(app.ports.bridgeReceive, { tag: 'local_storage', key, data: localStorage.getItem(key) });
+    send(app.ports.bridgeReceive, { tag: 'local_storage', key, data: storage.getItem(key) });
   });
   recv(app.ports.localStorageSet, ({ key, value }) => {
-    localStorage.setItem(key, value);
+    storage.setItem(key, value);
   });
   recv(app.ports.playTone, playTone);
   recv(app.ports.playNotification, (enabled) => {
@@ -3313,7 +3328,8 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
       case 'scroll_messages_to_bottom':
         requestAnimationFrame(() => requestAnimationFrame(() => {
           const list = document.getElementById('messages');
-          if (!list || !messagesPinnedToBottom) return;
+          if (!list || (!messagesPinnedToBottom && data !== true)) return;
+          messagesPinnedToBottom = true;
           list.scrollTop = list.scrollHeight;
           list.querySelectorAll('img, video').forEach((media) => {
             if (media.tagName === 'IMG' && media.complete) return;
@@ -3513,78 +3529,75 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
         syncThemeMeta();
         break;
       case 'set_sound_preference':
-        localStorage.setItem('plainwire_sound_enabled', data ? 'true' : 'false');
+        storage.setItem('plainwire_sound_enabled', data ? 'true' : 'false');
         if (!data) stopRingtones();
         break;
       case 'ui_density':
-        localStorage.setItem('plainwire_density', data === 'compact' ? 'compact' : 'comfortable');
+        storage.setItem('plainwire_density', data === 'compact' ? 'compact' : 'comfortable');
         applyUiPreferences();
         send(app.ports.bridgeReceive, { tag: 'toast', data: data === 'compact' ? 'Compact layout enabled' : 'Comfortable layout enabled' });
         break;
       case 'reduce_motion':
-        localStorage.setItem('plainwire_reduce_motion', data ? 'true' : 'false');
+        storage.setItem('plainwire_reduce_motion', data ? 'true' : 'false');
         applyUiPreferences();
         send(app.ports.bridgeReceive, { tag: 'toast', data: data ? 'Reduced motion enabled' : 'Standard motion enabled' });
         break;
       case 'ui_font_scale':
-        localStorage.setItem('plainwire_font_scale', ['small', 'large'].includes(data) ? data : 'default');
+        storage.setItem('plainwire_font_scale', ['small', 'large'].includes(data) ? data : 'default');
         applyUiPreferences();
         send(app.ports.bridgeReceive, { tag: 'toast', data: 'Text size updated' });
         break;
       case 'ui_corner_style':
-        localStorage.setItem('plainwire_corner_style', ['compact', 'rounded'].includes(data) ? data : 'default');
+        storage.setItem('plainwire_corner_style', ['compact', 'rounded'].includes(data) ? data : 'default');
         applyUiPreferences();
         send(app.ports.bridgeReceive, { tag: 'toast', data: 'Corner style updated' });
         break;
       case 'ui_accent':
-        localStorage.setItem('plainwire_accent', Object.hasOwn(accentPresets, data) ? data : 'blue');
+        storage.setItem('plainwire_accent', Object.hasOwn(accentPresets, data) ? data : 'blue');
         applyUiPreferences();
         send(app.ports.bridgeReceive, { tag: 'toast', data: 'Accent updated' });
         break;
       case 'chat_enter_mode':
-        localStorage.setItem('plainwire_chat_enter_mode', data === 'newline' ? 'newline' : 'send');
+        storage.setItem('plainwire_chat_enter_mode', data === 'newline' ? 'newline' : 'send');
         break;
       case 'chat_set_link_previews': {
         const enabled = data === true;
-        localStorage.setItem('plainwire_link_previews', enabled ? 'true' : 'false');
+        storage.setItem('plainwire_link_previews', enabled ? 'true' : 'false');
         document.querySelectorAll('.link-embed-wrap').forEach((node) => node.remove());
         document.querySelectorAll('.msg-body').forEach((node) => delete node.dataset.embedsMounted);
         if (enabled) mountLinkEmbeds();
-        send(app.ports.bridgeReceive, { tag: 'toast', data: enabled ? 'Link previews enabled' : 'Link previews disabled' });
         break;
       }
       case 'chat_set_animated_media': {
         const enabled = data === true;
-        localStorage.setItem('plainwire_animated_media', enabled ? 'true' : 'false');
+        storage.setItem('plainwire_animated_media', enabled ? 'true' : 'false');
         applyUiPreferences();
-        send(app.ports.bridgeReceive, { tag: 'toast', data: enabled ? 'Animated media enabled' : 'Animated media paused' });
         break;
       }
       case 'chat_set_compact_messages': {
         const enabled = data === true;
-        localStorage.setItem('plainwire_compact_messages', enabled ? 'true' : 'false');
+        storage.setItem('plainwire_compact_messages', enabled ? 'true' : 'false');
         applyUiPreferences();
-        send(app.ports.bridgeReceive, { tag: 'toast', data: enabled ? 'Compact messages enabled' : 'Comfortable messages enabled' });
         break;
       }
       case 'privacy_set_media_preload': {
         const enabled = data === true;
-        localStorage.setItem('plainwire_media_preload', enabled ? 'true' : 'false');
+        storage.setItem('plainwire_media_preload', enabled ? 'true' : 'false');
         applyUiPreferences();
-        send(app.ports.bridgeReceive, { tag: 'toast', data: enabled ? 'Media preloading enabled' : 'Media preloading reduced' });
         break;
       }
       case 'privacy_clear_drafts':
-        Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i))
+        send(app.ports.bridgeReceive, { tag: 'clear_drafts' });
+        Array.from({ length: storage.length }, (_, i) => storage.key(i))
           .filter((key) => key && (key.startsWith('plainwire_draft') || key.startsWith('draft:')))
-          .forEach((key) => localStorage.removeItem(key));
+          .forEach((key) => storage.removeItem(key));
         send(app.ports.bridgeReceive, { tag: 'toast', data: 'Local drafts cleared' });
         break;
       case 'privacy_reset_device':
         if (window.confirm('Reset Plainwire preferences stored in this browser?')) {
-          Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i))
+          Array.from({ length: storage.length }, (_, i) => storage.key(i))
             .filter((key) => key && key.startsWith('plainwire_'))
-            .forEach((key) => localStorage.removeItem(key));
+            .forEach((key) => storage.removeItem(key));
           location.reload();
         }
         break;
@@ -3617,7 +3630,7 @@ if (!clientConfig.registrationEnabled) root.dataset.registrationEnabled = 'false
         break;
       case 'select_audio_output':
         selectedOutputId = String(data || '');
-        localStorage.setItem('plainwire_audio_output', selectedOutputId);
+        storage.setItem('plainwire_audio_output', selectedOutputId);
         applySpeaker().then(publishAudioDevices);
         break;
       case 'start_mic_test':

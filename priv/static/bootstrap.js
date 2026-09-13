@@ -12,8 +12,8 @@
     idle_timeout_ms: 10 * 60 * 1000,
     compress_oversize_uploads: true,
     max_image_dimension: 4096,
-    version: '1.5.0',
-    asset_version: '1.5.0'
+    version: '1.6.0',
+    asset_version: '1.6.0'
   };
 
   const normalize = (raw) => {
@@ -40,7 +40,7 @@
   };
 
   const assetUrl = (path, config) => {
-    const version = encodeURIComponent(String(config.asset_version || config.version || '1.5.0'));
+    const version = encodeURIComponent(String(config.asset_version || config.version || '1.6.0'));
     return `${path}?v=${version}`;
   };
 
@@ -68,12 +68,14 @@
 
   const boot = async () => {
     let config = fallback;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
     try {
-      const response = await fetch('/api/client-config', { headers: { accept: 'application/json' }, cache: 'no-store' });
+      const response = await fetch('/api/client-config', { headers: { accept: 'application/json' }, cache: 'no-store', signal: controller.signal });
       if (response.ok) config = normalize(await response.json());
     } catch (_) {
       config = normalize(fallback);
-    }
+    } finally { clearTimeout(timeout); }
     applyEarlyUi(config);
     try {
       await loadStyles(config);

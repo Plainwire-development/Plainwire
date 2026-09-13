@@ -12,8 +12,6 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-scripts/install-openrc-release.sh
-scripts/update-openrc-release.sh
 erl_crash.dump
 *.crashdump
 *.dump
@@ -40,3 +38,7 @@ priv/static/app.js
 priv/static/app.css
 priv/static/elm/elm-stuff/
 data/
+
+!.env.development.example
+test-results/
+dist/

@@ -61,9 +61,10 @@ session_fast(Token) ->
         _ ->
             H = pw_util:sha256_hex(Token),
             Now = pw_util:now_ms(),
-            case ets:lookup(?SESSION_CACHE, H) of
+            try ets:lookup(?SESSION_CACHE, H) of
                 [{H, Session, Expires}] when Expires > Now -> {ok, Session};
                 _ -> {error, no_session}
+            catch error:badarg -> {error, database_unavailable}
             end
     end.
 
@@ -441,21 +442,6 @@ connect_with_retry(Attempts, DelayMs) ->
         Error -> Error
     end.
 
-maybe_upgrade_password_hash(Conn, Uid, Password, StoredHash) ->
-    case pw_util:password_needs_rehash(StoredHash) of
-        false -> ok;
-        true ->
-            Salt = pw_util:random_token(18),
-            Hash = pw_util:pbkdf2(Password, Salt),
-            %% Compare the old hash in the UPDATE so concurrent successful
-            %% logins cannot overwrite a newer password hash.
-            _ = exec(Conn,
-                "UPDATE users SET password_hash = $1, password_salt = $2, updated_at = $3 "
-                "WHERE id = $4 AND password_hash = $5",
-                [Hash, Salt, pw_util:now_ms(), Uid, StoredHash]),
-            ok
-    end.
-
 route({register, U0, D0, P0}, Conn) ->
     U = pw_util:normalize_username(U0),
     D0b = pw_util:clean_text(D0, 48),
@@ -493,7 +479,7 @@ route({login, U0, P0}, Conn) ->
         _ ->
             _ = pw_util:pbkdf2(P, <<"plainwire-login-timing-pad">>),
             {error, bad_login}
-end;
+    end;
 route({prune_sessions, Now}, Conn) ->
     ok = exec(Conn,
         "DELETE FROM sessions WHERE token_hash IN "
@@ -2637,3 +2623,19 @@ seed_forums(Conn) ->
         _ ->
             ok
     end.
+
+maybe_upgrade_password_hash(Conn, Uid, Password, StoredHash) ->
+    case pw_util:password_needs_rehash(StoredHash) of
+        false -> ok;
+        true ->
+            Salt = pw_util:random_token(18),
+            Hash = pw_util:pbkdf2(Password, Salt),
+            %% Compare the old hash in the UPDATE so concurrent successful
+            %% logins cannot overwrite a newer password hash.
+            _ = exec(Conn,
+                "UPDATE users SET password_hash = $1, password_salt = $2, updated_at = $3 "
+                "WHERE id = $4 AND password_hash = $5",
+                [Hash, Salt, pw_util:now_ms(), Uid, StoredHash]),
+            ok
+    end.
+

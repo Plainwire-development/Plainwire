@@ -1,0 +1,31 @@
+[Unit]
+Description=Plainwire chat server
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=plainwire
+Group=plainwire
+WorkingDirectory=/opt/plainwire/current
+EnvironmentFile=/etc/plainwire/plainwire.env
+Environment=PLAINWIRE_UPLOAD_DIR=/var/lib/plainwire/uploads
+Environment=PORT=8080
+ExecStart=/opt/plainwire/current/bin/plainwire_relay foreground
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+UMask=0077
+StateDirectory=plainwire
+LogsDirectory=plainwire
+RuntimeDirectory=plainwire
+Environment=ERL_CRASH_DUMP=/var/log/plainwire/erl_crash.dump
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/plainwire /var/log/plainwire /run/plainwire
+
+[Install]
+WantedBy=multi-user.target

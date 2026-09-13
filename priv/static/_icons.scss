@@ -1,0 +1,23 @@
+/* Lucide icons, ISC licensed. Local assets, no runtime dependency. */
+.ui-icon, .call-icon { display: inline-block; width: 18px; height: 18px; min-width: 18px; flex-shrink: 0; position: relative; border: 0; border-radius: 0; background: currentColor; mask: var(--icon) center / contain no-repeat; -webkit-mask: var(--icon) center / contain no-repeat; transform: none; }
+.ui-icon::before, .ui-icon::after, .call-icon::before, .call-icon::after { display: none; }
+.ui-icon-home { --icon: url('/assets/icons/House.svg'); }
+.ui-icon-forums { --icon: url('/assets/icons/MessagesSquare.svg'); }
+.ui-icon-messages { --icon: url('/assets/icons/MessageSquare.svg'); }
+.ui-icon-friends { --icon: url('/assets/icons/Users.svg'); }
+.ui-icon-servers { --icon: url('/assets/icons/PanelsTopLeft.svg'); }
+.ui-icon-settings { --icon: url('/assets/icons/Settings.svg'); }
+.ui-icon-profile { --icon: url('/assets/icons/UserRound.svg'); }
+.ui-icon-notifications { --icon: url('/assets/icons/Bell.svg'); }
+.ui-icon-menu { --icon: url('/assets/icons/Menu.svg'); }
+.ui-icon-search { --icon: url('/assets/icons/Search.svg'); }
+.ui-icon-attach { --icon: url('/assets/icons/Paperclip.svg'); }
+.ui-icon-send { --icon: url('/assets/icons/ArrowUp.svg'); }
+.ui-icon-call { --icon: url('/assets/icons/Phone.svg'); }
+.ui-icon-call-end { --icon: url('/assets/icons/PhoneOff.svg'); }
+.call-icon-mic { --icon: url('/assets/icons/Mic.svg'); }
+.call-icon-audio { --icon: url('/assets/icons/Headphones.svg'); }
+.call-icon-screen { --icon: url('/assets/icons/MonitorUp.svg'); }
+.call-icon-close { --icon: url('/assets/icons/X.svg'); }
+.call-icon-mic.call-icon-off { --icon: url('/assets/icons/MicOff.svg'); }
+.call-icon-audio.call-icon-off { --icon: url('/assets/icons/HeadphoneOff.svg'); }

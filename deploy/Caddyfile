@@ -1,0 +1,13 @@
+# Set PLAINWIRE_HOST in Caddy's environment to the public hostname.
+{$PLAINWIRE_HOST} {
+    encode zstd gzip
+    @uploads path /api/uploads
+    request_body @uploads {
+        max_size 250MB
+    }
+    @ordinary not path /api/uploads
+    request_body @ordinary {
+        max_size 25MB
+    }
+    reverse_proxy 127.0.0.1:8080
+}

@@ -36,6 +36,7 @@ websocket_init(State=#{uid:=Uid, status:=Status}) ->
     process_flag(message_queue_data, off_heap),
     debug(info, "connected", #{uid => Uid, status => Status}),
     pw_hub:connect(Uid, self(), Status),
+    erlang:send_after(60000, self(), revalidate_auth),
     Session = strip_session_urls(maps:get(session, State)),
     {reply, {text, pw_util:json(#{type=>hello, session=>Session})}, State}.
 
@@ -177,6 +178,13 @@ handle_msg(#{<<"type">> := <<"presence_update">>, <<"status">> := Status0}, #{ui
     {ok, State#{status => Status}};
 handle_msg(_, State) -> {ok, State}.
 
+websocket_info(revalidate_auth, State0) ->
+    case revalidate_session(State0) of
+        {ok, State} ->
+            erlang:send_after(60000, self(), revalidate_auth),
+            {ok, State};
+        {error, expired} -> {stop, State0}
+    end;
 websocket_info({hub_json, Event=#{type := voice_superseded}}, State=#{uid:=Uid}) ->
     deliver_hub_payload(pw_util:json(Event), voice_superseded, Uid, State#{voice => undefined});
 websocket_info({hub_json, Event=#{type := call_superseded}}, State=#{uid:=Uid}) ->
@@ -277,7 +285,7 @@ revalidate_session(State=#{last_auth_check := Last, token := Token, uid := Uid})
                 {ok, Session} ->
                     User = maps:get(user, Session),
                     case maps:get(id, User) of
-                        Uid -> {ok, revalidate_rooms(State#{session=>Session, last_auth_check=>Now})};
+                        Uid -> {ok, revalidate_subscriptions(revalidate_rooms(State#{session=>strip_session_urls(Session), last_auth_check=>Now}))};
                         _ -> {error, expired}
                     end;
                 _ ->
@@ -285,12 +293,22 @@ revalidate_session(State=#{last_auth_check := Last, token := Token, uid := Uid})
                         {ok, Session2} ->
                             User2 = maps:get(user, Session2),
                             case maps:get(id, User2) of
-                                Uid -> {ok, revalidate_rooms(State#{session=>Session2, last_auth_check=>Now})};
+                                Uid -> {ok, revalidate_subscriptions(revalidate_rooms(State#{session=>strip_session_urls(Session2), last_auth_check=>Now}))};
                                 _ -> {error, expired}
                             end;
                         _ -> {error, expired}
                     end
             end
+    end.
+
+revalidate_subscriptions(State=#{uid:=Uid, subs:=Subs}) ->
+    Allowed = [Key || Key <- Subs, can_subscribe(Uid, Key) =:= true],
+    case Allowed =:= Subs of
+        true -> State;
+        false ->
+            pw_hub:unsubscribe_all(self()),
+            lists:foreach(fun(Key) -> pw_hub:subscribe(self(), Key) end, Allowed),
+            State#{subs => Allowed}
     end.
 
 %% kicked/removed/blocked means the media room goes too.

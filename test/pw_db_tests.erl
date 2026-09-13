@@ -32,3 +32,12 @@ extract_file_ids_dedup_test() ->
     Body = <<"/api/files/", Id/binary, " /api/files/", Id/binary>>,
     Result = pw_db:extract_file_ids(Body),
     ?assertEqual([Id], Result).
+
+session_cache_unavailable_is_controlled_test() ->
+    ?assertEqual({error, database_unavailable}, pw_db:session_fast(<<"missing-cache-token">>)).
+
+idle_websocket_expires_without_incoming_frames_test() ->
+    State = #{uid => 999, token => <<"expired-test-token">>, subs => [],
+        voice => undefined, call => undefined,
+        last_auth_check => erlang:monotonic_time(millisecond) - 61000},
+    ?assertEqual({stop, State}, pw_ws:websocket_info(revalidate_auth, State)).

@@ -12,7 +12,7 @@ Requirements:
 - PostgreSQL 13+
 - rebar3
 - Node.js and npm
-- Elm 0.19.x
+- Elm 0.19.1 (installed by npm ci)
 
 Install frontend dependencies and build everything:
 
@@ -23,12 +23,12 @@ rebar3 get-deps
 rebar3 compile
 ```
 
-For a quick source audit, run `./scripts/verify-source.sh`. Before publishing a release, run `./scripts/release-check.sh`; it is deliberately strict and requires the native Elm compiler, Erlang, rebar3, Node.js, and npm so a source-only check cannot be mistaken for a release build. Sass is installed from the locked npm dependencies.
+For a quick source audit, run `./scripts/verify-source.sh`. Before publishing a release, run `./scripts/release-check.sh`; it is deliberately strict and requires Erlang, rebar3, Node.js, npm, and an installed Playwright Chromium browser so a source-only check cannot be mistaken for a release build. Sass and Elm are installed from the locked npm dependencies. Install the test browser with `npx playwright install chromium`.
 
 Create a PostgreSQL database, then run:
 
 ```sh
-cp .env.example .env
+cp .env.development.example .env
 ./scripts/start.sh
 ```
 
@@ -40,6 +40,8 @@ For the bundled development database helper:
 guix shell postgresql -- ./scripts/dev-db.sh start
 ./scripts/start.sh --build
 ```
+
+For a production host, follow [the deployment guide](deploy/README.md). It includes systemd and Caddy configuration, updates, verification, and rollback guidance. See [the 1.6.0 changes](RELEASE_NOTES_1.6.0.md) and [verified build status](BUILD_STATUS.md).
 
 ## Main features
 

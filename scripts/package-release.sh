@@ -5,7 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "${ROOT}"
 
 VERSION=$(tr -d '[:space:]' < VERSION)
-[[ ${VERSION} == 1.5.0 ]] || { printf 'Unexpected VERSION: %s\n' "${VERSION}" >&2; exit 1; }
+[[ ${VERSION} == 1.6.0 ]] || { printf 'Unexpected VERSION: %s\n' "${VERSION}" >&2; exit 1; }
 
 ./scripts/release-check.sh
 
@@ -28,6 +28,9 @@ tar -C "${ROOT}" -czf "${SOURCE_ARCHIVE}" \
   --exclude='./node_modules' \
   --exclude='./dist' \
   --exclude='./data' \
+  --exclude='./test-results' \
+  --exclude='./tooling' \
+  --exclude='./priv/static/elm/elm-stuff' \
   --exclude='./.git' \
   --exclude='./.env' \
   .
