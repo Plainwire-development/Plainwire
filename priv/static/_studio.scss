@@ -1,0 +1,114 @@
+/* The call workspace: quiet surfaces, generous controls, useful screen space. */
+.call-layer { width: max-content; max-width: calc(100vw - 24px); align-items: flex-end; }
+.call-overlay.expanded {
+  position: relative; display: flex; flex-direction: column; width: 420px;
+  height: min(710px, calc(100dvh - 40px)); min-width: 340px; min-height: 360px;
+  max-width: calc(100vw - 24px); max-height: calc(100dvh - 24px);
+  container-type: inline-size; border-radius: 16px; overflow: auto;
+  background: var(--bg); border: 1px solid var(--line2); scrollbar-width: thin;
+  box-shadow: 0 16px 48px #00000024;
+}
+.call-overlay.expanded > * { flex-shrink: 0; }
+.call-overlay-header {
+  position: sticky; top: 0; z-index: 3; min-height: 80px; padding: 18px 20px;
+  background: var(--bg2); border-bottom: 1px solid var(--line);
+}
+.call-overlay-title { font-size: 19px; letter-spacing: -.025em; font-weight: 650; }
+.call-overlay-meta { gap: 7px; font-size: 11px; }
+.call-minimize { width: 34px; height: 34px; border-radius: 8px; }
+.call-overlay-users { display: grid; grid-template-columns: 1fr; gap: 8px; padding: 14px; max-height: none; overflow: visible; flex: 1 0 auto; }
+.call-user-row { min-height: 100px; margin: 0; padding: 14px; gap: 11px; border: 1px solid var(--line); border-radius: 11px; background: var(--bg2); align-content: center; }
+.call-user-row > .avatar { width: 38px; height: 38px; flex: 0 0 38px; border-radius: 12px; }
+.call-user-row .avatar.live { outline: 2px solid color-mix(in srgb, var(--ok), transparent 45%); outline-offset: 3px; }
+.call-user-name { font-size: 14px; }
+.call-user-status { font-size: 11px; }
+.call-user-row pw-user-volume { padding: 8px 0 0; border-top: 1px solid var(--line); }
+pw-user-volume input[type=range], pw-input-volume input[type=range] {
+  appearance: none; background: transparent; height: 24px; cursor: pointer;
+  &::-webkit-slider-runnable-track { height: 4px; border-radius: 4px; background: var(--line2); }
+  &::-webkit-slider-thumb { appearance: none; width: 14px; height: 14px; margin-top: -5px; border: 2px solid var(--bg); border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  &::-moz-range-track { height: 4px; border-radius: 4px; background: var(--line2); }
+  &::-moz-range-thumb { width: 12px; height: 12px; border: 2px solid var(--bg); border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  &:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 5px; }
+}
+.call-input-panel { margin: 0 14px 12px; padding: 14px; border-radius: 10px; background: var(--bg2); }
+.call-input-panel select { height: 38px; }
+.call-mic-meter { margin-top: 10px; height: 5px; }
+.call-health { margin: 0 14px 10px; border-radius: 10px; background: var(--bg2); }
+.call-health summary { min-height: 42px; padding: 12px 14px; }
+.call-tools { padding: 0 14px 10px; }
+.call-overlay-controls { position: sticky; bottom: 0; z-index: 3; background: var(--bg2); padding: 12px 16px 18px; border-top: 1px solid var(--line2); }
+.call-control { min-height: 58px; border-radius: 10px; background: var(--bg); border-color: var(--line); transition: background-color .12s; }
+.call-control:hover { background: var(--hover); }
+.call-control.leave { background: #a82f40; border-color: #a82f40; }
+.call-control.active { border-color: var(--accent); background: var(--active); }
+.call-resize-handle { position: sticky; bottom: 0; z-index: 4; align-self: flex-end; width: 26px; height: 18px; min-height: 18px; margin-top: -18px; padding: 0 3px 1px 0; color: var(--muted); background: transparent; border: 0; cursor: nwse-resize; touch-action: none; font: 16px/1 monospace; }
+.call-resize-handle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.call-sharing-row { margin: 12px 14px 0; padding: 10px 12px; border-radius: 8px; background: var(--active); color: var(--text); }
+pw-screen-settings { display: block; margin: 0 14px 10px; padding: 0; border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); font-size: 12px; }
+pw-screen-settings summary { padding: 12px 14px; min-height: 42px; cursor: pointer; font-weight: 600; }
+pw-screen-settings label { display: block; margin: 0 14px 10px; color: var(--text2); }
+pw-screen-settings select { display: block; width: 100%; padding: 9px; margin-top: 6px; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+pw-screen-settings p { font-size: 11px; line-height: 1.6; color: var(--muted); margin: 10px 14px; }
+pw-screen-settings button { margin: 0 14px 14px; }
+@container (min-width: 560px) {
+  .call-overlay-users { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .call-user-row { min-height: 126px; }
+  .call-control { flex-direction: row; gap: 10px; font-size: 12px; }
+  .call-input-panel { display: grid; grid-template-columns: 1fr 1fr; column-gap: 20px; }
+  .call-input-heading, .call-mic-meter { grid-column: 1 / -1; }
+  .call-input-panel pw-input-volume { grid-column: 2; grid-row: 2 / 4; margin: 0; }
+}
+
+.pw-float { background: #111418; border: 1px solid #424950; border-radius: 14px; min-width: 300px; box-shadow: 0 18px 56px #00000040; color-scheme: dark; }
+.pw-float-bar { min-height: 56px; padding: 10px 12px 10px 18px; background: #20252b; border-bottom: 1px solid #343b43; gap: 12px; }
+.pw-float-title { font-size: 13px; font-weight: 600; color: #eef2f6; }
+.pw-float-title-wrap { gap: 4px; }
+.pw-float-state { font-size: 10px; color: #b1bac4; }
+.pw-float-state-dot { width: 5px; height: 5px; background: #79b996; }
+.pw-float-controls { gap: 4px; }
+.pw-float-btn { width: 34px; height: 34px; border: 1px solid transparent; border-radius: 7px; color: #c2c9d1; }
+.pw-float-btn:hover { background: #333b44; border-color: #485360; }
+.pw-float-window-icon.pip { width: 16px; height: 12px; border: 1.5px solid currentColor; border-radius: 2px; }
+.pw-float-window-icon.pip::after { content: ''; position: absolute; right: 1px; bottom: 1px; width: 7px; height: 4px; background: currentColor; }
+.pw-float video { background: #111418; display: block; width: 100%; }
+.screen-viewer-footer { flex: 0 0 auto; display: flex; align-items: center; gap: 14px; min-height: 38px; padding: 5px 14px; border-top: 1px solid #343b43; background: #20252b; color: #b1bac4; font: 10px/1.4 ui-monospace, monospace; }
+.screen-viewer-footer button { margin-left: auto; min-height: 28px; padding: 4px 9px; white-space: nowrap; border: 1px solid #424950; border-radius: 5px; background: transparent; color: #eef2f6; font: 11px/1.4 system-ui; cursor: pointer; }
+.screen-play-retry { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); padding: 12px 18px; color: #fff; background: #2e3741; border: 1px solid #596676; border-radius: 8px; cursor: pointer; }
+.screen-play-retry[hidden] { display: none; }
+.pw-float:fullscreen { inset: 0 !important; width: 100% !important; height: 100% !important; max-width: none !important; max-height: none !important; border-radius: 0; resize: none; }
+@supports (dynamic-range-limit: no-limit) { .pw-float video { dynamic-range-limit: no-limit; } }
+
+/* More readable everyday chat, with consistent spacing between surfaces. */
+.chat-header { min-height: 68px; padding-inline: 24px; background: var(--bg2); border-bottom: 1px solid var(--line); }
+.messages { scroll-padding-bottom: 20px; }
+.msg { padding-block: 9px; }
+.msg-head { margin-bottom: 4px; }
+.msg-body { line-height: 1.65; }
+.composer { margin-bottom: 18px; }
+.channel-link { min-height: 50px; }
+.server-welcome { border-radius: 12px; border-color: var(--line); }
+@media (prefers-reduced-motion: reduce) { .call-control { transition: none; } }
+@media (max-width: 760px) {
+  .call-layer { width: auto; max-width: none; }
+  .call-overlay.expanded { min-width: 0; width: 100%; height: auto; max-height: calc(var(--pw-visual-height, 100dvh) - var(--mobile-nav-h) - env(safe-area-inset-bottom) - 26px); min-height: 0; border-radius: 16px; }
+  .call-overlay-header { min-height: 66px; padding: 12px 16px; }
+  .call-overlay-title { font-size: 17px; }
+  .call-overlay-users { padding: 10px; gap: 7px; }
+  .call-user-row { min-height: 78px; padding: 10px 12px; }
+  .call-user-row pw-user-volume { padding-top: 5px; }
+  .call-input-panel { padding: 12px; margin-inline: 10px; }
+  .call-overlay-controls { padding: 10px 12px; gap: 7px; }
+  .call-control { min-height: 54px; }
+  .call-resize-handle { display: none; }
+  .pw-float { top: max(72px, env(safe-area-inset-top)) !important; min-width: 0; height: min(34dvh, 280px) !important; min-height: 180px; border-radius: 12px; }
+  .pw-float.expanded-view { height: calc(var(--pw-visual-height, 100dvh) - 150px) !important; max-height: calc(var(--pw-visual-height, 100dvh) - 150px) !important; }
+  .pw-float-bar { min-height: 48px; padding: 6px 8px 6px 12px; gap: 6px; }
+  .pw-float-controls { gap: 1px; }
+  .pw-float-btn { width: 34px; height: 36px; }
+  .screen-viewer-footer { padding-inline: 10px; gap: 8px; font-size: 9px; }
+  .chat-header { min-height: 62px; padding-inline: 14px; }
+  .msg { padding-block: 10px; }
+  .composer { margin-bottom: 10px; }
+}
+@media (max-height: 560px) and (min-width: 761px) { .call-overlay.expanded { min-height: 280px; } }

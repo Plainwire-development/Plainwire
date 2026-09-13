@@ -27,7 +27,7 @@ async function setup(context){
  await context.route('**/api/**',async route=>{
   const req=route.request(), url=new URL(req.url()), path=url.pathname;
   const reply=(data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify({ok:status<400,data,...(status===401?{error:'not_authenticated'}:{})})});
-  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.7.1',asset_version:'1.7.1',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
+  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.7.2',asset_version:'1.7.2',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
   if(path==='/api/me')return authenticated?reply({user:me,csrf:'test-csrf',server_time:now}):reply(null,401);
   if(path==='/api/sync')return reply(sync);
   if(path==='/api/forums')return reply([]);
@@ -52,6 +52,23 @@ try {
  const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
  await page.goto(origin);await page.waitForSelector('.home-welcome');
  await page.screenshot({path:'test-results/home-desktop.png'});
+ const navigation = page.getByRole('button',{name:'Resize navigation',exact:true});
+ const navigationWidth = await page.locator('.side').evaluate(el=>el.getBoundingClientRect().width);
+ await navigation.focus();await navigation.press('ArrowRight');
+ assert.equal(await page.locator('.side').evaluate(el=>el.getBoundingClientRect().width),navigationWidth+16);
+ await navigation.press('Home');
+ await page.locator('.workspace-menu summary').click();
+ assert(await page.getByRole('button',{name:'Join with invite',exact:true}).isVisible());
+ await page.keyboard.press('Escape');assert.equal(await page.locator('.workspace-menu[open]').count(),0);
+ await page.getByRole('button',{name:'Quick switcher',exact:true}).click();
+ await page.getByRole('searchbox',{name:'Find conversations and servers'}).fill('Jamie');
+ assert.equal(await page.locator('.switcher-result').count(),1);
+ await page.screenshot({path:'test-results/quick-switcher.png'});
+ await page.keyboard.press('Enter');await page.waitForSelector('#compose');
+ assert.equal(new URL(page.url()).hash,'#dm/1');
+ await page.keyboard.press('Control+k');await page.getByRole('searchbox',{name:'Find conversations and servers'}).fill('no such room');
+ await page.getByText('No matches. Try a person or server name.',{exact:true}).waitFor();await page.keyboard.press('Escape');
+ assert.equal(await page.locator('dialog[open]').count(),0);
  await page.evaluate(()=>location.hash='#dm/1');await page.waitForSelector('#compose');await page.waitForSelector('.msg');
  await page.waitForSelector('.code-block .hljs-title');
  assert.equal(await page.locator('.code-block .code-heading span').first().textContent(),'erlang');
@@ -65,6 +82,25 @@ try {
  assert.equal(await page.evaluate(()=>window.__xss),undefined);
  assert(await page.evaluate(()=>window.PlainwireHighlight.listLanguages().length)>180);
  await page.locator('#markdown-security-fixture').evaluate(el=>el.remove());
+ await page.evaluate(()=>{
+  window.__oldMessage=document.querySelector('.msg');window.__wholeMessageScans=0;
+  window.__queryAll=document.querySelectorAll;
+  document.querySelectorAll=function(selector){if(selector==='.msg-body'||selector==='.pw-media-player:not([data-player-ready])')window.__wholeMessageScans++;return window.__queryAll.call(this,selector);};
+ });
+ sockets.at(-1).send(JSON.stringify({type:'message_created',message:message(9000,Array(45).fill('A longer conversation to check reading position.').join('\n'))}));
+ await page.waitForSelector('[data-mid="9000"]');await page.waitForTimeout(100);
+ await page.locator('#messages').evaluate(el=>{el.scrollTop=0;});
+ await page.getByRole('button',{name:'Jump to latest ↓',exact:true}).waitFor();
+ sockets.at(-1).send(JSON.stringify({type:'message_created',message:message(9001,'A new message while you read earlier ones.')}));
+ await page.waitForSelector('[data-mid="9001"]');await page.waitForTimeout(100);
+ assert.equal(await page.locator('#messages').evaluate(el=>el.scrollTop),0,'live messages preserve reading position');
+ await page.getByRole('button',{name:'Jump to latest ↓',exact:true}).click();
+ await page.waitForFunction(()=>{const el=document.querySelector('#messages');return el.scrollHeight-el.scrollTop-el.clientHeight<5;});
+ assert.equal(await page.evaluate(()=>window.__oldMessage===document.querySelector('.msg')),true,'old message DOM is preserved');
+ assert.equal(await page.evaluate(()=>window.__wholeMessageScans),0,'new messages do not rescan all old media and embeds');
+ await page.evaluate(()=>{document.querySelectorAll=window.__queryAll;});
+ for(const id of [9000,9001])sockets.at(-1).send(JSON.stringify({type:'message_deleted',message_id:id}));
+ await page.waitForFunction(()=>!document.querySelector('[data-mid="9000"], [data-mid="9001"]'));
  await page.locator('#compose').fill(Array(75).fill('Long message with a new line.').join('\n'));
  await page.waitForTimeout(50);
  const composeMetrics=await page.locator('#compose').evaluate(el=>({scroll:el.scrollHeight,height:el.clientHeight,overflow:getComputedStyle(el).overflowY,style:el.getAttribute('style')}));
@@ -121,6 +157,14 @@ try {
  await page.getByRole('button',{name:'Retry',exact:true}).click();await page.waitForTimeout(50);assert.equal(delayed.length,1);await delayed[0]();await page.waitForFunction(()=>!document.querySelector('.msg.pending, .msg.failed'));
  if(await page.locator('.toast-close').count())await page.locator('.toast-close').click();
  await page.evaluate(()=>location.hash='#settings');await page.waitForSelector('.settings-page');await page.screenshot({path:'test-results/settings-desktop.png'});
+ await page.locator('.settings-content').evaluate(el=>{el.scrollTop=el.scrollHeight;});
+ await page.locator('.settings-sidebar').getByRole('button',{name:'Appearance',exact:true}).click();
+ await page.waitForFunction(()=>document.querySelector('.settings-content').scrollTop===0);
+ assert(await page.locator('.settings-content-top h1').isVisible());
+ await page.setViewportSize({width:390,height:640});
+ await page.screenshot({path:'test-results/settings-mobile.png'});
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+ await page.setViewportSize({width:1440,height:960});
  await page.getByRole('searchbox',{name:'Find a setting'}).fill('microphone');
  await page.locator('.settings-search-results button').click(); await page.waitForSelector('.voice-settings');
  assert.equal(await page.getByRole('searchbox',{name:'Find a setting'}).inputValue(),'');
@@ -155,5 +199,5 @@ try {
  }
  authenticated=false;const auth=await browser.newContext({viewport:{width:1440,height:960},colorScheme:'light'});await setup(auth);const login=await auth.newPage();login.on('pageerror',e=>errors.push(e.message));await login.goto(origin);await login.waitForSelector('.auth-submit');await login.screenshot({path:'test-results/login-desktop.png'});await login.setViewportSize({width:390,height:844});await login.screenshot({path:'test-results/login-mobile.png'});
  const blocked=await browser.newContext();await setup(blocked);await blocked.addInitScript(()=>Object.defineProperty(window,'localStorage',{get(){throw new DOMException('Storage blocked','SecurityError')}}));const blockedPage=await blocked.newPage();blockedPage.on('pageerror',e=>errors.push(e.message));await blockedPage.goto(origin);await blockedPage.waitForSelector('.auth-submit');
- assert.deepEqual(errors,[],'no browser exceptions');console.log('PASS: Markdown and syntax highlighting; unsafe markup rejection; long composer scrolling; settings search; welcome preview; invite expiry/revocation; desktop/light/dark/mobile layouts; drafts across routes; concurrent sends out of order; new draft preserved; late send isolated; failed send/retry; sign-in; no runtime exceptions.');
+ assert.deepEqual(errors,[],'no browser exceptions');console.log('PASS: quick switcher keyboard navigation/dismissal; sidebar resizing; workspace menu dismissal; latest-message navigation and preserved reading position; scoped media updates; settings tab scroll reset; Markdown and syntax highlighting; unsafe markup rejection; long composer scrolling; settings search; welcome preview; invite expiry/revocation; desktop/light/dark/mobile layouts; drafts across routes; concurrent sends out of order; new draft preserved; late send isolated; failed send/retry; sign-in; no runtime exceptions.');
 } finally {await browser.close();server.close();}

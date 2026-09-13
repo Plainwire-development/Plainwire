@@ -438,6 +438,7 @@
 
   const resizeComposer = (textarea) => {
     if (!(textarea instanceof HTMLTextAreaElement) || textarea.id !== 'compose') return;
+    textarea._measuredDraft = textarea.value;
     textarea.style.height = 'auto';
     const visibleHeight = window.visualViewport?.height || window.innerHeight || 720;
     const mobileLimit = Math.max(104, Math.min(176, Math.round(visibleHeight * 0.28)));
@@ -557,8 +558,9 @@
     return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
   };
 
-  const mountMediaPlayers = () => {
-    document.querySelectorAll('.pw-media-player:not([data-player-ready])').forEach((player) => {
+  const matchingNodes = (root, selector) => root.matches?.(selector) ? [root, ...root.querySelectorAll(selector)] : root.querySelectorAll(selector);
+  const mountMediaPlayers = (root = document) => {
+    matchingNodes(root, '.pw-media-player:not([data-player-ready])').forEach((player) => {
       const media = player.querySelector('audio, video');
       const playButtons = Array.from(player.querySelectorAll('[data-media-action="play"]'));
       const mute = player.querySelector('[data-media-action="mute"]');
@@ -727,8 +729,8 @@
     return card;
   };
 
-  const mountLinkEmbeds = () => {
-    document.querySelectorAll('.msg-body').forEach((body) => {
+  const mountLinkEmbeds = (root = document) => {
+    matchingNodes(root, '.msg-body').forEach((body) => {
       if (body.dataset.embedsMounted === 'true') return;
       const links = Array.from(body.querySelectorAll('.message-link[data-embed-url]'))
         .map((link) => ({ link, url: link.dataset.embedUrl || '' }))
@@ -848,22 +850,43 @@
   };
 
   let messageDomFrame = 0;
+  const changedMessageRoots = new Set();
+  let timersChanged = false, invitesChanged = false, composerChanged = false;
   const messageDomObserver = new MutationObserver((records) => {
-    const relevantSelector = '#compose, #messages, #message-history-sentinel, .pw-media-player, .pw-live-call-timer, .message-link, .msg-body, .invite-manager';
-    const relevant = records.some((record) => [...record.addedNodes, ...record.removedNodes].some((node) =>
-      node.nodeType === Node.ELEMENT_NODE && (node.matches?.(relevantSelector) || node.querySelector?.(relevantSelector))
-    ));
-    if (!relevant) return;
-    if (messageDomFrame) return;
+    const contains = (node, selector) => node.matches?.(selector) || node.querySelector?.(selector);
+    for (const record of records) {
+      for (const node of [...record.addedNodes, ...record.removedNodes]) {
+        if (node.nodeType !== Node.ELEMENT_NODE) continue;
+        if (contains(node, '.pw-live-call-timer')) timersChanged = true;
+        if (contains(node, '.invite-manager')) invitesChanged = true;
+        if (contains(node, '#compose')) composerChanged = true;
+        if (node.isConnected && contains(node, '#messages, .msg-body, .pw-media-player, .message-link')) changedMessageRoots.add(node.closest('.msg-body') || node);
+      }
+    }
+    if (messageDomFrame || (!changedMessageRoots.size && !timersChanged && !invitesChanged && !composerChanged)) return;
     messageDomFrame = requestAnimationFrame(() => {
       messageDomFrame = 0;
-      trackMessageScroll();
+      const list = trackMessageScroll();
       observeMessageHistory();
-      mountMediaPlayers();
-      mountLinkEmbeds();
-      updateCallTimers();
-      mountInviteManagers();
-      resizeComposer(document.getElementById('compose'));
+      // Visit only added subtrees, rather than rescanning every old message.
+      for (const root of changedMessageRoots) {
+        if (!root.isConnected) continue;
+        let covered = false;
+        for (let parent = root.parentElement; parent; parent = parent.parentElement) { if (changedMessageRoots.has(parent)) { covered = true; break; } }
+        if (covered) continue;
+        mountMediaPlayers(root);
+        mountLinkEmbeds(root);
+      }
+      if (changedMessageRoots.size) {
+        list?.dispatchEvent(new Event('plainwire:messages'));
+        const composer = document.getElementById('compose');
+        if (composer && composer._measuredDraft !== composer.value) composerChanged = true;
+      }
+      changedMessageRoots.clear();
+      if (timersChanged) updateCallTimers();
+      if (invitesChanged) mountInviteManagers();
+      if (composerChanged) resizeComposer(document.getElementById('compose'));
+      timersChanged = invitesChanged = composerChanged = false;
     });
   });
   messageDomObserver.observe(document.body, { childList: true, subtree: true });
@@ -1941,8 +1964,8 @@
     if (rect.width > maxW) wrapper.style.width = maxW + 'px';
     if (rect.height > maxH) wrapper.style.height = maxH + 'px';
     const next = wrapper.getBoundingClientRect();
-    const x = Math.max(0, Math.min(Math.max(0, window.innerWidth - 80), next.left));
-    const y = Math.max(0, Math.min(Math.max(0, window.innerHeight - 40), next.top));
+    const x = Math.max(8, Math.min(Math.max(8, window.innerWidth - next.width - 8), next.left));
+    const y = Math.max(8, Math.min(Math.max(8, window.innerHeight - next.height - 8), next.top));
     wrapper.style.left = x + 'px';
     wrapper.style.top = y + 'px';
     wrapper.style.right = 'auto';
@@ -1955,11 +1978,13 @@
     wrapper.id = 'pw-float-' + id;
     wrapper.className = 'pw-float';
     wrapper.style.display = 'flex';
-    wrapper.style.zIndex = String(floatZIndex++);
+    wrapper.style.zIndex = String(900 + (floatZIndex++ % 100));
+    wrapper.setAttribute('role', 'region');
+    wrapper.setAttribute('aria-label', titleText);
     const compactAtCreation = isCompactFloatLayout();
     if (!compactAtCreation) {
-      wrapper.style.width = 'min(560px, calc(100vw - 24px))';
-      wrapper.style.height = 'min(360px, calc(100dvh - 24px))';
+      wrapper.style.width = id === 'local-preview' ? '340px' : 'min(800px, calc(100vw - 460px))';
+      wrapper.style.height = id === 'local-preview' ? '280px' : 'min(520px, calc(100dvh - 110px))';
     }
 
     const saved = compactAtCreation ? null : floatPositions[id];
@@ -1969,7 +1994,7 @@
       wrapper.style.left = saved.x + 'px';
       wrapper.style.top = saved.y + 'px';
     } else if (!compactAtCreation && opts.top != null) {
-      wrapper.style.left = Math.max(16, Math.round((window.innerWidth - 560) / 2) - 100) + 'px';
+      wrapper.style.left = '24px';
       wrapper.style.top = opts.top + 'px';
     } else if (!compactAtCreation && opts.right != null && opts.bottom != null) {
       wrapper.style.right = opts.right + 'px';
@@ -2012,9 +2037,11 @@
     const btnFit = makeWindowButton('pw-float-fit', 'Center and fit window', 'fit');
     const btnFs = makeWindowButton('pw-float-fs', 'Fullscreen screen share', 'fullscreen');
     const btnClose = makeWindowButton('pw-float-close', 'Close screen share', 'close');
+    const btnPip = makeWindowButton('pw-float-pip', 'Picture in picture', 'pip');
 
     controls.appendChild(btnFit);
     controls.appendChild(btnFs);
+    if (document.pictureInPictureEnabled) controls.appendChild(btnPip);
     controls.appendChild(btnClose);
     bar.appendChild(titleWrap);
     bar.appendChild(controls);
@@ -2027,30 +2054,65 @@
 
     wrapper.appendChild(bar);
     wrapper.appendChild(video);
+    const footer = document.createElement('div'); footer.className = 'screen-viewer-footer';
+    const resolution = document.createElement('span'); resolution.textContent = 'Waiting for video';
+    const colour = document.createElement('span'); colour.textContent = 'Colour not reported';
+    const fitMode = document.createElement('button'); fitMode.type = 'button'; fitMode.textContent = 'Fill view'; fitMode.setAttribute('aria-pressed', 'false');
+    fitMode.addEventListener('click', () => {
+      const filled = fitMode.getAttribute('aria-pressed') !== 'true';
+      fitMode.setAttribute('aria-pressed', String(filled)); fitMode.textContent = filled ? 'Fit view' : 'Fill view';
+      video.style.objectFit = filled ? 'cover' : 'contain';
+    });
+    footer.append(resolution, colour, fitMode); wrapper.append(footer);
+    const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'screen-play-retry'; retry.textContent = 'Play screen share'; retry.hidden = true;
+    retry.addEventListener('click', () => video.play().catch(() => { retry.hidden = false; })); wrapper.append(retry);
+    const updateVideoInfo = () => {
+      resolution.textContent = video.videoWidth ? `${video.videoWidth} × ${video.videoHeight}` : 'Waiting for video';
+      let frame, transfer = null;
+      try { if (video.readyState >= 2 && typeof VideoFrame === 'function') { frame = new VideoFrame(video); transfer = frame.colorSpace?.transfer; } }
+      catch (_) {} finally { frame?.close(); }
+      const hdr = transfer === 'pq' || transfer === 'hlg';
+      colour.textContent = hdr ? `HDR · ${transfer.toUpperCase()}` : ['bt709', 'smpte170m', 'iec61966-2-1'].includes(transfer) ? 'SDR' : 'Colour not reported';
+      colour.title = hdr ? 'HDR metadata detected in this video. Display output depends on your browser and screen.' : 'An HDR-capable display alone does not confirm HDR capture or transmission.';
+      wrapper.dataset.hdr = String(hdr);
+    };
+    video.addEventListener('loadeddata', updateVideoInfo); video.addEventListener('resize', updateVideoInfo);
+    video.addEventListener('playing', () => { retry.hidden = true; state.lastElementChild.textContent = 'Live'; updateVideoInfo(); });
+    video.addEventListener('waiting', () => { state.lastElementChild.textContent = 'Buffering'; });
+    const play = () => video.play().catch(() => { retry.hidden = false; });
     document.body.appendChild(wrapper);
 
-    const bringForward = () => { wrapper.style.zIndex = String(++floatZIndex); };
+    const bringForward = () => {
+      for (const window of floatWindows.values()) window.wrapper.style.zIndex = '900';
+      wrapper.style.zIndex = '901';
+    };
     let fitRestore = null;
     let fitted = false;
     wrapper.addEventListener('pointerdown', bringForward);
 
     btnFs.addEventListener('click', (e) => {
       e.stopPropagation();
-      if (video.requestFullscreen) video.requestFullscreen().catch(() => {});
+      if (document.fullscreenElement === wrapper) document.exitFullscreen?.().catch(() => {});
+      else if (wrapper.requestFullscreen) wrapper.requestFullscreen().catch(() => {});
       else if (video.webkitRequestFullscreen) video.webkitRequestFullscreen();
     });
-    video.addEventListener('dblclick', () => {
-      if (video.requestFullscreen) video.requestFullscreen().catch(() => {});
-      else if (video.webkitRequestFullscreen) video.webkitRequestFullscreen();
+    btnPip.addEventListener('click', async () => {
+      try { if (document.pictureInPictureElement === video) await document.exitPictureInPicture(); else await video.requestPictureInPicture(); }
+      catch (_) { send(app.ports.bridgeReceive, { tag: 'toast', data: 'Picture in picture is not available for this stream.' }); }
     });
+    video.addEventListener('dblclick', () => btnFs.click());
     btnClose.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (document.fullscreenElement === wrapper) document.exitFullscreen?.().catch(() => {});
+      if (document.pictureInPictureElement === video) document.exitPictureInPicture?.().catch(() => {});
       if (opts.onClose) opts.onClose();
       else wrapper.style.display = 'none';
     });
 
     const fitToScreen = () => {
       if (isCompactFloatLayout()) {
+        wrapper.classList.toggle('expanded-view');
+        btnFit.setAttribute('aria-pressed', String(wrapper.classList.contains('expanded-view')));
         wrapper.style.removeProperty('left');
         wrapper.style.removeProperty('top');
         wrapper.style.removeProperty('right');
@@ -2120,8 +2182,8 @@
     });
     bar.addEventListener('pointermove', (e) => {
       if (!dragging || e.pointerId !== dragPointer) return;
-      const nx = Math.max(0, Math.min(window.innerWidth - 80, e.clientX - dragOffX));
-      const ny = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - dragOffY));
+      const nx = Math.max(8, Math.min(window.innerWidth - wrapper.offsetWidth - 8, e.clientX - dragOffX));
+      const ny = Math.max(8, Math.min(window.innerHeight - wrapper.offsetHeight - 8, e.clientY - dragOffY));
       wrapper.style.left = nx + 'px';
       wrapper.style.top = ny + 'px';
       floatPositions[id] = { ...floatPositions[id], x: nx, y: ny, w: wrapper.offsetWidth, h: wrapper.offsetHeight };
@@ -2145,7 +2207,7 @@
     let resizeObserver = null;
     if ('ResizeObserver' in window) {
       const observer = new ResizeObserver(() => {
-        if (wrapper.style.display === 'none' || isCompactFloatLayout()) return;
+        if (wrapper.style.display === 'none' || isCompactFloatLayout() || document.fullscreenElement === wrapper) return;
         const rect = wrapper.getBoundingClientRect();
         const w = Math.min(Math.max(220, rect.width), Math.max(220, window.innerWidth - 16));
         const h = Math.min(Math.max(160, rect.height), Math.max(160, window.innerHeight - 16));
@@ -2166,7 +2228,7 @@
     }
 
     const onViewportResize = () => {
-      if (wrapper.style.display === 'none') return;
+      if (wrapper.style.display === 'none' || document.fullscreenElement === wrapper) return;
       if (isCompactFloatLayout()) {
         wrapper.style.removeProperty('left');
         wrapper.style.removeProperty('top');
@@ -2196,8 +2258,8 @@
     });
 
     const dispose = () => { resizeObserver?.disconnect(); window.removeEventListener('resize', onViewportResize); };
-    floatWindows.set(id, { wrapper, video, title, bar, dispose });
-    return { wrapper, video, bar, title };
+    floatWindows.set(id, { wrapper, video, title, bar, dispose, play });
+    return { wrapper, video, bar, title, play };
   };
 
   const ensureFloatWindow = (id, titleText, accentColor, opts) => {
@@ -2207,20 +2269,24 @@
 
   // ---- Stage video for screenshare viewers ----
   const showStageVideo = (uid, stream) => {
-    const { wrapper, video } = ensureFloatWindow('stage-' + uid, (document.querySelector(`[data-peer-id="${uid}"] .call-user-name`)?.textContent || 'Participant') + ' · Screen', 'var(--accent,#5865f2)', {
+    const { wrapper, video, play } = ensureFloatWindow('stage-' + uid, (document.querySelector(`[data-peer-id="${uid}"] .call-user-name`)?.textContent || 'Participant') + ' · Screen', 'var(--accent,#5865f2)', {
       top: 80,
       onClose: () => { watchedScreens.delete(uid); wrapper.style.display = 'none'; video.srcObject = null; }
     });
     if (stream) {
       video.srcObject = stream;
-      video.play().catch(() => {});
+      play();
     }
     wrapper.style.display = 'flex';
   };
 
   const hideStageVideo = (uid) => {
     const w = floatWindows.get('stage-' + uid);
-    if (w) { w.wrapper.style.display = 'none'; w.video.srcObject = null; }
+    if (w) {
+      if (document.fullscreenElement === w.wrapper) document.exitFullscreen?.().catch(() => {});
+      if (document.pictureInPictureElement === w.video) document.exitPictureInPicture?.().catch(() => {});
+      w.wrapper.style.display = 'none'; w.video.srcObject = null;
+    }
   };
 
   const removeStageVideo = (uid) => {
@@ -2237,12 +2303,12 @@
 
   // ---- Local screen share preview ----
   const showLocalScreenPreview = (stream) => {
-    const { wrapper, video } = ensureFloatWindow('local-preview', 'Your screen', 'var(--ok,#23a55a)', {
+    const { wrapper, video, play } = ensureFloatWindow('local-preview', 'Your screen', 'var(--ok,#23a55a)', {
       top: 80,
       onClose: () => { stopScreenShare(); }
     });
     video.srcObject = stream;
-    video.play().catch(() => {});
+    play();
     wrapper.style.display = 'flex';
   };
 
@@ -2257,15 +2323,57 @@
   };
 
   // ---- Screen sharing ----
-  const screenShareEncoderTiers = [
-    { maxBitrate: 2500000, maxFramerate: 30, scaleResolutionDownBy: 1 },
-    { maxBitrate: 1500000, maxFramerate: 24, scaleResolutionDownBy: 1.5 },
-    { maxBitrate: 750000, maxFramerate: 15, scaleResolutionDownBy: 2 },
-  ];
+  const screenProfiles = {
+    balanced: { label: 'Balanced', width: 1600, height: 900, fps: 30, bitrate: 2500000, hint: 'detail' },
+    text: { label: 'Text & detail', width: 1920, height: 1080, fps: 30, bitrate: 3500000, hint: 'text' },
+    motion: { label: 'Smooth motion', width: 1920, height: 1080, fps: 60, bitrate: 4500000, hint: 'motion' }
+  };
+  let screenProfile = storage.getItem('plainwire_screen_profile') || 'balanced';
+  if (!Object.hasOwn(screenProfiles, screenProfile)) screenProfile = 'balanced';
+  const screenConstraints = () => {
+    const p = screenProfiles[screenProfile];
+    return { width: { ideal: p.width, max: p.width }, height: { ideal: p.height, max: p.height }, frameRate: { ideal: p.fps, max: p.fps } };
+  };
+  class ScreenSettings extends HTMLElement {
+    connectedCallback() { this.render(); }
+    render() {
+      if (this.childElementCount) { this.querySelector('button').disabled = !screenStream; return; }
+      const details = document.createElement('details');
+      const summary = document.createElement('summary'); summary.textContent = 'Screen sharing';
+      const label = document.createElement('label'); label.textContent = 'Share quality';
+      const select = document.createElement('select'); select.setAttribute('aria-label', 'Screen sharing quality');
+      for (const [value, profile] of Object.entries(screenProfiles)) {
+        const option = document.createElement('option'); option.value = value; option.textContent = `${profile.label} · up to ${profile.height}p / ${profile.fps} fps`; select.append(option);
+      }
+      select.value = screenProfile;
+      select.addEventListener('change', async () => {
+        screenProfile = select.value; storage.setItem('plainwire_screen_profile', screenProfile);
+        for (const control of document.querySelectorAll('pw-screen-settings select')) control.value = screenProfile;
+        if (screenStream) {
+          const track = screenStream.getVideoTracks()[0];
+          try { track.contentHint = screenProfiles[screenProfile].hint; await track.applyConstraints(screenConstraints()); }
+          catch (_) { send(app.ports.bridgeReceive, { tag: 'toast', data: 'The browser kept its available capture resolution.' }); }
+          await Promise.allSettled(Array.from(peers.values(), pc => applyEncoderTier(pc._videoSender, peers.size + 1)));
+        }
+      });
+      label.append(select);
+      const note = document.createElement('p');
+      note.textContent = 'Text & detail keeps writing sharp. Smooth motion prefers frame rate. Group calls use lower limits to protect your upload.';
+      const hdr = document.createElement('p');
+      hdr.textContent = window.matchMedia?.('(dynamic-range: high)').matches ? 'HDR display detected. Capture and stream colour depend on your browser; the viewer reports detected video colour.' : 'Colour is managed by your browser. The viewer reports HDR only when detected in the video.';
+      const change = document.createElement('button'); change.type = 'button'; change.className = 'btn secondary'; change.textContent = 'Change shared screen'; change.disabled = !screenStream;
+      change.addEventListener('click', () => startScreenShare(true));
+      details.append(summary, label, note, hdr, change); this.append(details);
+    }
+  }
+  customElements.define('pw-screen-settings', ScreenSettings);
+  const updateScreenControls = () => document.querySelectorAll('pw-screen-settings').forEach(control => control.render());
 
   const applyEncoderTier = async (sender, participantCount) => {
     if (!sender?.track) return;
-    const tier = screenShareEncoderTiers[Math.max(0, Math.min(participantCount - 2, screenShareEncoderTiers.length - 1))];
+    const profile = screenProfiles[screenProfile];
+    const load = Math.max(0, Math.min(participantCount - 2, 2));
+    const tier = { maxBitrate: Math.round(profile.bitrate * [1, .6, .3][load]), maxFramerate: Math.min(profile.fps, [60, 30, 20][load]), scaleResolutionDownBy: [1, 1.5, 2][load] };
     try {
       // getParameters is synchronous; treating it as a Promise used to abort
       // screen sharing at the first participant.
@@ -2283,8 +2391,14 @@
   };
 
   let screenCapturePending = false;
-  const startScreenShare = async () => {
-    if (screenStream || screenCapturePending) return;
+  const startScreenShare = async (replace = false) => {
+    if (screenCapturePending) return;
+    screenCapturePending = true;
+    try { await performScreenShare(replace); }
+    finally { screenCapturePending = false; }
+  };
+  const performScreenShare = async (replace) => {
+    if (screenStream && !replace) return;
     if (!displayMediaSupported) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing is unavailable in this browser.' });
       return;
@@ -2294,26 +2408,26 @@
       return;
     }
     const epoch = room.epoch;
-    screenCapturePending = true;
+    const previous = screenStream;
     let captured;
     try {
       captured = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 30, max: 30 } },
-        audio: false
+        video: screenConstraints(),
+        audio: false,
+        selfBrowserSurface: 'exclude',
+        surfaceSwitching: 'include'
       });
     } catch (error) {
       debug('MEDIA', 'display_media_failed', { name: error.name, error: error.message }, 'warn');
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing was cancelled or is unavailable.' });
       return;
-    } finally {
-      screenCapturePending = false;
     }
     // The user can leave while the browser's screen chooser is open.
-    if (!room || room.epoch !== epoch) { stopStream(captured); return; }
+    if (!room || room.epoch !== epoch || screenStream !== previous) { stopStream(captured); return; }
     const videoTrack = captured.getVideoTracks()[0];
     if (!videoTrack) { stopStream(captured); return; }
     screenStream = captured;
-    videoTrack.contentHint = 'detail';
+    videoTrack.contentHint = screenProfiles[screenProfile].hint;
     videoTrack.onended = () => { if (screenStream === captured) stopScreenShare(); };
     const targets = Array.from(peers.entries()).filter(([, pc]) => pc._videoSender && pc.signalingState !== 'closed');
     const results = await Promise.allSettled(targets.map(async ([uid, pc]) => {
@@ -2321,15 +2435,21 @@
       await applyEncoderTier(pc._videoSender, peers.size + 1);
       if (room?.epoch === epoch && screenStream === captured) screenSenders.set(uid, pc._videoSender);
     }));
-    if (!room || room.epoch !== epoch || screenStream !== captured) { stopStream(captured); return; }
+    if (!room || room.epoch !== epoch || screenStream !== captured) { stopStream(captured); if (previous) stopStream(previous); return; }
     if (results.some((result, i) => result.status === 'rejected' && targets[i][1].signalingState !== 'closed')) {
-      stopScreenShare();
-      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not send your screen. Try sharing again.' });
+      screenStream = previous;
+      await Promise.allSettled(targets.map(([, pc]) => pc._videoSender.replaceTrack(previous?.getVideoTracks()[0] || null)));
+      stopStream(captured);
+      screenSenders.clear();
+      if (previous) targets.forEach(([uid, pc]) => screenSenders.set(uid, pc._videoSender));
+      send(app.ports.bridgeReceive, { tag: 'toast', data: previous ? 'Could not switch screens. Your previous share is unchanged.' : 'Could not start sharing. Please try again.' });
       return;
     }
+    if (previous) stopStream(previous);
     sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen: true } });
     send(app.ports.bridgeReceive, { tag: 'screen_share_started', user_id: meId });
     showLocalScreenPreview(captured);
+    updateScreenControls();
     debug('MEDIA', 'screen_share_started', { tracks: captured.getTracks().length });
   };
 
@@ -2337,6 +2457,7 @@
     if (!screenStream) return;
     screenStream.getTracks().forEach((t) => t.stop());
     screenStream = null;
+    updateScreenControls();
     // Restore camera video on all peer senders
     const cameraTrack = localStream && localStream.getVideoTracks()[0];
     peers.forEach((pc, peerUid) => {
@@ -3163,7 +3284,13 @@
     let drag = null;
     let suppressClick = false;
     let raf = 0;
-    const desktop = () => window.matchMedia?.('(min-width: 701px)').matches === true;
+    const desktop = () => window.matchMedia?.('(min-width: 761px)').matches === true;
+    const sizeKey = 'plainwire_call_size_v1';
+    let preferredSize = null, resizing = null;
+    try {
+      const value = JSON.parse(storage.getItem(sizeKey) || 'null');
+      if (Number.isFinite(value?.w) && Number.isFinite(value?.h)) preferredSize = value;
+    } catch (_) {}
 
     const layer = () => document.querySelector('.call-layer');
     const clamp = (node, x, y) => {
@@ -3208,6 +3335,13 @@
     const applySaved = () => {
       const node = layer();
       if (!node) return;
+      const panel = node.querySelector('.call-overlay.expanded');
+      if (panel) {
+        if (desktop() && preferredSize) {
+          panel.style.width = `${Math.min(Math.max(340, preferredSize.w), innerWidth - 24)}px`;
+          panel.style.height = `${Math.min(Math.max(380, preferredSize.h), innerHeight - 24)}px`;
+        } else { panel.style.removeProperty('width'); panel.style.removeProperty('height'); }
+      }
       if (!desktop()) {
         resetLayerPosition(node, false);
         return;
@@ -3217,6 +3351,15 @@
 
     document.addEventListener('pointerdown', (ev) => {
       if (!desktop() || ev.button !== 0) return;
+      const grip = ev.target.closest?.('[data-call-resize]');
+      if (grip) {
+        const node = layer(), panel = grip.closest('.call-overlay');
+        if (!node || !panel) return;
+        const bounds = node.getBoundingClientRect(), rect = panel.getBoundingClientRect();
+        setLayerPosition(node, { x: bounds.left, y: bounds.top });
+        resizing = { node, panel, pointer: ev.pointerId, x: ev.clientX, y: ev.clientY, w: rect.width, h: rect.height };
+        grip.setPointerCapture(ev.pointerId); ev.preventDefault(); return;
+      }
       const handle = ev.target.closest?.('[data-call-drag-handle="true"]');
       if (!handle || ev.target.closest('button, input, select, a')) return;
       const node = handle.closest('.call-layer') || layer();
@@ -3243,6 +3386,13 @@
     });
 
     document.addEventListener('pointermove', (ev) => {
+      if (resizing && ev.pointerId === resizing.pointer) {
+        const r = resizing, bounds = r.node.getBoundingClientRect();
+        const w = Math.min(Math.max(340, r.w + ev.clientX - r.x), innerWidth - bounds.left - 12);
+        const h = Math.min(Math.max(380, r.h + ev.clientY - r.y), innerHeight - bounds.top - 12);
+        r.panel.style.width = `${w}px`; r.panel.style.height = `${h}px`;
+        preferredSize = { w, h }; ev.preventDefault(); return;
+      }
       if (!drag || drag.pointerId !== ev.pointerId) return;
       const dx = ev.clientX - drag.startX;
       const dy = ev.clientY - drag.startY;
@@ -3263,6 +3413,9 @@
     }, { passive: false });
 
     const finish = (ev) => {
+      if (resizing && ev.pointerId === resizing.pointer) {
+        resizing = null; storage.setItem(sizeKey, JSON.stringify(preferredSize)); return;
+      }
       if (!drag || drag.pointerId !== ev.pointerId) return;
       if (raf) { cancelAnimationFrame(raf); raf = 0; }
       const finished = drag;
@@ -3276,12 +3429,21 @@
     };
     document.addEventListener('pointerup', finish);
     document.addEventListener('pointercancel', finish);
+    document.addEventListener('lostpointercapture', finish);
+    document.addEventListener('keydown', ev => {
+      const grip = ev.target.closest?.('[data-call-resize]');
+      if (!grip || !desktop() || !['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(ev.key)) return;
+      const rect = grip.closest('.call-overlay').getBoundingClientRect();
+      preferredSize = { w: rect.width + (ev.key === 'ArrowRight' ? 24 : ev.key === 'ArrowLeft' ? -24 : 0), h: rect.height + (ev.key === 'ArrowDown' ? 24 : ev.key === 'ArrowUp' ? -24 : 0) };
+      storage.setItem(sizeKey, JSON.stringify(preferredSize)); applySaved(); ev.preventDefault();
+    });
 
     document.addEventListener('dblclick', (ev) => {
       if (!desktop()) return;
       const handle = ev.target.closest?.('[data-call-drag-handle="true"]');
       if (!handle || ev.target.closest('button, input, select, a')) return;
       const node = handle.closest('.call-layer') || layer();
+      preferredSize = null; storage.removeItem(sizeKey); applySaved();
       resetLayerPosition(node, true);
       ev.preventDefault();
     });
@@ -3294,6 +3456,7 @@
     }, true);
 
     window.addEventListener('resize', () => {
+      applySaved();
       const node = layer();
       if (!node) return;
       if (!desktop()) {
@@ -3682,17 +3845,24 @@
     switch (tag) {
       case 'preserve_message_scroll': {
         const list = document.getElementById('messages');
-        messageScrollSnapshot = list ? { height: list.scrollHeight, top: list.scrollTop } : null;
+        messageScrollSnapshot = list ? { element: list, route: location.hash, height: list.scrollHeight, top: list.scrollTop } : null;
         break;
       }
       case 'restore_message_scroll':
         requestAnimationFrame(() => requestAnimationFrame(() => {
           const list = document.getElementById('messages');
-          if (list && messageScrollSnapshot) {
+          if (list && messageScrollSnapshot?.element === list && messageScrollSnapshot.route === location.hash) {
             list.scrollTop = messageScrollSnapshot.top + (list.scrollHeight - messageScrollSnapshot.height);
           }
           messageScrollSnapshot = null;
           observeMessageHistory();
+        }));
+        break;
+      case 'settings_section_changed':
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          const content = document.querySelector('.settings-content');
+          if (content) content.scrollTop = 0;
+          document.querySelector('.settings-mobile-tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
         }));
         break;
       case 'scroll_messages_to_bottom':

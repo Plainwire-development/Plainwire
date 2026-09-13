@@ -2,7 +2,6 @@
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -15,12 +14,23 @@ enum { OUTPUT_COUNT = 19 };
 static int read_exact(unsigned char *p, size_t size) {
     size_t remaining = size;
     while (size) {
-        size_t n = fread(p, 1, size, stdin);
-        if (!n) return size == remaining && !ferror(stdin) ? 0 : -1;
+        ssize_t n = read(STDIN_FILENO, p, size);
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (!n) return size == remaining ? 0 : -1;
         p += n;
         size -= n;
     }
     return 1;
+}
+static int write_exact(const unsigned char *p, size_t size) {
+    while (size) {
+        ssize_t n = write(STDOUT_FILENO, p, size);
+        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (!n) return -1;
+        p += n;
+        size -= (size_t)n;
+    }
+    return 0;
 }
 static uint32_t u32(const unsigned char *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
@@ -45,7 +55,11 @@ int main(void) {
     int status;
     while ((status = read_exact(header, 4)) == 1) {
         uint32_t size = u32(header);
-        if (size < 4 || size > sizeof(input) || read_exact(input, size) != 1) return 2;
+        if (size < 4 || size > sizeof(input)) return 2;
+        /* An incomplete frame cannot keep the process stuck in a read. Idle
+           workers have no timer; only an active request has a deadline. */
+        alarm(1);
+        if (read_exact(input, size) != 1) return 2;
         uint32_t n = u32(input);
         if (n < 1 || n > 24 || size != 4 + n * 9 * 8) return 3;
         for (uint32_t i = 0; i < n * 9; i++) {
@@ -55,15 +69,14 @@ int main(void) {
         }
         /* A native regression must not leave an orphan CPU loop after the
            BEAM port timeout. The operating system enforces this deadline. */
-        alarm(1);
         pw_quality_analyze((int)n, rows, result);
-        alarm(0);
         output[0] = 0; output[1] = 0; output[2] = 0; output[3] = OUTPUT_COUNT * 8;
         for (int i = 0; i < OUTPUT_COUNT; i++) {
             if (!isfinite(result[i])) return 5;
             write_double(output + 4 + i * 8, result[i]);
         }
-        if (fwrite(output, 1, sizeof(output), stdout) != sizeof(output) || fflush(stdout)) return 6;
+        if (write_exact(output, sizeof(output))) return 6;
+        alarm(0);
     }
-    return status < 0 || ferror(stdin) ? 7 : 0;
+    return status < 0 ? 7 : 0;
 }

@@ -4,6 +4,7 @@ import { readFile, mkdir } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 import assert from 'node:assert/strict';
 import { now, people, sync, conversations } from './fixtures.mjs';
+import { nativeHealth } from './native-health.mjs';
 
 // Real RTCPeerConnections and RTP media. Only identity, signaling transport and
 // microphone hardware are fixtures, so no microphone or external server is needed.
@@ -46,13 +47,15 @@ async function setup(uid) {
       return osc;
     };
     window.__screens = [];
+    window.__displayRequests = [];
     window.__gumRequests = [];
     if (uid === 1) localStorage.setItem('plainwire_audio_input', 'unplugged');
     navigator.mediaDevices.enumerateDevices = async () => [
       { kind: 'audioinput', deviceId: 'desk', label: 'Desk microphone' },
       { kind: 'audioinput', deviceId: 'headset', label: 'Headset microphone' }
     ];
-    navigator.mediaDevices.getDisplayMedia = async () => {
+    navigator.mediaDevices.getDisplayMedia = async constraints => {
+      window.__displayRequests.push(constraints);
       const canvas = document.createElement('canvas');
       canvas.width = 640; canvas.height = 360;
       const ctx = canvas.getContext('2d');
@@ -87,7 +90,7 @@ async function setup(uid) {
   await context.route('**/api/**', async route => {
     const path = new URL(route.request().url()).pathname;
     const reply = data => route.fulfill({ json: { ok: true, data } });
-    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.1', asset_version: '1.7.1', registration_enabled: true } });
+    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.2', asset_version: '1.7.2', registration_enabled: true } });
     if (path === '/api/me') return reply({ user: people[uid - 1], csrf: 'test', server_time: now });
     if (path === '/api/sync') return reply({ ...sync, conversations: [{ ...conversations[0], peer_id: uid === 1 ? 2 : 1, peer_name: people[uid === 1 ? 1 : 0].display_name }] });
     if (path === '/api/messages') return reply([]);
@@ -100,6 +103,10 @@ async function setup(uid) {
     sockets.set(uid, ws);
     ws.onMessage(raw => {
       const msg = JSON.parse(raw);
+      if (msg.type === 'call_quality' && process.env.PLAINWIRE_TEST_NATIVE === '1') {
+        nativeHealth(msg.samples).then(result => send(uid, { type: 'call_quality_result', request_id: msg.request_id, peer_id: msg.peer_id, result })).catch(error => errors.push(error.message));
+        return;
+      }
       if (msg.type === 'ping') return send(uid, { type: 'pong' });
       if (msg.type === 'call_signal') return send(msg.to_user_id, { ...msg, conversation_id: 1, from_user_id: uid });
       if (msg.type === 'call_ring') {
@@ -162,6 +169,24 @@ try {
   assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_audio_input')), '', 'unavailable saved microphone recovers to default');
   await a.getByRole('button', { name: 'Open call details', exact: true }).click();
   await a.waitForSelector('#call-microphone');
+  // Keyboard resizing persists and reflows participant cards at wider sizes.
+  const grip = a.getByRole('button', { name: 'Resize call window', exact: true });
+  const originalWidth = (await a.locator('.call-overlay').boundingBox()).width;
+  await grip.focus();
+  for (let n = 0; n < 7; n++) await grip.press('ArrowRight');
+  assert((await a.locator('.call-overlay').boundingBox()).width > originalWidth + 150);
+  assert.equal(await a.locator('.call-overlay-users').evaluate(el => getComputedStyle(el).gridTemplateColumns.split(' ').length), 2);
+  assert(await a.evaluate(() => JSON.parse(localStorage.getItem('plainwire_call_size_v1')).w > 560));
+  await a.locator('.call-overlay-title').dblclick();
+  assert.equal(Math.round((await a.locator('.call-overlay').boundingBox()).width), Math.round(originalWidth));
+  assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_call_size_v1')), null);
+  const corner = await grip.boundingBox();
+  await a.mouse.move(corner.x + corner.width / 2, corner.y + corner.height / 2);
+  await a.mouse.down();
+  await a.mouse.move(corner.x - 50, corner.y - 70, { steps: 4 });
+  await a.mouse.up();
+  assert((await a.locator('.call-overlay').boundingBox()).width < originalWidth - 40, 'pointer resizing changes the actual call panel');
+  await a.locator('.call-overlay-title').dblclick();
   await a.waitForFunction(() => Number(document.querySelector('[data-call-mic-meter]')?.getAttribute('aria-valuenow')) > 0);
   await a.locator('pw-user-volume[user-id="2"] input').fill('35');
   assert.equal(await a.evaluate(() => document.querySelector('#remote-audio-2').volume), .35);
@@ -210,19 +235,104 @@ try {
   await a.waitForSelector('.call-sharing-row');
   await b.waitForFunction(async () => [...(await window.__pcs.at(-1).getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'video' && r.framesDecoded > 2));
   await b.getByRole('button', { name: 'Open call details', exact: true }).click();
+  assert.equal(await b.locator('#call-microphone').evaluate(el => el.selectedOptions[0]?.textContent), 'System default');
   await b.getByRole('button', { name: 'Watch screen', exact: true }).click();
   await b.waitForFunction(() => document.querySelector('#pw-float-stage-1 video')?.videoWidth > 0);
+  assert.equal(await a.evaluate(() => window.__displayRequests[0].video.frameRate.max), 30);
+  await a.locator('pw-screen-settings summary').click();
+  await a.getByRole('combobox', { name: 'Screen sharing quality', exact: true }).selectOption('motion');
+  await a.getByRole('button', { name: 'Change shared screen', exact: true }).click();
+  await a.waitForFunction(() => window.__screens.length === 2 && window.__screens[0].stream.getVideoTracks()[0].readyState === 'ended');
+  assert.equal(await a.evaluate(() => window.__displayRequests[1].video.frameRate.max), 60);
+  assert.equal(await a.evaluate(() => window.__pcs.at(-1)._videoSender.track === window.__screens[1].stream.getVideoTracks()[0]), true);
+  const framesBeforeSwitch = (await stats(b)).video[0];
+  await b.waitForFunction(async frames => [...(await window.__pcs.at(-1).getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'video' && r.framesDecoded > frames + 3), framesBeforeSwitch);
+  // Cancellation and sender failure both leave the existing share usable.
+  await a.evaluate(() => {
+    const original = navigator.mediaDevices.getDisplayMedia;
+    navigator.mediaDevices.getDisplayMedia = async () => { navigator.mediaDevices.getDisplayMedia = original; throw new DOMException('Cancelled', 'NotAllowedError'); };
+  });
+  await a.getByRole('button', { name: 'Change shared screen', exact: true }).click();
+  await a.getByText('Screen sharing was cancelled or is unavailable.', { exact: true }).waitFor();
+  assert.equal(await a.evaluate(() => window.__screens[1].stream.getVideoTracks()[0].readyState), 'live');
+  await a.evaluate(() => {
+    const sender = window.__pcs.at(-1)._videoSender, original = sender.replaceTrack.bind(sender);
+    sender.replaceTrack = async () => { sender.replaceTrack = original; throw new DOMException('Injected failure', 'InvalidModificationError'); };
+  });
+  await a.getByRole('button', { name: 'Change shared screen', exact: true }).click();
+  await a.waitForFunction(() => window.__screens.length === 3 && window.__screens[2].stream.getVideoTracks()[0].readyState === 'ended');
+  assert.equal(await a.evaluate(() => window.__pcs.at(-1)._videoSender.track === window.__screens[1].stream.getVideoTracks()[0] && window.__pcs.at(-1)._videoSender.track.readyState === 'live'), true);
+  await a.locator('pw-screen-settings summary').click();
+  const viewer = b.locator('#pw-float-stage-1');
+  await viewer.getByRole('button', { name: 'Fill view', exact: true }).click();
+  assert.equal(await viewer.locator('video').evaluate(el => getComputedStyle(el).objectFit), 'cover');
+  await viewer.getByRole('button', { name: 'Fit view', exact: true }).click();
+  await viewer.getByRole('button', { name: 'Fullscreen screen share', exact: true }).click();
+  await b.waitForFunction(() => document.fullscreenElement?.id === 'pw-float-stage-1');
+  assert(await viewer.locator('.screen-viewer-footer').isVisible());
+  await viewer.getByRole('button', { name: 'Fullscreen screen share', exact: true }).click();
+  await b.waitForFunction(() => !document.fullscreenElement);
+  // Exercise colour reporting using metadata fixtures, not an HDR hardware claim.
+  await b.evaluate(() => {
+    const NativeFrame = window.VideoFrame, video = document.querySelector('#pw-float-stage-1 video');
+    window.VideoFrame = class { colorSpace = { transfer: 'pq' }; close() { window.__frameClosed = true; } };
+    video.dispatchEvent(new Event('loadeddata')); window.VideoFrame = NativeFrame;
+  });
+  assert.equal(await viewer.getAttribute('data-hdr'), 'true');
+  assert.equal(await b.evaluate(() => window.__frameClosed), true);
+  await b.evaluate(() => document.querySelector('#pw-float-stage-1 video').dispatchEvent(new Event('loadeddata')));
+  assert.equal(await viewer.getAttribute('data-hdr'), 'false', 'ordinary SDR video must not be labelled HDR');
   await b.locator('#pw-float-stage-1').getByRole('button', { name: 'Close screen share', exact: true }).click();
   await b.getByRole('button', { name: 'Watch screen', exact: true }).click();
   await b.waitForFunction(() => document.querySelector('#pw-float-stage-1 video')?.videoWidth > 0);
   await b.screenshot({ path: 'test-results/screen-viewer.png' });
+  await b.setViewportSize({ width: 390, height: 844 });
+  const compactViewer = await viewer.boundingBox();
+  await viewer.getByRole('button', { name: 'Center and fit window', exact: true }).click();
+  assert((await viewer.boundingBox()).height > compactViewer.height + 200, 'mobile expand provides useful viewing space');
+  assert(await viewer.getByRole('button', { name: 'Close screen share', exact: true }).isVisible());
+  await b.screenshot({ path: 'test-results/screen-mobile.png' });
+  await viewer.getByRole('button', { name: 'Center and fit window', exact: true }).click();
+  await b.setViewportSize({ width: 1280, height: 900 });
   await b.getByRole('button', { name: 'Share', exact: true }).click();
   await a.waitForFunction(async () => [...(await window.__pcs.at(-1).getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'video' && r.framesDecoded > 2));
   await a.getByRole('button', { name: 'Watch screen', exact: true }).click();
   await a.waitForFunction(() => document.querySelector('#pw-float-stage-2 video')?.videoWidth > 0);
   await a.locator('.call-health summary').click();
   await a.waitForFunction(() => document.querySelector('[data-call-health-list]')?.textContent.includes('kb/s'), null, { timeout: 12000 });
-  for (const page of [a, b]) await page.getByRole('button', { name: 'Stop share', exact: true }).click();
+  if (process.env.PLAINWIRE_TEST_NATIVE === '1') {
+    await a.waitForFunction(() => document.querySelector('.call-health-score strong')?.textContent && document.querySelector('.call-health-native')?.textContent === 'Connection analysis', null, { timeout: 20000 });
+    assert(await a.locator('.call-health-sparkline').count() > 0);
+    await a.locator('.call-overlay').evaluate(el => { el.scrollTop = el.scrollHeight; });
+    await a.screenshot({ path: 'test-results/native-call-health.png' });
+  }
+  await a.locator('.call-health summary').click();
+  await a.evaluate(() => {
+    window.__healthMutations = 0;
+    window.__healthObserver = new MutationObserver(records => { window.__healthMutations += records.length; });
+    window.__healthObserver.observe(document.querySelector('[data-call-health-list]'), { childList: true, subtree: true });
+  });
+  await a.waitForTimeout(5200);
+  assert.equal(await a.evaluate(() => window.__healthMutations), 0, 'collapsed diagnostics do not rebuild hidden DOM');
+  await a.evaluate(() => window.__healthObserver.disconnect());
+  await a.locator('.call-health summary').click();
+  // Stop while replacement is settling: both old and new captures must end.
+  await a.evaluate(() => {
+    const sender = window.__pcs.at(-1)._videoSender, original = sender.replaceTrack.bind(sender);
+    sender.replaceTrack = async track => {
+      sender.replaceTrack = original;
+      await original(track);
+      await new Promise(resolve => { window.__finishScreenSwap = resolve; });
+    };
+  });
+  await a.locator('pw-screen-settings summary').click();
+  await a.getByRole('button', { name: 'Change shared screen', exact: true }).click();
+  await a.waitForFunction(() => typeof window.__finishScreenSwap === 'function');
+  await a.getByRole('button', { name: 'Stop share', exact: true }).click();
+  await a.evaluate(() => window.__finishScreenSwap());
+  await a.waitForFunction(() => window.__screens.every(s => s.stream.getTracks().every(t => t.readyState === 'ended')));
+  await a.locator('pw-screen-settings summary').click();
+  await b.getByRole('button', { name: 'Stop share', exact: true }).click();
   await a.waitForFunction(() => window.__pcs.at(-1)._videoSender.track === null);
   assert.equal(await a.evaluate(() => window.__screens.every(s => s.stream.getTracks().every(t => t.readyState === 'ended'))), true);
 
@@ -286,5 +396,5 @@ try {
   await a.waitForTimeout(100);
   assert.equal(await toneCount(), silentCount, 'disabled sounds suppress incoming ringing');
   assert.deepEqual(errors, [], 'no browser exceptions during calls and screen sharing');
-  console.log('PASS: real bidirectional RTP; missing device fallback; live input meter; mute/unmute; microphone swap and failed-swap recovery; screen sharing in both directions; visible screen viewing and reopening; call-health measurements; mobile controls; deafened exit/rejoin; call cleanup; direct audio settings; all sound previews and disabled ringing.');
+  console.log('PASS: real bidirectional RTP; missing device fallback; live input meter; mute/unmute; microphone swap and failed-swap recovery; screen sharing in both directions; visible screen viewing and reopening; quality presets; source replacement/cancellation/rollback/stop race; fullscreen and colour metadata; pointer/keyboard resizing; mobile viewer expansion; call-health measurements; mobile controls; deafened exit/rejoin; call cleanup; direct audio settings; all sound previews and disabled ringing.');
 } finally { await browser.close(); server.close(); }

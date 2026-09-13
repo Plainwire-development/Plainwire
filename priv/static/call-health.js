@@ -60,11 +60,15 @@
     let epoch = null;
     let unavailableUntil = 0;
     let running = false;
+    let renderedMount = null, renderedSignature = '';
     const format = (value, unit) => finite(value) ? `${value.toFixed(value < 10 ? 1 : 0)}${unit}` : 'Unavailable';
 
     function render() {
       const mount = document.querySelector('[data-call-health-list]');
-      if (!mount) return;
+      if (!mount || !mount.closest('.call-health')?.open || document.hidden) return;
+      const signature = JSON.stringify(Array.from(states, ([uid, state]) => [uid, getLabel(uid), state.pc.connectionState, state.sample, state.analysis]));
+      if (mount === renderedMount && signature === renderedSignature) return;
+      renderedMount = mount; renderedSignature = signature;
       const fragment = document.createDocumentFragment();
       for (const [uid, state] of states) {
         if (getPeers().get(uid) !== state.pc) continue;
@@ -77,6 +81,28 @@
         status.textContent = !connected ? 'Reconnecting' : !finite(score) ? 'Measuring' : score >= 80 ? 'Good' : score >= 55 ? 'Fair' : 'Poor';
         status.className = `call-health-status ${!connected || (finite(score) && score < 55) ? 'poor' : finite(score) && score >= 80 ? 'good' : ''}`;
         heading.append(name, status); card.append(heading);
+        const source = document.createElement('span'); source.className = 'call-health-native';
+        source.textContent = state.analysis ? 'Connection analysis' : !analysisEnabled ? 'Live measurements · analysis disabled' : performance.now() < unavailableUntil ? 'Live measurements · analysis unavailable' : 'Live measurements · gathering evidence';
+        card.append(source);
+        if (finite(score)) {
+          const summary = document.createElement('div'); summary.className = 'call-health-score';
+          const number = document.createElement('strong'); number.textContent = Math.round(score);
+          const caption = document.createElement('small'); caption.textContent = finite(state.analysis?.recent_score) ? '/ 100 · recent network quality' : '/ 100 · network quality';
+          summary.append(number, caption); card.append(summary);
+        }
+        const history = state.rows.filter(row => finite(row[2])).map(row => row[2]);
+        if (history.length >= 2) {
+          const graph = document.createElement('canvas'); graph.className = 'call-health-sparkline'; graph.width = 600; graph.height = 72;
+          graph.setAttribute('role', 'img'); graph.setAttribute('aria-label', `Recent jitter: ${history.map(value => Math.round(value)).join(', ')} milliseconds`);
+          const ctx = graph.getContext('2d');
+          if (ctx) {
+            const ceiling = Math.max(20, ...history); ctx.strokeStyle = getComputedStyle(mount).getPropertyValue('--accent').trim() || '#37664e'; ctx.lineWidth = 3; ctx.beginPath();
+            history.forEach((value, i) => { const x = 4 + i * 592 / (history.length - 1), y = 64 - value / ceiling * 56; if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+            ctx.stroke();
+            const label = document.createElement('small'); label.className = 'call-health-chart-label'; label.textContent = 'Jitter · recent samples';
+            card.append(label, graph);
+          }
+        }
         const metrics = document.createElement('dl'); metrics.className = 'call-health-metrics';
         const sample = state.sample || {};
         for (const [label, value] of [['Round trip', format(sample.rtt, ' ms')], ['Packet loss', format(sample.loss, '%')], ['Jitter', format(sample.jitter, ' ms')], ['Concealed audio', format(sample.concealment, '%')], ['Buffer delay', format(sample.buffer, ' ms')], ['Receiving', format(sample.rxBitrate, ' kb/s')]]) {
@@ -95,7 +121,7 @@
           card.append(analysis);
         }
         const note = document.createElement('p');
-        note.textContent = !connected ? 'Waiting for the call connection to recover.' : state.analysis ? recommendations[state.analysis.recommendation] || recommendations.insufficient_data : 'Live browser measurements. Trend analysis is not available yet.';
+        note.textContent = !connected ? 'Waiting for the call connection to recover.' : state.analysis ? recommendations[state.analysis.recommendation] || recommendations.insufficient_data : 'These are live connection measurements. Longer trends appear when native analysis is available.';
         card.append(note); fragment.append(card);
       }
       if (!fragment.childNodes.length) {
@@ -185,6 +211,7 @@
       generation++;
       clearInterval(timer); timer = null;
       states.clear(); pending.clear(); epoch = null;
+      renderedSignature = ''; renderedMount = null;
     }
     // Reopening a panel renders the most recent sample without another stats poll.
     document.addEventListener('toggle', event => { if (event.target.matches?.('.call-health') && event.target.open) render(); }, true);

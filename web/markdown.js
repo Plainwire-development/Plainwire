@@ -1,4 +1,5 @@
 import MarkdownIt from 'markdown-it';
+import './interface.js';
 
 // Raw HTML is deliberately disabled. Markdown never supplies attributes,
 // script, frames, style, or remote tracking images to the document.

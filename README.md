@@ -4,7 +4,9 @@ Plainwire Relay is a self-hostable chat app with servers, DMs, forums, voice cal
 
 It uses Erlang/OTP, Cowboy, PostgreSQL, Elm, SCSS, WebSocket, and WebRTC.
 
-Version 1.7.1 fixes formatting controls and channel icons, adds live input/per-person volume, strengthens call-health analysis, and introduces a Makefile. It includes the 1.7.0 additions: Cloudflare TURN, Markdown with syntax highlighting, explicit screen viewing, expiring/revocable invites, server welcome messages, and searchable settings. It retains the microphone, sound, and mobile fixes from 1.6.1.
+This updated 1.7.2 build includes a [broader interface and worker refresh](docs/UI_REFRESH.md): quick navigation, adjustable sidebar, improved settings and chat, fewer repeated DOM scans, and stronger call-health evidence.
+
+Version 1.7.2 adds a larger screen viewer, responsive and resizable call panels, capture quality presets, and screen switching with recovery. See [screen sharing and HDR limitations](docs/SCREEN_SHARING.md). It retains the 1.7.1 improvements, which fix formatting controls and channel icons, add live input/per-person volume, strengthen call-health analysis, and introduce a Makefile. It includes the 1.7.0 additions: Cloudflare TURN, Markdown with syntax highlighting, explicit screen viewing, expiring/revocable invites, server welcome messages, and searchable settings. It retains the microphone, sound, and mobile fixes from 1.6.1.
 
 Optional backend additions: [Partisan routing](docs/CLUSTERING.md) and [Fortran call health](docs/CALL_HEALTH.md). Both can be left off. See [Cloudflare setup](docs/CLOUDFLARE_TURN.md) before using the relay service. The source archive includes built frontend assets; Erlang releases and the native helper are built on your target host.
 
@@ -47,7 +49,7 @@ guix shell postgresql -- ./scripts/dev-db.sh start
 ./scripts/start.sh --build
 ```
 
-For a production host, follow [the deployment guide](deploy/README.md). It includes systemd and Caddy configuration, updates, verification, and rollback guidance. See [the 1.7.1 changes](RELEASE_NOTES_1.7.1.md) and [verified build status](BUILD_STATUS.md).
+For a production host, follow [the deployment guide](deploy/README.md). It includes systemd and Caddy configuration, updates, verification, and rollback guidance. See [the 1.7.2 changes](RELEASE_NOTES_1.7.2.md) and [verified build status](BUILD_STATUS.md).
 
 ## Main features
 

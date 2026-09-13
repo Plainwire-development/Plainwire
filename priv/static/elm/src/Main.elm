@@ -1019,14 +1019,17 @@ update msg model =
                     else
                         False
               }
-            , if t == "voice" then
-                bridgeSend (E.object [ ( "tag", E.string "list_audio_devices" ), ( "data", E.null ) ])
+            , Cmd.batch
+                [ bridgeSend (E.object [ ( "tag", E.string "settings_section_changed" ), ( "data", E.null ) ])
+                , if t == "voice" then
+                    bridgeSend (E.object [ ( "tag", E.string "list_audio_devices" ), ( "data", E.null ) ])
 
-              else if model.micTesting then
-                bridgeSend (E.object [ ( "tag", E.string "stop_mic_test" ), ( "data", E.null ) ])
+                  else if model.micTesting then
+                    bridgeSend (E.object [ ( "tag", E.string "stop_mic_test" ), ( "data", E.null ) ])
 
-              else
-                Cmd.none
+                  else
+                    Cmd.none
+                ]
             )
 
         SetFriendsTab tab ->
@@ -4672,7 +4675,7 @@ renderExpandedCallOverlay active model =
     div [ class "call-overlay expanded" ]
         [ div [ class "call-overlay-header", attribute "data-call-drag-handle" "true" ]
             [ div [ class "call-overlay-heading" ]
-                [ div [ class "call-overlay-title" ] [ text "Voice call" ]
+                [ div [ class "call-overlay-title" ] [ text "In the room" ]
                 , div [ class "call-overlay-meta" ]
                     [ span
                         [ class
@@ -4735,10 +4738,21 @@ renderExpandedCallOverlay active model =
                     ]
                 ]
             , select [ id "call-microphone", value model.selectedAudioInput, onInput SelectAudioInput ]
-                (option [ value "" ] [ text "System default" ] :: List.map (\device -> option [ value device.id ] [ text device.label ]) model.audioInputs)
+                (option [ value "", selected (model.selectedAudioInput == "") ] [ text "System default" ] :: List.map (\device -> option [ value device.id, selected (model.selectedAudioInput == device.id) ] [ text device.label ]) model.audioInputs)
             , div [ class "call-mic-meter", attribute "data-call-mic-meter" "true", attribute "role" "meter", attribute "aria-label" "Live microphone level", attribute "aria-valuemin" "0", attribute "aria-valuemax" "100", attribute "aria-valuenow" "0" ]
                 [ span [ class "call-mic-fill" ] [] ]
             , Html.node "pw-input-volume" [] []
+            ]
+        , Html.node "pw-screen-settings" [] []
+        , Html.node "details"
+            [ class "call-health" ]
+            [ Html.node "summary" [] [ text "Call health" ]
+            , div [ attribute "data-call-health-list" "true" ] []
+            , p [ class "call-health-privacy" ] [ text "Connection statistics only. No audio is recorded." ]
+            ]
+        , div [ class "call-tools" ]
+            [ button [ class "btn ghost", onClick (BridgeEvent "open_voice_settings" E.null) ] [ span [ class "ui-icon ui-icon-settings", attribute "aria-hidden" "true" ] [], text "Audio settings" ]
+            , button [ class "btn ghost", onClick (BridgeEvent "unlock_audio" E.null), title "Enable playback if your browser blocked call audio" ] [ text "Enable audio" ]
             ]
         , div [ class "call-overlay-controls", attribute "aria-label" "Call controls" ]
             [ control
@@ -4787,16 +4801,7 @@ renderExpandedCallOverlay active model =
                 )
             , button [ class "call-control leave", onClick EndCall ] [ callIcon "hangup", span [] [ text "Leave" ] ]
             ]
-        , Html.node "details"
-            [ class "call-health" ]
-            [ Html.node "summary" [] [ text "Call health" ]
-            , div [ attribute "data-call-health-list" "true" ] []
-            , p [ class "call-health-privacy" ] [ text "Connection statistics only. No audio is recorded." ]
-            ]
-        , div [ class "call-tools" ]
-            [ button [ class "btn ghost", onClick (BridgeEvent "open_voice_settings" E.null) ] [ span [ class "ui-icon ui-icon-settings", attribute "aria-hidden" "true" ] [], text "Audio settings" ]
-            , button [ class "btn ghost", onClick (BridgeEvent "unlock_audio" E.null), title "Enable playback if your browser blocked call audio" ] [ text "Enable audio" ]
-            ]
+        , button [ class "call-resize-handle", type_ "button", attribute "data-call-resize" "", attribute "aria-label" "Resize call window", title "Drag to resize; arrow keys resize when focused" ] [ text "↘" ]
         ]
 
 
@@ -5213,7 +5218,7 @@ authPasswordStrength password =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.7.1" ]
+    div [ class "layout", attribute "data-ui-version" "1.7.2", attribute "data-ui-revision" "interface-2" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -5236,6 +5241,7 @@ renderApp model =
             []
         , renderMobileNav model
         , renderServersSheet model
+        , Lazy.lazy3 renderQuickNavigation model.convs model.servers model.currentServer
         , renderContextMenu model
         , renderModal model
         ]
@@ -5495,6 +5501,7 @@ renderSide model =
                 ++ List.map (\c -> convRow c model) (List.filter (\c -> c.requestState /= "pending") model.convs)
             )
         , userPanel model
+        , Html.node "pw-sidebar-resize" [] []
         ]
 
 
@@ -5611,12 +5618,14 @@ renderServerSide model data =
                     []
                 )
             ]
+        , div [ class "search" ] [ quickJumpButton ]
         , div [ class "list server-channel-list" ]
             (channelGroup "Text channels" uncategorizedText
                 ++ channelGroup "Voice channels" uncategorizedVoice
                 ++ List.concatMap (\cat -> categoryBlock cat (List.filter (\c -> c.categoryId == Just cat.id) data.channels)) sortedCategories
             )
         , userPanel model
+        , Html.node "pw-sidebar-resize" [] []
         ]
 
 
@@ -5694,24 +5703,65 @@ sideHead model =
         [ div [ class "side-title-row" ]
             [ div [ class "side-title-copy" ]
                 [ h1 [] [ text model.appName ]
-                , small [] [ text "Communities, direct messages, and calls" ]
+                , small [] [ text "A place for your people" ]
                 ]
             , button [ class "side-close", type_ "button", onClick CloseSidebar, attribute "aria-label" "Close navigation" ]
                 [ span [ class "call-icon call-icon-close", attribute "aria-hidden" "true" ] [] ]
             ]
-        , div [ class "nav-actions" ]
-            [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "Create server" ]
-            , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with invite" ]
+        , Html.node "details"
+            [ class "workspace-menu" ]
+            [ Html.node "summary" [] [ text "Workspace", span [ attribute "aria-hidden" "true" ] [ text "⌄" ] ]
+            , div [ class "workspace-menu-items" ]
+                [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "Create server" ]
+                , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with invite" ]
+                ]
             ]
         ]
+
+
+quickJumpButton : Html Msg
+quickJumpButton =
+    button [ type_ "button", class "quick-jump-button", attribute "data-open-switcher" "", attribute "aria-label" "Quick switcher", title "Jump to a conversation or server (Ctrl+K / ⌘K)" ]
+        [ span [ class "ui-icon ui-icon-search", attribute "aria-hidden" "true" ] []
+        , span [] [ text "Jump to…" ]
+        , kbd [] [ text "Ctrl K" ]
+        ]
+
+
+renderQuickNavigation : List Conversation -> List Server -> Maybe ServerData -> Html Msg
+renderQuickNavigation conversations servers currentServer =
+    let
+        item name detail route =
+            E.object [ ( "name", E.string name ), ( "detail", E.string detail ), ( "href", E.string route ) ]
+
+        rooms =
+            currentServer
+                |> Maybe.map (\data -> List.map (\channel -> item channel.name (data.server.name ++ " · " ++ channel.kind) ("#channel/" ++ String.fromInt channel.id)) (List.filter (\channel -> channel.kind /= "voice") data.channels))
+                |> Maybe.withDefault []
+    in
+    Html.node "pw-quick-switcher"
+        [ attribute "items"
+            (E.encode 0
+                (E.list identity
+                    (List.map (\c -> item (convName c) "Conversation" ("#dm/" ++ String.fromInt c.id)) conversations
+                        ++ List.map (\server -> item server.name "Server" ("#server/" ++ String.fromInt server.id)) servers
+                        ++ rooms
+                        ++ [ item "Home" "Overview" "#home", item "Friends" "People" "#friends", item "Settings" "Personal preferences" "#settings", item "Notifications" "Activity" "#notifications" ]
+                    )
+                )
+            )
+        ]
+        []
 
 
 searchBox : Model -> Html Msg
 searchBox _ =
     div [ class "search" ]
-        [ input
+        [ quickJumpButton
+        , input
             [ id "globalSearch"
-            , placeholder "Search users and threads"
+            , placeholder "Search all of Plainwire"
+            , attribute "aria-label" "Search all of Plainwire"
             , onInput (\s -> SearchQuery s)
             , on "keydown"
                 (D.andThen
@@ -8509,7 +8559,7 @@ renderVoiceSettings model =
 
 renderProfileSettings : User -> Model -> Html Msg
 renderProfileSettings u model =
-    div [ class "settings-card" ]
+    div [ class "settings-card profile-settings-card" ]
         [ div
             [ class "settings-banner"
             , style "background-image"
@@ -8536,16 +8586,16 @@ renderProfileSettings u model =
             ]
         , div [ class "settings-fields" ]
             [ div [ class "field" ]
-                [ label [] [ text "Display name" ]
-                , input [ value model.profileDisplayName, maxlength 48, onInput ProfileDisplayName ] []
+                [ label [ for "profile-display-name" ] [ text "Display name" ]
+                , input [ id "profile-display-name", value model.profileDisplayName, maxlength 48, onInput ProfileDisplayName ] []
                 ]
             , div [ class "field" ]
-                [ label [] [ text "Bio" ]
-                , textarea [ value model.profileBio, maxlength 600, onInput ProfileBio ] []
+                [ label [ for "profile-bio" ] [ text "Bio" ]
+                , textarea [ id "profile-bio", value model.profileBio, maxlength 600, onInput ProfileBio ] []
                 ]
             , div [ class "field" ]
-                [ label [] [ text "Avatar URL" ]
-                , input [ value model.profileAvatarUrl, placeholder "https://...", onInput ProfileAvatarUrl ] []
+                [ label [ for "profile-avatar-url" ] [ text "Avatar URL" ]
+                , input [ id "profile-avatar-url", value model.profileAvatarUrl, placeholder "https://...", onInput ProfileAvatarUrl ] []
                 , div [ class "file-picker-row" ]
                     [ input [ id "profileAvatarFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "profileAvatarFile")) ] []
                     , label
@@ -8579,8 +8629,8 @@ renderProfileSettings u model =
                     ]
                 ]
             , div [ class "field" ]
-                [ label [] [ text "Banner URL" ]
-                , input [ value model.profileBannerUrl, placeholder "https://...", onInput ProfileBannerUrl ] []
+                [ label [ for "profile-banner-url" ] [ text "Banner URL" ]
+                , input [ id "profile-banner-url", value model.profileBannerUrl, placeholder "https://...", onInput ProfileBannerUrl ] []
                 , div [ class "file-picker-row" ]
                     [ input [ id "profileBannerFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "profileBannerFile")) ] []
                     , label
@@ -8614,8 +8664,8 @@ renderProfileSettings u model =
                     ]
                 ]
             , div [ class "field" ]
-                [ label [] [ text "Status" ]
-                , select [ value model.profileStatus, onInput ProfileStatus ]
+                [ label [ for "profile-status" ] [ text "Status" ]
+                , select [ id "profile-status", value model.profileStatus, onInput ProfileStatus ]
                     [ option [ value "online" ] [ text "Online (auto idle)" ]
                     , option [ value "away" ] [ text "Away" ]
                     , option [ value "busy" ] [ text "Busy" ]
@@ -8757,6 +8807,7 @@ renderMessagePage draftKey placeholderText model =
                                         groupedMessageViews model model.msg
                                    )
                             )
+                       , Html.node "pw-scroll-tools" [] []
                        , composerView draftKey placeholderText model
                        ]
                 )

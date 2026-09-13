@@ -61,12 +61,27 @@ contains
     score = max(0.0_c_double, 100 - penalty)
   end function network_score
 
+  ! Evidence needs sustained observations. A tab suspended for a minute does
+  ! not provide a minute of measured network quality when it wakes up.
+  pure function observed_seconds(times, n) result(seconds)
+    integer, intent(in) :: n
+    real(c_double), intent(in) :: times(:)
+    real(c_double) :: seconds, gap
+    integer :: i
+    seconds = 0
+    do i = 2, n
+      gap = times(i) - times(i - 1)
+      if (gap <= 20) seconds = seconds + gap
+    end do
+  end function observed_seconds
+
   subroutine analyze(n, x, out) bind(C, name='pw_quality_analyze')
     integer(c_int), value :: n
     real(c_double), intent(in) :: x(9, n)
     real(c_double), intent(out) :: out(output_count)
-    real(c_double) :: means(8), devs(8), slopes(8), vals(max_rows), times(max_rows)
+    real(c_double) :: means(8), devs(8), slopes(8), vals(max_rows), times(max_rows), weights(max_rows)
     real(c_double) :: recent(8), jitter_p95, recent_p95, duration, measured, burst, longest, run
+    real(c_double) :: weight, evidence(8), total_span, stability_penalty
     real(c_double), parameter :: maxima(9) = [300.0_c_double, 100.0_c_double, 10000.0_c_double, &
       30000.0_c_double, 100.0_c_double, 30000.0_c_double, 100000.0_c_double, 100000.0_c_double, 100.0_c_double]
     integer :: counts(8), i, j, m, first
@@ -89,6 +104,7 @@ contains
     devs = 0
     slopes = no_trend
     counts = 0
+    evidence = 0
     eligible = .false.
     recent = missing
     recent_eligible = .false.
@@ -101,13 +117,26 @@ contains
         m = m + 1
         vals(m) = x(j + 1, i)
         times(m) = x(1, i)
+        weights(m) = 1
+        ! Rates describe the previous polling interval. Weight that duration
+        ! so one short poll cannot dominate several seconds of reception.
+        if (j /= 2 .and. j /= 3) then
+          weights(m) = 0
+          if (i > 1) then
+            duration = x(1, i) - x(1, max(1, i - 1))
+            if (duration <= 20) weights(m) = duration
+          end if
+        end if
       end do
       counts(j) = m
       if (m == 0) cycle
-      means(j) = sum(vals(1:m)) / real(m, c_double)
-      devs(j) = sqrt(sum((vals(1:m) - means(j))**2) / real(m, c_double))
-      eligible(j) = m >= 3 .and. times(m) - times(1) >= 10
-      if (j <= 2) slopes(j) = robust_slope(vals, times, m)
+      evidence(j) = observed_seconds(times, m)
+      weight = sum(weights(1:m))
+      if (weight <= 0) cycle
+      means(j) = sum(vals(1:m) * weights(1:m)) / weight
+      devs(j) = sqrt(sum(weights(1:m) * (vals(1:m) - means(j))**2) / weight)
+      eligible(j) = m >= 3 .and. evidence(j) >= 10
+      if (j <= 2 .and. eligible(j)) slopes(j) = robust_slope(vals, times, m)
       if (j <= 5) then
         first = 1
         do while (first <= m)
@@ -115,8 +144,9 @@ contains
           first = first + 1
         end do
         if (first <= m) then
-          recent(j) = sum(vals(first:m)) / real(m - first + 1, c_double)
-          recent_eligible(j) = m - first + 1 >= 3 .and. times(m) - times(first) >= 10
+          weight = sum(weights(first:m))
+          if (weight > 0) recent(j) = sum(vals(first:m) * weights(first:m)) / weight
+          recent_eligible(j) = m - first + 1 >= 3 .and. observed_seconds(times(first:m), m - first + 1) >= 10
           if (j == 2) then
             call sort_values(vals(first:m), m - first + 1)
             recent_p95 = vals(first - 1 + ceiling(0.95_c_double * (m - first + 1)))
@@ -131,7 +161,10 @@ contains
     end do
 
     out(1) = network_score(means, jitter_p95, eligible)
-    if (eligible(1) .or. eligible(2)) out(2) = max(0.0_c_double, 100 - min(100.0_c_double, 3 * devs(1) + 2 * devs(2)))
+    stability_penalty = 0
+    if (eligible(1)) stability_penalty = stability_penalty + 3 * devs(1)
+    if (eligible(2)) stability_penalty = stability_penalty + 2 * devs(2)
+    if (eligible(1) .or. eligible(2)) out(2) = max(0.0_c_double, 100 - min(100.0_c_double, stability_penalty))
     out(3) = means(1)
     out(4) = jitter_p95
     out(5) = means(3)
@@ -153,7 +186,7 @@ contains
     longest = 0
     run = 0
     do i = 2, n
-      duration = x(1, i) - x(1, i - 1)
+      duration = x(1, i) - x(1, max(1, i - 1))
       if (x(2, i) < 0 .or. duration > 20) then
         run = 0
         cycle
@@ -172,6 +205,11 @@ contains
       out(17) = longest
     end if
     ! Evidence coverage, not a statistical confidence interval.
-    out(19) = out(12) * min(1.0_c_double, (x(1, n) - x(1, 1)) / 30)
+    total_span = x(1, n) - x(1, 1)
+    if (total_span > 0) then
+      out(19) = 100 * sum(evidence(1:5)) / (5 * total_span) * min(1.0_c_double, total_span / 30)
+    else
+      out(19) = 0
+    end if
   end subroutine analyze
 end module plainwire_quality

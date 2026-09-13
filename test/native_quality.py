@@ -46,6 +46,12 @@ worsening = [[t, 0 if t < 35 else 10, 5, 40, 0 if t < 35 else 10, 20, 24, 24, -1
 assert analyze(worsening)[13] < analyze(worsening)[0] - 15
 assert analyze(worsening)[18] == 100
 assert analyze(good)[17] == 40
+irregular = [[t, loss, 5, 40, 0, 20, 24, 24, -1] for t, loss in [(0, 0), (1, 20), (11, 0)]]
+assert math.isclose(analyze(irregular)[2], 20 / 11), 'loss means are weighted by measured interval duration'
+suspended = [[t, 0, 5, 40, 0, 20, 24, 24, -1] for t in (0, 100, 200)]
+assert analyze(suspended)[0] == -1 and analyze(suspended)[18] == 0, 'long unobserved gaps cannot manufacture evidence'
+partial_jitter = [[t, 0, jitter, 40, 0, 20, 24, 24, -1] for t, jitter in [(0,0), (5,1000), (10,-1)]]
+assert analyze(partial_jitter)[1] == 100, 'ineligible jitter does not distort supported loss stability'
 for val in [float('nan'), float('inf'), -0.5, 101]:
     bad = [r[:] for r in good]; bad[0][1] = val
     assert run(packet(bad)).returncode != 0
@@ -53,6 +59,10 @@ for data in [packet([]), packet(good)[:-8], struct.pack('>I', 0xFFFFFFFF), packe
     assert run(data).returncode != 0
 for end in range(1, len(packet(good))):
     assert run(packet(good)[:end]).returncode != 0, f'truncated frame at {end}'
+# A caller that leaves a partial frame open cannot strand the worker forever.
+with subprocess.Popen([worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as stalled:
+    stalled.stdin.write(packet(good)[:8]); stalled.stdin.flush()
+    assert stalled.wait(timeout=2) != 0
 # Deterministic bounded random windows exercise numerical output limits.
 rng = random.Random(1701)
 limits = [100, 10000, 30000, 100, 30000, 100000, 100000, 100]
