@@ -192,6 +192,19 @@
 .call-sharing-row > span:not(.call-icon) { flex: 1; }
 .call-sharing-row .btn { min-height: 28px; padding-inline: 8px; font-size: 11px; }
 
+.call-turn-limit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 6px 11px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--danger), transparent 92%);
+  color: var(--text2);
+  font-size: 12px;
+}
+.call-turn-limit-row .call-icon { color: var(--danger); }
+
 .call-overlay-users {
   max-height: 220px;
   padding: 6px;

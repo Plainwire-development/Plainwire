@@ -154,6 +154,9 @@ bridgeDecoder =
                     "chat_enter_sends" ->
                         D.map SetChatEnterSends (D.field "data" D.bool)
 
+                    "turn_limit_reached" ->
+                        D.map SetTurnLimitReached (D.field "data" D.bool)
+
                     "link_previews_enabled" ->
                         D.map SetLinkPreviewsEnabled (D.field "data" D.bool)
 
@@ -235,6 +238,7 @@ init flags url _ =
                 "system"
     in
     ( { appName = appName
+      , turnLimitReached = False
       , registrationEnabled = flags.registrationEnabled
       , instanceDescription = String.left 120 (String.trim flags.instanceDescription)
       , clientVersion = String.left 32 (String.trim flags.version)
@@ -943,6 +947,9 @@ update msg model =
                     ]
                 )
             )
+
+        SetTurnLimitReached reached ->
+            ( { model | turnLimitReached = reached }, Cmd.none )
 
         SetLinkPreviewsEnabled enabled ->
             ( { model | linkPreviewsEnabled = enabled }
@@ -4598,6 +4605,13 @@ renderExpandedCallOverlay active model =
             , button [ class "btn icon-btn call-minimize", title "Minimize call", onClick ToggleCallOverlay ]
                 [ span [ class "call-minimize-icon", attribute "aria-hidden" "true" ] [] ]
             ]
+        , if model.turnLimitReached then
+            div [ class "call-turn-limit-row" ]
+                [ callIcon "audio off"
+                , span [] [ text "GB limit reached, TURN disabled until next month." ]
+                ]
+          else
+            text ""
         , if model.voice.screenShare then
             div [ class "call-sharing-row" ]
                 [ callIcon "screen"

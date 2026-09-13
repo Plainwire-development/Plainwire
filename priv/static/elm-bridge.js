@@ -182,6 +182,7 @@
       .then((json) => {
         const config = json && json.ok && json.data;
         if (config && Array.isArray(config.iceServers)) rtcConfig = config;
+        send(app.ports.bridgeReceive, { tag: 'turn_limit_reached', data: config ? config.turnLimitReached === true : false });
         debug('RTC', 'config_loaded', { ice_server_count: rtcConfig.iceServers?.length || 0, source: config ? 'server' : 'fallback' });
         return rtcConfig;
       })

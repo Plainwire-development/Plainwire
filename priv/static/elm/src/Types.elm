@@ -385,6 +385,7 @@ type alias Drafts =
 
 type alias Model =
     { appName : String
+    , turnLimitReached : Bool
     , registrationEnabled : Bool
     , instanceDescription : String
     , clientVersion : String
@@ -598,6 +599,7 @@ type Msg
     | ToggleSound
     | SetSoundPreference Bool
     | SetChatEnterSends Bool
+    | SetTurnLimitReached Bool
     | SetLinkPreviewsEnabled Bool
     | SetAnimatedMediaEnabled Bool
     | SetCompactMessages Bool
