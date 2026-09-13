@@ -46,7 +46,7 @@ def main():
     parser.add_argument('--profile', choices=['default', 'cluster'], default='default')
     args = parser.parse_args()
     version = (ROOT / 'VERSION').read_text().strip()
-    if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+    if not re.fullmatch(r'\d+\.\d+\.\d+(?:-\d+)?', version):
         raise ValueError('Invalid release version')
     epoch = int(os.environ.get('SOURCE_DATE_EPOCH', '0'))
     dist = ROOT / 'dist'

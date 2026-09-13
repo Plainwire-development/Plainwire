@@ -340,6 +340,7 @@ init flags url _ =
       , profileTheme = defaultTheme
       , modalTitle = ""
       , modalBody = ""
+      , modalPeopleQuery = ""
       , modalUserIds = ""
       , modalBannerUrl = ""
       , modalWelcome = ""
@@ -641,7 +642,12 @@ update msg model =
                         ( model, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
 
                     else if String.startsWith "/conversation/" tag && String.endsWith "/members" tag then
-                        ( { model | toast = Just "People added" }, apiSend (encodeApiRequest (ApiGet "/sync?since=0")) )
+                        ( { model | toast = Just "People added" }
+                        , Cmd.batch
+                            [ apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+                            , apiSend (encodeApiRequest (ApiGet (String.dropRight 8 tag)))
+                            ]
+                        )
 
                     else if String.startsWith "/conversation/" tag && method == "GET" then
                         handleConversationDetail val model
@@ -1251,7 +1257,7 @@ update msg model =
             ( model, apiSend (encodeApiRequest (ApiPost ("/forum/" ++ String.fromInt forumId ++ "/leave") (Just (E.object [])))) )
 
         NewDmModal ->
-            ( { model | modal = Just "new_dm", modalTitle = "", modalUserIds = "" }, Cmd.none )
+            ( { model | modal = Just "new_dm", modalTitle = "", modalUserIds = "", modalPeopleQuery = "" }, Cmd.none )
 
         SearchUsersModal ->
             ( { model | modal = Just "search", searchQuery = "" }, Cmd.none )
@@ -1273,6 +1279,9 @@ update msg model =
 
         SetModalChoice field value ->
             case field of
+                "people_query" ->
+                    ( { model | modalPeopleQuery = value }, Cmd.none )
+
                 "body" ->
                     ( { model | modalBody = value }, Cmd.none )
 
@@ -1328,7 +1337,7 @@ update msg model =
             ( { model | modal = Just ("edit_conversation:" ++ String.fromInt conversation.id), modalTitle = conversation.name, modalBody = "" }, Cmd.none )
 
         AddPeopleModal conversationId ->
-            ( { model | modal = Just ("add_people:" ++ String.fromInt conversationId), modalUserIds = "", modalTitle = "" }, Cmd.none )
+            ( { model | modal = Just ("add_people:" ++ String.fromInt conversationId), modalUserIds = "", modalTitle = "", modalPeopleQuery = "" }, Cmd.none )
 
         ShowUserPopup userId ->
             ( model, setHash ("#profile/" ++ String.fromInt userId) )
@@ -2021,8 +2030,8 @@ submitModal model =
                     usernames =
                         csvUsernames model.modalUserIds
                 in
-                if List.isEmpty usernames then
-                    ( { model | toast = Just "Enter at least one username" }, Cmd.none )
+                if List.isEmpty usernames || List.length usernames > 49 then
+                    ( { model | toast = Just "Choose between 1 and 49 people" }, Cmd.none )
 
                 else
                     ( { model | modal = Nothing }
@@ -2184,9 +2193,12 @@ submitModal model =
                         let
                             usernames =
                                 csvUsernames model.modalUserIds
+
+                            remaining =
+                                model.convs |> List.filter (\c -> c.id == conversationId) |> List.head |> Maybe.map (\c -> Basics.max 0 (50 - c.memberCount)) |> Maybe.withDefault 0
                         in
-                        if List.isEmpty usernames then
-                            ( { model | toast = Just "Choose at least one username" }, Cmd.none )
+                        if List.isEmpty usernames || List.length usernames > remaining then
+                            ( { model | toast = Just "Choose people within the group limit of 50 members" }, Cmd.none )
 
                         else
                             ( { model | modal = Nothing }
@@ -3823,11 +3835,10 @@ modalContent kind model =
         ]
 
     else if kind == "new_dm" then
-        [ modalHead "New message" "Start a DM or group chat by username."
-        , div [ class "modal-body" ]
-            [ div [ class "field" ] [ label [] [ text "Usernames" ], input [ value model.modalUserIds, placeholder "alice, bob, charlie", onInput ModalUserIds, attribute "autocomplete" "off" ] [] ]
-            , div [ class "field" ] [ label [] [ text "Group name optional" ], input [ value model.modalTitle, placeholder "Leave blank for a 1:1 DM", onInput ModalTitle ] [] ]
-            , p [ class "muted modal-hint" ] [ text "Separate usernames with commas. You can include or omit the @ sign." ]
+        [ modalHead "New message" "Choose one person for a DM, or a few for a group."
+        , div [ class "modal-body people-modal-body" ]
+            [ renderPeoplePicker Nothing model
+            , div [ class "field" ] [ label [ attribute "for" "group-name" ] [ text "Group name · optional" ], input [ id "group-name", value model.modalTitle, maxlength 80, placeholder "Friday night, Study group…", onInput ModalTitle ] [] ]
             ]
         , modalActions "Start chat"
         ]
@@ -3977,8 +3988,9 @@ modalContent kind model =
 
     else if String.startsWith "edit_server:" kind then
         [ modalHead "Customize server" "Give this server its own identity across desktop and mobile."
-        , div [ class "modal-body" ]
-            [ div [ class "field" ] [ label [] [ text "Server name" ], input [ value model.modalTitle, maxlength 80, placeholder "Server name", onInput ModalTitle ] [] ]
+        , div [ class "modal-body server-customization" ]
+            [ renderServerIdentityPreview model
+            , div [ class "field" ] [ label [] [ text "Server name" ], input [ value model.modalTitle, maxlength 80, placeholder "Server name", onInput ModalTitle ] [] ]
             , div [ class "field" ] [ label [] [ text "Description" ], textarea [ value model.modalBody, maxlength 280, placeholder "What is this server for?", onInput ModalBody ] [] ]
             , div [ class "field" ]
                 [ label [] [ text "Welcome message" ]
@@ -3996,6 +4008,7 @@ modalContent kind model =
                 , div [ class "file-picker-row" ]
                     [ input [ id "serverIconFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverIconFile")) ] []
                     , label [ class "btn secondary file-picker-button", attribute "for" "serverIconFile" ] [ text "Choose icon" ]
+                    , button [ class "btn ghost", type_ "button", onClick (ModalUserIds ""), disabled (String.isEmpty model.modalUserIds) ] [ text "Remove icon" ]
                     , small [ class "muted" ] [ text "JPEG, PNG, GIF, WebP, or AVIF" ]
                     ]
                 ]
@@ -4005,6 +4018,7 @@ modalContent kind model =
                 , div [ class "file-picker-row" ]
                     [ input [ id "serverBannerFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverBannerFile")) ] []
                     , label [ class "btn secondary file-picker-button", attribute "for" "serverBannerFile" ] [ text "Choose banner" ]
+                    , button [ class "btn ghost", type_ "button", onClick (ModalBannerUrl ""), disabled (String.isEmpty model.modalBannerUrl) ] [ text "Remove banner" ]
                     , small [ class "muted" ] [ text "JPEG, PNG, GIF, WebP, or AVIF" ]
                     ]
                 ]
@@ -4031,6 +4045,13 @@ modalContent kind model =
                                 , style "background-color" color
                                 , onClick (SetModalChoice "accent" color)
                                 , attribute "aria-label" ("Use " ++ color)
+                                , attribute "aria-pressed"
+                                    (if model.modalAccentColor == color then
+                                        "true"
+
+                                     else
+                                        "false"
+                                    )
                                 ]
                                 []
                         )
@@ -4093,11 +4114,9 @@ modalContent kind model =
         ]
 
     else if String.startsWith "add_people:" kind then
-        [ modalHead "Add people" "Invite existing Plainwire users to this group."
-        , div [ class "modal-body" ]
-            [ div [ class "field" ] [ label [] [ text "Usernames" ], input [ value model.modalUserIds, maxlength 800, placeholder "alice, bob, charlie", onInput ModalUserIds, attribute "autocomplete" "off" ] [] ]
-            , p [ class "muted modal-hint" ] [ text "Separate usernames with commas. The group supports up to 50 members." ]
-            ]
+        [ modalHead "Add people" "Choose people to bring into the conversation."
+        , div [ class "modal-body people-modal-body" ]
+            [ renderPeoplePicker (String.toInt (String.dropLeft 11 kind)) model ]
         , modalActions "Add people"
         ]
 
@@ -5218,7 +5237,7 @@ authPasswordStrength password =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.7.2", attribute "data-ui-revision" "interface-2" ]
+    div [ class "layout", attribute "data-ui-version" "1.7.2-1", attribute "data-ui-revision" "interface-3" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -5366,7 +5385,7 @@ renderRail model =
                 []
     in
     nav [ class "rail", attribute "aria-label" "Main navigation" ]
-        ([ div [ class "mark", title model.appName, attribute "aria-label" model.appName ] []
+        ([ button [ class "mark", type_ "button", title (model.appName ++ " home"), attribute "aria-label" (model.appName ++ " home"), onClick (Go "#") ] [ text "P" ]
          , railBtn "home" "Home" (model.active == Home) (Go "#")
          , railBtn "messages" "Direct messages" (isDmActive model) (Go "#dms")
          , railBtn "forums" "Forums" (model.active == Forums) (Go "#forums")
@@ -5591,7 +5610,7 @@ renderServerSide model data =
                 [ div [ class "server-side-identity" ]
                     [ serverIcon data.server
                     , div [ class "side-title-copy" ]
-                        [ h1 [] [ text data.server.name ]
+                        [ h1 [ title data.server.name ] [ text data.server.name ]
                         , small []
                             [ text
                                 (if String.isEmpty data.server.description then
@@ -8838,6 +8857,150 @@ renderMessagePage draftKey placeholderText model =
             chatSurface
 
 
+renderPeoplePicker : Maybe Int -> Model -> Html Msg
+renderPeoplePicker conversationId model =
+    let
+        conversation =
+            model.convs |> List.filter (\c -> Just c.id == conversationId) |> List.head
+
+        existing =
+            conversation
+                |> Maybe.map (\c -> Dict.get c.id model.conversationMembers |> Maybe.withDefault c.members)
+                |> Maybe.withDefault []
+                |> List.map (.user >> .id)
+
+        excluded =
+            (Maybe.map .id model.me |> Maybe.withDefault 0) :: existing ++ (model.friends |> List.filter .blockedByMe |> List.map (.user >> .id))
+
+        selected =
+            csvUsernames model.modalUserIds
+
+        limit =
+            conversation |> Maybe.map (\c -> Basics.max 0 (50 - c.memberCount)) |> Maybe.withDefault 49
+
+        contacts =
+            (List.map .user (List.filter (\f -> f.status == "accepted" && not f.blockedByMe) model.friends)
+                ++ List.concatMap (.members >> List.map .user) model.convs
+                ++ (model.currentServer |> Maybe.map (.members >> List.map .user) |> Maybe.withDefault [])
+            )
+                |> List.filter (\u -> not (List.member u.id excluded))
+                |> List.map (\u -> ( u.id, u ))
+                |> Dict.fromList
+                |> Dict.values
+                |> List.sortBy (.displayName >> String.toLower)
+
+        query =
+            String.toLower (String.trim model.modalPeopleQuery)
+
+        matches =
+            contacts |> List.filter (\u -> String.contains query (String.toLower (u.displayName ++ " " ++ u.username)))
+
+        remove username =
+            ModalUserIds (String.join ", " (List.filter ((/=) username) selected))
+
+        person user =
+            let
+                username =
+                    normalizeUsernameInput user.username
+
+                chosen =
+                    List.member username selected
+            in
+            button
+                [ class
+                    ("people-option"
+                        ++ (if chosen then
+                                " selected"
+
+                            else
+                                ""
+                           )
+                    )
+                , type_ "button"
+                , attribute "aria-pressed"
+                    (if chosen then
+                        "true"
+
+                     else
+                        "false"
+                    )
+                , attribute "aria-label" ("Select " ++ user.displayName)
+                , disabled (not chosen && List.length selected >= limit)
+                , onClick
+                    (if chosen then
+                        remove username
+
+                     else
+                        ModalUserIds (String.join ", " (selected ++ [ username ]))
+                    )
+                ]
+                [ presenceAvatar model.userStatuses user.id user.avatarUrl user.displayName ""
+                , div [ class "people-option-copy" ] [ b [] [ text user.displayName ], small [] [ text ("@" ++ user.username) ] ]
+                , span [ class "people-check", attribute "aria-hidden" "true" ]
+                    [ text
+                        (if chosen then
+                            "✓"
+
+                         else
+                            "+"
+                        )
+                    ]
+                ]
+    in
+    div [ class "people-picker" ]
+        [ div [ class "people-selection-head" ] [ b [] [ text "People" ], small [ attribute "aria-live" "polite" ] [ text (String.fromInt (List.length selected) ++ " / " ++ String.fromInt limit ++ " selected") ] ]
+        , div [ class "people-selected" ]
+            (List.map (\username -> button [ class "person-chip", type_ "button", onClick (remove username), attribute "aria-label" ("Remove " ++ username) ] [ text ("@" ++ username), span [ attribute "aria-hidden" "true" ] [ text "×" ] ]) selected)
+        , input [ class "people-search", type_ "search", value model.modalPeopleQuery, placeholder "Find a friend or someone you know", attribute "aria-label" "Find people to add", onInput (SetModalChoice "people_query"), attribute "autocomplete" "off" ] []
+        , div [ class "people-options", attribute "aria-label" "People you know" ]
+            (if List.isEmpty matches then
+                [ p [ class "people-empty muted" ] [ text "No matches. You can add someone by username below." ] ]
+
+             else
+                List.map person matches
+            )
+        , details [ class "people-manual" ]
+            [ summary [] [ text "Add by username" ]
+            , div [ class "field" ] [ label [ attribute "for" "people-usernames" ] [ text "Selected usernames" ], input [ id "people-usernames", value model.modalUserIds, maxlength 1600, placeholder "alice, bob", onInput ModalUserIds, attribute "autocomplete" "off" ] [], small [ class "muted" ] [ text "Use commas to separate names. Everyone selected above is included here." ] ]
+            ]
+        ]
+
+
+renderServerIdentityPreview : Model -> Html Msg
+renderServerIdentityPreview model =
+    div [ class "server-identity-preview", style "--server-accent" model.modalAccentColor ]
+        [ div [ class "server-preview-banner" ]
+            [ if String.isEmpty model.modalBannerUrl then
+                text ""
+
+              else
+                img [ src model.modalBannerUrl, alt "Server banner preview", attribute "referrerpolicy" "no-referrer" ] []
+            ]
+        , div [ class "server-preview-identity" ]
+            [ div [ class "server-preview-icon" ]
+                [ if String.isEmpty model.modalUserIds then
+                    text (String.toUpper (String.left 1 model.modalTitle))
+
+                  else
+                    img [ src model.modalUserIds, alt "Server icon preview", attribute "referrerpolicy" "no-referrer" ] []
+                ]
+            , div []
+                [ span [ class "eyebrow" ] [ text "Server preview" ]
+                , h3 []
+                    [ text
+                        (if String.isEmpty model.modalTitle then
+                            "Your server"
+
+                         else
+                            model.modalTitle
+                        )
+                    ]
+                , p [ class "muted" ] [ text model.modalBody ]
+                ]
+            ]
+        ]
+
+
 renderGroupMembers : Model -> Conversation -> Html Msg
 renderGroupMembers model conversation =
     aside [ class "group-members", attribute "aria-label" "Group members" ]
@@ -8909,6 +9072,11 @@ renderChatHeader model =
                                     )
                                 ]
                             ]
+                        , if c.memberCount > 2 then
+                            button [ class "btn secondary group-add-button", type_ "button", onClick (AddPeopleModal id), attribute "aria-label" "Add people to group", title "Add people to group" ] [ span [ class "ui-icon ui-icon-friends", attribute "aria-hidden" "true" ] [], span [ class "group-add-label" ] [ text "Add people" ] ]
+
+                          else
+                            text ""
                         , chatConnectionBadge model
                         , if joinedCall then
                             button [ class "btn call-decline chat-call-action", onClick EndCall ] [ span [ class "ui-icon ui-icon-call-end", attribute "aria-hidden" "true" ] [], span [ class "chat-call-label" ] [ text "Leave" ] ]

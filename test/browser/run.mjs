@@ -16,6 +16,8 @@ let authenticated=true;
 let delayed=[];
 let failNext=false;
 let inviteOptions;
+let createdGroup;
+let addedPeople;
 let inviteRevoked = false;
 const sockets=[];
 const subscriptions=[];
@@ -27,7 +29,7 @@ async function setup(context){
  await context.route('**/api/**',async route=>{
   const req=route.request(), url=new URL(req.url()), path=url.pathname;
   const reply=(data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify({ok:status<400,data,...(status===401?{error:'not_authenticated'}:{})})});
-  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.7.2',asset_version:'1.7.2',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
+  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.7.2-1',asset_version:'1.7.2-1',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
   if(path==='/api/me')return authenticated?reply({user:me,csrf:'test-csrf',server_time:now}):reply(null,401);
   if(path==='/api/sync')return reply(sync);
   if(path==='/api/forums')return reply([]);
@@ -41,6 +43,15 @@ async function setup(context){
    const cid=Number(path.split('/')[3]);const mid=100+delayed.length;delayed.push(()=>reply(message(mid,req.postDataJSON().body,cid,me)));return;
   }
   if(/^\/api\/conversation\/\d+$/.test(path)){const c=conversations.find(c=>c.id===Number(path.split('/').pop()));return reply({conversation:c,members:c?.members||[]});}
+  if(path==='/api/conversations' && req.method()==='POST') {
+   createdGroup=req.postDataJSON();
+   const members=[me,...people.filter(p=>createdGroup.usernames.includes(p.username))].map(user=>({user,role:user.id===1?'owner':'member'}));
+   const group={...conversations[0],id:20,name:createdGroup.name,member_count:members.length,members,unread:0};conversations.push(group);return reply({id:20});
+  }
+  if(path==='/api/conversation/20/members' && req.method()==='POST') {
+   addedPeople=req.postDataJSON();const group=conversations.find(c=>c.id===20);
+   group.members.push(...people.filter(p=>addedPeople.usernames.includes(p.username)).map(user=>({user,role:'member'})));group.member_count=group.members.length;return reply({});
+  }
   if(path==='/api/rtc-config')return reply({iceServers:[]});
   if(path==='/api/voice-processing-config')return reply({krisp_available:false});
   return reply({});
@@ -174,9 +185,31 @@ try {
  assert.equal(await page.locator('.channel-glyph.text').first().evaluate(el=>getComputedStyle(el).backgroundImage),'none');
  await page.screenshot({path:'test-results/server-channels.png'});
  await page.getByRole('button',{name:'Customize',exact:true}).click();
+ await page.getByPlaceholder('Server name',{exact:true}).fill('plainwire development and friends');
+ await page.getByPlaceholder('What is this server for?').fill('Building things together, hanging out, and talking every day.');
+ await page.getByRole('button',{name:'Use #3b82f6',exact:true}).click();
+ assert.equal(await page.getByRole('button',{name:'Use #3b82f6',exact:true}).getAttribute('aria-pressed'),'true');
+ assert.equal(await page.locator('.server-preview-identity h3').textContent(),'plainwire development and friends');
+ await page.setViewportSize({width:390,height:640});
+ await page.locator('.modal-body').evaluate(el=>{el.scrollTop=0;});
+ const footer=await page.getByRole('button',{name:'Save server',exact:true}).boundingBox();assert(footer.y+footer.height<=640,'mobile customization footer remains reachable');
+ await page.screenshot({path:'test-results/server-customize-mobile.png'});
+ await page.setViewportSize({width:1440,height:960});
  await page.getByPlaceholder('A welcome note, a few rules, or where to start. Markdown is supported.').fill('## Start here\nBe kind. Share what you are working on.');
  await page.waitForSelector('.server-customize-preview h2');await page.screenshot({path:'test-results/server-customize.png'});
- await page.getByRole('button',{name:'Save server',exact:true}).click();await page.waitForSelector('.server-welcome h2');
+ await page.getByRole('button',{name:'Save server',exact:true}).click();await page.waitForFunction(()=>document.querySelector('.server-side-head h1')?.textContent==='plainwire development and friends');
+ assert.equal(testServer.accent_color,'#3b82f6');
+ const headerBounds=await page.locator('.server-side-head').evaluate(el=>{const title=el.querySelector('h1').getBoundingClientRect(),box=el.getBoundingClientRect();return {right:title.right<=box.right-15,left:title.left>=box.left+20,overflow:el.scrollWidth>el.clientWidth};});
+ assert.deepEqual(headerBounds,{right:true,left:true,overflow:false},'long server titles keep padding without overflow');
+ await page.emulateMedia({colorScheme:'dark'});await page.waitForTimeout(250);await page.screenshot({path:'test-results/server-charcoal.png',animations:'disabled'});
+ await page.setViewportSize({width:390,height:844});
+ await page.getByRole('button',{name:'Open navigation',exact:true}).click();
+ await page.waitForFunction(()=>Math.abs(document.querySelector('.side.open')?.getBoundingClientRect().x ?? -100)<1);await page.screenshot({path:'test-results/server-navigation-mobile.png',animations:'disabled'});
+ assert.equal(await page.locator('.server-side-head').evaluate(el=>el.scrollWidth<=el.clientWidth),true);
+ await page.getByRole('button',{name:'Close navigation',exact:true}).click();
+ await page.setViewportSize({width:1440,height:960});
+ await page.getByRole('button',{name:'Plainwire home',exact:true}).click();await page.waitForSelector('.home-welcome');
+ await page.evaluate(()=>location.hash='#server/1');await page.waitForSelector('.server-hero');
  await page.getByRole('button',{name:'Invite people',exact:true}).click();await page.waitForSelector('.invite-link-row');
  await page.getByRole('button',{name:'Revoke',exact:true}).click();await page.getByText('Revoked link',{exact:true}).waitFor();assert.equal(inviteRevoked,true);
  await page.getByRole('combobox',{name:'Invite expiration'}).selectOption('3600');
@@ -197,7 +230,41 @@ try {
   if(await page.locator('.toast-close').count())await page.locator('.toast-close').click();
   await page.screenshot({path:`test-results/chat-${width}.png`});
  }
+ await page.setViewportSize({width:1440,height:960});await page.evaluate(()=>location.hash='#dms');
+ await page.getByRole('button',{name:'New message',exact:true}).first().click();
+ await page.waitForSelector('.people-option');
+ assert.equal(await page.locator('.people-option').count(),3,'known people appear, self excluded');
+ await page.getByRole('button',{name:'Select Jamie Chen',exact:true}).click();
+ await page.getByRole('searchbox',{name:'Find people to add'}).fill('sam');
+ await page.waitForFunction(()=>document.querySelectorAll('.people-option').length===1);
+ assert.equal(await page.locator('.people-option').count(),1);
+ await page.getByRole('button',{name:'Select Sam Rivera',exact:true}).click();
+ await page.getByRole('button',{name:'Remove jamiechen',exact:true}).click();
+ await page.getByRole('searchbox',{name:'Find people to add'}).fill('');
+ await page.getByRole('button',{name:'Select Jamie Chen',exact:true}).click();
+ await page.getByLabel('Group name · optional',{exact:true}).fill('Friday night');
+ const actionStyle=await page.getByRole('button',{name:'Start chat',exact:true}).evaluate(el=>{const cs=getComputedStyle(el),probe=document.createElement('i');probe.style.color=cs.getPropertyValue('--action');el.append(probe);const expected=getComputedStyle(probe).color;probe.remove();return {actual:cs.backgroundColor,expected};});
+ assert.equal(actionStyle.actual,actionStyle.expected,'legacy button selector cannot override theme-aware action color');
+ await page.screenshot({path:'test-results/group-picker-desktop.png'});
+ await page.setViewportSize({width:360,height:640});
+ await page.screenshot({path:'test-results/group-picker-mobile.png'});
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+ await page.getByRole('button',{name:'Start chat',exact:true}).click();
+ await page.waitForFunction(()=>location.hash==='#dm/20');
+ await page.getByRole('button',{name:'Add people to group',exact:true}).waitFor();
+ assert.deepEqual([...createdGroup.usernames].sort(),['jamiechen','samrivera']);assert.equal(createdGroup.name,'Friday night');
+ await page.getByRole('button',{name:'Add people to group',exact:true}).click();
+ await page.waitForSelector('.people-option');
+ assert.equal(await page.locator('.people-option').count(),1,'existing members excluded');
+ await page.getByRole('button',{name:'Select Morgan Lee',exact:true}).click();
+ await page.getByRole('button',{name:'Add people',exact:true}).click();
+ await page.waitForFunction(()=>document.querySelector('.chat-header small')?.textContent==='4 people');
+ assert.deepEqual(addedPeople.usernames,['morganlee']);
+ await page.waitForFunction(()=>document.querySelectorAll('.group-member').length===4);
+ const groupCompose=await page.locator('.composer-send').boundingBox();assert(groupCompose.y+groupCompose.height<640,'group composer stays on screen');
+ if(await page.locator('.toast-close').count())await page.locator('.toast-close').click();
+ await page.screenshot({path:'test-results/group-chat-mobile.png',animations:'disabled'});
  authenticated=false;const auth=await browser.newContext({viewport:{width:1440,height:960},colorScheme:'light'});await setup(auth);const login=await auth.newPage();login.on('pageerror',e=>errors.push(e.message));await login.goto(origin);await login.waitForSelector('.auth-submit');await login.screenshot({path:'test-results/login-desktop.png'});await login.setViewportSize({width:390,height:844});await login.screenshot({path:'test-results/login-mobile.png'});
  const blocked=await browser.newContext();await setup(blocked);await blocked.addInitScript(()=>Object.defineProperty(window,'localStorage',{get(){throw new DOMException('Storage blocked','SecurityError')}}));const blockedPage=await blocked.newPage();blockedPage.on('pageerror',e=>errors.push(e.message));await blockedPage.goto(origin);await blockedPage.waitForSelector('.auth-submit');
- assert.deepEqual(errors,[],'no browser exceptions');console.log('PASS: quick switcher keyboard navigation/dismissal; sidebar resizing; workspace menu dismissal; latest-message navigation and preserved reading position; scoped media updates; settings tab scroll reset; Markdown and syntax highlighting; unsafe markup rejection; long composer scrolling; settings search; welcome preview; invite expiry/revocation; desktop/light/dark/mobile layouts; drafts across routes; concurrent sends out of order; new draft preserved; late send isolated; failed send/retry; sign-in; no runtime exceptions.');
+ assert.deepEqual(errors,[],'no browser exceptions');console.log('PASS: click-select group creation and adding members, live membership refresh, long server names, functional home mark, mobile customization footer; quick switcher keyboard navigation/dismissal; sidebar resizing; workspace menu dismissal; latest-message navigation and preserved reading position; scoped media updates; settings tab scroll reset; Markdown and syntax highlighting; unsafe markup rejection; long composer scrolling; settings search; welcome preview; invite expiry/revocation; desktop/light/dark/mobile layouts; drafts across routes; concurrent sends out of order; new draft preserved; late send isolated; failed send/retry; sign-in; no runtime exceptions.');
 } finally {await browser.close();server.close();}

@@ -468,6 +468,7 @@ type alias Model =
     , serverDescription : String
     , modalTitle : String
     , modalBody : String
+    , modalPeopleQuery : String
     , modalUserIds : String
     , modalBannerUrl : String
     , modalWelcome : String
