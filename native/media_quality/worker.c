@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -8,11 +9,14 @@
 
 extern void pw_quality_analyze(int n, const double *rows, double *output);
 _Static_assert(sizeof(double) == 8, "The port protocol requires binary64 doubles");
+_Static_assert(DBL_MANT_DIG == 53 && DBL_MAX_EXP == 1024, "IEEE binary64 is required");
+enum { OUTPUT_COUNT = 19 };
 
 static int read_exact(unsigned char *p, size_t size) {
+    size_t remaining = size;
     while (size) {
         size_t n = fread(p, 1, size, stdin);
-        if (!n) return 0;
+        if (!n) return size == remaining && !ferror(stdin) ? 0 : -1;
         p += n;
         size -= n;
     }
@@ -35,12 +39,13 @@ static void write_double(unsigned char *p, double value) {
     for (int i = 7; i >= 0; i--) { p[i] = (unsigned char)bits; bits >>= 8; }
 }
 int main(void) {
-    unsigned char header[4], input[4 + 24 * 9 * 8], output[4 + 13 * 8];
+    unsigned char header[4], input[4 + 24 * 9 * 8], output[4 + OUTPUT_COUNT * 8];
     const double maxima[9] = {300, 100, 10000, 30000, 100, 30000, 100000, 100000, 100};
-    double rows[24 * 9], result[13];
-    while (read_exact(header, 4)) {
+    double rows[24 * 9], result[OUTPUT_COUNT];
+    int status;
+    while ((status = read_exact(header, 4)) == 1) {
         uint32_t size = u32(header);
-        if (size < 4 || size > sizeof(input) || !read_exact(input, size)) return 2;
+        if (size < 4 || size > sizeof(input) || read_exact(input, size) != 1) return 2;
         uint32_t n = u32(input);
         if (n < 1 || n > 24 || size != 4 + n * 9 * 8) return 3;
         for (uint32_t i = 0; i < n * 9; i++) {
@@ -53,12 +58,12 @@ int main(void) {
         alarm(1);
         pw_quality_analyze((int)n, rows, result);
         alarm(0);
-        output[0] = 0; output[1] = 0; output[2] = 0; output[3] = 13 * 8;
-        for (int i = 0; i < 13; i++) {
+        output[0] = 0; output[1] = 0; output[2] = 0; output[3] = OUTPUT_COUNT * 8;
+        for (int i = 0; i < OUTPUT_COUNT; i++) {
             if (!isfinite(result[i])) return 5;
             write_double(output + 4 + i * 8, result[i]);
         }
         if (fwrite(output, 1, sizeof(output), stdout) != sizeof(output) || fflush(stdout)) return 6;
     }
-    return ferror(stdin) ? 7 : 0;
+    return status < 0 || ferror(stdin) ? 7 : 0;
 }

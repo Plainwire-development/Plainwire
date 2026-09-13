@@ -18,6 +18,19 @@ native_output_and_policy_test() ->
     ?assertEqual(audio_gaps, pw_media_quality:policy(#{score => 50, upstream_loss_pct => null, concealment_pct => 8})),
     ?assertEqual(healthy, pw_media_quality:policy(#{score => 96, upstream_loss_pct => null})).
 
+extended_output_test() ->
+    Legacy = [99, 99, 0, 5, 40, 0, 20, -1, -1000000000, -1000000000, 8, 100, 6],
+    Encode = fun(Vs) -> << <<(float(V)):64/float-big>> || V <- Vs >> end,
+    ?assertMatch({ok, #{recent_score := null}}, pw_media_quality:decode(Encode(Legacy))),
+    Extended = Legacy ++ [95, 60, 0, 0, 45, 100],
+    ?assertMatch({ok, #{recommendation := reduce_screen_bitrate, upstream_score := 60.0}},
+                 pw_media_quality:decode(Encode(Extended))),
+    ?assertMatch({error, _}, pw_media_quality:decode(Encode(Legacy ++ [101, 60, 0, 0, 45, 100]))),
+    ?assertEqual(reduce_screen_bitrate, pw_media_quality:policy(#{score => null, upstream_score => 60, upstream_loss_pct => 8})),
+    ?assertEqual(burst_packet_loss, pw_media_quality:policy(#{score => 70, loss_burst_seconds => 15, loss_burst_pct => 30})),
+    ?assertEqual(deteriorating_connection, pw_media_quality:policy(#{score => 85, recent_score => 60,
+        confidence_pct => 80, jitter_trend => 10, loss_trend => 2})).
+
 missing_worker_fallback_test() ->
     {ok, Worker} = pw_media_quality:start_link("/no/such/plainwire-quality"),
     try
@@ -50,6 +63,8 @@ native_calculation() ->
             {quality_result, <<"good">>, 2, R} ->
                 ?assert(maps:get(score, R) >= 95),
                 ?assertEqual(healthy, maps:get(recommendation, R)),
+                ?assert(maps:get(recent_score, R) >= 95),
+                ?assert(maps:get(confidence_pct, R) < 34),
                 ?assertEqual(5.0, maps:get(jitter_p95_ms, R))
         after 1500 -> ?assert(false) end,
         Poor = [[T, 10, 90, 500, 15, 150, 24, 24, 10] || T <- [0,5,10]],

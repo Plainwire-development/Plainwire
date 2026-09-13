@@ -873,7 +873,7 @@ update msg model =
         WsStatus connected ->
             ( { model | wsConnected = connected }
             , if connected && not model.wsConnected && model.me /= Nothing then
-                apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+                Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), routeCmd model.active, routeSubCmd model.active ]
 
               else
                 Cmd.none
@@ -882,7 +882,7 @@ update msg model =
         PageVisibility visible ->
             ( { model | pageVisible = visible }
             , if visible && model.me /= Nothing then
-                apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+                Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), routeCmd model.active ]
 
               else
                 Cmd.none
@@ -4738,6 +4738,7 @@ renderExpandedCallOverlay active model =
                 (option [ value "" ] [ text "System default" ] :: List.map (\device -> option [ value device.id ] [ text device.label ]) model.audioInputs)
             , div [ class "call-mic-meter", attribute "data-call-mic-meter" "true", attribute "role" "meter", attribute "aria-label" "Live microphone level", attribute "aria-valuemin" "0", attribute "aria-valuemax" "100", attribute "aria-valuenow" "0" ]
                 [ span [ class "call-mic-fill" ] [] ]
+            , Html.node "pw-input-volume" [] []
             ]
         , div [ class "call-overlay-controls", attribute "aria-label" "Call controls" ]
             [ control
@@ -4889,6 +4890,11 @@ renderCallUser model u =
           else
             text ""
         , retryButton
+        , if isSelf then
+            text ""
+
+          else
+            Html.node "pw-user-volume" [ attribute "user-id" (String.fromInt u.userId), attribute "user-name" u.displayName ] []
         ]
 
 
@@ -5207,7 +5213,7 @@ authPasswordStrength password =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.7.0" ]
+    div [ class "layout", attribute "data-ui-version" "1.7.1" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -7431,14 +7437,14 @@ renderVoicePage channelId model =
                     ]
 
                  else
-                    List.map (voiceParticipantRow members) voiceUsers
+                    List.map (voiceParticipantRow (Maybe.map .id model.me) members) voiceUsers
                 )
             ]
         ]
 
 
-voiceParticipantRow : List ServerMember -> { userId : Int, muted : Bool, deafened : Bool, screen : Bool, reconnecting : Bool } -> Html Msg
-voiceParticipantRow members vu =
+voiceParticipantRow : Maybe Int -> List ServerMember -> { userId : Int, muted : Bool, deafened : Bool, screen : Bool, reconnecting : Bool } -> Html Msg
+voiceParticipantRow selfId members vu =
     let
         maybeMember =
             List.filter (\m -> m.user.id == vu.userId) members |> List.head
@@ -7515,6 +7521,11 @@ voiceParticipantRow members vu =
 
           else
             span [ class pillClass ] [ text pillText ]
+        , if selfId == Just vu.userId then
+            Html.node "pw-input-volume" [] []
+
+          else
+            Html.node "pw-user-volume" [ attribute "user-id" (String.fromInt vu.userId), attribute "user-name" name ] []
         ]
 
 
@@ -8386,6 +8397,10 @@ renderVoiceSettings model =
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Input device" ], small [ class "muted" ] [ text "The microphone used in calls and voice channels." ] ]
             , select [ value model.selectedAudioInput, onInput SelectAudioInput, attribute "aria-label" "Input device" ] (deviceOptions model.audioInputs)
+            ]
+        , div [ class "setting-row setting-row-stack" ]
+            [ Html.node "pw-input-volume" [] []
+            , small [ class "muted" ] [ text "Applies immediately to calls and mic tests. Boost above 100% can distort loud microphones. Listening volume is adjustable for each person in call details." ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div []
@@ -9273,10 +9288,36 @@ composerView key placeholderText model =
                 , span [ class "composer-action-label" ] [ text "Attach" ]
                 ]
             , Html.details [ class "compose-format-help" ]
-                [ Html.summary [] [ text "Formatting" ]
-                , p [] [ text "**bold** · *italic* · `inline code` · > quote" ]
-                , pre [] [ text "```python\nprint(\"hello\")\n```" ]
-                , p [] [ text "Lists, links, tables, and fenced code are supported." ]
+                [ Html.summary [ attribute "aria-label" "Message formatting" ] [ span [ class "format-symbol", attribute "aria-hidden" "true" ] [ text "Aa" ], text "Format" ]
+                , div [ class "compose-format-panel", attribute "role" "region", attribute "aria-label" "Formatting tools" ]
+                    [ div [ class "format-panel-head" ]
+                        [ b [] [ text "Format your message" ]
+                        , button [ type_ "button", class "format-close", attribute "data-format-close" "", attribute "aria-label" "Close formatting" ] [ text "×" ]
+                        ]
+                    , div [ class "format-tools" ]
+                        (List.map (\( action, labelText ) -> button [ type_ "button", attribute "data-format" action ] [ text labelText ])
+                            [ ( "bold", "Bold" ), ( "italic", "Italic" ), ( "code", "Code" ), ( "quote", "Quote" ), ( "block", "Code block" ) ]
+                        )
+                    , p [ class "format-tip" ] [ text "Select text first, or start with a button. Ctrl/⌘ + B or I also works." ]
+                    , div [ class "compose-preview" ]
+                        [ small [] [ text "MESSAGE PREVIEW" ]
+                        , if String.isEmpty model.inputText then
+                            p [ class "muted" ] [ text "Your formatted message will appear here." ]
+
+                          else
+                            Html.node "pw-markdown" [ attribute "source" model.inputText ] []
+                        ]
+                    , p [ class "format-tip" ] [ text "Markdown supports lists, links, tables, and fenced code. Add a language after the opening ``` to highlight code." ]
+                    ]
+                ]
+            , small [ class "composer-count", attribute "aria-label" "Message character count" ]
+                [ text
+                    (if String.length model.inputText >= 4000 then
+                        String.fromInt (String.length model.inputText) ++ " / 5000"
+
+                     else
+                        ""
+                    )
                 ]
             , small [ class "muted composer-hint" ]
                 [ text
@@ -9584,12 +9625,13 @@ attachmentMarkup line =
 onComposerKeyDown : Bool -> Attribute Msg
 onComposerKeyDown enterSends =
     custom "keydown"
-        (D.map4
-            (\key shift ctrl meta ->
+        (D.map5
+            (\key shift ctrl meta composing ->
                 let
                     shouldSend =
                         key
                             == "Enter"
+                            && not composing
                             && ((enterSends && not shift) || (not enterSends && (ctrl || meta)))
                 in
                 if shouldSend then
@@ -9602,6 +9644,7 @@ onComposerKeyDown enterSends =
             (D.field "shiftKey" D.bool)
             (D.field "ctrlKey" D.bool)
             (D.field "metaKey" D.bool)
+            (D.field "isComposing" D.bool |> defaultValue False)
         )
 
 

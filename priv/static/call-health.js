@@ -4,6 +4,7 @@
   const finite = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
   const metric = (value, scale = 1) => finite(value) ? value * scale : null;
   const delta = (current, previous, key) => finite(current?.[key]) && finite(previous?.[key]) && current[key] >= previous[key] ? current[key] - previous[key] : null;
+  const lostDelta = (current, previous) => Number.isFinite(current?.packetsLost) && Number.isFinite(previous?.packetsLost) && current.packetsLost >= previous.packetsLost ? current.packetsLost - previous.packetsLost : null;
   const ratio = (n, d, scale = 1) => n !== null && d !== null && d > 0 ? n / d * scale : null;
 
   function parseStats(reports, previous = new Map()) {
@@ -16,20 +17,25 @@
     const elapsed = old && incoming.timestamp - old.timestamp;
     const outElapsed = oldOut && outgoing.timestamp - oldOut.timestamp;
     const validInterval = elapsed > 0 && elapsed <= 20000;
-    const lost = validInterval ? delta(incoming, old, 'packetsLost') : null;
+    const lost = validInterval ? lostDelta(incoming, old) : null;
     const received = validInterval ? delta(incoming, old, 'packetsReceived') : null;
     const remote = values.find(r => r.type === 'remote-inbound-rtp' && r.localId === outgoing?.id);
+    const oldRemote = remote && previous.get(remote.id);
+    // Remote timestamps identify RTCP feedback arrivals, not getStats calls.
+    // Reusing one report must not look like sustained fresh loss evidence.
+    const freshRemote = finite(remote?.timestamp) && incoming.timestamp >= remote.timestamp && incoming.timestamp - remote.timestamp <= 20000 && (!oldRemote || remote.timestamp > oldRemote.timestamp);
     const transport = values.find(r => r.type === 'transport' && (r.id === incoming.transportId || r.id === outgoing?.transportId));
-    const pair = values.find(r => r.type === 'candidate-pair' && r.state === 'succeeded' && (r.id === transport?.selectedCandidatePairId || r.nominated));
+    const candidates = values.filter(r => r.type === 'candidate-pair' && r.state === 'succeeded');
+    const pair = candidates.find(r => r.id === transport?.selectedCandidatePairId) || candidates.find(r => !transport?.selectedCandidatePairId && r.nominated);
     const sample = {
       loss: lost === null || received === null ? null : ratio(lost, lost + received, 100),
       jitter: metric(incoming.jitter, 1000),
-      rtt: metric(remote?.roundTripTime, 1000) ?? metric(pair?.currentRoundTripTime, 1000),
+      rtt: (freshRemote ? metric(remote?.roundTripTime, 1000) : null) ?? metric(pair?.currentRoundTripTime, 1000),
       concealment: validInterval ? ratio(delta(incoming, old, 'concealedSamples'), delta(incoming, old, 'totalSamplesReceived'), 100) : null,
       buffer: validInterval ? ratio(delta(incoming, old, 'jitterBufferDelay'), delta(incoming, old, 'jitterBufferEmittedCount'), 1000) : null,
       rxBitrate: validInterval ? ratio(delta(incoming, old, 'bytesReceived'), elapsed, 8) : null,
       txBitrate: outElapsed > 0 && outElapsed <= 20000 ? ratio(delta(outgoing, oldOut, 'bytesSent'), outElapsed, 8) : null,
-      upstreamLoss: finite(remote?.fractionLost) && remote.fractionLost <= 1 ? remote.fractionLost * 100 : null
+      upstreamLoss: freshRemote && finite(remote?.fractionLost) && remote.fractionLost <= 1 ? remote.fractionLost * 100 : null
     };
     return { sample, previous: new Map(values.map(r => [r.id, r])) };
   }
@@ -41,7 +47,9 @@
     audio_gaps: 'The browser is replacing missing audio. Check network stability.',
     receiving_packet_loss: 'Incoming audio packets are being lost.',
     high_latency: 'Network delay is high. Avoid busy Wi-Fi or heavy downloads.',
-    unstable_arrival: 'Audio packets are arriving unevenly. A steadier connection may help.'
+    unstable_arrival: 'Audio packets are arriving unevenly. A steadier connection may help.',
+    burst_packet_loss: 'Packets are being lost in sustained bursts. Check for competing network traffic.',
+    deteriorating_connection: 'Recent measurements are worse than earlier in this call.'
   };
   function create({ getPeers, getRoom, send, getLabel = () => 'Participant', analysisEnabled = true, adaptiveScreen = false, adapt = () => {} }) {
     const states = new Map();
@@ -65,7 +73,7 @@
         const name = document.createElement('b'); name.textContent = getLabel(uid);
         const status = document.createElement('span');
         const connected = state.pc.connectionState === 'connected';
-        const score = state.analysis?.score;
+        const score = finite(state.analysis?.recent_score) ? state.analysis.recent_score : state.analysis?.score;
         status.textContent = !connected ? 'Reconnecting' : !finite(score) ? 'Measuring' : score >= 80 ? 'Good' : score >= 55 ? 'Fair' : 'Poor';
         status.className = `call-health-status ${!connected || (finite(score) && score < 55) ? 'poor' : finite(score) && score >= 80 ? 'good' : ''}`;
         heading.append(name, status); card.append(heading);
@@ -77,6 +85,15 @@
           metrics.append(dt, dd);
         }
         card.append(metrics);
+        if (state.analysis) {
+          const analysis = document.createElement('dl'); analysis.className = 'call-health-metrics';
+          for (const [label, value, unit] of [['Recent quality', state.analysis.recent_score, '/100'], ['Outgoing quality', state.analysis.upstream_score, '/100'], ['Loss burst', state.analysis.loss_burst_seconds, ' s'], ['Delay p95', state.analysis.rtt_p95_ms, ' ms'], ['Evidence', state.analysis.confidence_pct, '%']]) {
+            const dt = document.createElement('dt'); dt.textContent = label;
+            const dd = document.createElement('dd'); dd.textContent = format(value, unit);
+            analysis.append(dt, dd);
+          }
+          card.append(analysis);
+        }
         const note = document.createElement('p');
         note.textContent = !connected ? 'Waiting for the call connection to recover.' : state.analysis ? recommendations[state.analysis.recommendation] || recommendations.insufficient_data : 'Live browser measurements. Trend analysis is not available yet.';
         card.append(note); fragment.append(card);
@@ -106,7 +123,15 @@
             states.set(uid, state);
           }
           let reports;
-          try { reports = await pc.getStats(); } catch (_) { continue; }
+          try {
+            let timeout;
+            try {
+              reports = await Promise.race([pc.getStats(), new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('stats_timeout')), 1500); })]);
+            } finally { clearTimeout(timeout); }
+          } catch (_) {
+            state.sample = null; state.rows = []; state.analysis = null;
+            continue;
+          }
           if (currentGeneration !== generation || getRoom()?.epoch !== epoch || getPeers().get(uid) !== pc) return;
           const parsed = parseStats(reports, state.previous);
           state.previous = parsed.previous;
@@ -135,7 +160,7 @@
     function receive(message) {
       const request = pending.get(message.request_id);
       pending.delete(message.request_id);
-      if (!request || request.epoch !== getRoom()?.epoch || getPeers().get(request.uid) !== request.pc) return;
+      if (!request || performance.now() - request.at > 15000 || request.epoch !== getRoom()?.epoch || getPeers().get(request.uid) !== request.pc || request.pc.connectionState !== 'connected') return;
       const state = states.get(request.uid);
       if (!state || state.pc !== request.pc) return;
       if (message.result?.unavailable) { unavailableUntil = performance.now() + 60000; state.analysis = null; render(); return; }
@@ -145,7 +170,7 @@
       state.analyzedAt = performance.now();
       if (adaptiveScreen) {
         state.poor = result.recommendation === 'reduce_screen_bitrate' ? state.poor + 1 : 0;
-        state.good = result.recommendation === 'healthy' && result.score >= 85 ? state.good + 1 : 0;
+        state.good = result.recommendation === 'healthy' && result.score >= 85 && finite(result.upstream_score) && result.upstream_score >= 90 ? state.good + 1 : 0;
         if (!state.limited && state.poor >= 3) { state.limited = true; adapt(request.pc, true); }
         if (state.limited && state.good >= 6) { state.limited = false; adapt(request.pc, false); }
       }

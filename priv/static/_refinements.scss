@@ -47,13 +47,38 @@ html[data-theme='dark'] {
 
 .msg-body, .reply-body, .thread-post-body { min-width: 0; }
 .composer textarea { field-sizing: fixed; overscroll-behavior: contain; max-height: 180px; padding: 14px 16px; line-height: 1.55; scrollbar-gutter: stable; }
-.compose-format-help { font-size: 11px; color: var(--muted); position: relative; }
-.compose-format-help summary { cursor: pointer; padding: 7px; list-style-position: inside; border-radius: 4px; }
-.compose-format-help[open] { position: absolute; bottom: 45px; left: 10px; z-index: 5; border: 1px solid var(--line); border-radius: 7px; padding: 10px 14px; max-width: calc(100% - 20px); background: var(--bg2); box-shadow: 0 4px 18px #00000014; }
-.compose-format-help p { margin: 6px 0; }
-.compose-format-help pre { margin: 6px 0; white-space: pre-wrap; }
-.composer { position: relative; }
-.composer-footer { gap: 8px; }
+/* The toggle stays in place. Only the bounded panel floats above chat. */
+.composer { position: relative; overflow: visible; border-radius: 12px; background: var(--bg2); }
+.composer textarea { border-radius: 12px 12px 0 0; min-height: 64px; }
+.composer-footer { gap: 8px; border-top: 1px solid var(--line); padding: 8px 10px; background: var(--bg2); border-radius: 0 0 12px 12px; }
+.composer-count { margin-left: auto; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.compose-format-help { font-size: 12px; color: var(--text2); }
+.compose-format-help summary { display: flex; align-items: center; gap: 6px; cursor: pointer; padding: 7px 9px; list-style: none; border-radius: 6px; min-height: 34px; }
+.compose-format-help summary::-webkit-details-marker { display: none; }
+.compose-format-help summary:hover, .compose-format-help[open] summary { background: var(--active); color: var(--text); }
+.format-symbol { font-size: 14px; font-weight: 650; text-decoration: underline; text-underline-offset: 3px; }
+.compose-format-panel { position: fixed; z-index: 150; width: min(440px, calc(100vw - 24px)); max-height: min(360px, 65dvh); overflow: auto; overscroll-behavior: contain; background: var(--bg2); border: 1px solid var(--line2); border-radius: 12px; box-shadow: 0 6px 22px #00000025; padding: 0 16px 12px; color: var(--text); }
+.format-panel-head { position: sticky; top: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; background: var(--bg2); padding: 10px 0; z-index: 1; border-bottom: 1px solid var(--line); }
+.format-close { border: 0; background: transparent; color: var(--text2); cursor: pointer; font-size: 23px; width: 36px; height: 36px; border-radius: 6px; }
+.format-close:hover { background: var(--hover); }
+.format-tools { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+.format-tools button { border: 1px solid var(--line); border-radius: 6px; background: var(--bg3); color: var(--text); padding: 7px 10px; min-height: 36px; cursor: pointer; font: inherit; }
+.format-tools button:hover { background: var(--active); border-color: var(--line2); }
+.format-tools [data-format='bold'] { font-weight: 700; }
+.format-tools [data-format='italic'] { font-style: italic; }
+.format-tools [data-format='code'], .format-tools [data-format='block'] { font-family: ui-monospace, monospace; }
+.format-tip { font-size: 11px; line-height: 1.6; color: var(--muted); margin: 12px 0; }
+.compose-preview { padding: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 7px; }
+.compose-preview > small { display: block; font-size: 9px; letter-spacing: .08em; color: var(--muted); margin-bottom: 10px; }
+.compose-preview pw-markdown { font-size: 13px; }
+.channel-glyph { display: grid; place-items: center; flex: 0 0 30px; width: 30px; height: 30px; border-radius: 8px; background: var(--bg3); color: var(--muted); }
+.channel-glyph::after { content: none; }
+.channel-glyph.text::before { content: '#'; font: 500 22px/1 ui-monospace, monospace; }
+.channel-glyph.voice::before { content: ''; width: 18px; height: 18px; background: currentColor; mask: url('/assets/icons/Headphones.svg') center / contain no-repeat; -webkit-mask: url('/assets/icons/Headphones.svg') center / contain no-repeat; }
+.channel-link { border-radius: 8px; gap: 12px; padding: 10px 12px; transition: background-color .12s; }
+.channel-link:hover { background: var(--hover); }
+.channel-link:hover .channel-glyph { color: var(--accent); }
+.channel-group-title { font-size: 10px; letter-spacing: .09em; margin-top: 20px; }
 .watch-screen { white-space: nowrap; font-size: 11px; min-height: 34px; padding: 6px 10px; }
 .call-user-info { min-width: 0; }
 .call-user-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -123,3 +148,16 @@ html[data-theme='dark'] {
 @media (max-width: 760px) {
   .pw-float { top: max(76px, env(safe-area-inset-top)) !important; bottom: auto !important; height: min(30dvh, 240px) !important; min-height: 160px; }
 }
+
+pw-input-volume, pw-user-volume { display: block; min-width: 0; }
+pw-input-volume label, pw-user-volume label { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 6px 12px; color: var(--text2); font-size: 11px; }
+pw-input-volume input, pw-user-volume input { grid-column: 1 / -1; width: 100%; min-height: 28px; margin: 0; accent-color: var(--accent); cursor: pointer; padding: 0; border: 0; background: transparent; }
+pw-input-volume output, pw-user-volume output { font-variant-numeric: tabular-nums; color: var(--muted); }
+.call-user-row { flex-wrap: wrap; }
+.call-user-row pw-user-volume { flex: 1 0 100%; padding: 6px 0 0 44px; }
+.call-input-panel pw-input-volume { margin-top: 10px; }
+@media (max-width: 760px) { pw-input-volume input, pw-user-volume input { min-height: 38px; } }
+.voice-participant { flex-wrap: wrap; }
+.voice-participant pw-user-volume, .voice-participant pw-input-volume { flex: 1 0 100%; padding-left: 44px; }
+/* Transient feedback must remain dismissible while call details are open. */
+.toast { z-index: 1200; }

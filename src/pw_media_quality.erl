@@ -47,14 +47,19 @@ validate(_) -> {error, invalid_samples}.
 increasing([A, B | Rest]) -> B - A >= 1 andalso increasing([B | Rest]);
 increasing([_]) -> true.
 
-decode(Bin) when is_binary(Bin), byte_size(Bin) =:= 104 ->
+%% Accept the previous 13-field worker during staged upgrades. Its new
+%% measurements remain null, so they cannot trigger new adaptive behavior.
+decode(Bin) when is_binary(Bin), byte_size(Bin) =:= 104; is_binary(Bin), byte_size(Bin) =:= 152 ->
     try
-        Values = [V || <<V:64/float-big>> <= Bin],
-        true = length(Values) =:= 13,
+        Raw = [V || <<V:64/float-big>> <= Bin],
+        true = length(Raw) * 8 =:= byte_size(Bin),
+        Values = case length(Raw) of 13 -> Raw ++ lists:duplicate(6, -1.0); 19 -> Raw end,
         Keys = [score, stability, loss_pct, jitter_p95_ms, rtt_ms, concealment_pct,
                 buffer_ms, bitrate_variation_pct, jitter_trend, loss_trend,
-                upstream_loss_pct, coverage_pct, sample_count],
-        Limits = [100, 100, 100, 10000, 30000, 100, 30000, 10000, 100000, 1000, 100, 100, 24],
+                upstream_loss_pct, coverage_pct, sample_count, recent_score, upstream_score,
+                loss_burst_pct, loss_burst_seconds, rtt_p95_ms, confidence_pct],
+        Limits = [100, 100, 100, 10000, 30000, 100, 30000, 10000, 100000, 1000, 100, 100, 24,
+                  100, 100, 100, 300, 30000, 100],
         true = lists:all(fun({K, V, Max}) ->
             case nullable(K, V) of
                 null -> K =/= sample_count andalso K =/= coverage_pct;
@@ -76,9 +81,17 @@ nullable(_, V) -> V.
 
 %% Interpretation belongs to the numerical worker; actions remain Plainwire's.
 %% These are advisory. Only optional, bounded screen bitrate changes use them.
+policy(#{upstream_score := Score, upstream_loss_pct := Loss})
+  when is_number(Score), Score =< 75, is_number(Loss), Loss >= 5 -> reduce_screen_bitrate;
 policy(#{score := Score}) when Score =:= null -> insufficient_data;
 policy(#{score := Score, upstream_loss_pct := Loss}) when is_number(Loss), Loss >= 5, Score < 60 -> reduce_screen_bitrate;
 policy(#{concealment_pct := Conceal}) when is_number(Conceal), Conceal >= 5 -> audio_gaps;
+policy(#{score := Score, recent_score := Recent, confidence_pct := Evidence,
+         jitter_trend := Jitter, loss_trend := Loss})
+  when is_number(Score), is_number(Recent), is_number(Evidence), Evidence >= 40,
+       Recent < Score - 15, ((is_number(Jitter) andalso Jitter >= 5) orelse (is_number(Loss) andalso Loss >= 1)) -> deteriorating_connection;
+policy(#{loss_burst_seconds := Seconds, loss_burst_pct := Percent})
+  when is_number(Seconds), Seconds >= 10, is_number(Percent), Percent >= 20 -> burst_packet_loss;
 policy(#{loss_pct := Loss}) when is_number(Loss), Loss >= 3 -> receiving_packet_loss;
 policy(#{rtt_ms := RTT}) when is_number(RTT), RTT >= 400 -> high_latency;
 policy(#{jitter_p95_ms := Jitter}) when is_number(Jitter), Jitter >= 50 -> unstable_arrival;

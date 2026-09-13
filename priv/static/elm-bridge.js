@@ -71,6 +71,55 @@
   let deafened = false;
   let selectedInputId = storage.getItem('plainwire_audio_input') || '';
   let selectedOutputId = storage.getItem('plainwire_audio_output') || '';
+  const readVolume = (key, maximum) => {
+    const saved = storage.getItem(key);
+    const value = saved === null ? 100 : Number(saved);
+    return Number.isFinite(value) ? Math.max(0, Math.min(maximum, value)) : 100;
+  };
+  let inputVolume = readVolume('plainwire_input_volume', 200);
+  const inputGains = new Set();
+  const peerVolumeKey = uid => `plainwire_peer_volume_${meId}_${uid}`;
+  class PlainwireVolume extends HTMLElement {
+    static observedAttributes = ['user-id', 'user-name'];
+    connectedCallback() { this.render(); }
+    attributeChangedCallback() { if (this.isConnected) this.render(); }
+    render() {
+      const uid = Number(this.getAttribute('user-id'));
+      const input = this.localName === 'pw-input-volume';
+      if (!input && (!Number.isSafeInteger(uid) || uid <= 0)) return;
+      const label = document.createElement('label');
+      const title = document.createElement('span');
+      title.textContent = input ? 'Input volume' : 'Listening volume';
+      const output = document.createElement('output');
+      const range = document.createElement('input');
+      range.type = 'range'; range.min = '0'; range.max = input ? '200' : '100'; range.step = '1';
+      range.value = String(input ? inputVolume : readVolume(peerVolumeKey(uid), 100));
+      range.setAttribute('aria-label', input ? 'Input volume' : `${this.getAttribute('user-name') || 'Participant'} listening volume`);
+      output.textContent = `${range.value}%`;
+      range.addEventListener('input', () => {
+        const value = Math.max(0, Math.min(input ? 200 : 100, Number(range.value)));
+        output.textContent = `${value}%`;
+        if (input) {
+          inputVolume = value;
+          storage.setItem('plainwire_input_volume', String(value));
+          for (const gain of inputGains) gain.gain.setTargetAtTime(value / 100, gain.context.currentTime, 0.02);
+        } else {
+          storage.setItem(peerVolumeKey(uid), String(value));
+          const audio = document.getElementById(`remote-audio-${uid}`);
+          if (audio) audio.volume = value / 100;
+        }
+        for (const other of document.querySelectorAll(input ? 'pw-input-volume' : `pw-user-volume[user-id="${uid}"]`)) {
+          if (other === this) continue;
+          const slider = other.querySelector('input'); const readout = other.querySelector('output');
+          if (slider) slider.value = String(value);
+          if (readout) readout.textContent = `${value}%`;
+        }
+      });
+      label.append(title, output, range); this.replaceChildren(label);
+    }
+  }
+  customElements.define('pw-input-volume', class extends PlainwireVolume {});
+  customElements.define('pw-user-volume', class extends PlainwireVolume {});
   const normalizeProcessingMode = (value) => ['noise', 'studio', 'krisp'].includes(value) ? value : 'noise';
   let voiceProcessingMode = normalizeProcessingMode(storage.getItem('plainwire_voice_processing') || 'noise');
   let voiceProcessingConfig = {
@@ -523,7 +572,8 @@
       player.dataset.playerReady = 'true';
       let scrubbing = false;
       let resumeAfterScrub = false;
-      const savedVolume = Number(storage.getItem('plainwire_media_volume'));
+      const savedSetting = storage.getItem('plainwire_media_volume');
+      const savedVolume = savedSetting === null ? NaN : Number(savedSetting);
       media.volume = Number.isFinite(savedVolume) ? Math.max(0, Math.min(1, savedVolume)) : 0.85;
       seek.value = '0';
       if (volume) volume.value = String(media.volume);
@@ -994,6 +1044,83 @@
     return composers.reverse().find((element) => element.offsetParent !== null) || null;
   };
 
+  const closeFormatting = (restoreFocus = false) => {
+    for (const details of document.querySelectorAll('.compose-format-help[open]')) {
+      details.open = false;
+      if (restoreFocus) details.querySelector('summary')?.focus();
+    }
+  };
+  const placeFormatting = () => {
+    for (const details of document.querySelectorAll('.compose-format-help[open]')) {
+      const panel = details.querySelector('.compose-format-panel');
+      if (!panel) continue;
+      const view = window.visualViewport;
+      const top = view?.offsetTop || 0, left = view?.offsetLeft || 0;
+      const width = view?.width || innerWidth, height = view?.height || innerHeight;
+      const anchor = details.closest('.composer').getBoundingClientRect();
+      panel.style.width = `${Math.min(440, width - 24)}px`;
+      panel.style.maxHeight = `${Math.max(80, Math.min(360, height - 24, anchor.top - top - 20))}px`;
+      panel.style.left = `${Math.max(left + 12, Math.min(anchor.left, left + width - panel.offsetWidth - 12))}px`;
+      panel.style.top = `${Math.max(top + 12, Math.min(anchor.top - panel.offsetHeight - 8, top + height - panel.offsetHeight - 12))}px`;
+    }
+  };
+  let formattingFrame = 0;
+  const scheduleFormatting = () => {
+    if (formattingFrame) return;
+    formattingFrame = requestAnimationFrame(() => { formattingFrame = 0; placeFormatting(); });
+  };
+  const applyFormatting = (kind) => {
+    const field = activeComposer();
+    if (!field) return;
+    const start = field.selectionStart, end = field.selectionEnd;
+    const selected = field.value.slice(start, end);
+    const styles = { bold: ['**', '**', 'text'], italic: ['*', '*', 'text'], code: ['`', '`', 'code'], block: ['```text\n', '\n```', 'code'], quote: ['> ', '', 'quote'] };
+    const style = styles[kind];
+    if (!style) return;
+    let [before, after, fallback] = style;
+    if ((kind === 'quote' || kind === 'block') && start > 0 && field.value[start - 1] !== '\n') before = '\n' + before;
+    if ((kind === 'quote' || kind === 'block') && end < field.value.length && field.value[end] !== '\n') after += '\n';
+    const content = kind === 'quote' ? (selected || fallback).replaceAll('\n', '\n> ') : selected || fallback;
+    const replacement = before + content + after;
+    if (field.value.length - (end - start) + replacement.length > field.maxLength) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'This message has reached the 5,000 character limit.' });
+      return;
+    }
+    field.setRangeText(replacement, start, end, 'end');
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    field.focus({ preventScroll: true });
+    field.setSelectionRange(start + before.length, start + before.length + content.length);
+    scheduleFormatting();
+  };
+  document.addEventListener('toggle', event => {
+    if (event.target.matches?.('.compose-format-help')) scheduleFormatting();
+  }, true);
+  document.addEventListener('pointerdown', event => {
+    if (!event.target.closest?.('.compose-format-help')) closeFormatting();
+  }, true);
+  document.addEventListener('click', event => {
+    if (event.target.closest?.('[data-format-close]')) { event.preventDefault(); closeFormatting(true); }
+    const tool = event.target.closest?.('[data-format]');
+    if (tool) { event.preventDefault(); applyFormatting(tool.dataset.format); }
+  }, true);
+  document.addEventListener('keydown', event => {
+    if (event.isComposing) return;
+    if (event.key === 'Escape' && document.querySelector('.compose-format-help[open]')) {
+      event.preventDefault(); event.stopImmediatePropagation(); closeFormatting(true);
+    } else if (event.target === activeComposer() && (event.ctrlKey || event.metaKey) && !event.altKey) {
+      const kind = { b: 'bold', i: 'italic', e: 'code' }[event.key.toLowerCase()];
+      if (kind) { event.preventDefault(); event.stopPropagation(); applyFormatting(kind); }
+    }
+  }, true);
+  document.addEventListener('input', event => { if (event.target.id === 'compose') scheduleFormatting(); }, true);
+  document.addEventListener('focusin', event => {
+    if (!event.target.closest?.('.compose-format-help, .composer')) closeFormatting();
+  });
+  window.addEventListener('hashchange', () => closeFormatting());
+  window.addEventListener('resize', scheduleFormatting, { passive: true });
+  window.visualViewport?.addEventListener('resize', scheduleFormatting, { passive: true });
+  window.visualViewport?.addEventListener('scroll', scheduleFormatting, { passive: true });
+
   const appendToComposer = (text) => {
     const composer = activeComposer();
     if (!composer) return;
@@ -1448,8 +1575,32 @@
   const prepareMicrophone = async () => {
     const mode = voiceProcessingMode;
     debug('MEDIA', 'microphone_request', { selected_input: selectedInputId || 'default', processing_mode: mode });
-    if (mode === 'krisp') return krispMicrophoneLease();
-    return nativeMicrophoneLease(await openRawMicrophone(mode), mode);
+    const lease = mode === 'krisp' ? await krispMicrophoneLease() : nativeMicrophoneLease(await openRawMicrophone(mode), mode);
+    let source, gain, destination;
+    try {
+      const ctx = audioContext();
+      if (!ctx) throw new Error('Microphone volume requires Web Audio support');
+      await ctx.resume();
+      if (ctx.state !== 'running') throw new Error('Click the call button again to enable microphone audio');
+      source = ctx.createMediaStreamSource(lease.stream);
+      gain = ctx.createGain(); destination = ctx.createMediaStreamDestination();
+      gain.gain.value = inputVolume / 100;
+      source.connect(gain); gain.connect(destination); inputGains.add(gain);
+      let released = false;
+      return { stream: destination.stream, rawStream: lease.rawStream, mode, release: async () => {
+        if (released) return;
+        released = true; inputGains.delete(gain);
+        source.disconnect(); gain.disconnect(); destination.disconnect();
+        stopStream(destination.stream);
+        await lease.release();
+      } };
+    } catch (error) {
+      try { source?.disconnect(); gain?.disconnect(); destination?.disconnect(); } catch (_) {}
+      if (destination) stopStream(destination.stream);
+      if (gain) inputGains.delete(gain);
+      await lease.release();
+      throw error;
+    }
   };
 
   const observeMicrophoneTracks = (stream) => {
@@ -2219,7 +2370,7 @@
       el.autoplay = true;
       el.playsInline = true;
       el.controls = false;
-      el.volume = 1;
+      el.volume = readVolume(peerVolumeKey(uid), 100) / 100;
       el.style.position = 'fixed';
       el.style.left = '-9999px';
       el.style.top = '0';

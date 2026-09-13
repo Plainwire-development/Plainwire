@@ -87,7 +87,7 @@ async function setup(uid) {
   await context.route('**/api/**', async route => {
     const path = new URL(route.request().url()).pathname;
     const reply = data => route.fulfill({ json: { ok: true, data } });
-    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.0', asset_version: '1.7.0', registration_enabled: true } });
+    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.1', asset_version: '1.7.1', registration_enabled: true } });
     if (path === '/api/me') return reply({ user: people[uid - 1], csrf: 'test', server_time: now });
     if (path === '/api/sync') return reply({ ...sync, conversations: [{ ...conversations[0], peer_id: uid === 1 ? 2 : 1, peer_name: people[uid === 1 ? 1 : 0].display_name }] });
     if (path === '/api/messages') return reply([]);
@@ -163,6 +163,20 @@ try {
   await a.getByRole('button', { name: 'Open call details', exact: true }).click();
   await a.waitForSelector('#call-microphone');
   await a.waitForFunction(() => Number(document.querySelector('[data-call-mic-meter]')?.getAttribute('aria-valuenow')) > 0);
+  await a.locator('pw-user-volume[user-id="2"] input').fill('35');
+  assert.equal(await a.evaluate(() => document.querySelector('#remote-audio-2').volume), .35);
+  assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_peer_volume_1_2')), '35');
+  await a.locator('pw-input-volume input').fill('0');
+  await a.waitForTimeout(600);
+  const quietBefore = (await stats(b)).inbound[0].energy;
+  await b.waitForTimeout(300);
+  const quietDelta = (await stats(b)).inbound[0].energy - quietBefore;
+  await a.locator('pw-input-volume input').fill('100');
+  await a.waitForTimeout(500);
+  const loudBefore = (await stats(b)).inbound[0].energy;
+  await b.waitForTimeout(300);
+  const loudDelta = (await stats(b)).inbound[0].energy - loudBefore;
+  assert(loudDelta > quietDelta * 4 + .0001, 'input volume changes real outgoing audio energy');
   await a.getByRole('button', { name: 'Mute', exact: true }).click();
   await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === false);
   await a.waitForFunction(() => document.querySelector('[data-call-mic-meter]')?.getAttribute('aria-valuenow') === '0');
@@ -171,8 +185,10 @@ try {
   await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === true);
 
   // Live microphone swap transmits the new track and releases the old hardware.
+  await a.evaluate(() => { window.__beforeMicSwap = window.__pcs.at(-1)._audioSender.track; });
   await a.locator('#call-microphone').selectOption('desk');
-  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track === window.__mics.at(-1).stream.getAudioTracks()[0]);
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track !== window.__beforeMicSwap && window.__pcs.at(-1)._audioSender.track.readyState === 'live');
+  await a.waitForFunction(() => window.__beforeMicSwap.readyState === 'ended');
   await a.waitForFunction(() => window.__mics[0].stream.getAudioTracks()[0].readyState === 'ended');
   const beforeSwap = (await stats(b)).inbound[0].energy;
   await b.waitForTimeout(250);

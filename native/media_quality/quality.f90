@@ -2,22 +2,98 @@ module plainwire_quality
   use iso_c_binding, only: c_double, c_int
   use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
   implicit none
+  private
+  public :: analyze
+  integer, parameter :: max_rows = 24, output_count = 19
+  real(c_double), parameter :: missing = -1.0_c_double, no_trend = -1.0e9_c_double
 contains
+  ! Bounded insertion sort avoids allocation and external numerical libraries.
+  pure subroutine sort_values(values, n)
+    integer, intent(in) :: n
+    real(c_double), intent(inout) :: values(:)
+    real(c_double) :: value
+    integer :: i, j
+    do i = 2, n
+      value = values(i)
+      j = i - 1
+      do while (j >= 1)
+        if (values(j) <= value) exit
+        values(j + 1) = values(j)
+        j = j - 1
+      end do
+      values(j + 1) = value
+    end do
+  end subroutine sort_values
+
+  ! Median pairwise slope (Theil-Sen), in units per ten seconds. A single
+  ! arrival spike should affect p95, but should not manufacture a rising trend.
+  pure function robust_slope(values, times, n) result(slope)
+    integer, intent(in) :: n
+    real(c_double), intent(in) :: values(:), times(:)
+    real(c_double) :: slope, pairs(max_rows * (max_rows - 1) / 2)
+    integer :: i, j, count
+    slope = no_trend
+    if (n < 3) return
+    if (times(n) - times(1) < 10) return
+    count = 0
+    do i = 1, n - 1
+      do j = i + 1, n
+        count = count + 1
+        pairs(count) = 10 * (values(j) - values(i)) / (times(j) - times(i))
+      end do
+    end do
+    call sort_values(pairs, count)
+    slope = (pairs((count + 1) / 2) + pairs((count + 2) / 2)) / 2
+  end function robust_slope
+
+  pure function network_score(means, jitter_p95, eligible) result(score)
+    real(c_double), intent(in) :: means(:), jitter_p95
+    logical, intent(in) :: eligible(:)
+    real(c_double) :: score, penalty
+    score = missing
+    if (count(eligible(1:5)) < 2) return
+    penalty = 0
+    if (eligible(1)) penalty = penalty + min(35.0_c_double, means(1) * 5)
+    if (eligible(2)) penalty = penalty + min(15.0_c_double, max(0.0_c_double, jitter_p95 - 20) * 0.25_c_double)
+    if (eligible(3)) penalty = penalty + min(20.0_c_double, max(0.0_c_double, means(3) - 150) * 0.04_c_double)
+    if (eligible(4)) penalty = penalty + min(30.0_c_double, means(4) * 3)
+    if (eligible(5)) penalty = penalty + min(15.0_c_double, max(0.0_c_double, means(5) - 80) * 0.10_c_double)
+    score = max(0.0_c_double, 100 - penalty)
+  end function network_score
+
   subroutine analyze(n, x, out) bind(C, name='pw_quality_analyze')
     integer(c_int), value :: n
     real(c_double), intent(in) :: x(9, n)
-    real(c_double), intent(out) :: out(13)
-    real(c_double) :: means(8), devs(8), slopes(8), vals(24), times(24)
-    real(c_double) :: tmp, tm, denom, penalty, p95, cv, coverage
-    integer :: counts(8), i, j, k, m, observed
+    real(c_double), intent(out) :: out(output_count)
+    real(c_double) :: means(8), devs(8), slopes(8), vals(max_rows), times(max_rows)
+    real(c_double) :: recent(8), jitter_p95, recent_p95, duration, measured, burst, longest, run
+    real(c_double), parameter :: maxima(9) = [300.0_c_double, 100.0_c_double, 10000.0_c_double, &
+      30000.0_c_double, 100.0_c_double, 30000.0_c_double, 100000.0_c_double, 100000.0_c_double, 100.0_c_double]
+    integer :: counts(8), i, j, m, first
+    logical :: eligible(8), recent_eligible(8)
 
-    out = -1.0_c_double
-    if (n < 1 .or. n > 24) return
+    out = missing
+    if (n < 1 .or. n > max_rows) return
     if (any(.not. ieee_is_finite(x))) return
-    means = -1.0_c_double
-    devs = 0.0_c_double
-    slopes = -1000000000.0_c_double
+    ! Validate here too: the C wrapper is not the numerical routine's only
+    ! possible caller. Never divide by duplicate times or accept invalid units.
+    do i = 1, n
+      if (any(x(:, i) > maxima)) return
+      if (any(x(:, i) < 0 .and. abs(x(:, i) - missing) > 0)) return
+      if (x(1, i) < 0) return
+    end do
+    do i = 2, n
+      if (x(1, i) - x(1, i - 1) < 1) return
+    end do
+    means = missing
+    devs = 0
+    slopes = no_trend
     counts = 0
+    eligible = .false.
+    recent = missing
+    recent_eligible = .false.
+    jitter_p95 = missing
+    recent_p95 = missing
     do j = 1, 8
       m = 0
       do i = 1, n
@@ -30,56 +106,72 @@ contains
       if (m == 0) cycle
       means(j) = sum(vals(1:m)) / real(m, c_double)
       devs(j) = sqrt(sum((vals(1:m) - means(j))**2) / real(m, c_double))
-      if (m >= 3) then
-        tm = sum(times(1:m)) / real(m, c_double)
-        denom = sum((times(1:m) - tm)**2)
-        if (denom > 0) slopes(j) = 10 * sum((times(1:m)-tm)*(vals(1:m)-means(j))) / denom
-      end if
-      if (j == 2) then
-        do i = 2, m
-          tmp = vals(i)
-          k = i - 1
-          do while (k >= 1)
-            if (vals(k) <= tmp) exit
-            vals(k + 1) = vals(k)
-            k = k - 1
-          end do
-          vals(k + 1) = tmp
+      eligible(j) = m >= 3 .and. times(m) - times(1) >= 10
+      if (j <= 2) slopes(j) = robust_slope(vals, times, m)
+      if (j <= 5) then
+        first = 1
+        do while (first <= m)
+          if (times(first) >= x(1, n) - 20) exit
+          first = first + 1
         end do
-        out(4) = vals(max(1, ceiling(0.95_c_double * m)))
+        if (first <= m) then
+          recent(j) = sum(vals(first:m)) / real(m - first + 1, c_double)
+          recent_eligible(j) = m - first + 1 >= 3 .and. times(m) - times(first) >= 10
+          if (j == 2) then
+            call sort_values(vals(first:m), m - first + 1)
+            recent_p95 = vals(first - 1 + ceiling(0.95_c_double * (m - first + 1)))
+          end if
+        end if
+      end if
+      if (j == 2 .or. j == 3) then
+        call sort_values(vals, m)
+        if (j == 2) jitter_p95 = vals(ceiling(0.95_c_double * m))
+        if (j == 3) out(18) = vals(ceiling(0.95_c_double * m))
       end if
     end do
 
-    observed = count(counts(1:5) > 0)
-    coverage = 100.0_c_double * observed / 5
-    penalty = 0
-    if (counts(1) > 0) penalty = penalty + min(35.0_c_double, means(1) * 5)
-    if (counts(2) > 0) then
-      p95 = out(4)
-      penalty = penalty + min(15.0_c_double, max(0.0_c_double, p95 - 20) * 0.25_c_double)
-    end if
-    if (counts(3) > 0) penalty = penalty + min(20.0_c_double, max(0.0_c_double, means(3)-150) * 0.04_c_double)
-    if (counts(4) > 0) penalty = penalty + min(30.0_c_double, means(4) * 3)
-    if (counts(5) > 0) penalty = penalty + min(15.0_c_double, max(0.0_c_double, means(5)-80) * 0.10_c_double)
-    if (observed >= 2 .and. n >= 3) out(1) = max(0.0_c_double, 100 - penalty)
-    cv = 0
-    if (counts(6) >= 3 .and. means(6) > 0) then
-      cv = 100 * devs(6) / means(6)
-      out(8) = cv
-    end if
-    if (counts(1) >= 3 .or. counts(2) >= 3) then
-      out(2) = max(0.0_c_double, 100 - min(100.0_c_double, 3*devs(1) + 2*devs(2)))
-    end if
-    ! Bitrate variation is exposed separately: speech and silence naturally vary.
-    ! It must not independently classify a quiet microphone as a bad network.
+    out(1) = network_score(means, jitter_p95, eligible)
+    if (eligible(1) .or. eligible(2)) out(2) = max(0.0_c_double, 100 - min(100.0_c_double, 3 * devs(1) + 2 * devs(2)))
     out(3) = means(1)
+    out(4) = jitter_p95
     out(5) = means(3)
     out(6) = means(4)
     out(7) = means(5)
-    out(9) = slopes(2)
-    out(10) = slopes(1)
+    ! Silence changes bitrate naturally; neither rate variation lowers scores.
+    if (eligible(6) .and. means(6) > 0) out(8) = 100 * devs(6) / means(6)
+    out(9:10) = [slopes(2), slopes(1)]
     out(11) = means(8)
-    out(12) = coverage
+    out(12) = 100.0_c_double * sum(counts(1:5)) / (5 * n)
     out(13) = n
+    out(14) = network_score(recent, recent_p95, recent_eligible)
+    if (eligible(8)) out(15) = max(0.0_c_double, 100 - min(100.0_c_double, means(8) * 5))
+
+    ! Each loss sample describes the preceding interval. Missing observations
+    ! and gaps over 20 seconds break runs; they never count as good reception.
+    measured = 0
+    burst = 0
+    longest = 0
+    run = 0
+    do i = 2, n
+      duration = x(1, i) - x(1, i - 1)
+      if (x(2, i) < 0 .or. duration > 20) then
+        run = 0
+        cycle
+      end if
+      measured = measured + duration
+      if (x(2, i) >= 3) then
+        run = run + duration
+        burst = burst + duration
+        longest = max(longest, run)
+      else
+        run = 0
+      end if
+    end do
+    if (measured > 0) then
+      out(16) = 100 * burst / measured
+      out(17) = longest
+    end if
+    ! Evidence coverage, not a statistical confidence interval.
+    out(19) = out(12) * min(1.0_c_double, (x(1, n) - x(1, 1)) / 30)
   end subroutine analyze
 end module plainwire_quality

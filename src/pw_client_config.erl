@@ -24,7 +24,7 @@ public() ->
 version() ->
     case application:get_key(plainwire_relay, vsn) of
         {ok, Vsn} -> pw_util:bin(Vsn);
-        _ -> <<"1.7.0">>
+        _ -> <<"1.7.1">>
     end.
 
 asset_version() ->

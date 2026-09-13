@@ -42,3 +42,6 @@ data/
 !.env.development.example
 test-results/
 dist/
+
+priv/bin/pw-media-quality
+priv/bin/.pw-media-quality.*
