@@ -126,6 +126,12 @@ bridgeDecoder =
                     "status_change" ->
                         D.map SetMyStatus (D.field "data" D.string)
 
+                    "screen_share_started" ->
+                        D.succeed (BridgeEvent "screen_share_started" E.null)
+
+                    "screen_share_stopped" ->
+                        D.succeed (BridgeEvent "screen_share_stopped" E.null)
+
                     "rtc_join_failed" ->
                         D.map RtcJoinFailed (D.field "data" D.string)
 
@@ -153,9 +159,6 @@ bridgeDecoder =
 
                     "chat_enter_sends" ->
                         D.map SetChatEnterSends (D.field "data" D.bool)
-
-                    "turn_limit_reached" ->
-                        D.map SetTurnLimitReached (D.field "data" D.bool)
 
                     "link_previews_enabled" ->
                         D.map SetLinkPreviewsEnabled (D.field "data" D.bool)
@@ -238,7 +241,6 @@ init flags url _ =
                 "system"
     in
     ( { appName = appName
-      , turnLimitReached = False
       , registrationEnabled = flags.registrationEnabled
       , instanceDescription = String.left 120 (String.trim flags.instanceDescription)
       , clientVersion = String.left 32 (String.trim flags.version)
@@ -301,6 +303,7 @@ init flags url _ =
       , replyTo = Nothing
       , toast = Nothing
       , modal = Nothing
+      , settingsSearch = ""
       , settingsTab = "profile"
       , inputText = ""
       , sidebarOpen = False
@@ -339,6 +342,7 @@ init flags url _ =
       , modalBody = ""
       , modalUserIds = ""
       , modalBannerUrl = ""
+      , modalWelcome = ""
       , modalAccentColor = "#5865f2"
       , friendsTab = "online"
       , friendQuery = ""
@@ -948,9 +952,6 @@ update msg model =
                 )
             )
 
-        SetTurnLimitReached reached ->
-            ( { model | turnLimitReached = reached }, Cmd.none )
-
         SetLinkPreviewsEnabled enabled ->
             ( { model | linkPreviewsEnabled = enabled }
             , bridgeSend (E.object [ ( "tag", E.string "chat_set_link_previews" ), ( "data", E.bool enabled ) ])
@@ -992,9 +993,13 @@ update msg model =
         Logout ->
             ( model, apiSend (encodeApiRequest (ApiPost "/logout" (Just (E.object [])))) )
 
+        SettingsSearch query ->
+            ( { model | settingsSearch = query }, Cmd.none )
+
         SetSettingsTab t ->
             ( { model
                 | settingsTab = t
+                , settingsSearch = ""
                 , micTesting =
                     if t == "voice" then
                         model.micTesting
@@ -1271,6 +1276,9 @@ update msg model =
                 "user_ids" ->
                     ( { model | modalUserIds = value }, Cmd.none )
 
+                "welcome" ->
+                    ( { model | modalWelcome = value }, Cmd.none )
+
                 "accent" ->
                     ( { model | modalAccentColor = value }, Cmd.none )
 
@@ -1285,7 +1293,7 @@ update msg model =
                 ( { model | modal = Just "join_invite", modalTitle = "", modalBody = "0", modalUserIds = "" }, Cmd.none )
 
             else
-                ( { model | modal = Just ("invite:" ++ String.fromInt serverId), modalTitle = "", modalBody = "0", modalUserIds = "" }, Cmd.none )
+                ( { model | modal = Just ("invite:" ++ String.fromInt serverId), modalTitle = "86400", modalBody = "0", modalUserIds = "" }, Cmd.none )
 
         ChannelModal serverId ->
             ( { model | modal = Just ("channel:" ++ String.fromInt serverId), modalTitle = "", modalBody = "text", modalUserIds = "" }, Cmd.none )
@@ -1307,6 +1315,7 @@ update msg model =
                 , modalBody = server.description
                 , modalUserIds = server.iconUrl
                 , modalBannerUrl = server.bannerUrl
+                , modalWelcome = server.welcomeMessage
                 , modalAccentColor = server.accentColor
               }
             , Cmd.none
@@ -1327,6 +1336,14 @@ update msg model =
                     bridgeSend (E.object [ ( "tag", E.string tag ), ( "data", data ) ])
             in
             case tag of
+                "open_voice_settings" ->
+                    ( { model | settingsTab = "voice" }
+                    , Cmd.batch
+                        [ setHash "#settings"
+                        , bridgeSend (E.object [ ( "tag", E.string "list_audio_devices" ), ( "data", E.null ) ])
+                        ]
+                    )
+
                 "join_voice" ->
                     case D.decodeValue D.int data of
                         Ok channelId ->
@@ -2060,6 +2077,7 @@ submitModal model =
                                         (E.object
                                             [ ( "channel_id", maybeInt (String.toInt (String.trim model.modalUserIds)) )
                                             , ( "max_uses", E.int (Maybe.withDefault 0 (String.toInt (String.trim model.modalBody))) )
+                                            , ( "expires_in", E.int (Maybe.withDefault 86400 (String.toInt model.modalTitle)) )
                                             ]
                                         )
                                     )
@@ -2073,7 +2091,7 @@ submitModal model =
             else if kind == "join_invite" then
                 let
                     code =
-                        String.trim model.modalUserIds
+                        model.modalUserIds |> String.trim |> String.split "#invite/" |> List.reverse |> List.head |> Maybe.withDefault ""
                 in
                 if String.isEmpty code then
                     ( { model | toast = Just "Enter an invite code" }, Cmd.none )
@@ -2202,6 +2220,7 @@ submitModal model =
                                                 , ( "icon_url", E.string model.modalUserIds )
                                                 , ( "banner_url", E.string model.modalBannerUrl )
                                                 , ( "accent_color", E.string model.modalAccentColor )
+                                                , ( "welcome_message", E.string model.modalWelcome )
                                                 ]
                                             )
                                         )
@@ -2888,6 +2907,7 @@ handleWsEvent val model =
                             , connected = False
                             , connectionFailed = False
                             , reconnecting = False
+                            , screen = False
                             }
 
                         peer =
@@ -3650,15 +3670,7 @@ voiceUserDecoder =
 
 callPeerJoinedDecoder : Decoder CallUser
 callPeerJoinedDecoder =
-    D.map8 CallUser
-        (D.field "user_id" D.int)
-        (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "Unknown" ])
-        (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
-        (D.succeed False)
-        (D.succeed False)
-        (D.succeed False)
-        (D.succeed False)
-        (D.succeed False)
+    decodeCallUser
 
 
 audioDeviceDecoder : Decoder AudioDevice
@@ -3880,7 +3892,7 @@ modalContent kind model =
     else if kind == "join_invite" then
         [ modalHead "Join a Server" "Enter an invite code to join."
         , div [ class "modal-body" ]
-            [ div [ class "field" ] [ label [] [ text "Invite code" ], input [ value model.modalUserIds, placeholder "e.g. abc123", onInput ModalUserIds ] [] ]
+            [ div [ class "field" ] [ label [] [ text "Invite code" ], input [ value model.modalUserIds, placeholder "Paste an invite link or code", onInput ModalUserIds ] [] ]
             ]
         , modalActions "Join"
         ]
@@ -3945,7 +3957,17 @@ modalContent kind model =
                     , choicePill (model.modalBody == "25") "25 uses" (SetModalChoice "body" "25")
                     ]
                 ]
-            , p [ class "muted modal-hint" ] [ text "Plainwire reuses an equivalent active invite, so repeated clicks do not create clutter." ]
+            , div [ class "field" ]
+                [ label [] [ text "Expires after" ]
+                , select [ value model.modalTitle, onInput ModalTitle, attribute "aria-label" "Invite expiration" ]
+                    [ option [ value "3600" ] [ text "1 hour" ]
+                    , option [ value "86400" ] [ text "24 hours" ]
+                    , option [ value "604800" ] [ text "7 days" ]
+                    , option [ value "0" ] [ text "Never" ]
+                    ]
+                ]
+            , p [ class "muted modal-hint" ] [ text "Only people with this link can join. Revoke a link below to stop new joins." ]
+            , div [ class "invite-manager", attribute "data-invite-server" (String.dropLeft 7 kind) ] []
             ]
         , modalActions "Copy invite"
         ]
@@ -3955,6 +3977,16 @@ modalContent kind model =
         , div [ class "modal-body" ]
             [ div [ class "field" ] [ label [] [ text "Server name" ], input [ value model.modalTitle, maxlength 80, placeholder "Server name", onInput ModalTitle ] [] ]
             , div [ class "field" ] [ label [] [ text "Description" ], textarea [ value model.modalBody, maxlength 280, placeholder "What is this server for?", onInput ModalBody ] [] ]
+            , div [ class "field" ]
+                [ label [] [ text "Welcome message" ]
+                , textarea [ value model.modalWelcome, maxlength 2000, rows 4, placeholder "A welcome note, a few rules, or where to start. Markdown is supported.", onInput (SetModalChoice "welcome") ] []
+                , small [ class "muted" ] [ text "Shown on your server home. Up to 2,000 characters." ]
+                ]
+            , div [ class "server-customize-preview", style "--server-accent" model.modalAccentColor ]
+                [ span [ class "eyebrow" ] [ text "Welcome preview" ]
+                , h3 [] [ text model.modalTitle ]
+                , Html.node "pw-markdown" [ attribute "source" model.modalWelcome ] []
+                ]
             , div [ class "field" ]
                 [ label [] [ text "Server icon" ]
                 , input [ value model.modalUserIds, placeholder "Upload an image or paste a URL", onInput ModalUserIds ] []
@@ -4075,7 +4107,7 @@ modalContent kind model =
                 String.split ":" rest
 
             url =
-                Maybe.withDefault "" (listAt 1 parts)
+                String.join ":" (List.drop 1 parts)
 
             displayLink =
                 url
@@ -4110,7 +4142,7 @@ modalHead : String -> String -> Html Msg
 modalHead title subtitle =
     div [ class "modal-head" ]
         [ div [] [ h2 [] [ text title ], p [ class "muted" ] [ text subtitle ] ]
-        , button [ class "btn ghost", onClick CloseModal ] [ text "×" ]
+        , button [ class "btn ghost", attribute "aria-label" "Close dialog", type_ "button", onClick CloseModal ] [ text "×" ]
         ]
 
 
@@ -4456,7 +4488,9 @@ renderCompactCallBar active model =
                 "Audio failed · Open to retry"
 
             else if connectedCount == List.length remoteUsers then
-                "Audio connected · " ++ String.fromInt count ++ " participant"
+                "Audio connected · "
+                    ++ String.fromInt count
+                    ++ " participant"
                     ++ (if count /= 1 then
                             "s"
 
@@ -4475,8 +4509,10 @@ renderCompactCallBar active model =
             count - 3
     in
     div [ class "call-bar compact" ]
-        [ div
+        [ button
             [ class "call-bar-drag-area"
+            , type_ "button"
+            , attribute "aria-label" "Open call details"
             , attribute "data-call-drag-handle" "true"
             , title "Open call details"
             , onClick ToggleCallOverlay
@@ -4514,6 +4550,13 @@ renderCompactCallBar active model =
                      else
                         "Mute"
                     )
+                , attribute "aria-pressed"
+                    (if model.voice.muted then
+                        "true"
+
+                     else
+                        "false"
+                    )
                 , onClickStop (BridgeEvent "toggle_mute" E.null)
                 ]
                 [ callIcon
@@ -4541,6 +4584,13 @@ renderCompactCallBar active model =
                      else
                         "Deafen"
                     )
+                , attribute "aria-pressed"
+                    (if model.voice.deafened then
+                        "true"
+
+                     else
+                        "false"
+                    )
                 , onClickStop (BridgeEvent "toggle_deafen" E.null)
                 ]
                 [ callIcon
@@ -4559,7 +4609,7 @@ renderCompactCallBar active model =
                 button [ class "btn icon-btn", title "Share screen", onClickStop StartScreenShare ]
                     [ callIcon "screen" ]
             , button [ class "btn icon-btn call-decline", title "Leave call", onClickStop EndCall ]
-                [ callIcon "close" ]
+                [ callIcon "hangup" ]
             ]
         ]
 
@@ -4573,45 +4623,78 @@ renderExpandedCallOverlay : ActiveCall -> Model -> Html Msg
 renderExpandedCallOverlay active model =
     let
         duration =
-            floor (toFloat (model.serverTime - active.startTime) / 1000)
-
-        minutes =
-            String.fromInt (duration // 60)
-
-        seconds =
-            String.fromInt (modBy 60 duration) |> String.padLeft 2 '0'
+            Basics.max 0 (floor (toFloat (model.serverTime - active.startTime) / 1000))
 
         timerText =
-            minutes ++ ":" ++ seconds
+            String.fromInt (duration // 60) ++ ":" ++ (String.fromInt (modBy 60 duration) |> String.padLeft 2 '0')
+
+        remoteUsers =
+            List.filter (\u -> Just u.userId /= Maybe.map .id model.me) active.users
+
+        connected =
+            not (List.isEmpty remoteUsers) && List.all .connected remoteUsers
+
+        statusText =
+            if List.any .connectionFailed remoteUsers then
+                "Connection needs attention"
+
+            else if connected then
+                "Connected"
+
+            else if List.isEmpty remoteUsers then
+                "Waiting for others"
+
+            else
+                "Connecting audio"
+
+        control icon label activeState action =
+            button
+                [ class
+                    ("call-control"
+                        ++ (if activeState then
+                                " active"
+
+                            else
+                                ""
+                           )
+                    )
+                , onClick action
+                , attribute "aria-pressed"
+                    (if activeState then
+                        "true"
+
+                     else
+                        "false"
+                    )
+                ]
+                [ callIcon icon, span [] [ text label ] ]
     in
     div [ class "call-overlay expanded" ]
         [ div [ class "call-overlay-header", attribute "data-call-drag-handle" "true" ]
             [ div [ class "call-overlay-heading" ]
-                [ div [ class "call-overlay-title" ]
-                    [ span [ class "call-overlay-icon" ] [ callIcon "audio" ]
-                    , span [] [ text "Voice call" ]
-                    ]
+                [ div [ class "call-overlay-title" ] [ text "Voice call" ]
                 , div [ class "call-overlay-meta" ]
-                    [ span [ class "call-connection-dot", attribute "aria-hidden" "true" ] []
-                    , span [] [ text (String.fromInt (List.length active.users) ++ " participants") ]
-                    , span [ attribute "aria-hidden" "true" ] [ text "·" ]
-                    , span
-                        [ class "call-overlay-timer pw-live-call-timer"
-                        , attribute "data-call-start" (String.fromInt active.startTime)
+                    [ span
+                        [ class
+                            ("call-connection-dot"
+                                ++ (if connected then
+                                        " connected"
+
+                                    else
+                                        ""
+                                   )
+                            )
+                        , attribute "aria-hidden" "true"
                         ]
-                        [ text timerText ]
+                        []
+                    , span [] [ text statusText ]
+                    , span [ attribute "aria-hidden" "true" ] [ text "·" ]
+                    , span [ class "call-overlay-timer pw-live-call-timer", attribute "data-call-start" (String.fromInt active.startTime) ] [ text timerText ]
                     ]
                 ]
             , button [ class "btn icon-btn call-minimize", title "Minimize call", onClick ToggleCallOverlay ]
                 [ span [ class "call-minimize-icon", attribute "aria-hidden" "true" ] [] ]
             ]
-        , if model.turnLimitReached then
-            div [ class "call-turn-limit-row" ]
-                [ callIcon "audio off"
-                , span [] [ text "GB limit reached, TURN disabled until next month." ]
-                ]
-          else
-            text ""
         , if model.voice.screenShare then
             div [ class "call-sharing-row" ]
                 [ callIcon "screen"
@@ -4623,78 +4706,95 @@ renderExpandedCallOverlay active model =
             text ""
         , div [ class "call-overlay-users" ]
             (if List.isEmpty active.users then
-                [ div [ class "call-empty" ] [ text "Connecting audio..." ] ]
+                [ div [ class "call-empty" ] [ text "Your call will appear here when someone joins." ] ]
 
              else
                 List.map (renderCallUser model) active.users
             )
-        , div [ class "call-overlay-controls", attribute "aria-label" "Call controls" ]
-            [ button
-                [ class
-                    ("call-control"
-                        ++ (if model.voice.muted then
-                                " active danger"
+        , div [ class "call-input-panel" ]
+            [ div [ class "call-input-heading" ]
+                [ label [ for "call-microphone" ] [ text "Your microphone" ]
+                , span
+                    [ class
+                        ("call-mic-status"
+                            ++ (if model.voice.muted then
+                                    " muted"
 
-                            else
-                                ""
-                           )
-                    )
-                , onClick (BridgeEvent "toggle_mute" E.null)
-                ]
-                [ callIcon
-                    (if model.voice.muted then
-                        "mic off"
-
-                     else
-                        "mic"
-                    )
-                , span []
+                                else
+                                    ""
+                               )
+                        )
+                    ]
                     [ text
                         (if model.voice.muted then
-                            "Unmute"
+                            "Muted"
 
                          else
-                            "Mute"
+                            "Microphone on"
                         )
                     ]
                 ]
-            , button
-                [ class
-                    ("call-control"
-                        ++ (if model.voice.deafened then
-                                " active danger"
+            , select [ id "call-microphone", value model.selectedAudioInput, onInput SelectAudioInput ]
+                (option [ value "" ] [ text "System default" ] :: List.map (\device -> option [ value device.id ] [ text device.label ]) model.audioInputs)
+            , div [ class "call-mic-meter", attribute "data-call-mic-meter" "true", attribute "role" "meter", attribute "aria-label" "Live microphone level", attribute "aria-valuemin" "0", attribute "aria-valuemax" "100", attribute "aria-valuenow" "0" ]
+                [ span [ class "call-mic-fill" ] [] ]
+            ]
+        , div [ class "call-overlay-controls", attribute "aria-label" "Call controls" ]
+            [ control
+                (if model.voice.muted then
+                    "mic off"
 
-                            else
-                                ""
-                           )
-                    )
-                , onClick (BridgeEvent "toggle_deafen" E.null)
-                ]
-                [ callIcon
-                    (if model.voice.deafened then
-                        "audio off"
+                 else
+                    "mic"
+                )
+                (if model.voice.muted then
+                    "Unmute"
 
-                     else
-                        "audio"
-                    )
-                , span []
-                    [ text
-                        (if model.voice.deafened then
-                            "Undeafen"
+                 else
+                    "Mute"
+                )
+                model.voice.muted
+                (BridgeEvent "toggle_mute" E.null)
+            , control
+                (if model.voice.deafened then
+                    "audio off"
 
-                         else
-                            "Deafen"
-                        )
-                    ]
-                ]
-            , if model.voice.screenShare then
-                button [ class "call-control active", onClick StopScreenShare ] [ callIcon "screen off", span [] [ text "Stop share" ] ]
+                 else
+                    "audio"
+                )
+                (if model.voice.deafened then
+                    "Undeafen"
 
-              else
-                button [ class "call-control", onClick StartScreenShare ] [ callIcon "screen", span [] [ text "Share" ] ]
-            , button [ class "call-control", onClick (BridgeEvent "unlock_audio" E.null) ] [ callIcon "audio", span [] [ text "Resume audio" ] ]
-            , button [ class "call-control", onClick (BridgeEvent "toggle_speaker" E.null) ] [ callIcon "audio", span [] [ text "Speaker" ] ]
-            , button [ class "call-control danger leave", onClick EndCall ] [ callIcon "close", span [] [ text "Leave" ] ]
+                 else
+                    "Deafen"
+                )
+                model.voice.deafened
+                (BridgeEvent "toggle_deafen" E.null)
+            , control "screen"
+                (if model.voice.screenShare then
+                    "Stop share"
+
+                 else
+                    "Share"
+                )
+                model.voice.screenShare
+                (if model.voice.screenShare then
+                    StopScreenShare
+
+                 else
+                    StartScreenShare
+                )
+            , button [ class "call-control leave", onClick EndCall ] [ callIcon "hangup", span [] [ text "Leave" ] ]
+            ]
+        , Html.node "details"
+            [ class "call-health" ]
+            [ Html.node "summary" [] [ text "Call health" ]
+            , div [ attribute "data-call-health-list" "true" ] []
+            , p [ class "call-health-privacy" ] [ text "Connection statistics only. No audio is recorded." ]
+            ]
+        , div [ class "call-tools" ]
+            [ button [ class "btn ghost", onClick (BridgeEvent "open_voice_settings" E.null) ] [ span [ class "ui-icon ui-icon-settings", attribute "aria-hidden" "true" ] [], text "Audio settings" ]
+            , button [ class "btn ghost", onClick (BridgeEvent "unlock_audio" E.null), title "Enable playback if your browser blocked call audio" ] [ text "Enable audio" ]
             ]
         ]
 
@@ -4705,9 +4805,23 @@ renderCallUser model u =
         isSelf =
             Maybe.map .id model.me == Just u.userId
 
+        muted =
+            if isSelf then
+                model.voice.muted
+
+            else
+                u.muted
+
+        deafened =
+            if isSelf then
+                model.voice.deafened
+
+            else
+                u.deafened
+
         avatarClass =
             "small"
-                ++ (if (u.connected || isSelf) && not u.muted then
+                ++ (if (u.connected || isSelf) && not muted then
                         " live"
 
                     else
@@ -4721,10 +4835,10 @@ renderCallUser model u =
             else if u.connectionFailed then
                 "Audio connection failed"
 
-            else if u.muted then
+            else if muted then
                 "Muted"
 
-            else if u.deafened then
+            else if deafened then
                 "Deafened"
 
             else if isSelf then
@@ -4743,7 +4857,7 @@ renderCallUser model u =
             else
                 text ""
     in
-    div [ class "call-user-row" ]
+    div [ class "call-user-row", attribute "data-peer-id" (String.fromInt u.userId) ]
         [ avatarImg u.avatarUrl u.displayName avatarClass
         , div [ class "call-user-info" ]
             [ span [ class "call-user-name" ] [ text u.displayName ]
@@ -4756,10 +4870,10 @@ renderCallUser model u =
                             else if u.reconnecting then
                                 " reconnecting"
 
-                            else if u.muted then
+                            else if muted then
                                 " muted"
 
-                            else if u.deafened then
+                            else if deafened then
                                 " deafened"
 
                             else
@@ -4769,6 +4883,11 @@ renderCallUser model u =
                 ]
                 [ text statusText ]
             ]
+        , if u.screen && not isSelf then
+            button [ class "btn secondary watch-screen", attribute "data-watch-screen" (String.fromInt u.userId), onClick (BridgeEvent "watch_screen" (E.int u.userId)) ] [ text "Watch screen" ]
+
+          else
+            text ""
         , retryButton
         ]
 
@@ -5088,7 +5207,7 @@ authPasswordStrength password =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.6.0" ]
+    div [ class "layout", attribute "data-ui-version" "1.7.0" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -6306,7 +6425,8 @@ forumCard : Model -> Forum -> Html Msg
 forumCard model f =
     let
         memberText =
-            String.fromInt f.memberCount ++ " member"
+            String.fromInt f.memberCount
+                ++ " member"
                 ++ (if f.memberCount /= 1 then
                         "s"
 
@@ -6315,7 +6435,8 @@ forumCard model f =
                    )
 
         threadText =
-            String.fromInt f.threadCount ++ " thread"
+            String.fromInt f.threadCount
+                ++ " thread"
                 ++ (if f.threadCount /= 1 then
                         "s"
 
@@ -7025,6 +7146,14 @@ renderServerPage model =
                       else
                         text ""
                     ]
+                , if String.isEmpty data.server.welcomeMessage then
+                    text ""
+
+                  else
+                    section [ class "card server-welcome" ]
+                        [ h2 [] [ text "Welcome" ]
+                        , Html.node "pw-markdown" [ attribute "source" data.server.welcomeMessage ] []
+                        ]
                 , div [ class "server-overview-grid" ]
                     [ section [ class "card server-overview-panel server-channel-panel" ]
                         [ div [ class "section-head compact-section-head" ]
@@ -7225,6 +7354,13 @@ renderVoicePage channelId model =
                                     " secondary"
                                )
                         )
+                    , attribute "aria-pressed"
+                        (if model.voice.muted then
+                            "true"
+
+                         else
+                            "false"
+                        )
                     , onClick (BridgeEvent "toggle_mute" E.null)
                     ]
                     [ text
@@ -7244,6 +7380,13 @@ renderVoicePage channelId model =
                                 else
                                     " secondary"
                                )
+                        )
+                    , attribute "aria-pressed"
+                        (if model.voice.deafened then
+                            "true"
+
+                         else
+                            "false"
                         )
                     , onClick (BridgeEvent "toggle_deafen" E.null)
                     ]
@@ -7269,7 +7412,7 @@ renderVoicePage channelId model =
             , if hasScreenShare then
                 div [ class "voice-screen-banner" ]
                     [ span [ class "screen-pulse" ] []
-                    , text (String.fromInt shareCount ++ " sharing screen  -  look for the floating window")
+                    , text (String.fromInt shareCount ++ " sharing · Choose Watch screen below")
                     ]
 
               else
@@ -7367,7 +7510,11 @@ voiceParticipantRow members vu =
             [ b [] [ text name ]
             , small [ class "muted" ] [ text stateText ]
             ]
-        , span [ class pillClass ] [ text pillText ]
+        , if vu.screen then
+            button [ class "btn secondary watch-screen", onClick (BridgeEvent "watch_screen" (E.int vu.userId)) ] [ text "Watch screen" ]
+
+          else
+            span [ class pillClass ] [ text pillText ]
         ]
 
 
@@ -7614,6 +7761,10 @@ renderSettingsPage model =
                         [ div [] [ span [ class "eyebrow" ] [ text "Personal settings" ], h1 [] [ text (settingsTitle model.settingsTab) ] ]
                         , span [ class "settings-user-chip" ] [ avatarImg u.avatarUrl u.displayName "small", text ("@" ++ u.username) ]
                         ]
+                    , div [ class "settings-search" ]
+                        [ input [ type_ "search", value model.settingsSearch, placeholder "Find a setting…", attribute "aria-label" "Find a setting", onInput SettingsSearch ] []
+                        , renderSettingsSearch model.settingsSearch
+                        ]
                     , div [ class "settings-content-inner" ]
                         [ case model.settingsTab of
                             "appearance" ->
@@ -7642,6 +7793,35 @@ renderSettingsPage model =
 
         Nothing ->
             text ""
+
+
+renderSettingsSearch : String -> Html Msg
+renderSettingsSearch query =
+    let
+        sections =
+            [ ( "profile", "Profile", "Name, avatar, banner and bio" )
+            , ( "appearance", "Appearance", "Theme, colors, system default and density" )
+            , ( "chat", "Chat", "Messages, enter to send, time and media" )
+            , ( "voice", "Voice & audio", "Microphone, speaker, noise suppression and test" )
+            , ( "sound", "Notifications", "Sounds, chimes, volume and desktop alerts" )
+            , ( "privacy", "Privacy", "Drafts, local storage and preferences" )
+            , ( "account", "Account", "Password, sessions, security and connection diagnostics" )
+            ]
+
+        matches =
+            List.filter (\( _, name, detail ) -> String.contains (String.toLower (String.trim query)) (String.toLower (name ++ " " ++ detail))) sections
+    in
+    if String.isEmpty (String.trim query) then
+        text ""
+
+    else
+        div [ class "settings-search-results", attribute "aria-live" "polite" ]
+            (if List.isEmpty matches then
+                [ p [ class "muted" ] [ text "No matching settings. Try microphone, theme, or password." ] ]
+
+             else
+                List.map (\( key, name, detail ) -> button [ type_ "button", onClick (SetSettingsTab key) ] [ b [] [ text name ], small [] [ text detail ] ]) matches
+            )
 
 
 settingsMobileTab : String -> String -> String -> Html Msg
@@ -8153,9 +8333,10 @@ renderNotificationSettings model =
             ]
         , div [ class "notification-sound-preview" ]
             [ div [] [ b [] [ text "Sound preview" ], small [ class "muted" ] [ text "Short, soft cues designed to stay out of the way." ] ]
-            , div [ class "segmented-control" ]
-                [ button [ class "btn secondary", onClick (BridgeEvent "preview_sound" (E.string "notification")) ] [ text "Message" ]
-                , button [ class "btn secondary", onClick (BridgeEvent "preview_sound" (E.string "incoming")) ] [ text "Incoming call" ]
+            , div [ class "sound-preview-list" ]
+                [ button [ class "sound-preview-btn", onClick (BridgeEvent "preview_sound" (E.string "notification")) ] [ span [ class "ui-icon ui-icon-notifications", attribute "aria-hidden" "true" ] [], span [] [ b [] [ text "Message" ], small [] [ text "A soft two-note bell" ] ], span [ class "sound-preview-action" ] [ text "Play" ] ]
+                , button [ class "sound-preview-btn", onClick (BridgeEvent "preview_sound" (E.string "incoming")) ] [ span [ class "ui-icon ui-icon-call", attribute "aria-hidden" "true" ] [], span [] [ b [] [ text "Incoming call" ], small [] [ text "A warm, rising chime" ] ], span [ class "sound-preview-action" ] [ text "Play" ] ]
+                , button [ class "sound-preview-btn", onClick (BridgeEvent "preview_sound" (E.string "outgoing")) ] [ span [ class "ui-icon ui-icon-call", attribute "aria-hidden" "true" ] [], span [] [ b [] [ text "Calling" ], small [] [ text "A quiet waiting tone" ] ], span [ class "sound-preview-action" ] [ text "Play" ] ]
                 ]
             ]
         ]
@@ -8204,7 +8385,7 @@ renderVoiceSettings model =
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Input device" ], small [ class "muted" ] [ text "The microphone used in calls and voice channels." ] ]
-            , select [ value model.selectedAudioInput, onInput SelectAudioInput ] (deviceOptions model.audioInputs)
+            , select [ value model.selectedAudioInput, onInput SelectAudioInput, attribute "aria-label" "Input device" ] (deviceOptions model.audioInputs)
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div []
@@ -8219,7 +8400,7 @@ renderVoiceSettings model =
                         )
                     ]
                 ]
-            , select [ value model.selectedAudioOutput, onInput SelectAudioOutput, disabled (not model.outputSelectionSupported) ] (deviceOptions model.audioOutputs)
+            , select [ value model.selectedAudioOutput, onInput SelectAudioOutput, attribute "aria-label" "Output device", disabled (not model.outputSelectionSupported) ] (deviceOptions model.audioOutputs)
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div []
@@ -8305,8 +8486,8 @@ renderVoiceSettings model =
                 text ""
             ]
         , div [ class "voice-settings-note" ]
-            [ b [] [ text "Connection tip" ]
-            , p [ class "muted" ] [ text "For calls outside your home network, configure TURN before launch. Plainwire will show each remote peer as connected only after ICE and audio are actually established." ]
+            [ b [] [ text "Having trouble being heard?" ]
+            , p [ class "muted" ] [ text "Choose your microphone, start a test, and speak. The meter should move. Check your headset’s mute switch if it stays still. You can change devices during a call." ]
             ]
         ]
 
@@ -8555,7 +8736,7 @@ renderMessagePage draftKey placeholderText model =
                                )
                              ]
                                 ++ (if List.isEmpty model.msg then
-                                        [ ( "empty", div [ class "empty chat-empty" ] [ div [ class "chat-empty-mark", attribute "aria-hidden" "true" ] [ span [ class "ui-icon ui-icon-messages" ] [] ], h2 [] [ text "You’re in good company." ], p [ class "muted" ] [ text "Say hello. This is the start of your conversation." ] ] ) ]
+                                        [ ( "empty", div [ class "empty chat-empty" ] [ div [ class "chat-empty-mark", attribute "aria-hidden" "true" ] [ span [ class "ui-icon ui-icon-messages" ] [] ], h2 [] [ text "Start the conversation" ], p [ class "muted" ] [ text "Send a message, share a file, or make a call." ] ] ) ]
 
                                     else
                                         groupedMessageViews model model.msg
@@ -8719,7 +8900,8 @@ renderDmCallBar active model =
                 "No one connected"
 
             else
-                String.fromInt count ++ " participant"
+                String.fromInt count
+                    ++ " participant"
                     ++ (if count /= 1 then
                             "s"
 
@@ -8738,11 +8920,11 @@ renderDmCallBar active model =
     in
     div [ class "dm-call-bar" ]
         [ div [ class "dm-call-bar-main" ]
-            [ span [ class "dm-call-bar-icon" ] [ span [ class "live-dot", attribute "aria-hidden" "true" ] [] ]
+            [ span [ class "dm-call-bar-icon" ] [ callIcon "audio" ]
             , span [ class "dm-call-bar-title" ]
                 [ text
                     (if joinedCall then
-                        "In Call"
+                        "In call"
 
                      else
                         "Call active"
@@ -8778,50 +8960,15 @@ renderDmCallBar active model =
             ]
         , div [ class "dm-call-bar-controls" ]
             (if joinedCall then
-                [ button
-                    [ class
-                        ("btn icon-btn"
-                            ++ (if model.voice.muted then
-                                    " call-muted"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "toggle_mute" E.null)
-                    ]
-                    [ callIcon
-                        (if model.voice.muted then
-                            "mic off"
+                [ button [ class "btn secondary", onClick ToggleCallOverlay ]
+                    [ text
+                        (if active.expanded then
+                            "Minimize"
 
                          else
-                            "mic"
+                            "Call details"
                         )
                     ]
-                , button
-                    [ class
-                        ("btn icon-btn"
-                            ++ (if model.voice.deafened then
-                                    " call-muted"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "toggle_deafen" E.null)
-                    ]
-                    [ callIcon
-                        (if model.voice.deafened then
-                            "audio off"
-
-                         else
-                            "audio"
-                        )
-                    ]
-                , button [ class "btn icon-btn", onClick (BridgeEvent "toggle_speaker" E.null) ]
-                    [ callIcon "audio" ]
-                , button [ class "btn call-decline", onClick EndCall ]
-                    [ text "Leave" ]
                 ]
 
              else
@@ -9125,6 +9272,12 @@ composerView key placeholderText model =
                 [ span [ class "ui-icon ui-icon-attach", attribute "aria-hidden" "true" ] []
                 , span [ class "composer-action-label" ] [ text "Attach" ]
                 ]
+            , Html.details [ class "compose-format-help" ]
+                [ Html.summary [] [ text "Formatting" ]
+                , p [] [ text "**bold** · *italic* · `inline code` · > quote" ]
+                , pre [] [ text "```python\nprint(\"hello\")\n```" ]
+                , p [] [ text "Lists, links, tables, and fenced code are supported." ]
+                ]
             , small [ class "muted composer-hint" ]
                 [ text
                     (if model.chatEnterSends then
@@ -9187,65 +9340,102 @@ messageRequest requestId path body =
 
 renderMessageBody : String -> List (Html Msg)
 renderMessageBody body =
+    renderRichChunks (String.lines body) [] Nothing []
+
+
+renderRichChunks : List String -> List String -> Maybe String -> List (Html Msg) -> List (Html Msg)
+renderRichChunks remaining pending fence acc =
     let
-        lines =
-            String.lines body
+        flush =
+            if List.isEmpty pending then
+                acc
+
+            else
+                Html.node "pw-markdown" [ attribute "source" (String.join "\n" (List.reverse pending)) ] [] :: acc
     in
-    lines
-        |> List.indexedMap
-            (\index line ->
-                case attachmentMarkup line of
-                    Just ( AttachmentImage, name, url ) ->
-                        a [ class "message-image-link", href url, target "_blank", rel "noopener" ]
-                            [ img [ class "message-image", src url, alt name, attribute "loading" "lazy" ] [] ]
+    case remaining of
+        [] ->
+            List.reverse flush
 
-                    Just ( AttachmentAudio, name, url ) ->
-                        div [ class "media-attachment pw-media-player pw-audio-player", attribute "data-media-url" url ]
-                            [ audio [ class "pw-audio-element", src url, preload "metadata" ] []
-                            , button [ type_ "button", class "pw-media-play", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
-                            , div [ class "pw-media-copy" ]
-                                [ div [ class "pw-media-heading" ]
-                                    [ b [ class "pw-media-name", title name ] [ text name ]
-                                    , a [ class "pw-media-download", href url, attribute "download" name, title "Download audio" ] [ text "Download" ]
-                                    ]
-                                , div [ class "pw-media-timeline" ]
-                                    [ span [ class "pw-media-time" ] [ text "0:00" ]
-                                    , input [ class "pw-media-seek", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1000", step "1", attribute "aria-label" "Seek audio" ] []
-                                    , span [ class "pw-media-duration" ] [ text "-:--" ]
-                                    ]
-                                ]
-                            , button [ type_ "button", class "pw-media-mute", attribute "data-media-action" "mute", attribute "aria-label" "Mute audio" ] [ text "Sound" ]
-                            , input [ class "pw-media-volume", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1", step "0.02", attribute "aria-label" "Audio volume" ] []
-                            ]
+        line :: rest ->
+            let
+                marker =
+                    String.left 3 (String.trimLeft line)
 
-                    Just ( AttachmentVideo, name, url ) ->
-                        div [ class "media-attachment pw-media-player pw-video-player", attribute "data-media-url" url ]
-                            [ div [ class "pw-video-frame" ]
-                                [ video [ class "message-video", src url, preload "metadata", attribute "playsinline" "" ] []
-                                , button [ type_ "button", class "pw-video-center-play", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
-                                ]
-                            , div [ class "pw-video-controls" ]
-                                [ button [ type_ "button", class "pw-media-play compact", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
-                                , span [ class "pw-media-time" ] [ text "0:00" ]
-                                , input [ class "pw-media-seek", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1000", step "1", attribute "aria-label" "Seek video" ] []
-                                , span [ class "pw-media-duration" ] [ text "-:--" ]
-                                , button [ type_ "button", class "pw-media-mute compact", attribute "data-media-action" "mute", attribute "aria-label" "Mute video" ] [ text "Sound" ]
-                                , input [ class "pw-media-volume", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1", step "0.02", attribute "aria-label" "Video volume" ] []
-                                , button [ type_ "button", class "pw-media-fullscreen", attribute "data-media-action" "fullscreen", attribute "aria-label" "Fullscreen video" ] [ text "Full" ]
-                                ]
-                            , div [ class "pw-video-meta" ]
-                                [ span [ title name ] [ text name ]
-                                , a [ href url, attribute "download" name, title "Download video" ] [ text "Download" ]
-                                ]
-                            ]
+                nextFence =
+                    if marker == "```" || marker == "~~~" then
+                        if fence == Just marker then
+                            Nothing
 
-                    Just ( AttachmentFile, name, url ) ->
-                        a [ class "message-file", href url, target "_blank", rel "noopener" ]
-                            [ span [ class "message-file-icon" ] [ text "↧" ], span [] [ text name ] ]
+                        else if fence == Nothing then
+                            Just marker
 
-                    Nothing ->
-                        renderTextLine index (List.length lines) line
-            )
+                        else
+                            fence
+
+                    else
+                        fence
+            in
+            if fence == Nothing && attachmentMarkup line /= Nothing then
+                renderRichChunks rest [] nextFence (renderAttachmentLine line :: flush)
+
+            else
+                renderRichChunks rest (line :: pending) nextFence acc
+
+
+renderAttachmentLine : String -> Html Msg
+renderAttachmentLine line =
+    case attachmentMarkup line of
+        Just ( AttachmentImage, name, url ) ->
+            a [ class "message-image-link", href url, target "_blank", rel "noopener" ]
+                [ img [ class "message-image", src url, alt name, attribute "loading" "lazy" ] [] ]
+
+        Just ( AttachmentAudio, name, url ) ->
+            div [ class "media-attachment pw-media-player pw-audio-player", attribute "data-media-url" url ]
+                [ audio [ class "pw-audio-element", src url, preload "metadata" ] []
+                , button [ type_ "button", class "pw-media-play", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
+                , div [ class "pw-media-copy" ]
+                    [ div [ class "pw-media-heading" ]
+                        [ b [ class "pw-media-name", title name ] [ text name ]
+                        , a [ class "pw-media-download", href url, attribute "download" name, title "Download audio" ] [ text "Download" ]
+                        ]
+                    , div [ class "pw-media-timeline" ]
+                        [ span [ class "pw-media-time" ] [ text "0:00" ]
+                        , input [ class "pw-media-seek", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1000", step "1", attribute "aria-label" "Seek audio" ] []
+                        , span [ class "pw-media-duration" ] [ text "-:--" ]
+                        ]
+                    ]
+                , button [ type_ "button", class "pw-media-mute", attribute "data-media-action" "mute", attribute "aria-label" "Mute audio" ] [ text "Sound" ]
+                , input [ class "pw-media-volume", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1", step "0.02", attribute "aria-label" "Audio volume" ] []
+                ]
+
+        Just ( AttachmentVideo, name, url ) ->
+            div [ class "media-attachment pw-media-player pw-video-player", attribute "data-media-url" url ]
+                [ div [ class "pw-video-frame" ]
+                    [ video [ class "message-video", src url, preload "metadata", attribute "playsinline" "" ] []
+                    , button [ type_ "button", class "pw-video-center-play", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
+                    ]
+                , div [ class "pw-video-controls" ]
+                    [ button [ type_ "button", class "pw-media-play compact", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
+                    , span [ class "pw-media-time" ] [ text "0:00" ]
+                    , input [ class "pw-media-seek", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1000", step "1", attribute "aria-label" "Seek video" ] []
+                    , span [ class "pw-media-duration" ] [ text "-:--" ]
+                    , button [ type_ "button", class "pw-media-mute compact", attribute "data-media-action" "mute", attribute "aria-label" "Mute video" ] [ text "Sound" ]
+                    , input [ class "pw-media-volume", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1", step "0.02", attribute "aria-label" "Video volume" ] []
+                    , button [ type_ "button", class "pw-media-fullscreen", attribute "data-media-action" "fullscreen", attribute "aria-label" "Fullscreen video" ] [ text "Full" ]
+                    ]
+                , div [ class "pw-video-meta" ]
+                    [ span [ title name ] [ text name ]
+                    , a [ href url, attribute "download" name, title "Download video" ] [ text "Download" ]
+                    ]
+                ]
+
+        Just ( AttachmentFile, name, url ) ->
+            a [ class "message-file", href url, target "_blank", rel "noopener" ]
+                [ span [ class "message-file-icon" ] [ text "↧" ], span [] [ text name ] ]
+
+        Nothing ->
+            Html.node "pw-markdown" [ attribute "source" line ] []
 
 
 renderTextLine : Int -> Int -> String -> Html Msg
@@ -9432,7 +9622,8 @@ renderNotificationsPage model =
                             "You're caught up."
 
                          else
-                            String.fromInt unseen ++ " unread item"
+                            String.fromInt unseen
+                                ++ " unread item"
                                 ++ (if unseen == 1 then
                                         "."
 
@@ -9978,6 +10169,7 @@ encodeServer server =
         [ ( "id", E.int server.id )
         , ( "name", E.string server.name )
         , ( "description", E.string server.description )
+        , ( "welcome_message", E.string server.welcomeMessage )
         , ( "icon_url", E.string server.iconUrl )
         , ( "banner_url", E.string server.bannerUrl )
         , ( "accent_color", E.string server.accentColor )

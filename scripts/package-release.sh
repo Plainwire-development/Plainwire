@@ -5,7 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "${ROOT}"
 
 VERSION=$(tr -d '[:space:]' < VERSION)
-[[ ${VERSION} == 1.6.0 ]] || { printf 'Unexpected VERSION: %s\n' "${VERSION}" >&2; exit 1; }
+[[ ${VERSION} == 1.7.0 ]] || { printf 'Unexpected VERSION: %s\n' "${VERSION}" >&2; exit 1; }
 
 ./scripts/release-check.sh
 
@@ -25,6 +25,7 @@ sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
 # but excludes local databases, dependencies, compiler output, uploads, and secrets.
 tar -C "${ROOT}" -czf "${SOURCE_ARCHIVE}" \
   --exclude='./_build' \
+  --exclude='./priv/bin/pw-media-quality' \
   --exclude='./node_modules' \
   --exclude='./dist' \
   --exclude='./data' \

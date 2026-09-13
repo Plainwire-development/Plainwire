@@ -3,21 +3,27 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "npm run build:haml && npm run build:scss && npm run build:elm",
+    "build": "npm run build:rich-text && npm run build:haml && npm run build:scss && npm run build:elm",
     "build:haml": "bash scripts/build-haml.sh",
     "build:scss": "sass priv/static/style.scss priv/static/app.css --no-source-map",
     "build:elm": "bash scripts/build-elm.sh",
     "dev": "npm run build:haml && npm run build:scss && bash scripts/build-elm.sh",
     "start": "bash scripts/start.sh",
     "start:build": "bash scripts/start.sh --build",
-    "test:browser": "node test/browser/run.mjs"
+    "test:browser": "node test/browser/run.mjs",
+    "test:rtc": "node test/browser/rtc.mjs",
+    "build:rich-text": "node scripts/build-rich-text.mjs",
+    "test:health": "node test/browser/call-health.mjs"
   },
   "devDependencies": {
     "elm": "^0.19.1-6",
+    "esbuild": "0.28.2",
     "playwright": "^1.62.1",
     "sass": "^1.101.0"
   },
   "dependencies": {
-    "haml": "^0.4.3"
+    "haml": "^0.4.3",
+    "highlight.js": "11.12.0",
+    "markdown-it": "15.0.2"
   }
 }

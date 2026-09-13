@@ -134,7 +134,7 @@ button:disabled { cursor: not-allowed; }
 .msg-actions .msg-action { min-height: 30px; }
 .message-date { display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 10px; font-weight: 600; padding: 20px 8px 14px; }
 .message-date::before, .message-date::after { content: ''; height: 1px; background: var(--line); flex: 1; }
-.chat-empty { text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 75%; }
+.chat-empty { font-style: normal; border: 0; background: transparent; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 75%; }
 .chat-empty h2 { font-size: 23px; letter-spacing: -.035em; margin: 18px 0 6px; }
 .chat-empty p { font-size: 13px; max-width: 34ch; line-height: 1.6; }
 .chat-empty-mark { width: 58px; height: 58px; display: grid; place-items: center; border-radius: 18px; color: var(--text2); background: var(--bg3); }
@@ -272,3 +272,14 @@ button:disabled { cursor: not-allowed; }
   .composer-send.composer-action { width: auto; min-width: 70px !important; padding: 0 10px !important; border-radius: 6px !important; }
   .toast { top: calc(68px + env(safe-area-inset-top)); bottom: auto; right: 12px; left: 12px; }
 }
+
+/* Sound previews are labeled actions, with space to compare each cue. */
+.notification-sound-preview { display: block; padding-top: 22px; }
+.notification-sound-preview > div:first-child small { display: block; margin-top: 5px; }
+.sound-preview-list { display: grid; gap: 8px; margin-top: 16px; }
+.sound-preview-btn { display: flex; align-items: center; gap: 13px; width: 100%; min-height: 64px; padding: 12px 15px; text-align: left; border: 1px solid var(--line); border-radius: 8px; background: var(--bg2); color: var(--text); font: inherit; cursor: pointer; }
+.sound-preview-btn:hover { background: var(--hover-soft); border-color: var(--line2); }
+.sound-preview-btn > .ui-icon { color: var(--text2); }
+.sound-preview-btn b { display: block; font-size: 13px; font-weight: 600; }
+.sound-preview-btn small { display: block; margin-top: 4px; color: var(--text2); font-size: 12px; }
+.sound-preview-action { margin-left: auto; color: var(--accent); font-size: 12px; font-weight: 600; padding: 7px 10px; border-radius: 5px; background: var(--active); }

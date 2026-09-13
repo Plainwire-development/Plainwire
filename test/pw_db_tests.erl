@@ -41,3 +41,9 @@ idle_websocket_expires_without_incoming_frames_test() ->
         voice => undefined, call => undefined,
         last_auth_check => erlang:monotonic_time(millisecond) - 61000},
     ?assertEqual({stop, State}, pw_ws:websocket_info(revalidate_auth, State)).
+
+invite_options_test() ->
+    ?assertEqual({ok, 1, 86400}, pw_db:invite_options(1, 86400)),
+    ?assertEqual({ok, 0, 0}, pw_db:invite_options(0, 0)),
+    [ ?assertMatch({error, invalid_invite_options}, pw_db:invite_options(M, E))
+      || {M, E} <- [{-1, 86400}, {10001, 86400}, {0, -1}, {0, 1}, {0, 2592001}, {<<"1">>, 3600}, {1, null}] ].

@@ -192,19 +192,6 @@
 .call-sharing-row > span:not(.call-icon) { flex: 1; }
 .call-sharing-row .btn { min-height: 28px; padding-inline: 8px; font-size: 11px; }
 
-.call-turn-limit-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 34px;
-  padding: 6px 11px;
-  border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--danger), transparent 92%);
-  color: var(--text2);
-  font-size: 12px;
-}
-.call-turn-limit-row .call-icon { color: var(--danger); }
-
 .call-overlay-users {
   max-height: 220px;
   padding: 6px;
@@ -493,3 +480,66 @@
   background: #383c42;
   color: #fff;
 }
+
+/* Call controls: four clear actions, devices and input feedback in reach. */
+.call-overlay.expanded { width: 384px; border-radius: 12px; box-shadow: 0 12px 40px #00000020; }
+.call-overlay-header { min-height: 72px; padding: 14px 16px; }
+.call-overlay-title { font-size: 16px; letter-spacing: -.02em; }
+.call-overlay-meta { margin: 6px 0 0; font-size: 12px; }
+.call-connection-dot { background: var(--muted); }
+.call-connection-dot.connected { background: var(--ok); }
+.call-bar-drag-area { border: 0; background: transparent; color: inherit; text-align: left; font: inherit; }
+.call-bar-info { min-width: 0; }
+.call-overlay-users { padding: 8px; }
+.call-user-row { min-height: 58px; padding: 9px 8px; }
+.call-user-name { font-size: 13px; }
+.call-user-status { font-size: 12px; margin-top: 3px; }
+.call-input-panel { margin: 0 16px 16px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--hover-soft); }
+.call-input-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.call-input-heading label { font-size: 12px; font-weight: 600; color: var(--text1); }
+.call-mic-status { font-size: 11px; color: var(--text2); }
+.call-input-panel select { display: block; width: 100%; height: 34px; min-width: 0; border: 1px solid var(--line2); border-radius: 5px; background: var(--bg2); color: var(--text); padding: 0 8px; font: inherit; font-size: 12px; }
+.call-mic-meter { height: 4px; margin-top: 12px; border-radius: 2px; overflow: hidden; background: var(--line); }
+.call-mic-fill { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--ok); transition: width .1s linear; }
+.call-overlay-controls { grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 12px 16px; gap: 8px; background: var(--bg2); }
+.call-control { min-height: 62px; flex-direction: column; gap: 7px; padding: 9px 4px; background: var(--bg3); font-size: 11px; font-weight: 600; border-radius: 8px; }
+.call-control .call-icon { width: 20px; height: 20px; }
+.call-control:active { transform: translateY(1px); }
+.call-control.leave { background: #ab3540; border-color: #ab3540; color: #fff; }
+.call-control.leave:hover { background: #922c36; border-color: #922c36; color: #fff; }
+.call-tools { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 12px 10px; }
+.call-tools .btn { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 6px; font-size: 11px; color: var(--text2); }
+.call-tools .ui-icon { width: 14px; height: 14px; min-width: 14px; }
+.call-popup-actions .btn { min-height: 42px; border-radius: 7px; }
+.call-popup-actions .call-accept { background: #237547 !important; }
+.call-popup-actions .call-accept:hover { background: #1d623b !important; }
+.call-bar-controls .call-decline { background: #ab3540 !important; border-color: #ab3540 !important; color: #fff !important; }
+.call-bar-controls .call-decline:hover { background: #922c36 !important; }
+.call-control.active { background: var(--active); color: var(--text1); border-color: var(--accent); }
+.call-bar-controls .btn.call-muted { background: var(--active) !important; color: var(--text1) !important; border-color: var(--accent) !important; opacity: 1; }
+@media (max-width: 760px) {
+  .call-overlay.expanded { width: 100%; }
+  .call-overlay-header { min-height: 66px; padding: 12px 14px; }
+  .call-overlay-users { max-height: min(25dvh, 220px); overflow-y: auto; }
+  .call-input-panel { margin: 0 12px 12px; }
+  .call-overlay-controls { grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 12px; }
+  .call-control { min-height: 62px; }
+  .call-control span:last-child { font-size: 11px; }
+  .call-tools .btn { min-height: 44px; }
+}
+@media (prefers-reduced-motion: reduce) { .call-mic-fill { transition: none; } }
+
+.call-health { margin: 0 16px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg2); font-size: 12px; }
+.call-health summary { padding: 10px 12px; cursor: pointer; font-weight: 600; color: var(--text1); }
+.call-health-peer { margin: 0 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+.call-health-heading { display: flex; justify-content: space-between; gap: 12px; }
+.call-health-status { color: var(--text2); }
+.call-health-status.good { color: var(--ok); }
+.call-health-status.poor { color: var(--danger); }
+.call-health-metrics { display: grid; grid-template-columns: 1fr auto; gap: 5px 12px; margin: 12px 0; font-size: 11px; }
+.call-health-metrics dt { color: var(--text2); }
+.call-health-metrics dd { margin: 0; color: var(--text1); font-variant-numeric: tabular-nums; }
+.call-health p { margin: 8px 0 0; color: var(--text2); font-size: 11px; line-height: 1.5; }
+.call-health .call-health-privacy { margin: 0; padding: 0 12px 12px; }
+.call-overlay.expanded { max-height: calc(100dvh - 36px); overflow-y: auto; }
+@media (max-width: 760px) { .call-overlay.expanded { max-height: calc(100dvh - var(--mobile-nav-h) - env(safe-area-inset-bottom) - 24px); } }

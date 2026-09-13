@@ -1,0 +1,274 @@
+import { chromium } from 'playwright';
+import { createServer } from 'node:http';
+import { readFile, mkdir } from 'node:fs/promises';
+import { resolve, extname } from 'node:path';
+import assert from 'node:assert/strict';
+import { now, people, sync, conversations } from './fixtures.mjs';
+
+// Real RTCPeerConnections and RTP media. Only identity, signaling transport and
+// microphone hardware are fixtures, so no microphone or external server is needed.
+const root = resolve('priv/static');
+const server = createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    const file = url.pathname === '/' ? 'index.html' : url.pathname.replace(/^\/assets\//, '');
+    const path = resolve(root, file);
+    if (!path.startsWith(root + '/')) throw Error('path');
+    const bytes = await readFile(path);
+    res.writeHead(200, { 'content-type': ({ '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' })[extname(path)] || 'application/octet-stream' });
+    res.end(bytes);
+  } catch { res.writeHead(404); res.end(); }
+});
+await new Promise(r => server.listen(0, '127.0.0.1', r));
+const origin = `http://127.0.0.1:${server.address().port}`;
+const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_EXECUTABLE || undefined, args: ['--no-sandbox', '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required', '--disable-features=WebRtcHideLocalIpsWithMdns', '--allow-loopback-in-peer-connection'] });
+const sockets = new Map();
+const errors = [];
+const send = (uid, data) => sockets.get(uid)?.send(JSON.stringify(data));
+const states = new Map();
+const members = new Set();
+const roster = () => people.slice(0, 2).map(p => ({ user_id: p.id, profile: p, muted: false, deafened: false, screen: false, ...states.get(p.id) }));
+async function setup(uid) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  await context.grantPermissions(['microphone']);
+  await context.addInitScript(({ uid }) => {
+    window.PLAINWIRE_DEBUG = true;
+    const NativePC = window.RTCPeerConnection;
+    window.__pcs = [];
+    window.__mics = [];
+    window.__tones = [];
+    const createOscillator = AudioContext.prototype.createOscillator;
+    AudioContext.prototype.createOscillator = function () {
+      const osc = createOscillator.call(this);
+      const record = { osc, ended: false };
+      osc.addEventListener('ended', () => { record.ended = true; });
+      window.__tones.push(record);
+      return osc;
+    };
+    window.__screens = [];
+    window.__gumRequests = [];
+    if (uid === 1) localStorage.setItem('plainwire_audio_input', 'unplugged');
+    navigator.mediaDevices.enumerateDevices = async () => [
+      { kind: 'audioinput', deviceId: 'desk', label: 'Desk microphone' },
+      { kind: 'audioinput', deviceId: 'headset', label: 'Headset microphone' }
+    ];
+    navigator.mediaDevices.getDisplayMedia = async () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 640; canvas.height = 360;
+      const ctx = canvas.getContext('2d');
+      let frame = 0;
+      const timer = setInterval(() => {
+        ctx.fillStyle = frame++ % 2 ? '#326b98' : '#98a4af';
+        ctx.fillRect(0, 0, 640, 360);
+      }, 60);
+      const stream = canvas.captureStream(15);
+      window.__screens.push({ stream, timer });
+      return stream;
+    };
+    window.RTCPeerConnection = class extends NativePC {
+      constructor(config) { super(config); window.__pcs.push(this); }
+    };
+    navigator.mediaDevices.getUserMedia = async (constraints) => {
+      window.__gumRequests.push(constraints);
+      if (constraints.audio?.deviceId?.exact === 'unplugged') throw new DOMException('Device removed', 'NotFoundError');
+      const ctx = new AudioContext();
+      await ctx.resume();
+      const oscillator = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const dest = ctx.createMediaStreamDestination();
+      oscillator.frequency.value = uid === 1 ? 440 : 660;
+      gain.gain.value = 0.15;
+      oscillator.connect(gain).connect(dest);
+      oscillator.start();
+      window.__mics.push({ ctx, oscillator, stream: dest.stream });
+      return dest.stream;
+    };
+  }, { uid });
+  await context.route('**/api/**', async route => {
+    const path = new URL(route.request().url()).pathname;
+    const reply = data => route.fulfill({ json: { ok: true, data } });
+    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.0', asset_version: '1.7.0', registration_enabled: true } });
+    if (path === '/api/me') return reply({ user: people[uid - 1], csrf: 'test', server_time: now });
+    if (path === '/api/sync') return reply({ ...sync, conversations: [{ ...conversations[0], peer_id: uid === 1 ? 2 : 1, peer_name: people[uid === 1 ? 1 : 0].display_name }] });
+    if (path === '/api/messages') return reply([]);
+    if (path === '/api/conversation/1') return reply({ conversation: conversations[0], members: conversations[0].members });
+    if (path === '/api/rtc-config') return reply({ iceServers: [] });
+    if (path === '/api/voice-processing-config') return reply({ krisp_available: false });
+    return reply({});
+  });
+  await context.routeWebSocket('**/ws', ws => {
+    sockets.set(uid, ws);
+    ws.onMessage(raw => {
+      const msg = JSON.parse(raw);
+      if (msg.type === 'ping') return send(uid, { type: 'pong' });
+      if (msg.type === 'call_signal') return send(msg.to_user_id, { ...msg, conversation_id: 1, from_user_id: uid });
+      if (msg.type === 'call_ring') {
+        send(uid, { type: 'call_ringing', conversation_id: 1, profile: people[uid === 1 ? 1 : 0] });
+        send(uid === 1 ? 2 : 1, { type: 'call_incoming', conversation_id: 1, from_user_id: uid, profile: people[uid - 1] });
+      }
+      if (msg.type === 'call_accept') {
+        states.clear();
+        members.add(1); members.add(2);
+        for (const target of [1, 2]) {
+          send(target, { type: 'call_accepted', conversation_id: 1, user_id: target === 1 ? 2 : 1, profile: people[target === 1 ? 1 : 0] });
+          send(target, { type: 'call_state', conversation_id: 1, users: roster() });
+        }
+      }
+      if (msg.type === 'call_state' && msg.patch) {
+        states.set(uid, { ...states.get(uid), ...msg.patch });
+        for (const target of [1, 2]) send(target, { type: 'call_state', conversation_id: 1, users: roster() });
+      }
+      if (msg.type === 'call_leave') {
+        members.delete(uid);
+        const other = uid === 1 ? 2 : 1;
+        send(other, { type: 'call_peer_left', conversation_id: 1, user_id: uid });
+        send(other, { type: 'call_state', conversation_id: 1, users: roster().filter(u => members.has(u.user_id)) });
+        for (const target of [1, 2]) send(target, { type: 'call_presence', conversation_id: 1, active: members.size > 0, users: roster().filter(u => members.has(u.user_id)) });
+      }
+      if (msg.type === 'call_cancel') {
+        for (const target of [1, 2]) send(target, { type: 'call_cancelled', conversation_id: 1 });
+      }
+    });
+    send(uid, { type: 'hello', session: { user: people[uid - 1] } });
+  });
+  const page = await context.newPage();
+  page.on('pageerror', e => errors.push(e.message));
+  if (process.env.RTC_DEBUG) page.on('console', m => console.log(uid, m.text()));
+  await page.goto(origin + '/#dm/1');
+  await page.waitForSelector('#compose');
+  return page;
+}
+async function stats(page) {
+  return page.evaluate(async () => {
+    const pc = window.__pcs.filter(p => p.signalingState !== 'closed').at(-1);
+    if (!pc) return null;
+    const reports = [...(await pc.getStats()).values()];
+    return { video: reports.filter(r => r.type === 'inbound-rtp' && r.kind === 'video').map(r => r.framesDecoded), connection: pc.connectionState, transceivers: pc.getTransceivers().map(t => ({ mid: t.mid, direction: t.currentDirection, kind: t.receiver.track.kind, sending: !!t.sender.track, enabled: t.sender.track?.enabled })), inbound: reports.filter(r => r.type === 'inbound-rtp' && r.kind === 'audio').map(r => ({ packets: r.packetsReceived, energy: r.totalAudioEnergy })), outbound: reports.filter(r => r.type === 'outbound-rtp' && r.kind === 'audio').map(r => r.packetsSent) };
+  });
+}
+try {
+  const [a, b] = await Promise.all([setup(1), setup(2)]);
+  await a.getByRole('button', { name: 'Start call', exact: true }).click();
+  await b.getByRole('button', { name: 'Accept', exact: true }).click();
+  await a.waitForFunction(() => window.__pcs.some(p => p.connectionState === 'connected'), null, { timeout: 15000 }).catch(async e => { console.log(await stats(a), await stats(b)); throw e; });
+  await b.waitForFunction(() => window.__pcs.some(p => p.connectionState === 'connected'));
+  await a.waitForTimeout(1800);
+  const initial = await Promise.all([stats(a), stats(b)]);
+  if (process.env.RTC_DEBUG) console.log(JSON.stringify(initial, null, 2));
+  for (const [i, result] of initial.entries()) {
+    assert(result.inbound.some(r => r.packets > 10 && r.energy > 0), `peer ${i + 1} receives audible RTP`);
+    assert(result.transceivers.some(t => t.kind === 'audio' && t.sending && t.enabled && t.direction === 'sendrecv'), `peer ${i + 1} sends microphone on negotiated transceiver`);
+  }
+  assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_audio_input')), '', 'unavailable saved microphone recovers to default');
+  await a.getByRole('button', { name: 'Open call details', exact: true }).click();
+  await a.waitForSelector('#call-microphone');
+  await a.waitForFunction(() => Number(document.querySelector('[data-call-mic-meter]')?.getAttribute('aria-valuenow')) > 0);
+  await a.getByRole('button', { name: 'Mute', exact: true }).click();
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === false);
+  await a.waitForFunction(() => document.querySelector('[data-call-mic-meter]')?.getAttribute('aria-valuenow') === '0');
+  assert.equal(await a.getByRole('button', { name: 'Unmute', exact: true }).getAttribute('aria-pressed'), 'true');
+  await a.getByRole('button', { name: 'Unmute', exact: true }).click();
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === true);
+
+  // Live microphone swap transmits the new track and releases the old hardware.
+  await a.locator('#call-microphone').selectOption('desk');
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track === window.__mics.at(-1).stream.getAudioTracks()[0]);
+  await a.waitForFunction(() => window.__mics[0].stream.getAudioTracks()[0].readyState === 'ended');
+  const beforeSwap = (await stats(b)).inbound[0].energy;
+  await b.waitForTimeout(250);
+  assert((await stats(b)).inbound[0].energy > beforeSwap, 'switched microphone remains audible remotely');
+
+  // A sender failure must preserve the current microphone and roll back selection.
+  await a.evaluate(() => {
+    const sender = window.__pcs.at(-1)._audioSender;
+    const original = sender.replaceTrack.bind(sender);
+    window.__beforeFailedSwap = sender.track;
+    sender.replaceTrack = async track => { sender.replaceTrack = original; throw new DOMException('Injected sender failure', 'InvalidModificationError'); };
+  });
+  await a.locator('#call-microphone').selectOption('headset');
+  await a.waitForFunction(() => document.querySelector('#call-microphone')?.value === 'desk');
+  assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track === window.__beforeFailedSwap && window.__beforeFailedSwap.readyState === 'live'), true);
+
+  // Both negotiated video directions work without sacrificing microphone audio.
+  await a.getByRole('button', { name: 'Share', exact: true }).click();
+  await a.waitForSelector('.call-sharing-row');
+  await b.waitForFunction(async () => [...(await window.__pcs.at(-1).getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'video' && r.framesDecoded > 2));
+  await b.getByRole('button', { name: 'Open call details', exact: true }).click();
+  await b.getByRole('button', { name: 'Watch screen', exact: true }).click();
+  await b.waitForFunction(() => document.querySelector('#pw-float-stage-1 video')?.videoWidth > 0);
+  await b.locator('#pw-float-stage-1').getByRole('button', { name: 'Close screen share', exact: true }).click();
+  await b.getByRole('button', { name: 'Watch screen', exact: true }).click();
+  await b.waitForFunction(() => document.querySelector('#pw-float-stage-1 video')?.videoWidth > 0);
+  await b.screenshot({ path: 'test-results/screen-viewer.png' });
+  await b.getByRole('button', { name: 'Share', exact: true }).click();
+  await a.waitForFunction(async () => [...(await window.__pcs.at(-1).getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'video' && r.framesDecoded > 2));
+  await a.getByRole('button', { name: 'Watch screen', exact: true }).click();
+  await a.waitForFunction(() => document.querySelector('#pw-float-stage-2 video')?.videoWidth > 0);
+  await a.locator('.call-health summary').click();
+  await a.waitForFunction(() => document.querySelector('[data-call-health-list]')?.textContent.includes('kb/s'), null, { timeout: 12000 });
+  for (const page of [a, b]) await page.getByRole('button', { name: 'Stop share', exact: true }).click();
+  await a.waitForFunction(() => window.__pcs.at(-1)._videoSender.track === null);
+  assert.equal(await a.evaluate(() => window.__screens.every(s => s.stream.getTracks().every(t => t.readyState === 'ended'))), true);
+
+  if (await a.locator('.toast-close').count()) await a.locator('.toast-close').click();
+  await mkdir('test-results', { recursive: true });
+  await a.screenshot({ path: 'test-results/call-desktop.png' });
+  await a.emulateMedia({ colorScheme: 'dark' });
+  await a.waitForTimeout(200);
+  await a.screenshot({ path: 'test-results/call-dark.png' });
+  await a.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await a.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  const leave = await a.locator('.call-overlay').getByRole('button', { name: 'Leave', exact: true }).boundingBox();
+  assert(leave && leave.y + leave.height < 844 && leave.width >= 44, 'mobile call controls fit and have touch targets');
+  await a.screenshot({ path: 'test-results/call-mobile.png' });
+  await a.setViewportSize({ width: 1280, height: 900 });
+  await a.emulateMedia({ colorScheme: 'light' });
+
+  await a.getByRole('button', { name: 'Deafen', exact: true }).click();
+  await a.locator('.call-overlay').getByRole('button', { name: 'Leave', exact: true }).click();
+  await b.waitForFunction(() => window.__pcs.every(pc => pc.connectionState === 'closed'));
+  await b.locator('.call-overlay').getByRole('button', { name: 'Leave', exact: true }).click();
+  assert.equal(await a.evaluate(() => window.__pcs.every(pc => pc.connectionState === 'closed')), true);
+  assert.equal(await a.evaluate(() => window.__mics.every(m => m.stream.getTracks().every(t => t.readyState === 'ended'))), true);
+  await b.getByRole('button', { name: 'Start call', exact: true }).click();
+  await a.getByRole('button', { name: 'Accept', exact: true }).click();
+  await a.waitForFunction(async () => {
+    const pc = window.__pcs.at(-1);
+    return pc.connectionState === 'connected' && [...(await pc.getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'audio' && r.totalAudioEnergy > 0.005);
+  });
+  await b.waitForFunction(async () => { const pc = window.__pcs.at(-1); return pc.connectionState === 'connected' && [...(await pc.getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'audio' && r.totalAudioEnergy > 0.005); });
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender?.track?.readyState === 'live');
+  assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track.enabled), true, 'new call starts unmuted after leaving deafened');
+  assert.equal(await a.evaluate(() => [...document.querySelectorAll('audio')].filter(el => el.srcObject).every(el => !el.muted)), true, 'new call playback is not left deafened');
+  await a.getByRole('button', { name: 'Open call details', exact: true }).click();
+  await a.getByRole('button', { name: 'Audio settings', exact: true }).click();
+  await a.waitForSelector('.voice-settings');
+  await a.locator('.call-overlay').getByRole('button', { name: 'Leave', exact: true }).click();
+  await b.waitForFunction(() => window.__pcs.every(pc => pc.connectionState === 'closed'));
+  await b.locator('.call-bar [title="Leave call"]').click();
+  await a.locator('.settings-tab').filter({ hasText: /^Notifications$/ }).click();
+  await a.waitForSelector('.sound-preview-list');
+  const toneCount = () => a.evaluate(() => window.__tones.length);
+  for (const name of ['Message', 'Incoming call', 'Calling']) {
+    const before = await toneCount();
+    await a.locator('.sound-preview-btn').filter({ hasText: name }).click();
+    await a.waitForFunction(before => window.__tones.length > before, before);
+  }
+  await a.getByRole('switch', { name: 'Toggle sound effects', exact: true }).click();
+  await a.waitForFunction(() => window.__tones.filter(t => !window.__mics.some(m => m.oscillator === t.osc)).every(t => t.ended));
+  assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_sound_enabled')), 'false');
+  const previewCount = await toneCount();
+  await a.locator('.sound-preview-btn').filter({ hasText: 'Message' }).click();
+  await a.waitForFunction(before => window.__tones.length > before, previewCount);
+  await a.screenshot({ path: 'test-results/sounds-desktop.png' });
+  await a.evaluate(() => location.hash = '#dm/1');
+  await a.waitForSelector('#compose');
+  await a.waitForTimeout(600);
+  const silentCount = await toneCount();
+  await b.getByRole('button', { name: 'Start call', exact: true }).click();
+  await a.getByRole('button', { name: 'Decline', exact: true }).waitFor();
+  await a.waitForTimeout(100);
+  assert.equal(await toneCount(), silentCount, 'disabled sounds suppress incoming ringing');
+  assert.deepEqual(errors, [], 'no browser exceptions during calls and screen sharing');
+  console.log('PASS: real bidirectional RTP; missing device fallback; live input meter; mute/unmute; microphone swap and failed-swap recovery; screen sharing in both directions; visible screen viewing and reopening; call-health measurements; mobile controls; deafened exit/rejoin; call cleanup; direct audio settings; all sound previews and disabled ringing.');
+} finally { await browser.close(); server.close(); }

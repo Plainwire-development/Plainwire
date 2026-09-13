@@ -27,8 +27,8 @@ disconnect(Pid) -> gen_server:cast(?MODULE, {disconnect, Pid}).
 subscribe(Pid, Key) -> gen_server:cast(?MODULE, {subscribe, Pid, Key}).
 unsubscribe_all(Pid) -> gen_server:cast(?MODULE, {unsubscribe_all, Pid}).
 watch_presence(Pid, Uids) -> gen_server:cast(?MODULE, {watch_presence, Pid, Uids}).
-notify_user(Uid, Event) -> gen_server:cast(?MODULE, {notify_user, Uid, Event}).
-broadcast(Key, Event) -> gen_server:cast(?MODULE, {broadcast, Key, Event}).
+notify_user(Uid, Event) -> pw_cluster:send_user(Uid, Event).
+broadcast(Key, Event) -> pw_cluster:broadcast(Key, Event).
 status_update(Uid, Status) -> gen_server:cast(?MODULE, {status_update, Uid, undefined, Status}).
 status_update(Uid, Pid, Status) -> gen_server:cast(?MODULE, {status_update, Uid, Pid, Status}).
 %% join must answer before the browser starts grabbing media.
@@ -143,6 +143,9 @@ handle_cast({watch_presence, Pid, Uids0}, St0) ->
     Statuses = maps:from_list([{U, S} || U <- Uids, {ok, S} <- [maps:find(U, St0#st.online)]]),
     Pid ! {hub_json, #{type => presence_state, online => maps:keys(Statuses), statuses => Statuses}},
     {noreply, St0#st{watches = Watches, watchers = Watchers}};
+handle_cast(cluster_resync, St) ->
+    send_many(maps:keys(St#st.pids), #{type => realtime_resync}),
+    {noreply, St};
 handle_cast({notify_user, Uid, Event}, St) ->
     Payload = case maps:get(type, Event, undefined) of
         call_incoming -> Event;

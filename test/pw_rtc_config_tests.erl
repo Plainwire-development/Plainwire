@@ -4,8 +4,8 @@
 
 default_config_test() ->
     with_env([], fun() ->
-        ?assertEqual(#{iceServers => [#{urls => [<<"stun:stun.l.google.com:19302">>]}],
-                iceTransportPolicy => <<"all">>},
+        ?assertMatch(#{iceServers := [#{urls := [<<"stun:stun.l.google.com:19302">>]}],
+                iceTransportPolicy := <<"all">>},
             pw_rtc_config:get())
     end).
 

@@ -17,8 +17,8 @@
     return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
   };
   const clientConfig = Object.freeze({
-    version: typeof rawClientConfig.version === 'string' ? rawClientConfig.version.slice(0, 32) : '1.6.0',
-    assetVersion: typeof rawClientConfig.asset_version === 'string' ? rawClientConfig.asset_version.slice(0, 64) : '1.6.0',
+    version: typeof rawClientConfig.version === 'string' ? rawClientConfig.version.slice(0, 32) : '1.6.1',
+    assetVersion: typeof rawClientConfig.asset_version === 'string' ? rawClientConfig.asset_version.slice(0, 64) : '1.6.1',
     appName: typeof rawClientConfig.app_name === 'string' && rawClientConfig.app_name.trim()
       ? rawClientConfig.app_name.trim().slice(0, 48) : 'Plainwire',
     defaultTheme: ['light', 'dark', 'system'].includes(rawClientConfig.default_theme)
@@ -61,6 +61,7 @@
   let microphoneEpoch = 0;
   let room = null;
   let roomEpoch = 0;
+  let callHealth = null;
   const RTC_RESUME_KEY = 'plainwire_rtc_room';
   const RTC_RESUME_MAX_AGE_MS = 60000;
   let resumeAttempted = false;
@@ -106,6 +107,7 @@
   let syncInFlight = null;
   let syncQueued = false;
   const screenSharers = new Set();
+  const watchedScreens = new Set();
   // very noisy. off unless somebody actually asks for it.
   const debugEnabled = window.PLAINWIRE_DEBUG === true || storage.getItem('plainwire_debug') === 'true';
   const startedAt = performance.now();
@@ -172,22 +174,47 @@
   };
   debug('BOOT', 'bridge_initialized', { debug: debugEnabled, secure_context: window.isSecureContext, online: navigator.onLine, client_config: clientConfig });
 
+  let rtcConfigNextRefresh = 0;
+  let rtcConfigValidUntil = 0;
+  let rtcRefreshTimer = null;
   const loadRtcConfig = () => {
     if (window.PLAINWIRE_RTC_CONFIG) return Promise.resolve(rtcConfig);
-    if (rtcConfigRequest && Date.now() - rtcConfigFetchedAt < 5 * 60 * 1000) return rtcConfigRequest;
-    rtcConfigFetchedAt = Date.now();
-    debug('RTC', 'config_fetch_started');
-    rtcConfigRequest = fetch('/api/rtc-config', { headers: { accept: 'application/json' } })
-      .then((res) => res.ok ? res.json() : null)
-      .then((json) => {
-        const config = json && json.ok && json.data;
-        if (config && Array.isArray(config.iceServers)) rtcConfig = config;
-        send(app.ports.bridgeReceive, { tag: 'turn_limit_reached', data: config ? config.turnLimitReached === true : false });
-        debug('RTC', 'config_loaded', { ice_server_count: rtcConfig.iceServers?.length || 0, source: config ? 'server' : 'fallback' });
+    if (rtcConfigRequest) return rtcConfigRequest;
+    if (Date.now() < rtcConfigNextRefresh) return Promise.resolve(rtcConfig);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 6500);
+    rtcConfigRequest = fetch('/api/rtc-config', { headers: { accept: 'application/json' }, cache: 'no-store', signal: controller.signal })
+      .then(res => { if (!res.ok) throw new Error('Relay configuration unavailable'); return res.json(); })
+      .then(json => {
+        const config = json?.ok && json.data;
+        if (!config || !Array.isArray(config.iceServers)) throw new Error('Invalid relay configuration');
+        const before = JSON.stringify(rtcConfig.iceServers);
+        rtcConfig = config;
+        rtcConfigFetchedAt = Date.now();
+        rtcConfigValidUntil = Date.now() + (Number(config.turnTtlSeconds) || 3600) * 1000;
+        rtcConfigNextRefresh = Date.now() + Math.max(30, Math.min(300, Number(config.refreshAfterSeconds) || 300)) * 1000;
+        for (const [uid, pc] of peers) {
+          if (pc.signalingState === 'closed') continue;
+          try {
+            pc.setConfiguration({ ...pc.getConfiguration(), iceServers: config.iceServers, iceTransportPolicy: config.iceTransportPolicy || 'all' });
+            // Updating credentials also renews an existing TURN allocation.
+            if (before !== JSON.stringify(config.iceServers) && config.turnStatus === 'ready' && room?.joined) {
+              restartPeerIce(uid, pc, 'relay_credentials_refreshed', { force: true });
+            }
+          } catch (error) { debug('RTC', 'configuration_update_failed', { error: error.message }, 'warn'); }
+        }
         return rtcConfig;
       })
-      .catch((error) => { debug('RTC', 'config_fetch_failed', { error: error.message }, 'warn'); return rtcConfig; });
+      .catch(error => {
+        rtcConfigNextRefresh = Date.now() + 30000;
+        if (Date.now() >= rtcConfigValidUntil) rtcConfig = { ...rtcConfig, iceServers: defaultRtcConfig.iceServers, turnStatus: 'unavailable' };
+        debug('RTC', 'config_fetch_failed', { error: error.message }, 'warn');
+        return rtcConfig;
+      }).finally(() => { clearTimeout(timeout); rtcConfigRequest = null; });
     return rtcConfigRequest;
+  };
+  const startRtcRefresh = () => {
+    if (!rtcRefreshTimer) rtcRefreshTimer = setInterval(() => { if (room?.joined) loadRtcConfig(); }, 15000);
   };
 
   const krispAssetPath = (value, fallback) =>
@@ -369,7 +396,8 @@
     textarea.style.height = `${Math.min(limit, Math.max(48, textarea.scrollHeight))}px`;
     textarea.style.overflowY = textarea.scrollHeight > limit ? 'auto' : 'hidden';
   };
-  document.addEventListener('input', (event) => resizeComposer(event.target), { passive: true });
+  // Elm stops propagation for onInput; capture is required for autosizing.
+  document.addEventListener('input', (event) => resizeComposer(event.target), { passive: true, capture: true });
   document.addEventListener('focusin', (event) => {
     resizeComposer(event.target);
     if (window.innerWidth <= 760 && event.target instanceof HTMLElement) {
@@ -715,9 +743,63 @@
     if (!callTimerId) callTimerId = setInterval(updateCallTimers, 1000);
   };
 
+  const inviteRoots = new WeakSet();
+  const mountInviteManagers = () => {
+    document.querySelectorAll('[data-invite-server]').forEach(root => {
+      if (inviteRoots.has(root)) return;
+      inviteRoots.add(root);
+      const sid = Number(root.dataset.inviteServer);
+      if (!Number.isSafeInteger(sid) || sid < 1) return;
+      const heading = document.createElement('h3'); heading.textContent = 'Manage links';
+      const list = document.createElement('div'); list.className = 'invite-link-list'; list.setAttribute('aria-live', 'polite');
+      root.append(heading, list);
+      const refresh = async () => {
+        list.textContent = 'Loading invite links…';
+        try {
+          const invites = await accountApi('GET', `/server/${sid}/invites`);
+          if (!root.isConnected) return;
+          if (!Array.isArray(invites)) throw new Error('Could not load invites');
+          list.textContent = '';
+          if (!invites.length) { list.textContent = 'No invite links yet.'; return; }
+          for (const invite of invites) {
+            const row = document.createElement('div'); row.className = 'invite-link-row';
+            const copy = document.createElement('div'); copy.className = 'invite-link-info';
+            const expired = invite.expires_at > 0 && invite.expires_at <= Date.now();
+            const used = invite.max_uses > 0 && invite.uses >= invite.max_uses;
+            const inactive = invite.revoked || expired || used;
+            const title = document.createElement('b'); title.textContent = invite.revoked ? 'Revoked link' : expired ? 'Expired link' : used ? 'Use limit reached' : 'Active invite';
+            const detail = document.createElement('small');
+            detail.textContent = `${invite.uses} / ${invite.max_uses || 'unlimited'} uses · ${invite.expires_at ? 'Expires ' + new Date(invite.expires_at).toLocaleString() : 'Never expires'}`;
+            copy.append(title, detail); row.append(copy);
+            if (!inactive) {
+              const copyButton = document.createElement('button'); copyButton.type = 'button'; copyButton.className = 'btn secondary'; copyButton.textContent = 'Copy'; copyButton.setAttribute('aria-label', 'Copy invite link');
+              copyButton.addEventListener('click', async () => {
+                try { await navigator.clipboard.writeText(`${location.origin}/#invite/${invite.code}`); copyButton.textContent = 'Copied'; }
+                catch (_) { copyButton.textContent = 'Copy failed'; }
+              });
+              const revoke = document.createElement('button'); revoke.type = 'button'; revoke.className = 'btn ghost danger-text'; revoke.textContent = 'Revoke';
+              revoke.addEventListener('click', async () => {
+                revoke.disabled = true;
+                try { await accountApi('DELETE', `/server/${sid}/invites/${encodeURIComponent(invite.code)}`); await refresh(); }
+                catch (_) { revoke.disabled = false; revoke.textContent = 'Retry revoke'; }
+              });
+              row.append(copyButton, revoke);
+            }
+            list.append(row);
+          }
+        } catch (_) {
+          if (!root.isConnected) return;
+          list.textContent = 'Could not load invite links. ';
+          const retry = document.createElement('button'); retry.className = 'btn secondary'; retry.type = 'button'; retry.textContent = 'Retry'; retry.addEventListener('click', refresh); list.append(retry);
+        }
+      };
+      refresh();
+    });
+  };
+
   let messageDomFrame = 0;
   const messageDomObserver = new MutationObserver((records) => {
-    const relevantSelector = '#messages, #message-history-sentinel, .pw-media-player, .pw-live-call-timer, .message-link, .msg-body';
+    const relevantSelector = '#compose, #messages, #message-history-sentinel, .pw-media-player, .pw-live-call-timer, .message-link, .msg-body, .invite-manager';
     const relevant = records.some((record) => [...record.addedNodes, ...record.removedNodes].some((node) =>
       node.nodeType === Node.ELEMENT_NODE && (node.matches?.(relevantSelector) || node.querySelector?.(relevantSelector))
     ));
@@ -730,6 +812,8 @@
       mountMediaPlayers();
       mountLinkEmbeds();
       updateCallTimers();
+      mountInviteManagers();
+      resizeComposer(document.getElementById('compose'));
     });
   });
   messageDomObserver.observe(document.body, { childList: true, subtree: true });
@@ -747,43 +831,76 @@
   };
 
   const soundNodes = new Set();
-  const playTone = ({ freq = 660, endFreq = freq, dur = 120, delay = 0, type = 'sine', vol = 0.1 } = {}) => {
+  let soundEpoch = 0;
+  let lastNotificationAt = -Infinity;
+  const stopSoundGroup = (group) => {
+    const ctx = audioCtx;
+    if (!ctx || !soundNodes.size) return;
+    for (const node of soundNodes) {
+      if (group && node.group !== group) continue;
+      const now = ctx.currentTime;
+      try {
+        if (node.gain.gain.cancelAndHoldAtTime) node.gain.gain.cancelAndHoldAtTime(now);
+        else { node.gain.gain.cancelScheduledValues(now); node.gain.gain.setValueAtTime(0.0001, now); }
+        node.gain.gain.linearRampToValueAtTime(0, now + 0.015);
+        node.osc.stop(now + 0.02);
+      } catch (_) {}
+    }
+  };
+  const playTone = ({ freq = 660, dur = 240, delay = 0, vol = 0.04, group = 'effect' } = {}) => {
     const ctx = audioContext();
-    if (!ctx || ctx.state === 'closed') return null;
+    if (!ctx || ctx.state !== 'running' || soundNodes.size >= 36) return null;
     const start = ctx.currentTime + Math.max(0, delay) / 1000;
-    const stop = start + Math.max(40, dur) / 1000;
+    const stop = start + Math.max(60, dur) / 1000;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
-    osc.type = type;
-    osc.frequency.setValueAtTime(freq, start);
-    osc.frequency.exponentialRampToValueAtTime(Math.max(40, endFreq), stop);
-    gain.gain.setValueAtTime(0.0001, start);
-    gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, vol), start + 0.018);
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(Math.max(80, Math.min(4000, freq)), start);
+    gain.gain.setValueAtTime(0, start);
+    gain.gain.linearRampToValueAtTime(Math.min(0.08, Math.max(0.0002, vol)), start + 0.009);
     gain.gain.exponentialRampToValueAtTime(0.0001, stop);
+    gain.gain.linearRampToValueAtTime(0, stop + 0.015);
     osc.connect(gain);
     gain.connect(ctx.destination);
-    soundNodes.add(osc);
+    const node = { osc, gain, group };
+    soundNodes.add(node);
     osc.onended = () => {
-      soundNodes.delete(osc);
+      soundNodes.delete(node);
       try { osc.disconnect(); gain.disconnect(); } catch (_) {}
     };
     osc.start(start);
-    osc.stop(stop + 0.01);
+    osc.stop(stop + 0.02);
     return osc;
   };
 
-  const playSound = (name) => {
-    if (name === 'notification') {
-      playTone({ freq: 659.25, endFreq: 698.46, dur: 105, vol: 0.055 });
-      playTone({ freq: 880, endFreq: 932.33, dur: 145, delay: 92, vol: 0.045 });
-    } else if (name === 'incoming') {
-      playTone({ freq: 523.25, endFreq: 554.37, dur: 230, vol: 0.05 });
-      playTone({ freq: 659.25, endFreq: 698.46, dur: 260, delay: 190, vol: 0.045 });
-      playTone({ freq: 783.99, endFreq: 830.61, dur: 330, delay: 390, vol: 0.04 });
-    } else if (name === 'outgoing') {
-      playTone({ freq: 440, endFreq: 466.16, dur: 180, vol: 0.035 });
-      playTone({ freq: 554.37, endFreq: 587.33, dur: 220, delay: 175, vol: 0.03 });
+  // Rounded, fixed-pitch bell tones. A quiet upper partial adds warmth without
+  // sharp waveforms, pitch sweeps, downloads, or a new AudioContext per alert.
+  const soundPatterns = {
+    notification: [[784, 0, 250, 0.035], [1046.5, 85, 330, 0.026]],
+    incoming: [[523.25, 0, 430, 0.038], [659.25, 160, 430, 0.033], [783.99, 320, 540, 0.028]],
+    outgoing: [[392, 0, 300, 0.025], [523.25, 240, 380, 0.022]]
+  };
+  const playSound = (name, { preview = false } = {}) => {
+    if (!soundPatterns[name] || (!preview && storage.getItem('plainwire_sound_enabled') === 'false')) return;
+    if (!preview && name === 'notification') {
+      if (performance.now() - lastNotificationAt < 700) return;
+      lastNotificationAt = performance.now();
     }
+    const epoch = soundEpoch;
+    const ctx = audioContext();
+    if (!ctx) return;
+    const play = () => {
+      if (epoch !== soundEpoch || ctx.state !== 'running') return;
+      if (!preview && storage.getItem('plainwire_sound_enabled') === 'false') return;
+      const group = preview ? 'preview' : name === 'notification' ? 'effect' : 'ringtone';
+      stopSoundGroup(group);
+      soundPatterns[name].forEach(([freq, delay, dur, vol]) => {
+        playTone({ freq, delay, dur, vol, group });
+        playTone({ freq: freq * 2, delay, dur: dur * 0.55, vol: vol * 0.12, group });
+      });
+    };
+    if (ctx.state === 'suspended') ctx.resume().then(play).catch(() => {});
+    else play();
   };
 
   const stopRingtones = () => {
@@ -791,16 +908,19 @@
     if (outgoingTimer) clearInterval(outgoingTimer);
     ringtoneTimer = null;
     outgoingTimer = null;
+    soundEpoch++;
+    stopSoundGroup('ringtone');
   };
 
   const startRingtone = (kind) => {
     stopRingtones();
+    if (storage.getItem('plainwire_sound_enabled') === 'false') return;
     if (kind === 'incoming') {
       playSound('incoming');
-      ringtoneTimer = setInterval(() => playSound('incoming'), 2600);
+      ringtoneTimer = setInterval(() => playSound('incoming'), 3800);
     } else {
       playSound('outgoing');
-      outgoingTimer = setInterval(() => playSound('outgoing'), 3000);
+      outgoingTimer = setInterval(() => playSound('outgoing'), 4200);
     }
   };
 
@@ -830,6 +950,9 @@
       if (json.ok && json.data && json.data.csrf) csrf = json.data.csrf;
       if (json.ok && json.data && json.data.user && json.data.user.id) meId = json.data.user.id;
       if (json.ok && json.data) updatePresenceWatch(json.data);
+      if (json.ok && method === 'POST' && /^\/server\/\d+\/invites$/.test(path) && typeof json.data?.url === 'string' && json.data.url.startsWith('#invite/')) {
+        json.data.url = new URL(json.data.url, location.origin + '/').href;
+      }
       send(app.ports.apiReceive, {
         path,
         method,
@@ -1183,8 +1306,22 @@
   };
 
   const stopStream = (stream) => stream?.getTracks?.().forEach((track) => track.stop());
-  const openRawMicrophone = (mode = voiceProcessingMode) =>
-    navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints(mode), video: false });
+  const openRawMicrophone = async (mode = voiceProcessingMode) => {
+    try {
+      return await navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints(mode), video: false });
+    } catch (error) {
+      if (!selectedInputId || !['NotFoundError', 'OverconstrainedError'].includes(error.name)) throw error;
+      // Device IDs can expire or refer to an unplugged headset. Keep permission
+      // failures explicit, but recover an unavailable saved device to the default.
+      const { deviceId, ...audio } = microphoneConstraints(mode);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio, video: false });
+      selectedInputId = '';
+      storage.setItem('plainwire_audio_input', '');
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Saved microphone unavailable. Using your system default.' });
+      publishAudioDevices();
+      return stream;
+    }
+  };
 
   const nativeMicrophoneLease = (stream, mode) => {
     let released = false;
@@ -1359,6 +1496,7 @@
         localStream = lease.stream;
         observeMicrophoneTracks(localStream);
         startVoiceDetection(localStream);
+        publishAudioDevices();
         return localStream;
       } catch (error) {
         debug('MEDIA', 'microphone_failed', { name: error.name, error: error.message, processing_mode: voiceProcessingMode }, error.message === 'microphone_request_cancelled' ? 'warn' : 'error');
@@ -1412,11 +1550,19 @@
       throw new Error('No microphone track');
     }
     track.enabled = !micMuted;
-    try {
-      await Promise.all(Array.from(peers.values()).map((pc) => pc._audioSender ? pc._audioSender.replaceTrack(track) : Promise.resolve()));
-    } catch (error) {
+    const senders = Array.from(peers.values()).filter((pc) => pc._audioSender && pc.signalingState !== 'closed')
+      .map((pc) => ({ pc, sender: pc._audioSender, previous: pc._audioSender.track }));
+    const results = await Promise.allSettled(senders.map(({ sender }) => sender.replaceTrack(track)));
+    const failed = results.find((result, i) => result.status === 'rejected' && senders[i].pc.signalingState !== 'closed');
+    if (failed || changeEpoch !== microphoneEpoch) {
+      // Wait for every swap before rolling back. Otherwise a slow successful swap
+      // can leave a peer transmitting a stopped replacement microphone.
+      await Promise.allSettled(senders.map(({ pc, sender, previous }) =>
+        pc.signalingState !== 'closed' && sender.track === track
+          ? sender.replaceTrack(changeEpoch === microphoneEpoch ? previous : localStream?.getAudioTracks()[0] || null)
+          : Promise.resolve()));
       await replacementLease.release();
-      throw error;
+      throw failed?.reason || new Error('microphone_request_cancelled');
     }
     localMicrophoneLease = replacementLease;
     localStream = replacementLease.stream;
@@ -1577,6 +1723,7 @@
     stopVoiceDetection();
     const ctx = audioContext();
     if (!ctx) return debug('VOICE', 'detector_unavailable', { reason: 'AudioContext unsupported' }, 'warn');
+    ctx.resume().catch(() => {});
     const analyser = ctx.createAnalyser();
     const source = ctx.createMediaStreamSource(stream);
     analyser.fftSize = 512;
@@ -1593,6 +1740,16 @@
       const rms = Math.sqrt(sum / samples.length);
       const db = rms > 0 ? 20 * Math.log10(rms) : -100;
       vad.lastDb = db;
+      // Update the small native meter without dispatching 25 Elm renders/second.
+      if (!vad.nextMeterAt || performance.now() >= vad.nextMeterAt) {
+        vad.nextMeterAt = performance.now() + 120;
+        const meter = document.querySelector('[data-call-mic-meter]');
+        const level = micMuted ? 0 : Math.round(Math.max(0, Math.min(100, (db + 60) * 100 / 54)));
+        if (meter && meter.getAttribute('aria-valuenow') !== String(level)) {
+          meter.setAttribute('aria-valuenow', String(level));
+          if (meter.firstElementChild) meter.firstElementChild.style.width = `${level}%`;
+        }
+      }
       if (!vad.speaking && db < vad.noiseDb + 8) vad.noiseDb = vad.noiseDb * 0.98 + db * 0.02;
       const active = !micMuted && db > Math.max(-50, vad.noiseDb + 12);
       vad.above = active ? vad.above + 1 : 0;
@@ -1646,6 +1803,7 @@
     const wrapper = document.createElement('div');
     wrapper.id = 'pw-float-' + id;
     wrapper.className = 'pw-float';
+    wrapper.style.display = 'flex';
     wrapper.style.zIndex = String(floatZIndex++);
     const compactAtCreation = isCompactFloatLayout();
     if (!compactAtCreation) {
@@ -1659,6 +1817,9 @@
       if (Number.isFinite(saved.h)) wrapper.style.height = Math.max(160, saved.h) + 'px';
       wrapper.style.left = saved.x + 'px';
       wrapper.style.top = saved.y + 'px';
+    } else if (!compactAtCreation && opts.top != null) {
+      wrapper.style.left = Math.max(16, Math.round((window.innerWidth - 560) / 2) - 100) + 'px';
+      wrapper.style.top = opts.top + 'px';
     } else if (!compactAtCreation && opts.right != null && opts.bottom != null) {
       wrapper.style.right = opts.right + 'px';
       wrapper.style.bottom = opts.bottom + 'px';
@@ -1830,6 +1991,7 @@
     // CSS resize gives the same resize-anywhere-at-the-corner interaction users
     // expect from desktop chat apps. ResizeObserver persists and clamps the size.
     let resizeObserved = false;
+    let resizeObserver = null;
     if ('ResizeObserver' in window) {
       const observer = new ResizeObserver(() => {
         if (wrapper.style.display === 'none' || isCompactFloatLayout()) return;
@@ -1842,6 +2004,7 @@
         saveFloatStates();
       });
       observer.observe(wrapper);
+      resizeObserver = observer;
       resizeObserved = true;
     }
     if (!resizeObserved) {
@@ -1881,7 +2044,8 @@
       }
     });
 
-    floatWindows.set(id, { wrapper, video, title, bar });
+    const dispose = () => { resizeObserver?.disconnect(); window.removeEventListener('resize', onViewportResize); };
+    floatWindows.set(id, { wrapper, video, title, bar, dispose });
     return { wrapper, video, bar, title };
   };
 
@@ -1892,15 +2056,15 @@
 
   // ---- Stage video for screenshare viewers ----
   const showStageVideo = (uid, stream) => {
-    const { wrapper, video } = ensureFloatWindow('stage-' + uid, 'Screen share', 'var(--accent,#5865f2)', {
-      right: 16, bottom: 80,
-      onClose: () => { wrapper.style.display = 'none'; video.srcObject = null; }
+    const { wrapper, video } = ensureFloatWindow('stage-' + uid, (document.querySelector(`[data-peer-id="${uid}"] .call-user-name`)?.textContent || 'Participant') + ' · Screen', 'var(--accent,#5865f2)', {
+      top: 80,
+      onClose: () => { watchedScreens.delete(uid); wrapper.style.display = 'none'; video.srcObject = null; }
     });
     if (stream) {
       video.srcObject = stream;
       video.play().catch(() => {});
     }
-    wrapper.style.display = '';
+    wrapper.style.display = 'flex';
   };
 
   const hideStageVideo = (uid) => {
@@ -1912,27 +2076,30 @@
     const w = floatWindows.get('stage-' + uid);
     if (w) {
       if (w.video.srcObject) { w.video.srcObject.getTracks().forEach((t) => t.stop()); w.video.srcObject = null; }
+      w.dispose?.();
       w.wrapper.remove();
       floatWindows.delete('stage-' + uid);
     }
     screenSharers.delete(uid);
+    watchedScreens.delete(uid);
   };
 
   // ---- Local screen share preview ----
   const showLocalScreenPreview = (stream) => {
     const { wrapper, video } = ensureFloatWindow('local-preview', 'Your screen', 'var(--ok,#23a55a)', {
-      right: 16, bottom: 80,
+      top: 80,
       onClose: () => { stopScreenShare(); }
     });
     video.srcObject = stream;
     video.play().catch(() => {});
-    wrapper.style.display = '';
+    wrapper.style.display = 'flex';
   };
 
   const removeLocalScreenPreview = () => {
     const w = floatWindows.get('local-preview');
     if (w) {
       if (w.video.srcObject) { w.video.srcObject.getTracks().forEach((t) => t.stop()); w.video.srcObject = null; }
+      w.dispose?.();
       w.wrapper.remove();
       floatWindows.delete('local-preview');
     }
@@ -1945,68 +2112,74 @@
     { maxBitrate: 750000, maxFramerate: 15, scaleResolutionDownBy: 2 },
   ];
 
-  const applyEncoderTier = (sender, participantCount) => {
-    if (!sender || !sender.track) return;
-    const tierIndex = Math.min(participantCount - 2, screenShareEncoderTiers.length - 1);
-    const tier = screenShareEncoderTiers[Math.max(0, tierIndex)];
-    sender.getParameters().then((params) => {
-      params.encodings = params.encodings || [{}];
-      params.encodings[0].maxBitrate = tier.maxBitrate;
-      params.encodings[0].maxFramerate = tier.maxFramerate;
-      params.encodings[0].scaleResolutionDownBy = tier.scaleResolutionDownBy;
-      sender.setParameters(params).catch(() => {});
-    }).catch(() => {});
+  const applyEncoderTier = async (sender, participantCount) => {
+    if (!sender?.track) return;
+    const tier = screenShareEncoderTiers[Math.max(0, Math.min(participantCount - 2, screenShareEncoderTiers.length - 1))];
+    try {
+      // getParameters is synchronous; treating it as a Promise used to abort
+      // screen sharing at the first participant.
+      const params = sender.getParameters();
+      if (!params.encodings?.length) return;
+      Object.assign(params.encodings[0], tier);
+      if (sender._qualityLimited) {
+        params.encodings[0].maxBitrate = Math.min(params.encodings[0].maxBitrate, 750000);
+        params.encodings[0].maxFramerate = Math.min(params.encodings[0].maxFramerate, 15);
+      }
+      await sender.setParameters(params);
+    } catch (error) {
+      debug('MEDIA', 'encoder_tier_skipped', { error: error.message }, 'warn');
+    }
   };
 
+  let screenCapturePending = false;
   const startScreenShare = async () => {
+    if (screenStream || screenCapturePending) return;
     if (!displayMediaSupported) {
-      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing is not supported on this browser. Use Chrome, Edge, Firefox, or Safari on desktop.' });
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing is unavailable in this browser.' });
       return;
     }
     if (!room) {
-      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Join a voice channel first.' });
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Join a call or voice channel to share your screen.' });
       return;
     }
+    const epoch = room.epoch;
+    screenCapturePending = true;
+    let captured;
     try {
-      screenStream = await navigator.mediaDevices.getDisplayMedia({
+      captured = await navigator.mediaDevices.getDisplayMedia({
         video: { frameRate: { ideal: 30, max: 30 } },
-        audio: true
+        audio: false
       });
-    } catch (e) {
-      debug('MEDIA', 'display_media_failed', { name: e.name, error: e.message }, 'warn');
-      // Safari may not support audio in getDisplayMedia; retry without
-      if (e.name !== 'AbortError') {
-        try {
-          screenStream = await navigator.mediaDevices.getDisplayMedia({
-            video: { frameRate: { ideal: 30, max: 30 } }
-          });
-        } catch (e2) {
-          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing was cancelled or is not available.' });
-          return;
-        }
-      } else {
-        return;
-      }
+    } catch (error) {
+      debug('MEDIA', 'display_media_failed', { name: error.name, error: error.message }, 'warn');
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing was cancelled or is unavailable.' });
+      return;
+    } finally {
+      screenCapturePending = false;
     }
-    const videoTrack = screenStream.getVideoTracks()[0];
-    if (videoTrack) {
-      videoTrack.contentHint = 'detail';
-      videoTrack.onended = () => stopScreenShare();
+    // The user can leave while the browser's screen chooser is open.
+    if (!room || room.epoch !== epoch) { stopStream(captured); return; }
+    const videoTrack = captured.getVideoTracks()[0];
+    if (!videoTrack) { stopStream(captured); return; }
+    screenStream = captured;
+    videoTrack.contentHint = 'detail';
+    videoTrack.onended = () => { if (screenStream === captured) stopScreenShare(); };
+    const targets = Array.from(peers.entries()).filter(([, pc]) => pc._videoSender && pc.signalingState !== 'closed');
+    const results = await Promise.allSettled(targets.map(async ([uid, pc]) => {
+      await pc._videoSender.replaceTrack(videoTrack);
+      await applyEncoderTier(pc._videoSender, peers.size + 1);
+      if (room?.epoch === epoch && screenStream === captured) screenSenders.set(uid, pc._videoSender);
+    }));
+    if (!room || room.epoch !== epoch || screenStream !== captured) { stopStream(captured); return; }
+    if (results.some((result, i) => result.status === 'rejected' && targets[i][1].signalingState !== 'closed')) {
+      stopScreenShare();
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not send your screen. Try sharing again.' });
+      return;
     }
-    // Set screen flag on server
     sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen: true } });
-    // Replace video track on all peer senders
-    peers.forEach((pc, peerUid) => {
-      if (pc._videoSender) {
-        pc._videoSender.replaceTrack(videoTrack).catch(() => {});
-        applyEncoderTier(pc._videoSender, peers.size + 1);
-        screenSenders.set(peerUid, pc._videoSender);
-      }
-    });
     send(app.ports.bridgeReceive, { tag: 'screen_share_started', user_id: meId });
-    send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing started' });
-    showLocalScreenPreview(screenStream);
-    debug('MEDIA', 'screen_share_started', { tracks: screenStream.getTracks().length });
+    showLocalScreenPreview(captured);
+    debug('MEDIA', 'screen_share_started', { tracks: captured.getTracks().length });
   };
 
   const stopScreenShare = () => {
@@ -2161,6 +2334,7 @@
   const cleanupAllFloatWindows = () => {
     floatWindows.forEach((w, id) => {
       if (w.video.srcObject) { w.video.srcObject.getTracks().forEach((t) => t.stop()); w.video.srcObject = null; }
+      w.dispose?.();
       w.wrapper.remove();
     });
     floatWindows.clear();
@@ -2189,6 +2363,9 @@
       else sendWs({ type: previous.joined ? 'call_leave' : 'call_cancel', conversation_id: previous.id });
     }
     roomEpoch++;
+    callHealth?.stop();
+    clearInterval(rtcRefreshTimer); rtcRefreshTimer = null;
+    watchedScreens.clear();
     peers.forEach((_, uid) => closePeer(uid));
     peerPromises.clear();
     signalQueues.clear();
@@ -2202,6 +2379,10 @@
     room = null;
     resumeInFlight = false;
     releaseCurrentMicrophone();
+    // Elm clears these on exit too. Resume stores its own intent before cleanup.
+    micMuted = false;
+    deafened = false;
+    stopRingtones();
   };
 
   const switchRtcRoom = (kind, id) => {
@@ -2289,6 +2470,8 @@
       pc._restartTimer = null;
       if (!room || pc._roomEpoch !== room.epoch || pc.signalingState === 'closed' || (pc.connectionState === 'connected' && !force)) return;
       try {
+        await loadRtcConfig();
+        if (!room || pc._roomEpoch !== room.epoch || pc.signalingState === 'closed') return;
         if (!pc._offerer) {
           // answerer asks; offerer restarts.
           sendSignal(uid, { kind: 'renegotiate' });
@@ -2329,6 +2512,33 @@
     }
   };
 
+  const bindPeerMedia = async (pc, stream) => {
+    const active = pc.getTransceivers().filter((t) => !t.stopped);
+    const audio = active.find((t) => t.receiver.track.kind === 'audio');
+    const video = active.find((t) => t.receiver.track.kind === 'video');
+    const track = stream?.getAudioTracks().find((t) => t.readyState === 'live');
+    if (!audio || !track) throw new Error('No negotiated microphone channel');
+    track.enabled = !micMuted;
+    audio.direction = 'sendrecv';
+    await audio.sender.replaceTrack(track);
+    audio.sender.setStreams?.(stream);
+    pc._audioSender = audio.sender;
+    try {
+      const codecs = RTCRtpReceiver.getCapabilities?.('audio')?.codecs || [];
+      const opus = codecs.filter((codec) => /audio\/opus/i.test(codec.mimeType || ''));
+      const rest = codecs.filter((codec) => !/audio\/opus/i.test(codec.mimeType || ''));
+      if (opus.length) audio.setCodecPreferences?.([...opus, ...rest]);
+    } catch (error) {
+      debug('RTC', 'codec_preference_skipped', { error: error.message }, 'warn');
+    }
+    if (video) {
+      video.direction = 'sendrecv';
+      await video.sender.replaceTrack(screenStream?.getVideoTracks()[0] || stream.getVideoTracks()[0] || null);
+      pc._videoSender = video.sender;
+      if (screenStream) await applyEncoderTier(video.sender, peers.size + 1);
+    }
+  };
+
   const createPeer = async (uid, epoch) => {
     await loadRtcConfig();
     if (!room || room.epoch !== epoch) return null;
@@ -2359,26 +2569,13 @@
     pc._failureReported = false;
     pc._mediaConnected = false;
     pc._remoteAudioSeen = false;
-    // fixed transceivers make screen sharing a track swap, not a glare party.
-    const audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
-    const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
-    try {
-      const audioCaps = RTCRtpReceiver.getCapabilities?.('audio');
-      const codecs = audioCaps?.codecs || [];
-      const opus = codecs.filter((codec) => /audio\/opus/i.test(codec.mimeType || ''));
-      const rest = codecs.filter((codec) => !/audio\/opus/i.test(codec.mimeType || ''));
-      if (opus.length && typeof audioTransceiver.setCodecPreferences === 'function') {
-        audioTransceiver.setCodecPreferences([...opus, ...rest]);
-      }
-    } catch (error) {
-      debug('RTC', 'codec_preference_skipped', { peer_user_id: uid, error: error.message }, 'warn');
+    // Only the offerer creates m-lines. An answerer must bind its microphone to
+    // the offered transceiver; pre-created addTransceiver senders stay unassociated.
+    if (offerer) {
+      pc.addTransceiver('audio', { direction: 'sendrecv' });
+      pc.addTransceiver('video', { direction: 'sendrecv' });
+      await bindPeerMedia(pc, stream);
     }
-    const audioTrack = stream.getAudioTracks()[0];
-    const videoTrack = stream.getVideoTracks()[0];
-    if (audioTrack) await audioTransceiver.sender.replaceTrack(audioTrack);
-    if (videoTrack) await videoTransceiver.sender.replaceTrack(videoTrack);
-    pc._audioSender = audioTransceiver.sender;
-    pc._videoSender = videoTransceiver.sender;
     pc.onnegotiationneeded = () => {
       if (!pc._offerer) return;
       makeOffer(uid, pc).catch((error) => {
@@ -2444,9 +2641,9 @@
       } else if (ev.track.kind === 'video') {
         // Store stream for later  -  stage video only shown for screen sharers
         if (!pc._videoStreams) pc._videoStreams = new Map();
-        const stream = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
+        const stream = new MediaStream([ev.track]);
         pc._videoStreams.set(ev.track.id, stream);
-        if (screenSharers.has(uid)) {
+        if (screenSharers.has(uid) && watchedScreens.has(uid)) {
           showStageVideo(uid, stream);
         }
       }
@@ -2627,6 +2824,8 @@
         pc._failureReported = false;
         reportPeerFailure(uid, pc, false);
         debug('RTC', 'remote_offer_applied', { peer_user_id: uid });
+        await bindPeerMedia(pc, await ensureMedia());
+        if (!room || room.epoch !== pc._roomEpoch || pc.signalingState === 'closed') return;
         await drainPendingCandidates(uid, pc);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
@@ -2677,6 +2876,8 @@
       return;
     }
     room.joined = true;
+    callHealth?.start();
+    startRtcRefresh();
     resumeInFlight = false;
     persistRtcIntent();
     const epoch = room.epoch;
@@ -2689,7 +2890,7 @@
     ids.forEach((uid) => {
       const shouldOffer = meId > uid;
       ensurePeer(uid).then((pc) => {
-        if (shouldOffer) callPeer(uid);
+        if (shouldOffer && pc && !pc._negotiated) callPeer(uid).catch(() => {});
         // roster wins; remind Elm what RTC already decided.
         pc?._publishConnectionState?.(true);
       }).catch(() => {});
@@ -2703,12 +2904,12 @@
       if (uid && uid !== meId && user.screen) next.add(uid);
     });
     next.forEach((uid) => {
-      if (screenSharers.has(uid)) return;
+      if (screenSharers.has(uid) || !watchedScreens.has(uid)) return;
       const streams = peers.get(uid)?._videoStreams;
       const stream = streams && Array.from(streams.values()).pop();
       if (stream) showStageVideo(uid, stream);
     });
-    screenSharers.forEach((uid) => { if (!next.has(uid)) hideStageVideo(uid); });
+    screenSharers.forEach((uid) => { if (!next.has(uid)) { hideStageVideo(uid); watchedScreens.delete(uid); } });
     screenSharers.clear();
     next.forEach((uid) => screenSharers.add(uid));
   };
@@ -2726,6 +2927,13 @@
   };
 
   const handleRtcEvent = (msg) => {
+    if (msg.type === 'call_quality_result') { callHealth?.receive(msg); return; }
+    if (msg.type === 'realtime_resync') {
+      api({ method: 'GET', path: '/sync?since=0' });
+      const route = location.hash.match(/^#(dm|channel)\/(\d+)$/);
+      if (route) api({ method: 'GET', path: `/messages?scope=${route[1] === 'dm' ? 'direct' : 'channel'}&scope_id=${route[2]}` });
+      return;
+    }
     if (/^(voice|call)_/.test(msg.type || '')) debug('RTC', 'server_event', { message: msg });
     if (['voice_state', 'call_state', 'voice_peer_joined', 'call_peer_joined', 'call_ringing', 'call_incoming'].includes(msg.type)) markActive();
     if (msg.type === 'voice_state') {
@@ -2971,8 +3179,18 @@
       new Notification(title, { body });
     }
   });
-  recv(app.ports.copyText, (text) => {
-    if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || event.isComposing) return;
+    const close = document.querySelector('.modal .modal-head > button');
+    if (close) { event.preventDefault(); close.click(); }
+  }, true);
+  recv(app.ports.copyText, async (text) => {
+    try {
+      await navigator.clipboard.writeText(text.startsWith('#invite/') ? new URL(text, location.origin + '/').href : text);
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Copied to clipboard' });
+    } catch (_) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not copy. Select the text and copy it manually.' });
+    }
   });
   recv(app.ports.localStorageGet, ({ key }) => {
     send(app.ports.bridgeReceive, { tag: 'local_storage', key, data: storage.getItem(key) });
@@ -3264,7 +3482,7 @@
       } catch (_) {}
       list.append(
         valueRow('ICE servers', String(iceCount), iceCount > 0 ? 'good' : 'warn'),
-        valueRow('TURN relay', turnReady ? 'Configured' : 'Not detected', turnReady ? 'good' : 'warn')
+        valueRow('TURN relay', turnReady ? 'Ready' : ({ over_limit: 'Usage limit reached', usage_unavailable: 'Usage check unavailable', unavailable: 'Temporarily unavailable' }[rtcConfig.turnStatus] || 'Not configured'), turnReady ? 'good' : 'warn')
       );
 
       reportText = [
@@ -3531,6 +3749,7 @@
         break;
       case 'set_sound_preference':
         storage.setItem('plainwire_sound_enabled', data ? 'true' : 'false');
+        if (!data) { stopRingtones(); stopSoundGroup(); }
         if (!data) stopRingtones();
         break;
       case 'ui_density':
@@ -3619,8 +3838,7 @@
         }
         break;
       case 'preview_sound':
-        stopRingtones();
-        playSound(data === 'incoming' ? 'incoming' : 'notification');
+        playSound(data, { preview: true });
         break;
       case 'list_audio_devices':
         publishAudioDevices();
@@ -3650,6 +3868,16 @@
       case 'presence_update':
         setDesiredStatus(String(data));
         break;
+      case 'watch_screen': {
+        const uid = Number(data);
+        if (uid === meId && screenStream) { showLocalScreenPreview(screenStream); break; }
+        if (!room?.joined || !screenSharers.has(uid)) break;
+        watchedScreens.add(uid);
+        const streams = peers.get(uid)?._videoStreams;
+        const stream = streams && Array.from(streams.values()).pop();
+        showStageVideo(uid, stream);
+        break;
+      }
       case 'start_screen_share':
         startScreenShare();
         break;
@@ -3724,4 +3952,15 @@
   });
   enableDrag();
   document.addEventListener('click', () => audioContext()?.resume?.(), { once: true });
+  callHealth = window.PlainwireCallHealth?.create({
+    getPeers: () => peers, getRoom: () => room, send: sendWs,
+    analysisEnabled: rawClientConfig.media_quality_enabled !== false,
+    adaptiveScreen: rawClientConfig.adaptive_screen === true,
+    getLabel: (uid) => document.querySelector(`.call-user-row[data-peer-id="${uid}"] .call-user-name`)?.textContent || 'Participant',
+    adapt: (pc, limited) => {
+      if (!pc._videoSender) return;
+      pc._videoSender._qualityLimited = limited;
+      if (screenStream) applyEncoderTier(pc._videoSender, peers.size + 1);
+    }
+  });
 })();

@@ -4215,12 +4215,12 @@ body {
 
 .btn:active { transform: none; }
 
-.btn:not(.secondary):not(.ghost):not(.danger):not(.call-decline):not(.call-accept) {
+.btn:not(.secondary):not(.ghost):not(.danger):not(.call-decline):not(.call-accept):not(.icon-btn):not(.chat-call-action) {
   background: var(--accent);
   box-shadow: none;
 }
 
-.btn:not(.secondary):not(.ghost):not(.danger):not(.call-decline):not(.call-accept):hover {
+.btn:not(.secondary):not(.ghost):not(.danger):not(.call-decline):not(.call-accept):not(.icon-btn):not(.chat-call-action):hover {
   background: var(--accent2);
 }
 

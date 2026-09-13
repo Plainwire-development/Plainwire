@@ -12,8 +12,8 @@
     idle_timeout_ms: 10 * 60 * 1000,
     compress_oversize_uploads: true,
     max_image_dimension: 4096,
-    version: '1.6.0',
-    asset_version: '1.6.0'
+    version: '1.7.0',
+    asset_version: '1.7.0'
   };
 
   const normalize = (raw) => {
@@ -40,7 +40,7 @@
   };
 
   const assetUrl = (path, config) => {
-    const version = encodeURIComponent(String(config.asset_version || config.version || '1.6.0'));
+    const version = encodeURIComponent(String(config.asset_version || config.version || '1.7.0'));
     return `${path}?v=${version}`;
   };
 
@@ -80,6 +80,9 @@
     try {
       await loadStyles(config);
       await loadScript(assetUrl('/assets/app.js', config));
+      // Optional diagnostics must never prevent the chat client from starting.
+      await Promise.all(['/assets/call-health.js', '/assets/markdown.js'].map(path =>
+        Promise.race([loadScript(assetUrl(path, config)).catch(() => {}), new Promise(resolve => setTimeout(resolve, 2500))])));
       await loadScript(assetUrl('/assets/elm-bridge.js', config));
     } catch (error) {
       const root = document.getElementById('app');

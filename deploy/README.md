@@ -14,7 +14,7 @@ rebar3 eunit
 rebar3 release
 ```
 
-Copy `_build/default/rel/plainwire_relay` to a versioned directory such as `/opt/plainwire/releases/1.6.0`. Make `/opt/plainwire/current` a symlink to that directory. Create a dedicated `plainwire` service account with no login shell. The release should be readable and executable by that account, but owned by the administrator.
+Copy `_build/default/rel/plainwire_relay` to a versioned directory such as `/opt/plainwire/releases/1.7.0`. Make `/opt/plainwire/current` a symlink to that directory. Create a dedicated `plainwire` service account with no login shell. The release should be readable and executable by that account, but owned by the administrator.
 
 Copy `.env.example` to `/etc/plainwire/plainwire.env`, replace the example values, and restrict the file to root. Set the public URL, database credentials, encryption key, and TURN credentials. Keep this environment file, the database, and uploads when upgrading. Losing or changing the encryption key makes previously encrypted messages unreadable.
 
@@ -50,3 +50,11 @@ Browser regression tests use deterministic API fixtures. They verify frontend be
 Back up PostgreSQL, the upload directory, and the environment file before upgrading. Build the new release in a separate directory, stop the service, point `current` at the new release, and start it. Keep the previous release until the health check and account smoke tests pass. If startup fails, stop the service before restoring the previous symlink. Review database migration compatibility before rolling back code; a symlink change does not roll back the database.
 
 Keep backups off the server and periodically restore one into a separate environment. Do not use a copy of the live PostgreSQL data directory as your only backup.
+
+## 1.7.0 optional features
+
+Cloudflare TURN setup is in [CLOUDFLARE_TURN.md](../docs/CLOUDFLARE_TURN.md). Its tokens belong in the existing private environment file. The credentials are distinct from a Cloudflare Tunnel token. The usage guard is not a billing cap.
+
+[Call health](../docs/CALL_HEALTH.md) works with browser measurements alone. Build the optional native helper before `rebar3 release` to enable Fortran analysis. [Partisan routing](../docs/CLUSTERING.md) requires the separate cluster build profile and one fixed WebSocket owner. Do not distribute `/ws` between API nodes. It needs a staging test on OTP 27+ before use.
+
+Migration 17 adds an empty `welcome_message` column. Existing invites keep their current expiration; newly created invites default to 24 hours. Back up before upgrading and verify creation, joining and revocation against PostgreSQL.

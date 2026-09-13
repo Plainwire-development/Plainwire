@@ -6,12 +6,14 @@ start_link() -> supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
     Children = [
+        #{id => pw_cf_turn, start => {pw_cf_turn, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_cf_turn]},
+        #{id => pw_cluster, start => {pw_cluster, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_cluster]},
+        #{id => pw_media_quality, start => {pw_media_quality, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_media_quality]},
         #{id => pw_rate, start => {pw_rate, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_rate]},
         #{id => pw_hub, start => {pw_hub, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_hub]},
         #{id => pw_media, start => {pw_media, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_media]},
         #{id => pw_db, start => {pw_db, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_db]},
         #{id => pw_upload_gc, start => {pw_upload_gc, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_upload_gc]},
-        #{id => pw_cf_turn, start => {pw_cf_turn, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_cf_turn]},
         %% listener goes last; DB and hub should exist before traffic does.
         http_listener_spec()
     ],

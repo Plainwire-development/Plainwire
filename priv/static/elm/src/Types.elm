@@ -216,6 +216,7 @@ type alias Server =
     , iconUrl : String
     , bannerUrl : String
     , accentColor : String
+    , welcomeMessage : String
     , ownerId : Int
     , role : String
     , memberCount : Int
@@ -297,6 +298,7 @@ type alias CallUser =
     , connected : Bool
     , connectionFailed : Bool
     , reconnecting : Bool
+    , screen : Bool
     }
 
 
@@ -385,7 +387,6 @@ type alias Drafts =
 
 type alias Model =
     { appName : String
-    , turnLimitReached : Bool
     , registrationEnabled : Bool
     , instanceDescription : String
     , clientVersion : String
@@ -438,6 +439,7 @@ type alias Model =
     , replyTo : Maybe ReplyPreview
     , toast : Maybe String
     , modal : Maybe String
+    , settingsSearch : String
     , settingsTab : String
     , inputText : String
     , sidebarOpen : Bool
@@ -468,6 +470,7 @@ type alias Model =
     , modalBody : String
     , modalUserIds : String
     , modalBannerUrl : String
+    , modalWelcome : String
     , modalAccentColor : String
     , friendsTab : String
     , friendQuery : String
@@ -599,7 +602,6 @@ type Msg
     | ToggleSound
     | SetSoundPreference Bool
     | SetChatEnterSends Bool
-    | SetTurnLimitReached Bool
     | SetLinkPreviewsEnabled Bool
     | SetAnimatedMediaEnabled Bool
     | SetCompactMessages Bool
@@ -616,6 +618,7 @@ type Msg
     | RtcResuming String Int Bool Bool
     | FileUpload String (Maybe String)
     | ReadFile String
+    | SettingsSearch String
     | SetSettingsTab String
     | SetFriendsTab String
     | FriendQuery String
@@ -798,6 +801,7 @@ decodeServer =
         |> andMap (D.field "icon_url" D.string |> defaultValue "")
         |> andMap (D.field "banner_url" D.string |> defaultValue "")
         |> andMap (D.field "accent_color" D.string |> defaultValue "#5865f2")
+        |> andMap (D.field "welcome_message" D.string |> defaultValue "")
         |> andMap (D.field "owner_id" D.int)
         |> andMap (D.field "role" D.string |> defaultValue "member")
         |> andMap (D.field "member_count" D.int |> defaultValue 1)
@@ -885,15 +889,16 @@ defaultMsg =
 
 decodeCallUser : D.Decoder CallUser
 decodeCallUser =
-    D.map8 CallUser
-        (D.field "user_id" D.int)
-        (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "Unknown" ])
-        (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
-        (D.field "muted" D.bool |> defaultValue False)
-        (D.field "deafened" D.bool |> defaultValue False)
-        (D.field "connected" D.bool |> defaultValue False)
-        (D.succeed False)
-        (D.field "reconnecting" D.bool |> defaultValue False)
+    D.succeed CallUser
+        |> andMap (D.field "user_id" D.int)
+        |> andMap (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "Unknown" ])
+        |> andMap (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
+        |> andMap (D.field "muted" D.bool |> defaultValue False)
+        |> andMap (D.field "deafened" D.bool |> defaultValue False)
+        |> andMap (D.field "connected" D.bool |> defaultValue False)
+        |> andMap (D.succeed False)
+        |> andMap (D.field "reconnecting" D.bool |> defaultValue False)
+        |> andMap (D.field "screen" D.bool |> defaultValue False)
 
 
 encodeMessage : { body : String, replyToId : Maybe Int } -> E.Value

@@ -1,213 +1,207 @@
-%% Cloudflare Realtime TURN integration.
-%%
-%% Two independent Cloudflare API calls live here:
-%%   1. Minting short-lived TURN credentials (rtc.live.cloudflare.com) —
-%%      one credential is shared across all users for its TTL window rather
-%%      than minted per-request, since it's just as valid for anyone during
-%%      that window and Cloudflare bills on relayed bytes, not credential count.
-%%   2. Polling this month's actual relayed-egress usage (the GraphQL
-%%      Analytics API) so the app can stop offering TURN once a configured
-%%      byte budget is reached, instead of quietly running past whatever
-%%      free/paid cap the account has.
-%%
-%% Both calls are best-effort: on any failure this falls back to omitting
-%% the TURN server (STUN-only), never to crashing a live request.
+%% Cloudflare credentials stay server-side. Only short-lived, per-user ICE
+%% credentials leave this process. External HTTP never runs in a call handler.
 -module(pw_cf_turn).
 -behaviour(gen_server).
--export([start_link/0, ice_entry/0, configured/0]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+-export([start_link/0, configured/0, validate/0, ice_entry/1, parse_credentials/1,
+         parse_usage/1, budget_state/3]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-ifdef(TEST).
+-export([start_link/1]).
+start_link(Fetch) -> gen_server:start_link({local, ?MODULE}, ?MODULE, Fetch, []).
+-endif.
 
--define(CREDENTIALS_URL_PREFIX, "https://rtc.live.cloudflare.com/v1/turn/keys/").
--define(CREDENTIALS_URL_SUFFIX, "/credentials/generate-ice-servers").
--define(GRAPHQL_URL, "https://api.cloudflare.com/client/v4/graphql").
-%% mint a fresh credential a bit before it actually expires, not at the wire.
--define(CRED_EXPIRY_BUFFER_SECONDS, 300).
--define(DEFAULT_MONTHLY_LIMIT_BYTES, 950000000000). %% ~950 decimal GB: a safety
-                                                     %% margin under Cloudflare's
-                                                     %% published 1000 GB free tier.
--define(DEFAULT_CHECK_INTERVAL_MS, 300000). %% 5 minutes; usage isn't billed
-                                             %% in real time, so there is no
-                                             %% point polling much faster.
-
-start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
-
-%% true once a TURN key id + its API token are both set. Cloudflare mode
-%% takes priority over the legacy coturn-secret/static-credential modes in
-%% pw_rtc_config when this is true.
-configured() ->
-    key_id() =/= <<>> andalso turn_token() =/= <<>>.
-
-%% {ok, IceServerMap} | {error, over_limit} | {error, not_configured} | {error, term()}
-ice_entry() ->
+start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, fun fetch/1, []).
+env(K) -> pw_util:env_str(K, <<>>).
+configured() -> env("PLAINWIRE_CF_TURN_KEY_ID") =/= <<>> andalso env("PLAINWIRE_CF_TURN_API_TOKEN") =/= <<>>.
+validate() ->
+    Key = env("PLAINWIRE_CF_TURN_KEY_ID"), Token = env("PLAINWIRE_CF_TURN_API_TOKEN"),
+    Account = env("PLAINWIRE_CF_ACCOUNT_ID"),
+    case {Key, Token} of
+        {<<>>, <<>>} -> ok;
+        _ ->
+            case identifier(Key) andalso byte_size(Token) >= 20 andalso byte_size(Token) =< 4096
+                 andalso (Account =:= <<>> orelse identifier(Account))
+                 andalso binary:match(Token, [<<"\r">>, <<"\n">>]) =:= nomatch of
+                true -> ok;
+                false -> {error, invalid_cloudflare_turn_config}
+            end
+    end.
+identifier(B) -> is_binary(B) andalso byte_size(B) >= 8 andalso byte_size(B) =< 128
+    andalso re:run(B, <<"^[A-Za-z0-9_-]+$">>, [{capture, none}]) =:= match.
+ttl() -> max(600, min(86400, pw_util:env_int("PLAINWIRE_TURN_TTL_SECONDS", 3600))).
+ice_entry(Uid) when is_integer(Uid), Uid > 0 ->
     case configured() of
         false -> {error, not_configured};
-        true -> gen_server:call(?MODULE, ice_entry, 20000)
-    end.
-
-init([]) ->
-    case configured() andalso account_id() =:= <<>> of
-        true -> logger:warning("[plainwire:cf_turn] PLAINWIRE_CF_TURN_KEY_ID is set but "
-                                "PLAINWIRE_CF_ACCOUNT_ID is not — usage limit checking is disabled "
-                                "and TURN will run unmetered against your Cloudflare account.");
-        false -> ok
-    end,
-    self() ! check_usage,
-    {ok, #{cred => undefined, cred_expires_at => 0, over_limit => false}}.
-
-handle_call(ice_entry, _From, #{over_limit := true} = State) ->
-    {reply, {error, over_limit}, State};
-handle_call(ice_entry, _From, State) ->
-    Now = erlang:system_time(second),
-    case State of
-        #{cred := Entry, cred_expires_at := ExpiresAt} when Entry =/= undefined, ExpiresAt > Now ->
-            {reply, {ok, Entry}, State};
-        _ ->
-            case fetch_credential() of
-                {ok, Entry, ExpiresAt} ->
-                    {reply, {ok, Entry}, State#{cred => Entry, cred_expires_at => ExpiresAt}};
-                {error, Reason} ->
-                    logger:warning("[plainwire:cf_turn] credential_fetch_failed reason=~p", [Reason]),
-                    {reply, {error, Reason}, State}
-            end
+        true -> try gen_server:call(?MODULE, {ice, Uid}, 6000) catch exit:_ -> {error, unavailable} end
     end;
-handle_call(_Msg, _From, State) ->
-    {reply, {error, unknown_call}, State}.
+ice_entry(_) -> {error, unauthorized}.
 
-handle_cast(_Msg, State) -> {noreply, State}.
-
-handle_info(check_usage, State) ->
-    NewState = case account_id() of
-        <<>> -> State#{over_limit => false};
-        _ ->
-            case fetch_usage_bytes() of
-                {ok, Bytes} ->
-                    Limit = limit_bytes(),
-                    OverLimit = Bytes >= Limit,
-                    WasOverLimit = maps:get(over_limit, State, false),
-                    case OverLimit of
-                        WasOverLimit -> ok;
-                        _ -> logger:notice("[plainwire:cf_turn] turn_limit_state_changed over_limit=~p "
-                                           "usage_bytes=~p limit_bytes=~p", [OverLimit, Bytes, Limit])
-                    end,
-                    State#{over_limit => OverLimit};
-                {error, Reason} ->
-                    logger:warning("[plainwire:cf_turn] usage_check_failed reason=~p", [Reason]),
-                    State
-            end
-    end,
-    erlang:send_after(check_interval_ms(), self(), check_usage),
-    {noreply, NewState};
-handle_info(_Msg, State) -> {noreply, State}.
-
-%% --- config ---
-
-key_id() -> pw_util:env_str("PLAINWIRE_CF_TURN_KEY_ID", <<>>).
-turn_token() -> pw_util:env_str("PLAINWIRE_CF_TURN_API_TOKEN", <<>>).
-account_id() -> pw_util:env_str("PLAINWIRE_CF_ACCOUNT_ID", <<>>).
-
-%% the analytics query can reuse the TURN token if it also carries the
-%% "Account Analytics" permission, or use a separate token if you'd rather
-%% keep the two scoped apart.
-analytics_token() ->
-    case pw_util:env_str("PLAINWIRE_CF_ANALYTICS_API_TOKEN", <<>>) of
-        <<>> -> turn_token();
-        T -> T
-    end.
-
-limit_bytes() -> pw_util:env_int("PLAINWIRE_TURN_MONTHLY_LIMIT_BYTES", ?DEFAULT_MONTHLY_LIMIT_BYTES).
-
-check_interval_ms() -> erlang:max(60000, pw_util:env_int("PLAINWIRE_CF_USAGE_CHECK_INTERVAL_MS", ?DEFAULT_CHECK_INTERVAL_MS)).
-
-cred_ttl_seconds() ->
-    N = pw_util:env_int("PLAINWIRE_TURN_TTL_SECONDS", 3600),
-    erlang:min(86400, erlang:max(300, N)).
-
-%% --- Cloudflare: mint TURN credentials ---
-
-fetch_credential() ->
-    Url = iolist_to_binary([?CREDENTIALS_URL_PREFIX, key_id(), ?CREDENTIALS_URL_SUFFIX]),
-    Body = jsx:encode(#{ttl => cred_ttl_seconds()}),
-    case http_post_json(Url, turn_token(), Body) of
-        {ok, 201, RespBody} -> parse_credential_response(RespBody);
-        {ok, Code, RespBody} -> {error, {http_error, Code, safe_snippet(RespBody)}};
-        {error, Reason} -> {error, Reason}
-    end.
-
-parse_credential_response(RespBody) ->
-    try jsx:decode(RespBody, [return_maps]) of
-        #{<<"iceServers">> := Servers} when is_list(Servers) ->
-            %% the STUN entry in that list has no username; the TURN entry does.
-            case lists:filter(fun(S) -> is_map(S) andalso maps:is_key(<<"username">>, S) end, Servers) of
-                [Entry | _] ->
-                    Urls = maps:get(<<"urls">>, Entry, []),
-                    Username = maps:get(<<"username">>, Entry, <<>>),
-                    Credential = maps:get(<<"credential">>, Entry, <<>>),
-                    ExpiresAt = erlang:system_time(second) + cred_ttl_seconds() - ?CRED_EXPIRY_BUFFER_SECONDS,
-                    {ok, #{urls => Urls, username => Username, credential => Credential,
-                           credentialType => <<"password">>}, ExpiresAt};
-                [] -> {error, no_turn_entry_in_response}
+init(Fetch) ->
+    self() ! usage,
+    erlang:send_after(60000, self(), sweep),
+    {ok, #{fetch => Fetch, cache => #{}, jobs => #{}, budget => unknown,
+           retry_at => erlang:monotonic_time(second) - 1}}.
+handle_call({ice, Uid}, From, S) ->
+    Now = erlang:monotonic_time(second),
+    case budget_state(maps:get(budget, S), Now, env("PLAINWIRE_CF_ACCOUNT_ID") =/= <<>>) of
+        ok ->
+            case maps:get(Uid, maps:get(cache, S), undefined) of
+                {Entry, Until} when Until > Now + 60 ->
+                    S1 = case Until < Now + 300 of true -> launch(Uid, [], S); false -> S end,
+                    {reply, {ok, Entry, Until - Now}, S1};
+                _ ->
+                    case maps:get(Uid, maps:get(jobs, S), undefined) of
+                        #{waiters := W} = J when length(W) < 8 ->
+                            {noreply, S#{jobs => maps:put(Uid, J#{waiters => [From | W]}, maps:get(jobs, S))}};
+                        undefined ->
+                            S1 = launch(Uid, [From], S),
+                            case maps:is_key(Uid, maps:get(jobs, S1)) of
+                                true -> {noreply, S1};
+                                false -> {reply, {error, unavailable}, S1}
+                            end;
+                        _ -> {reply, {error, busy}, S}
+                    end
             end;
-        _ -> {error, unexpected_response}
-    catch _:_ -> {error, invalid_json}
+        Reason -> {reply, {error, Reason}, S}
+    end;
+handle_call(_, _, S) -> {reply, {error, unsupported}, S}.
+handle_cast(_, S) -> {noreply, S}.
+handle_info(usage, S) ->
+    Interval = max(60000, min(900000, pw_util:env_int("PLAINWIRE_CF_USAGE_CHECK_INTERVAL_MS", 300000))),
+    erlang:send_after(Interval, self(), usage),
+    S1 = case configured() andalso env("PLAINWIRE_CF_ACCOUNT_ID") =/= <<>> of
+        true -> launch(usage, [], S);
+        false -> S
+    end,
+    {noreply, S1};
+handle_info(sweep, S) ->
+    Now = erlang:monotonic_time(second),
+    erlang:send_after(60000, self(), sweep),
+    {noreply, S#{cache => maps:filter(fun(_, {_, Until}) -> Until > Now end, maps:get(cache, S))}};
+handle_info({result, Key, Pid, Result}, S) ->
+    case maps:get(Key, maps:get(jobs, S), undefined) of
+        #{pid := Pid} = J -> {noreply, finish(Key, J, Result, S)};
+        _ -> {noreply, S}
+    end;
+handle_info({job_timeout, Key, Pid}, S) ->
+    case maps:get(Key, maps:get(jobs, S), undefined) of
+        #{pid := Pid} = J -> exit(Pid, kill), {noreply, finish(Key, J, {error, timeout}, S)};
+        _ -> {noreply, S}
+    end;
+handle_info({'DOWN', Ref, process, _, _}, S) ->
+    case [{K, J} || {K, #{ref := R} = J} <- maps:to_list(maps:get(jobs, S)), R =:= Ref] of
+        [{K, J}] -> {noreply, finish(K, J, {error, worker_failed}, S)};
+        _ -> {noreply, S}
+    end;
+handle_info(_, S) -> {noreply, S}.
+terminate(_, S) -> [exit(maps:get(pid, J), kill) || J <- maps:values(maps:get(jobs, S))], ok.
+code_change(_, S, _) -> {ok, S}.
+
+launch(Key, Waiters, S) ->
+    Jobs = maps:get(jobs, S), Now = erlang:monotonic_time(second),
+    Limit = case Key of usage -> 5; _ -> 4 end,
+    case not maps:is_key(Key, Jobs) andalso map_size(Jobs) < Limit andalso
+         (Key =:= usage orelse Now >= maps:get(retry_at, S)) of
+        false -> S;
+        true ->
+            Parent = self(), Fetch = maps:get(fetch, S),
+            {Pid, Ref} = spawn_monitor(fun() ->
+                Result = try Fetch(Key) catch _:_ -> {error, fetch_failed} end,
+                Parent ! {result, Key, self(), Result}
+            end),
+            Timer = erlang:send_after(5000, self(), {job_timeout, Key, Pid}),
+            S#{jobs => maps:put(Key, #{pid => Pid, ref => Ref, timer => Timer, waiters => Waiters}, Jobs)}
+    end.
+finish(Key, J, Result, S) ->
+    erlang:demonitor(maps:get(ref, J), [flush]), erlang:cancel_timer(maps:get(timer, J)),
+    S0 = S#{jobs => maps:remove(Key, maps:get(jobs, S))},
+    Now = erlang:monotonic_time(second),
+    case {Key, Result} of
+        {usage, {ok, Bytes}} when is_integer(Bytes), Bytes >= 0 ->
+            Limit = max(0, pw_util:env_int("PLAINWIRE_TURN_MONTHLY_LIMIT_BYTES", 950000000000)),
+            {Month, _} = month_range(),
+            S0#{budget => {Bytes >= Limit, Now, Month}};
+        {usage, _} -> logger:warning("[plainwire:turn] usage lookup unavailable"), S0;
+        {_, {ok, Entry}} when is_map(Entry) ->
+            Lifetime = ttl() - 10,
+            {Reply, Cache} = case budget_state(maps:get(budget, S0), Now, env("PLAINWIRE_CF_ACCOUNT_ID") =/= <<>>) of
+                ok ->
+                    C0 = maps:filter(fun(_, {_, Until}) -> Until > Now end, maps:get(cache, S0)),
+                    C1 = case map_size(C0) >= 1024 of true -> maps:remove(hd(maps:keys(C0)), C0); false -> C0 end,
+                    {{ok, Entry, Lifetime}, maps:put(Key, {Entry, Now + Lifetime}, C1)};
+                Reason -> {{error, Reason}, maps:get(cache, S0)}
+            end,
+            [gen_server:reply(W, Reply) || W <- maps:get(waiters, J)],
+            S0#{cache => Cache, retry_at => erlang:monotonic_time(second) - 1};
+        _ ->
+            [gen_server:reply(W, {error, unavailable}) || W <- maps:get(waiters, J)],
+            %% Do not log response bodies or tokens, even for provider errors.
+            logger:warning("[plainwire:turn] credential lookup unavailable; retry delayed"),
+            S0#{retry_at => Now + 30}
     end.
 
-%% --- Cloudflare: this month's relayed-egress usage ---
+budget_state(_, _, false) -> ok;
+budget_state({Over, At, Month}, Now, true) when Now - At =< 900 ->
+    case month_range() of
+        {Month, _} -> case Over of true -> over_limit; false -> ok end;
+        _ -> usage_unavailable
+    end;
+budget_state(_, _, true) -> usage_unavailable.
 
-fetch_usage_bytes() ->
-    {DateFrom, DateTo} = current_month_range(),
-    %% the dataset's date_geq/date_leq filters take a plain 'YYYY-MM-DD' Date,
-    %% not a DateTime — confirmed against Cloudflare's actual API, which
-    %% rejected a full ISO-8601 timestamp here with a parse error.
-    Query = <<"query GetTurnUsage($accountId: String!, $dateFrom: Date!, $dateTo: Date!) { "
-              "viewer { accounts(filter: { accountTag: $accountId }) { "
-              "callsTurnUsageAdaptiveGroups(limit: 10000, filter: { date_geq: $dateFrom, date_leq: $dateTo }) { "
-              "sum { egressBytes } } } } }">>,
-    Body = jsx:encode(#{
-        query => Query,
-        variables => #{accountId => account_id(), dateFrom => DateFrom, dateTo => DateTo}
-    }),
-    case http_post_json(<<?GRAPHQL_URL>>, analytics_token(), Body) of
-        {ok, 200, RespBody} -> parse_usage_response(RespBody);
-        {ok, Code, RespBody} -> {error, {http_error, Code, safe_snippet(RespBody)}};
-        {error, Reason} -> {error, Reason}
+fetch(usage) ->
+    {From, To} = month_range(),
+    Query = <<"query($accountId: String!, $dateFrom: Date!, $dateTo: Date!) { viewer { accounts(filter: {accountTag: $accountId}) { callsTurnUsageAdaptiveGroups(limit: 1, filter: {date_geq: $dateFrom, date_leq: $dateTo}) { sum { egressBytes } } } } }">>,
+    Token = case env("PLAINWIRE_CF_ANALYTICS_API_TOKEN") of <<>> -> env("PLAINWIRE_CF_TURN_API_TOKEN"); T -> T end,
+    case post("https://api.cloudflare.com/client/v4/graphql", Token,
+              #{query => Query, variables => #{accountId => env("PLAINWIRE_CF_ACCOUNT_ID"), dateFrom => From, dateTo => To}}) of
+        {ok, 200, Body} -> parse_usage(Body);
+        _ -> {error, usage_unavailable}
+    end;
+fetch(_) ->
+    Url = "https://rtc.live.cloudflare.com/v1/turn/keys/" ++ binary_to_list(env("PLAINWIRE_CF_TURN_KEY_ID")) ++ "/credentials/generate-ice-servers",
+    case post(Url, env("PLAINWIRE_CF_TURN_API_TOKEN"), #{ttl => ttl()}) of
+        {ok, 201, Body} -> parse_credentials(Body);
+        _ -> {error, credential_unavailable}
     end.
-
-parse_usage_response(RespBody) ->
-    try jsx:decode(RespBody, [return_maps]) of
-        #{<<"errors">> := Errors} when is_list(Errors), Errors =/= [] ->
-            {error, {graphql_errors, Errors}};
-        #{<<"data">> := #{<<"viewer">> := #{<<"accounts">> := Accounts}}} ->
-            Groups = lists:flatmap(fun(A) -> maps:get(<<"callsTurnUsageAdaptiveGroups">>, A, []) end, Accounts),
-            Total = lists:foldl(fun(G, Acc) ->
-                Sum = maps:get(<<"sum">>, G, #{}),
-                Acc + to_int(maps:get(<<"egressBytes">>, Sum, 0))
-            end, 0, Groups),
-            {ok, Total};
-        _ -> {error, unexpected_response}
-    catch _:_ -> {error, invalid_json}
+post(Url, Token, Body) ->
+    TLS = [{verify, verify_peer}, {cacerts, public_key:cacerts_get()},
+           {customize_hostname_check, [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]}],
+    Headers = [{"authorization", "Bearer " ++ binary_to_list(Token)}, {"accept", "application/json"}],
+    case httpc:request(post, {Url, Headers, "application/json", jsx:encode(Body)},
+                       [{ssl, TLS}, {autoredirect, false}, {timeout, 4000}, {connect_timeout, 2000}],
+                       [{body_format, binary}]) of
+        {ok, {{_, Code, _}, _, Resp}} when byte_size(Resp) =< 262144 -> {ok, Code, Resp};
+        _ -> {error, http_failed}
     end.
-
-to_int(N) when is_integer(N) -> N;
-to_int(N) when is_float(N) -> round(N);
-to_int(_) -> 0.
-
-current_month_range() ->
+parse_credentials(B) when is_binary(B), byte_size(B) =< 262144 ->
+    try
+        #{<<"iceServers">> := Servers} = jsx:decode(B, [return_maps]),
+        true = is_list(Servers) andalso length(Servers) =< 8,
+        Entries = [S || S <- Servers, is_map(S), maps:is_key(<<"username">>, S)],
+        [#{<<"urls">> := Urls, <<"username">> := U, <<"credential">> := P} | _] = Entries,
+        true = is_list(Urls) andalso length(Urls) > 0 andalso length(Urls) =< 16,
+        true = lists:all(fun valid_turn_url/1, Urls),
+        true = is_binary(U) andalso byte_size(U) > 0 andalso byte_size(U) =< 2048,
+        true = is_binary(P) andalso byte_size(P) > 0 andalso byte_size(P) =< 2048,
+        {ok, #{urls => Urls, username => U, credential => P, credentialType => <<"password">>}}
+    catch _:_ -> {error, invalid_credentials} end;
+parse_credentials(_) -> {error, invalid_credentials}.
+valid_turn_url(U) when is_binary(U), byte_size(U) < 256 ->
+    re:run(U, <<"^turns?:turn\\.cloudflare\\.com:(3478|5349|443|80)\\?transport=(udp|tcp)$">>, [{capture, none}]) =:= match;
+valid_turn_url(_) -> false.
+parse_usage(B) when is_binary(B), byte_size(B) =< 262144 ->
+    try
+        M = jsx:decode(B, [return_maps]),
+        Errors = maps:get(<<"errors">>, M, null), true = Errors =:= null orelse Errors =:= [],
+        #{<<"data">> := #{<<"viewer">> := #{<<"accounts">> := [A]}}} = M,
+        #{<<"callsTurnUsageAdaptiveGroups">> := Groups} = A,
+        true = is_list(Groups) andalso length(Groups) =< 1,
+        Ns = [begin #{<<"sum">> := #{<<"egressBytes">> := N}} = G,
+                    true = is_integer(N) andalso N >= 0, N end || G <- Groups],
+        {ok, lists:sum(Ns)}
+    catch _:_ -> {error, invalid_usage} end;
+parse_usage(_) -> {error, invalid_usage}.
+month_range() ->
     {{Y, M, D}, _} = calendar:universal_time(),
-    From = iolist_to_binary(io_lib:format("~4..0B-~2..0B-01", [Y, M])),
-    To = iolist_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B", [Y, M, D])),
-    {From, To}.
-
-%% --- shared HTTP helper (inets/httpc, same client pw_http_fetch uses) ---
-
-http_post_json(UrlBin, TokenBin, Body) ->
-    Url = binary_to_list(iolist_to_binary(UrlBin)),
-    Headers = [{"authorization", "Bearer " ++ binary_to_list(TokenBin)}],
-    HttpOptions = [{timeout, 15000}, {connect_timeout, 5000}],
-    Request = {Url, Headers, "application/json", Body},
-    case httpc:request(post, Request, HttpOptions, [{body_format, binary}]) of
-        {ok, {{_, Code, _}, _RespHeaders, RespBody}} -> {ok, Code, RespBody};
-        {error, Reason} -> {error, Reason}
-    end.
-
-safe_snippet(Bin) when is_binary(Bin) -> binary:part(Bin, 0, erlang:min(200, byte_size(Bin)));
-safe_snippet(Other) -> Other.
+    {iolist_to_binary(io_lib:format("~4..0B-~2..0B-01", [Y, M])),
+     iolist_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B", [Y, M, D]))}.

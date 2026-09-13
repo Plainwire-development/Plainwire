@@ -6,7 +6,9 @@
 -define(MAX_PROFILE_IMAGE_BYTES, 16777216).
 
 public() ->
-    #{version => version(),
+    #{media_quality_enabled => os:getenv("PLAINWIRE_MEDIA_QUALITY") =/= "off",
+      adaptive_screen => pw_util:env_bool("PLAINWIRE_ADAPTIVE_SCREEN", false),
+      version => version(),
       asset_version => asset_version(),
       app_name => clean_app_name(pw_util:env_str("PLAINWIRE_APP_NAME", <<"Plainwire">>)),
       default_theme => default_theme(),
@@ -22,7 +24,7 @@ public() ->
 version() ->
     case application:get_key(plainwire_relay, vsn) of
         {ok, Vsn} -> pw_util:bin(Vsn);
-        _ -> <<"1.6.0">>
+        _ -> <<"1.7.0">>
     end.
 
 asset_version() ->
@@ -47,7 +49,7 @@ compute_asset_version() ->
     case code:priv_dir(plainwire_relay) of
         Dir when is_list(Dir) ->
             Static = filename:join(Dir, "static"),
-            Paths = ["app.js", "app.css", "elm-bridge.js", "bootstrap.js"],
+            Paths = ["app.js", "app.css", "elm-bridge.js", "bootstrap.js", "call-health.js", "markdown.js", "highlight-all.js"],
             case read_asset_parts(Static, Paths, []) of
                 {ok, Parts} ->
                     Hash = pw_util:sha256_hex(iolist_to_binary(lists:reverse(Parts))),

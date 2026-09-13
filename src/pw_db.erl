@@ -8,7 +8,7 @@
     friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friend_unblock/2, friends/1,
     forums/1, create_forum/4, delete_forum/2, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, delete_thread/2, reply_thread/3, vote_thread/3,
     servers/1, create_server/3, update_server/3, server/2, create_channel/4, create_channel/5,
-    create_invite/4, invite_preview/1, join_invite/2,
+    create_invite/4, create_invite/5, list_invites/2, revoke_invite/3, invite_options/2, invite_preview/1, join_invite/2,
     messages/5, post_channel_message/4, delete_message/2,
     conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4,
     add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4,
@@ -55,6 +55,12 @@ health() ->
     end.
 
 session_fast(Token) ->
+    case pw_cluster_config:get() of
+        #{backend := partisan} -> {error, no_session};
+        _ -> session_cached(Token)
+    end.
+
+session_cached(Token) ->
     case Token of
         undefined -> {error, no_session};
         <<>> -> {error, no_session};
@@ -192,7 +198,10 @@ update_category(Uid, ServerId, CatId, Patch) -> call({update_category, Uid, Serv
 reorder_categories(Uid, ServerId, Order) -> call({reorder_categories, Uid, ServerId, Order}).
 delete_category(Uid, ServerId, CatId) -> call({delete_category, Uid, ServerId, CatId}).
 move_channel(Uid, ChannelId, CatId, Position) -> call({move_channel, Uid, ChannelId, CatId, Position}).
-create_invite(Uid, ServerId, ChannelId, MaxUses) -> call({create_invite, Uid, ServerId, ChannelId, MaxUses}).
+create_invite(Uid, ServerId, ChannelId, MaxUses) -> create_invite(Uid, ServerId, ChannelId, MaxUses, 86400).
+create_invite(Uid, ServerId, ChannelId, MaxUses, ExpiresIn) -> call({create_invite, Uid, ServerId, ChannelId, MaxUses, ExpiresIn}).
+list_invites(Uid, Sid) -> call({list_invites, Uid, Sid}).
+revoke_invite(Uid, Sid, Code) -> call({revoke_invite, Uid, Sid, Code}).
 invite_preview(Code) -> call({invite_preview, Code}).
 join_invite(Uid, Code) -> call({join_invite, Uid, Code}).
 messages(Uid, Scope, ScopeId, Before, After) -> call({messages, Uid, Scope, ScopeId, Before, After}).
@@ -351,7 +360,8 @@ read_msg({update_category, _, _, _, _}) -> false;
 read_msg({reorder_categories, _, _, _}) -> false;
 read_msg({delete_category, _, _, _}) -> false;
 read_msg({move_channel, _, _, _, _}) -> false;
-read_msg({create_invite, _, _, _, _}) -> false;
+read_msg({create_invite, _, _, _, _, _}) -> false;
+read_msg({revoke_invite, _, _, _}) -> false;
 read_msg({join_invite, _, _}) -> false;
 read_msg({post_channel_message, _, _, _, _}) -> false;
 read_msg({delete_message, _, _}) -> false;
@@ -908,7 +918,7 @@ route({vote_thread, Uid, ThreadId0, Value0}, Conn) ->
             {error, not_found}
     end;
 route({servers, Uid}, Conn) ->
-    Sql = "SELECT s.id, s.owner_id, s.name, s.description, s.icon_url, s.banner_url, s.accent_color, s.created_at, s.updated_at, sm.role, "
+    Sql = "SELECT s.id, s.owner_id, s.name, s.description, s.icon_url, s.banner_url, s.accent_color, s.welcome_message, s.created_at, s.updated_at, sm.role, "
           "(SELECT count(*) FROM server_members WHERE server_id = s.id) "
           "FROM servers s JOIN server_members sm ON sm.server_id = s.id AND sm.user_id = $1 "
           "ORDER BY sm.joined_at ASC",
@@ -951,6 +961,8 @@ route({update_server, Uid, Sid0, Patch}, Conn) ->
             Icon = store_image_url(RawIcon),
             Banner = store_image_url(RawBanner),
             Accent = clean_accent(maps:get(<<"accent_color">>, Patch, <<>>)),
+            Welcome = pw_util:clean_text(maps:get(<<"welcome_message">>, Patch, <<>>), 2000),
+            HasWelcome = maps:is_key(<<"welcome_message">>, Patch),
             HasDesc = maps:is_key(<<"description">>, Patch),
             %% /api/media is derived output. don't save it over the real source.
             HasIcon = maps:is_key(<<"icon_url">>, Patch) andalso not derived_media_url(RawIcon)
@@ -967,8 +979,8 @@ route({update_server, Uid, Sid0, Patch}, Conn) ->
                         "description = CASE WHEN $3 THEN $2 ELSE description END, "
                         "icon_url = CASE WHEN $4 THEN $5 ELSE icon_url END, "
                         "banner_url = CASE WHEN $6 THEN $7 ELSE banner_url END, "
-                        "accent_color = CASE WHEN $8 THEN $9 ELSE accent_color END, updated_at = $10 WHERE id = $11",
-                        [Name, Desc, HasDesc, HasIcon, Icon, HasBanner, Banner, HasAccent, Accent, Now, Sid]),
+                        "accent_color = CASE WHEN $8 THEN $9 ELSE accent_color END, welcome_message = CASE WHEN $12 THEN $13 ELSE welcome_message END, updated_at = $10 WHERE id = $11",
+                        [Name, Desc, HasDesc, HasIcon, Icon, HasBanner, Banner, HasAccent, Accent, Now, Sid, HasWelcome, Welcome]),
                     case HasIcon of true -> insert_server_upload_ref(Conn, Sid, Icon); false -> ok end,
                     case HasBanner of true -> insert_server_upload_ref(Conn, Sid, Banner); false -> ok end,
                     publish_server_event(Conn, Sid, #{type => server_updated, server_id => Sid}),
@@ -981,7 +993,7 @@ route({server, Uid, ServerId0}, Conn) ->
     Sid = pw_util:int(ServerId0),
     case one(Conn, "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2", [Sid, Uid]) of
         {ok, [Role]} ->
-            {ok, S} = one(Conn, "SELECT id, owner_id, name, description, icon_url, banner_url, accent_color, created_at, updated_at FROM servers WHERE id = $1", [Sid]),
+            {ok, S} = one(Conn, "SELECT id, owner_id, name, description, icon_url, banner_url, accent_color, welcome_message, created_at, updated_at FROM servers WHERE id = $1", [Sid]),
             {ok, Ch} = rows(Conn, "SELECT id, server_id, name, kind, position, topic, created_at, category_id FROM channels WHERE server_id = $1 ORDER BY position ASC, id ASC", [Sid]),
             {ok, Cats} = rows(Conn, "SELECT id, server_id, name, position, created_at FROM channel_categories WHERE server_id = $1 ORDER BY position ASC, id ASC", [Sid]),
             {ok, Ms} = rows(Conn,
@@ -1106,28 +1118,49 @@ route({move_channel, Uid, ChannelId0, CatId0, Position0}, Conn) ->
             end;
         _ -> {error, not_found}
     end;
-route({create_invite, Uid, Sid0, ChannelId0, MaxUses0}, Conn) ->
-    Sid = pw_util:int(Sid0),
-    ChannelId = pw_util:int(ChannelId0),
-    MaxUses = normalize_max_uses(pw_util:int(MaxUses0)),
-    case {can_manage_server(Conn, Uid, Sid), valid_invite_channel(Conn, Sid, ChannelId)} of
-        {true, true} ->
-            case existing_invite(Conn, Sid, ChannelId, MaxUses) of
-                {ok, Code} ->
-                    {ok, #{code => Code, url => <<"#invite/", Code/binary>>, existing => true}};
-                not_found ->
-                    Code = pw_util:random_token(12),
+route({create_invite, Uid, Sid0, ChannelId0, MaxUses0, ExpiresIn0}, Conn) ->
+    Sid = pw_util:int(Sid0), ChannelId = pw_util:int(ChannelId0),
+    case invite_options(MaxUses0, ExpiresIn0) of
+        {error, _} = Error -> Error;
+        {ok, MaxUses, ExpiresIn} -> with_tx(Conn, fun() ->
+            %% Serialize the per-server cap and code reuse across API nodes.
+            _ = one(Conn, "SELECT id FROM servers WHERE id = $1 FOR UPDATE", [Sid]),
+            case {can_manage_server(Conn, Uid, Sid), valid_invite_channel(Conn, Sid, ChannelId)} of
+                {true, true} ->
+                    Existing = case ExpiresIn of 0 -> existing_invite(Conn, Sid, ChannelId, MaxUses); _ -> not_found end,
                     Now = pw_util:now_ms(),
-                    ok = exec(Conn,
-                        "INSERT INTO server_invites(code, server_id, channel_id, creator_id, max_uses, uses, created_at, expires_at, revoked) "
-                        "VALUES($1,$2,$3,$4,$5,0,$6,0,false)",
-                        [Code, Sid, ChannelId, Uid, MaxUses, Now]),
-                    {ok, #{code => Code, url => <<"#invite/", Code/binary>>}}
-            end;
-        {false, _} ->
-            {error, forbidden};
-        {_, false} ->
-            {error, invalid_channel}
+                    case Existing of
+                        {ok, Code} -> {ok, #{code => Code, url => <<"#invite/", Code/binary>>, existing => true, expires_at => 0}};
+                        not_found ->
+                            {ok, [Count]} = one(Conn, "SELECT count(*) FROM server_invites WHERE server_id = $1 AND revoked = false AND (expires_at = 0 OR expires_at > $2) AND (max_uses = 0 OR uses < max_uses)", [Sid, Now]),
+                            case Count >= 100 of
+                                true -> {error, invite_limit};
+                                false ->
+                                    Code = pw_util:random_token(24),
+                                    Expires = case ExpiresIn of 0 -> 0; _ -> Now + ExpiresIn * 1000 end,
+                                    ok = exec(Conn, "INSERT INTO server_invites(code, server_id, channel_id, creator_id, max_uses, uses, created_at, expires_at, revoked) VALUES($1,$2,$3,$4,$5,0,$6,$7,false)",
+                                              [Code, Sid, ChannelId, Uid, MaxUses, Now, Expires]),
+                                    {ok, #{code => Code, url => <<"#invite/", Code/binary>>, expires_at => Expires, max_uses => MaxUses}}
+                            end
+                    end;
+                {false, _} -> {error, forbidden};
+                _ -> {error, invalid_channel}
+            end
+        end)
+    end;
+route({list_invites, Uid, Sid0}, Conn) ->
+    Sid = pw_util:int(Sid0),
+    case can_manage_server(Conn, Uid, Sid) of
+        false -> {error, forbidden};
+        true ->
+            {ok, Rs} = rows(Conn, "SELECT code, channel_id, max_uses, uses, created_at, expires_at, revoked FROM server_invites WHERE server_id = $1 ORDER BY created_at DESC LIMIT 100", [Sid]),
+            {ok, [#{code => Code, channel_id => C, max_uses => Max, uses => Uses, created_at => At, expires_at => Exp, revoked => Rev} || [Code, C, Max, Uses, At, Exp, Rev] <- Rs]}
+    end;
+route({revoke_invite, Uid, Sid0, Code0}, Conn) ->
+    Sid = pw_util:int(Sid0), Code = pw_util:clean_text(Code0, 80),
+    case can_manage_server(Conn, Uid, Sid) of
+        false -> {error, forbidden};
+        true -> exec(Conn, "UPDATE server_invites SET revoked = true WHERE server_id = $1 AND code = $2", [Sid, Code]), ok
     end;
 route({invite_preview, Code0}, Conn) ->
     Code = pw_util:clean_text(Code0, 80),
@@ -1787,6 +1820,9 @@ migrations() -> [
         "CREATE INDEX IF NOT EXISTS idx_upload_refs_scope_lookup ON upload_refs(scope, scope_id, upload_id)",
         "CREATE INDEX IF NOT EXISTS idx_direct_members_thread_request ON direct_members(thread_id, request_state, user_id)",
         "CREATE INDEX IF NOT EXISTS idx_server_members_server_role ON server_members(server_id, role, user_id)"
+    ]},
+    {17, [
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS welcome_message text NOT NULL DEFAULT ''"
     ]}
 ].
 
@@ -2065,10 +2101,7 @@ profile_file_signature(<<"image/avif">>, <<_:4/binary,"ftyp",Brands/binary>>) ->
     binary:match(Brands, <<"avif">>) =/= nomatch orelse binary:match(Brands, <<"avis">>) =/= nomatch;
 profile_file_signature(_, _) -> false.
 
-normalize_max_uses(undefined) -> 0;
-normalize_max_uses(I) when is_integer(I), I > 0, I =< 1000 -> I;
-normalize_max_uses(I) when is_integer(I), I > 1000 -> 1000;
-normalize_max_uses(_) -> 0.
+
 
 normalize_theme(<<"light">>) -> <<"light">>;
 normalize_theme(<<"dark">>) -> <<"dark">>;
@@ -2087,6 +2120,11 @@ clean_slug(Slug0, _Name) ->
     Lower = string:lowercase(binary_to_list(pw_util:clean_text(Slug0, 40))),
     Filtered = [C || C <- Lower, (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse C =:= $_ orelse C =:= $-],
     pw_util:bin(Filtered).
+
+invite_options(Max, Exp) when is_integer(Max), Max >= 0, Max =< 10000,
+                               is_integer(Exp), Exp >= 0, Exp =< 2592000 ->
+    case Exp =:= 0 orelse Exp >= 60 of true -> {ok, Max, Exp}; false -> {error, invalid_invite_options} end;
+invite_options(_, _) -> {error, invalid_invite_options}.
 
 valid_invite_channel(_Conn, _Sid, undefined) -> true;
 valid_invite_channel(Conn, Sid, ChannelId) ->
@@ -2284,15 +2322,15 @@ friend_map([Status, Req, Addr, Id, U, D, Bio, Avatar, Banner, St, Theme, Created
       blocked_by_me => (Status =:= <<"blocked">> andalso Req =:= Viewer),
       user => user_map([Id, U, D, Bio, Avatar, Banner, St, Theme, Created, Last])}.
 
-server_row_map([Id, Owner, Name, Desc, Icon, Banner, Accent, Created, Updated, Role, Members]) ->
+server_row_map([Id, Owner, Name, Desc, Icon, Banner, Accent, Welcome, Created, Updated, Role, Members]) ->
     #{id => Id, owner_id => Owner, name => Name, description => Desc,
-      icon_url => pw_util:proxied_image(Icon), banner_url => pw_util:proxied_image(Banner), accent_color => Accent,
+      icon_url => pw_util:proxied_image(Icon), banner_url => pw_util:proxied_image(Banner), accent_color => Accent, welcome_message => Welcome,
       created_at => Created, updated_at => Updated,
       role => Role, member_count => Members}.
 
-server_full_map([Id, Owner, Name, Desc, Icon, Banner, Accent, Created, Updated], Role) ->
+server_full_map([Id, Owner, Name, Desc, Icon, Banner, Accent, Welcome, Created, Updated], Role) ->
     #{id => Id, owner_id => Owner, name => Name, description => Desc,
-      icon_url => pw_util:proxied_image(Icon), banner_url => pw_util:proxied_image(Banner), accent_color => Accent,
+      icon_url => pw_util:proxied_image(Icon), banner_url => pw_util:proxied_image(Banner), accent_color => Accent, welcome_message => Welcome,
       created_at => Created, updated_at => Updated, role => Role}.
 
 clean_accent(<<"#", Hex:6/binary>>) ->

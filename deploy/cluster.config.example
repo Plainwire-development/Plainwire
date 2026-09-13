@@ -1,0 +1,13 @@
+%% Merge into sys.config. For the API node, exchange name/listen_ip/peers.
+%% Keep realtime_node the SAME on every node. All addresses must be private.
+[{plainwire_relay, [
+    {cluster, #{backend => partisan,
+                name => 'plainwire-owner@10.20.0.10',
+                realtime_node => 'plainwire-owner@10.20.0.10',
+                listen_ip => {10,20,0,10}, listen_port => 9911,
+                certfile => "/etc/plainwire/cluster/owner.crt",
+                keyfile => "/etc/plainwire/cluster/owner.key",
+                cacertfile => "/etc/plainwire/cluster/ca.crt",
+                peers => [#{name => 'plainwire-api@10.20.0.11',
+                            ip => {10,20,0,11}, port => 9911}]}}
+]}].

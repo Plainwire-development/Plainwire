@@ -8,6 +8,12 @@
 -define(MAX_SUBS, 200).
 
 init(Req0, _State) ->
+    case pw_cluster_config:websocket_owner() of
+        true -> init_owner(Req0);
+        false -> {ok, cowboy_req:reply(503, #{<<"retry-after">> => <<"5">>}, <<"Route WebSockets to the realtime owner">>, Req0), #{}}
+    end.
+
+init_owner(Req0) ->
     case origin_allowed(Req0) of
         false ->
             logger:warning("[plainwire:ws] connection_rejected reason=origin host=~p origin=~p", [cowboy_req:header(<<"host">>, Req0), cowboy_req:header(<<"origin">>, Req0)]),
@@ -60,6 +66,18 @@ websocket_handle({text, Data}, State0=#{uid:=Uid}) ->
     end;
 websocket_handle(_Frame, State) -> {ok, State}.
 
+handle_msg(#{<<"type">> := <<"call_quality">>, <<"request_id">> := Request,
+             <<"peer_id">> := Peer, <<"samples">> := Rows}, State = #{uid := Uid})
+  when is_binary(Request), byte_size(Request) =< 96, is_integer(Peer), Peer > 0 ->
+    InRoom = is_integer(maps:get(call, State, undefined)) orelse is_integer(maps:get(voice, State, undefined)),
+    case InRoom andalso pw_rate:allow({call_quality, Uid}, 60, 60000) of
+        true ->
+            case pw_media_quality:submit(self(), Request, Peer, Rows) of
+                ok -> {ok, State};
+                {error, _} -> quality_reply(Request, Peer, #{unavailable => true}, State)
+            end;
+        false -> {ok, State}
+    end;
 handle_msg(#{<<"type">> := <<"ping">>}, State) ->
     {reply, {text, pw_util:json(#{type => pong, ts => pw_util:now_ms()})}, State};
 handle_msg(#{<<"type">> := <<"subscribe">>, <<"key">> := Key0}, State=#{uid:=Uid, subs := Subs}) ->
@@ -178,6 +196,8 @@ handle_msg(#{<<"type">> := <<"presence_update">>, <<"status">> := Status0}, #{ui
     {ok, State#{status => Status}};
 handle_msg(_, State) -> {ok, State}.
 
+websocket_info({quality_result, Request, Peer, Result}, State) ->
+    quality_reply(Request, Peer, Result, State);
 websocket_info(revalidate_auth, State0) ->
     case revalidate_session(State0) of
         {ok, State} ->
@@ -194,6 +214,10 @@ websocket_info({hub_json, Event}, State=#{uid:=Uid}) ->
 websocket_info({hub_text, Payload, Type}, State=#{uid:=Uid}) ->
     deliver_hub_payload(Payload, Type, Uid, State);
 websocket_info(_, State) -> {ok, State}.
+
+quality_reply(Request, Peer, Result, State) ->
+    {reply, {text, pw_util:json(#{type => call_quality_result, request_id => Request,
+                                peer_id => Peer, result => Result})}, State}.
 
 deliver_hub_payload(Payload, Type, Uid, State) ->
     QueueLen = case process_info(self(), message_queue_len) of {message_queue_len, N} -> N; _ -> 0 end,

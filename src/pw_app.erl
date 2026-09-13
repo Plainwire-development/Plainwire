@@ -3,6 +3,10 @@
 -export([start/2, stop/1]).
 
 start(_Type, _Args) ->
+    case pw_cluster_config:validate(pw_cluster_config:get()) of
+        ok -> ok;
+        {error, Reason} -> erlang:error({cluster_configuration_error, Reason})
+    end,
     ensure_secure_config(),
     %% listener belongs under the supervisor. dead-but-running is a bad look.
     pw_sup:start_link().

@@ -4,11 +4,15 @@ Plainwire Relay is a self-hostable chat app with servers, DMs, forums, voice cal
 
 It uses Erlang/OTP, Cowboy, PostgreSQL, Elm, SCSS, WebSocket, and WebRTC.
 
+Version 1.7.0 adds Cloudflare TURN, Markdown with syntax highlighting, explicit screen viewing, expiring/revocable invites, server welcome messages, and searchable settings. It retains the microphone, sound, and mobile fixes from 1.6.1.
+
+Optional backend additions: [Partisan routing](docs/CLUSTERING.md) and [Fortran call health](docs/CALL_HEALTH.md). Both can be left off. See [Cloudflare setup](docs/CLOUDFLARE_TURN.md) before using the relay service. The source archive includes built frontend assets; Erlang releases and the native helper are built on your target host.
+
 ## Quick start
 
 Requirements:
 
-- Erlang/OTP 24+
+- Erlang/OTP 25+ (OTP 27+ and the installed OTP source tree for the optional cluster profile)
 - PostgreSQL 13+
 - rebar3
 - Node.js and npm
@@ -23,7 +27,7 @@ rebar3 get-deps
 rebar3 compile
 ```
 
-For a quick source audit, run `./scripts/verify-source.sh`. Before publishing a release, run `./scripts/release-check.sh`; it is deliberately strict and requires Erlang, rebar3, Node.js, npm, and an installed Playwright Chromium browser so a source-only check cannot be mistaken for a release build. Sass and Elm are installed from the locked npm dependencies. Install the test browser with `npx playwright install chromium`.
+For a quick source audit, run `./scripts/verify-source.sh`. Before publishing a release, run `./scripts/release-check.sh`; it is deliberately strict and requires Erlang, rebar3, Node.js, npm, and an installed Playwright Chromium browser so a source-only check cannot be mistaken for a release build. Sass and Elm are installed from the locked npm dependencies. Install the test browser with `npx playwright install chromium`. Run `npm run test:rtc` for real browser audio and screen-sharing regressions with fixture signaling and synthesized input devices.
 
 Create a PostgreSQL database, then run:
 
@@ -41,7 +45,7 @@ guix shell postgresql -- ./scripts/dev-db.sh start
 ./scripts/start.sh --build
 ```
 
-For a production host, follow [the deployment guide](deploy/README.md). It includes systemd and Caddy configuration, updates, verification, and rollback guidance. See [the 1.6.0 changes](RELEASE_NOTES_1.6.0.md) and [verified build status](BUILD_STATUS.md).
+For a production host, follow [the deployment guide](deploy/README.md). It includes systemd and Caddy configuration, updates, verification, and rollback guidance. See [the 1.7.0 changes](RELEASE_NOTES_1.7.0.md) and [verified build status](BUILD_STATUS.md).
 
 ## Main features
 

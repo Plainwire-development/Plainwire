@@ -52,6 +52,16 @@ printf '\n'
 
 TURN_URLS=${PLAINWIRE_TURN_URLS:-}
 TURN_SECRET=${PLAINWIRE_TURN_SECRET:-}
+CF_TURN_KEY_ID=${PLAINWIRE_CF_TURN_KEY_ID:-}
+CF_TURN_API_TOKEN=${PLAINWIRE_CF_TURN_API_TOKEN:-}
+CF_ACCOUNT_ID=${PLAINWIRE_CF_ACCOUNT_ID:-}
+CF_ANALYTICS_API_TOKEN=${PLAINWIRE_CF_ANALYTICS_API_TOKEN:-}
+if [[ -n ${CF_TURN_KEY_ID} || -n ${CF_TURN_API_TOKEN} ]]; then
+    [[ -n ${CF_TURN_KEY_ID} && ${#CF_TURN_API_TOKEN} -ge 20 ]] || die "Set both Cloudflare TURN key ID and API token."
+    for cf_value in "$CF_TURN_KEY_ID" "$CF_TURN_API_TOKEN" "$CF_ACCOUNT_ID" "$CF_ANALYTICS_API_TOKEN"; do
+        [[ $cf_value != *"'"* && $cf_value != *$'\n'* && $cf_value != *$'\r'* ]] || die "Cloudflare configuration contains unsupported characters."
+    done
+else
 if [[ -z ${TURN_URLS} ]]; then
     printf 'TURN URLs (comma-separated, example turn:turn.example.com:3478?transport=udp): '
     read -r TURN_URLS
@@ -67,6 +77,7 @@ fi
     || die "PLAINWIRE_TURN_SECRET must contain at least 32 characters."
 [[ ${TURN_URLS} != *"'"* && ${TURN_URLS} != *$'\n'* ]] || die "TURN URLs contain unsupported shell characters."
 [[ ${TURN_SECRET} != *"'"* && ${TURN_SECRET} != *$'\n'* ]] || die "TURN secret contains unsupported shell characters."
+fi
 
 DB_PASS=$(openssl rand -hex 32)
 ENC_KEY=$(openssl rand -base64 32 | tr -d '\n')
@@ -79,7 +90,7 @@ run_as_app() {
 info "Building frontend, Erlang, tests, and the release"
 run_as_app "cd '${REPO}' && npm ci"
 run_as_app "cd '${REPO}' && npm run build"
-grep -Fq 'Plainwire 1.6.0 workspace' "${REPO}/priv/static/app.css" || die "New UI CSS fingerprint is missing."
+grep -Fq 'Plainwire 1.7.0 workspace' "${REPO}/priv/static/app.css" || die "New UI CSS fingerprint is missing."
 grep -Fq 'data-ui-version' "${REPO}/priv/static/app.js" || die "New Elm UI fingerprint is missing."
 run_as_app "cd '${REPO}' && rebar3 compile && rebar3 eunit && rebar3 release"
 [[ -x ${RELEASE} ]] || die "Release executable was not created."
@@ -143,6 +154,10 @@ export PLAINWIRE_SESSION_DAYS=30
 export PLAINWIRE_MAX_SESSIONS_PER_USER=32
 export PLAINWIRE_TURN_URLS='${TURN_URLS}'
 export PLAINWIRE_TURN_SECRET='${TURN_SECRET}'
+export PLAINWIRE_CF_TURN_KEY_ID='${CF_TURN_KEY_ID}'
+export PLAINWIRE_CF_TURN_API_TOKEN='${CF_TURN_API_TOKEN}'
+export PLAINWIRE_CF_ACCOUNT_ID='${CF_ACCOUNT_ID}'
+export PLAINWIRE_CF_ANALYTICS_API_TOKEN='${CF_ANALYTICS_API_TOKEN}'
 export PLAINWIRE_TURN_USERNAME=plainwire
 export PLAINWIRE_TURN_TTL_SECONDS=3600
 export PLAINWIRE_REQUIRE_TURN=true
@@ -205,9 +220,9 @@ for _ in $(seq 1 30); do
 done
 curl -fsS http://127.0.0.1:8080/ >/dev/null \
     || die "Plainwire did not answer on port 8080. Check ${LOG_DIR}/plainwire-error.log"
-curl -fsS http://127.0.0.1:8080/api/version | grep -Fq '1.6.0' \
-    || die "Plainwire answered, but the running release is not 1.6.0."
-curl -fsS http://127.0.0.1:8080/assets/app.css | grep -Fq 'Plainwire 1.6.0 workspace' \
+curl -fsS http://127.0.0.1:8080/api/version | grep -Fq '1.7.0' \
+    || die "Plainwire answered, but the running release is not 1.7.0."
+curl -fsS http://127.0.0.1:8080/assets/app.css | grep -Fq 'Plainwire 1.7.0 workspace' \
     || die "Plainwire answered, but the refreshed CSS is not being served."
 curl -fsS http://127.0.0.1:8080/assets/app.js | grep -Fq 'data-ui-version' \
     || die "Plainwire answered, but the refreshed Elm frontend is not being served."
