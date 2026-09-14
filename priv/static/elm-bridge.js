@@ -441,7 +441,7 @@
     textarea._measuredDraft = textarea.value;
     textarea.style.height = 'auto';
     const visibleHeight = window.visualViewport?.height || window.innerHeight || 720;
-    const mobileLimit = Math.max(104, Math.min(176, Math.round(visibleHeight * 0.28)));
+    const mobileLimit = Math.max(72, Math.min(112, Math.round(visibleHeight * 0.2)));
     const limit = window.innerWidth <= 760 ? mobileLimit : 180;
     textarea.style.height = `${Math.min(limit, Math.max(48, textarea.scrollHeight))}px`;
     textarea.style.overflowY = textarea.scrollHeight > limit ? 'auto' : 'hidden';
@@ -524,12 +524,16 @@
     const reduceMotion = storage.getItem('plainwire_reduce_motion') === 'true';
     const fontScale = storage.getItem('plainwire_font_scale') || 'default';
     const cornerStyle = storage.getItem('plainwire_corner_style') || 'default';
+    const animatedMedia = storage.getItem('plainwire_animated_media') !== 'false';
+    const linkPreviews = storage.getItem('plainwire_link_previews') !== 'false';
     const accentName = storage.getItem('plainwire_accent') || 'blue';
     const accent = accentPresets[accentName] || accentPresets.blue;
     document.documentElement.dataset.density = density === 'compact' ? 'compact' : 'comfortable';
     document.documentElement.dataset.reduceMotion = reduceMotion ? 'true' : 'false';
     document.documentElement.dataset.fontScale = ['small', 'large'].includes(fontScale) ? fontScale : 'default';
     document.documentElement.dataset.cornerStyle = ['compact', 'rounded'].includes(cornerStyle) ? cornerStyle : 'default';
+    document.documentElement.dataset.animatedMedia = animatedMedia ? 'true' : 'false';
+    document.documentElement.dataset.linkPreviews = linkPreviews ? 'true' : 'false';
     document.documentElement.style.setProperty('--accent', accent[0]);
     document.documentElement.style.setProperty('--accent2', accent[1]);
     send(app.ports.bridgeReceive, {
@@ -752,15 +756,63 @@
     });
   };
 
+  let forcedMessageScroll = 0;
+  let forcedMessageList = null;
+  let forcedMessageSettle = null;
+  const traceMessageScroll = (event, list = forcedMessageList) => {
+    window.__plainwireScrollTrace = (window.__plainwireScrollTrace || []).slice(-30);
+    window.__plainwireScrollTrace.push({ event, at: Math.round(performance.now()), top: list?.scrollTop, height: list?.scrollHeight, client: list?.clientHeight, token: forcedMessageScroll });
+  };
+  const cancelForcedMessageScroll = () => {
+    traceMessageScroll('cancel');
+    forcedMessageScroll += 1;
+    forcedMessageList = null;
+    forcedMessageSettle = null;
+  };
+
   const trackMessageScroll = () => {
     const list = document.getElementById('messages');
     if (!list || list === messageListElement) return list;
     messageListElement = list;
     messagesPinnedToBottom = true;
+    list.addEventListener('wheel', cancelForcedMessageScroll, { passive: true });
+    list.addEventListener('touchstart', cancelForcedMessageScroll, { passive: true });
+    list.addEventListener('pointerdown', cancelForcedMessageScroll, { passive: true });
     list.addEventListener('scroll', () => {
       messagesPinnedToBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 120;
     }, { passive: true });
     return list;
+  };
+
+  const scrollMessageListToBottom = (force = false) => {
+    const list = trackMessageScroll();
+    if (!list || (!force && !messagesPinnedToBottom)) return;
+    const forcedToken = force ? ++forcedMessageScroll : forcedMessageScroll;
+    traceMessageScroll(force ? 'force' : 'follow', list);
+    messagesPinnedToBottom = true;
+    const settle = () => {
+      if (!list.isConnected || list !== document.getElementById('messages')) return;
+      if (force ? forcedToken !== forcedMessageScroll : !messagesPinnedToBottom) return;
+      list.scrollTop = list.scrollHeight;
+      messagesPinnedToBottom = true;
+      traceMessageScroll(force ? 'settle-force' : 'settle-follow', list);
+    };
+    if (force) {
+      forcedMessageList = list;
+      forcedMessageSettle = settle;
+    }
+    settle();
+    requestAnimationFrame(() => requestAnimationFrame(settle));
+    setTimeout(settle, 90);
+    setTimeout(settle, 260);
+    if (force) {
+      // Markdown previews and proxied media can gain their final height after the
+      // first paint. Keep a newly opened room at its latest message while that
+      // layout settles, unless the reader starts scrolling themselves.
+      setTimeout(settle, 600);
+      setTimeout(settle, 1200);
+      setTimeout(settle, 2400);
+    }
   };
 
   const observeMessageHistory = () => {
@@ -879,6 +931,8 @@
       }
       if (changedMessageRoots.size) {
         list?.dispatchEvent(new Event('plainwire:messages'));
+        if (forcedMessageList === list && forcedMessageSettle) forcedMessageSettle();
+        else if (messagesPinnedToBottom) scrollMessageListToBottom();
         const composer = document.getElementById('compose');
         if (composer && composer._measuredDraft !== composer.value) composerChanged = true;
       }
@@ -890,6 +944,15 @@
     });
   });
   messageDomObserver.observe(document.body, { childList: true, subtree: true });
+  document.addEventListener('load', (event) => {
+    const media = event.target;
+    if ((media instanceof HTMLImageElement || media instanceof HTMLVideoElement)
+        && media.closest?.('#messages') === forcedMessageList) forcedMessageSettle?.();
+  }, true);
+  document.addEventListener('keydown', (event) => {
+    if (!forcedMessageList || event.target?.matches?.('input, textarea, select, [contenteditable="true"]')) return;
+    if (['PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown', ' '].includes(event.key)) cancelForcedMessageScroll();
+  });
   trackMessageScroll();
   observeMessageHistory();
   mountMediaPlayers();
@@ -950,14 +1013,20 @@
   // sharp waveforms, pitch sweeps, downloads, or a new AudioContext per alert.
   const soundPatterns = {
     notification: [[784, 0, 250, 0.035], [1046.5, 85, 330, 0.026]],
+    mention: [[880, 0, 200, 0.045], [1174.66, 110, 260, 0.05], [1567.98, 235, 340, 0.042]],
     incoming: [[523.25, 0, 430, 0.038], [659.25, 160, 430, 0.033], [783.99, 320, 540, 0.028]],
     outgoing: [[392, 0, 300, 0.025], [523.25, 240, 380, 0.022]]
   };
+  let lastMentionAt = 0;
   const playSound = (name, { preview = false } = {}) => {
     if (!soundPatterns[name] || (!preview && storage.getItem('plainwire_sound_enabled') === 'false')) return;
     if (!preview && name === 'notification') {
       if (performance.now() - lastNotificationAt < 700) return;
       lastNotificationAt = performance.now();
+    }
+    if (!preview && name === 'mention') {
+      if (performance.now() - lastMentionAt < 1200) return;
+      lastMentionAt = performance.now();
     }
     const epoch = soundEpoch;
     const ctx = audioContext();
@@ -1147,9 +1216,15 @@
   const appendToComposer = (text) => {
     const composer = activeComposer();
     if (!composer) return;
-    composer.value += composer.value && !composer.value.endsWith('\n') ? '\n' + text : text;
+    const start = composer.selectionStart ?? composer.value.length;
+    const end = composer.selectionEnd ?? start;
+    const before = composer.value.slice(0, start);
+    const after = composer.value.slice(end);
+    const leading = before && !before.endsWith('\n') ? '\n' : '';
+    const trailing = after.startsWith('\n') ? '' : '\n';
+    composer.setRangeText(leading + text + trailing, start, end, 'end');
     composer.dispatchEvent(new Event('input', { bubbles: true }));
-    composer.focus();
+    composer.focus({ preventScroll: true });
   };
 
   const humanBytes = (bytes) => {
@@ -1330,8 +1405,35 @@
   document.body.appendChild(attachmentInput);
   document.addEventListener('paste', (event) => {
     if (document.activeElement !== activeComposer()) return;
-    const files = Array.from(event.clipboardData?.files || []);
-    if (files.length) { event.preventDefault(); uploadFiles(files); }
+    const clipboard = event.clipboardData;
+    const itemFiles = Array.from(clipboard?.items || []).filter(item => item.kind === 'file').map(item => item.getAsFile()).filter(Boolean);
+    const files = itemFiles.length ? itemFiles : Array.from(clipboard?.files || []);
+    const html = String(clipboard?.getData('text/html') || '').slice(0, 2 * 1024 * 1024);
+    let imageSource = '';
+    if (html) {
+      try { imageSource = new DOMParser().parseFromString(html, 'text/html').querySelector('img')?.getAttribute('src') || ''; }
+      catch (_) {}
+    }
+    const remoteImage = (() => {
+      try {
+        const url = new URL(imageSource);
+        return /^https?:$/.test(url.protocol) && /\.(?:gif|png|jpe?g|webp|avif)$/i.test(url.pathname) ? url.href : '';
+      } catch (_) { return ''; }
+    })();
+    if (remoteImage && (/\.gif(?:$|[?#])/i.test(remoteImage) || !files.length)) {
+      event.preventDefault();
+      const name = /\.gif(?:$|[?#])/i.test(remoteImage) ? 'animated.gif' : 'image';
+      appendToComposer(`![${name}](${remoteImage})`);
+    } else if (files.length) {
+      event.preventDefault();
+      uploadFiles(files);
+    } else if (/^data:image\/(?:gif|png|jpeg|webp|avif);base64,/i.test(imageSource) && imageSource.length <= clientConfig.uploadMaxBytes * 1.5) {
+      event.preventDefault();
+      fetch(imageSource).then(response => response.blob()).then(blob => {
+        const extension = { 'image/gif': 'gif', 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/avif': 'avif' }[blob.type] || 'image';
+        return uploadFiles([new File([blob], `pasted-image.${extension}`, { type: blob.type, lastModified: Date.now() })]);
+      }).catch(() => send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not read that pasted image.' }));
+    }
   });
   document.addEventListener('dragover', (event) => { if (activeComposer()) event.preventDefault(); });
   document.addEventListener('drop', (event) => {
@@ -3236,6 +3338,14 @@
     if ((msg.type === 'voice_signal' || msg.type === 'call_signal') && eventMatchesRoom(msg)) handleSignal(msg).catch(() => {});
     if (['call_declined', 'call_cancelled', 'call_missed', 'call_ended'].includes(msg.type) && eventMatchesRoom(msg)) leaveRtcRoom();
     if (msg.type === 'call_accepted') stopRingtones();
+    if (msg.type === 'error' && msg.error === 'no_active_call' && room?.kind === 'call') {
+      debug('RTC', 'call_accept_rejected', { conversation_id: room.id }, 'warn');
+      leaveRtcRoom();
+      stopRingtones();
+      send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'call' });
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'That call is no longer available.' });
+      return;
+    }
     if (msg.type === 'error' && resumeInFlight) {
       debug('RTC', 'room_resume_rejected', { error: msg.error }, 'warn');
       leaveRtcRoom();
@@ -3488,10 +3598,19 @@
   recv(app.ports.setTitle, (title) => {
     document.title = title;
   });
-  recv(app.ports.notify, ({ title = clientConfig.appName, body = '' } = {}) => {
-    if ('Notification' in window && Notification.permission === 'granted') {
-      new Notification(title, { body });
-    }
+  const mentionNotifications = new Map();
+  recv(app.ports.notify, ({ title = clientConfig.appName, body = '', url = '', tag = '' } = {}) => {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const key = tag || `${url}:${title}`;
+    if (mentionNotifications.has(key)) return;
+    const notification = new Notification(title, { body, tag: key });
+    mentionNotifications.set(key, notification);
+    notification.onclose = () => mentionNotifications.delete(key);
+    notification.onclick = () => {
+      if (url && url.startsWith('#')) location.hash = url;
+      window.focus();
+      notification.close();
+    };
   });
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape' || event.isComposing) return;
@@ -3515,6 +3634,9 @@
   recv(app.ports.playTone, playTone);
   recv(app.ports.playNotification, (enabled) => {
     if (enabled) playSound('notification');
+  });
+  recv(app.ports.playMention, (enabled) => {
+    if (enabled) playSound('mention');
   });
   recv(app.ports.playRingtone, (enabled) => {
     if (!enabled) return stopRingtones();
@@ -3866,19 +3988,18 @@
         }));
         break;
       case 'scroll_messages_to_bottom':
-        requestAnimationFrame(() => requestAnimationFrame(() => {
+        {
           const list = document.getElementById('messages');
-          if (!list || (!messagesPinnedToBottom && data !== true)) return;
-          messagesPinnedToBottom = true;
-          list.scrollTop = list.scrollHeight;
+          if (!list || (!messagesPinnedToBottom && data !== true)) break;
+          scrollMessageListToBottom(data === true);
           list.querySelectorAll('img, video').forEach((media) => {
             if (media.tagName === 'IMG' && media.complete) return;
             media.addEventListener('load', () => {
-              if (messagesPinnedToBottom) list.scrollTop = list.scrollHeight;
+              if (messagesPinnedToBottom) scrollMessageListToBottom();
             }, { once: true });
           });
           observeMessageHistory();
-        }));
+        }
         break;
       case 'connect_ws':
         connectWs();
@@ -4104,9 +4225,8 @@
       case 'chat_set_link_previews': {
         const enabled = data === true;
         storage.setItem('plainwire_link_previews', enabled ? 'true' : 'false');
-        document.querySelectorAll('.link-embed-wrap').forEach((node) => node.remove());
-        document.querySelectorAll('.msg-body').forEach((node) => delete node.dataset.embedsMounted);
-        if (enabled) mountLinkEmbeds();
+        document.documentElement.dataset.linkPreviews = enabled ? 'true' : 'false';
+        document.querySelectorAll('pw-markdown').forEach((node) => node.refreshEmbeds?.());
         break;
       }
       case 'chat_set_animated_media': {

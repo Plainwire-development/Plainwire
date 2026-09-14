@@ -115,6 +115,40 @@ call_accept_establishes_bidirectional_signaling_test() ->
         gen_server:stop(Hub)
     end.
 
+missed_call_ends_ring_and_rejects_late_accept_test() ->
+    stop_existing_hub(),
+    {ok, Hub} = pw_hub:start_link(),
+    Parent = self(),
+    Caller = spawn(fun() -> socket_loop(Parent, missed_caller) end),
+    Callee = spawn(fun() -> socket_loop(Parent, missed_callee) end),
+    CallerProfile = #{id => 1, display_name => <<"Caller">>, avatar_url => <<>>},
+    CalleeProfile = #{id => 2, display_name => <<"Callee">>, avatar_url => <<>>},
+    try
+        pw_hub:connect(1, Caller, <<"online">>),
+        pw_hub:connect(2, Callee, <<"online">>),
+        _ = gen_server:call(pw_hub, sync),
+        pw_hub:call_ring(502, 1, Caller, CallerProfile, [2]),
+        _ = gen_server:call(pw_hub, sync),
+
+        Hub ! {ring_timeout, 502, 1},
+        _ = gen_server:call(pw_hub, sync),
+        CallerEvent = await_event(missed_caller, call_missed, 502),
+        CalleeEvent = await_event(missed_callee, call_missed, 502),
+        ?assertEqual(timeout, maps:get(reason, CallerEvent)),
+        ?assertEqual(1, maps:get(from_user_id, CallerEvent)),
+        ?assertEqual(<<"Caller">>, maps:get(display_name, maps:get(profile, CallerEvent))),
+        ?assertEqual(1, maps:get(from_user_id, CalleeEvent)),
+        ?assertEqual(<<"timeout">>, maps:get(reason, CalleeEvent)),
+        ?assertEqual({error, no_active_call},
+            pw_hub:call_accept(502, 2, Callee, CalleeProfile, [1])),
+        assert_no_event(missed_caller, call_state, 502),
+        assert_no_event(missed_callee, call_state, 502)
+    after
+        exit(Caller, kill),
+        exit(Callee, kill),
+        gen_server:stop(Hub)
+    end.
+
 call_presence_and_cross_room_eviction_test() ->
     stop_existing_hub(),
     {ok, Hub} = pw_hub:start_link(),
@@ -270,6 +304,15 @@ socket_loop(Parent, Tag) ->
             Json = jsx:decode(Payload, [return_maps]),
             Parent ! {socket_event, Tag, #{type => call_signal,
                 conversation_id => maps:get(<<"conversation_id">>, Json), signal => maps:get(<<"signal">>, Json)}},
+            socket_loop(Parent, Tag);
+        {hub_text, Payload, call_missed} ->
+            Json = jsx:decode(Payload, [return_maps]),
+            Profile0 = maps:get(<<"profile">>, Json, #{}),
+            Profile = #{display_name => maps:get(<<"display_name">>, Profile0, <<>>)},
+            Parent ! {socket_event, Tag, #{type => call_missed,
+                conversation_id => maps:get(<<"conversation_id">>, Json),
+                from_user_id => maps:get(<<"from_user_id">>, Json),
+                reason => maps:get(<<"reason">>, Json), profile => Profile}},
             socket_loop(Parent, Tag);
         {hub_text, _Payload, _Type} ->
             socket_loop(Parent, Tag)

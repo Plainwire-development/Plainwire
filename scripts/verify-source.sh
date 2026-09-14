@@ -14,7 +14,7 @@ from pathlib import Path
 import json
 import ast
 version = Path('VERSION').read_text().strip()
-assert version == '1.7.2-1'
+assert version == '1.7.2-2'
 assert f'{{vsn, "{version}"}}' in Path('src/plainwire_relay.app.src').read_text()
 assert f'{{release, {{plainwire_relay, "{version}"}}' in Path('rebar.config').read_text()
 assert f'attribute "data-ui-version" "{version}"' in Path('priv/static/elm/src/Main.elm').read_text()

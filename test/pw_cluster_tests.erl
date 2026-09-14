@@ -22,6 +22,7 @@ wire_validation_test() ->
     Bad = pw_cluster_wire:encode(api, Boot, 2, Now, {topic, {direct, 17}}, (event())#{pid => self()}),
     ?assertMatch({error, _}, pw_cluster_wire:decode(Bad, [api], Now)),
     ?assertEqual(false, pw_cluster_wire:allowed({user, 1}, #{type => call_signal})),
+    ?assertEqual(true, pw_cluster_wire:allowed({user, 1}, #{type => mention, scope => direct})),
     Huge = pw_cluster_wire:encode(api, Boot, 3, Now, {user, 1}, #{type => direct_message, data => binary:copy(<<0>>, 140000)}),
     ?assertMatch({error, _}, pw_cluster_wire:decode(Huge, [api], Now)).
 

@@ -9,6 +9,8 @@ const root=resolve('priv/static');
 const server=createServer(async(req,res)=>{try{const url=new URL(req.url,'http://localhost');const file=url.pathname==='/'?'index.html':url.pathname.replace(/^\/assets\//,'');const path=resolve(root,file);if(!path.startsWith(root+'/'))throw Error('path');const bytes=await readFile(path);res.writeHead(200,{'content-type':({'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml'})[extname(path)]||'application/octet-stream'});res.end(bytes);}catch{res.writeHead(404);res.end();}});
 await new Promise(r=>server.listen(0,'127.0.0.1',r));
 const origin=`http://127.0.0.1:${server.address().port}`;
+const previewGif=Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==','base64');
+previewGif.writeUInt16LE(320,6);previewGif.writeUInt16LE(180,8);
 const browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_EXECUTABLE||undefined,args:['--no-sandbox','--disable-dev-shm-usage']});
 const errors=[];
 await mkdir('test-results',{recursive:true});
@@ -22,14 +24,25 @@ let inviteRevoked = false;
 const sockets=[];
 const subscriptions=[];
 let messageFetches=0;
+let embedHits=[];
+let pastedUploadType='';
 let testServer = { ...servers[0], role: 'owner', welcome_message: 'Welcome to **The Workshop**. Read the rules and say hello.' };
+conversations[1].last_body='Status: **ready to review** with [notes](https://example.com/notes).';
 const serverData = () => ({server:testServer, channels:[{id:1,server_id:1,name:'general',kind:'text',position:0,topic:'',created_at:now}],categories:[],members:people.map(user=>({user,role:user.id===1?'owner':'member',muted:false,joined_at:now}))});
 messages.push(message(8, 'Here is the change:\n\n```erlang\nhello(Name) -> {ok, Name}.\n```\n\n**Ready to review.** [Notes](https://example.com/notes)\n\n> Keep it simple.\n\n| Task | Status |\n| --- | --- |\n| Audio | Passed |'));
+messages.push(message(20, 'Happy to. New walkthrough:\n\nhttps://www.youtube.com/watch?v=dQw4w9WgXcQ'));
+messages.push(message(21, 'Also tracking progress here: https://example.com/project'));
+messages.push(message(22, 'Nothing to see: https://gone.example/nope'));
+messages.push({...message(23, 'Missed call'),kind:'missed_call'});
+messages.push(message(26, 'A direct GIF:\n\nhttps://media.example/celebrate.gif'));
+messages.push(message(27, 'Markdown image syntax:\n\n![Celebration](https://media.example/confetti.gif)'));
+messages.push(message(28, 'A static image beside a caption: https://media.example/diagram.png and it stays in this message.'));
+messages.push(message(29, 'Text before ![inline.gif](/api/files/pasted-gif) and text after the pasted GIF.'));
 async function setup(context){
  await context.route('**/api/**',async route=>{
   const req=route.request(), url=new URL(req.url()), path=url.pathname;
   const reply=(data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify({ok:status<400,data,...(status===401?{error:'not_authenticated'}:{})})});
-  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.7.2-1',asset_version:'1.7.2-1',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
+  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.7.2-2',asset_version:'1.7.2-2',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
   if(path==='/api/me')return authenticated?reply({user:me,csrf:'test-csrf',server_time:now}):reply(null,401);
   if(path==='/api/sync')return reply(sync);
   if(path==='/api/forums')return reply([]);
@@ -54,6 +67,18 @@ async function setup(context){
   }
   if(path==='/api/rtc-config')return reply({iceServers:[]});
   if(path==='/api/voice-processing-config')return reply({krisp_available:false});
+  if(path==='/api/uploads'&&req.method()==='POST'){pastedUploadType=req.headers()['content-type']||'';return reply({id:'pasted-gif',name:'pasted.gif',content_type:'image/gif',url:'/api/files/pasted-gif'});}
+  if(path==='/api/files/pasted-gif')return route.fulfill({status:200,contentType:'image/gif',body:previewGif});
+  if(path==='/api/media/test-gif')return route.fulfill({status:200,contentType:'image/gif',body:previewGif});
+  if(path==='/api/media/test-image')return route.fulfill({status:200,contentType:'image/gif',body:previewGif});
+  if(path==='/api/embed'){
+   const target=url.searchParams.get('url');embedHits.push(target);
+   const imagePath=new URL(target).pathname.toLowerCase();
+   if(imagePath.endsWith('.gif'))return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({ok:true,data:{url:target,title:'Animated image',description:'',image:'/api/media/test-gif',site_name:'media.example',kind:'gif'}})});
+   if(/\.(?:png|jpe?g|webp|avif)$/.test(imagePath))return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({ok:true,data:{url:target,title:'Image',description:'',image:'/api/media/test-image',site_name:'media.example',kind:'image'}})});
+   if(target==='https://example.com/project')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({ok:true,data:{url:target,title:'The Project Handbook',description:'Everything about building and shipping the workspace.',image:'',site_name:'Example Wiki'}})});
+   return route.fulfill({status:502,contentType:'application/json',body:JSON.stringify({ok:false,error:'embed_failed'})});
+  }
   return reply({});
  });
  await context.routeWebSocket('**/ws', ws=>{sockets.push(ws);ws.onMessage(raw=>{const msg=JSON.parse(raw);if(msg.type==='subscribe')subscriptions.push(msg.key);if(msg.type==='ping')ws.send(JSON.stringify({type:'pong'}));});ws.send(JSON.stringify({type:'hello',session:{user:me}}));});
@@ -62,6 +87,11 @@ try {
  const context=await browser.newContext({viewport:{width:1440,height:960},colorScheme:'light'});await setup(context);
  const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
  await page.goto(origin);await page.waitForSelector('.home-welcome');
+ await page.waitForSelector('.dm-preview strong');
+ assert((await page.locator('.dm-preview a[href="https://example.com/notes"]').count())>=2,'home and sidebar DMs render safe inline Markdown');
+ assert.equal(await page.locator('.dm-preview .link-video, .dm-preview .link-embed').count(),0,'compact inbox previews never embed');
+ const shellGap=await page.locator('.layout').evaluate(el=>{const side=el.querySelector('.side').getBoundingClientRect(),main=el.querySelector('.main').getBoundingClientRect();return main.left-side.right;});
+ assert(shellGap>=8,`navigation and content keep a visible gutter (${shellGap}px)`);
  await page.screenshot({path:'test-results/home-desktop.png'});
  const navigation = page.getByRole('button',{name:'Resize navigation',exact:true});
  const navigationWidth = await page.locator('.side').evaluate(el=>el.getBoundingClientRect().width);
@@ -77,15 +107,31 @@ try {
  await page.screenshot({path:'test-results/quick-switcher.png'});
  await page.keyboard.press('Enter');await page.waitForSelector('#compose');
  assert.equal(new URL(page.url()).hash,'#dm/1');
+ await page.waitForSelector('.call-event');
+ try { await page.waitForFunction(()=>{const el=document.querySelector('#messages');return el&&el.scrollHeight-el.scrollTop-el.clientHeight<5;},{timeout:5000}); }
+ catch (error) { console.log(await page.evaluate(()=>({metrics:(()=>{const el=document.querySelector('#messages');return {top:el?.scrollTop,height:el?.scrollHeight,client:el?.clientHeight};})(),trace:window.__plainwireScrollTrace}))); throw error; }
+ assert.equal(await page.getByRole('note',{name:/Missed call/}).count(),1,'missed calls render as timeline events');
+ const activeRowInset=await page.locator('.side .dm-row.active').evaluate(row=>{const side=row.closest('.side').getBoundingClientRect(),box=row.getBoundingClientRect();return side.right-box.right;});
+ assert(activeRowInset>=8,`selected conversation stays clear of the navigation edge (${activeRowInset}px)`);
  await page.keyboard.press('Control+k');await page.getByRole('searchbox',{name:'Find conversations and servers'}).fill('no such room');
  await page.getByText('No matches. Try a person or server name.',{exact:true}).waitFor();await page.keyboard.press('Escape');
  assert.equal(await page.locator('dialog[open]').count(),0);
  await page.evaluate(()=>location.hash='#dm/1');await page.waitForSelector('#compose');await page.waitForSelector('.msg');
- await page.waitForSelector('.code-block .hljs-title');
+ await page.locator('#compose').fill('@ja');await page.waitForSelector('.mention-panel:not([hidden])');
+ assert.equal(await page.locator('.mention-option').count(),1);
+ await page.keyboard.press('Enter');assert.equal(await page.locator('#compose').inputValue(),'@jamiechen ');
+ await page.locator('#compose').fill('');
+ sockets.at(-1).send(JSON.stringify({type:'message_created',message:message(24,'@alexmorgan can you review this?')}));
+ await page.waitForSelector('[data-mid="24"] .mention-self');
+ sockets.at(-1).send(JSON.stringify({type:'mention',scope:'direct',scope_id:2,conversation_id:2,message:message(25,'@alexmorgan a note for you',2,people[2])}));
+ await page.waitForSelector('.dm-row .mention-chip');
+ const codeMessage=page.locator('.msg',{hasText:'Here is the change'});
+ await codeMessage.scrollIntoViewIfNeeded();
+ await codeMessage.locator('.code-block .hljs-title').waitFor({state:'attached'});
  assert.equal(await page.locator('.code-block .code-heading span').first().textContent(),'erlang');
  assert(await page.locator('.msg-body strong').count()>0);
  assert.equal(await page.locator('.markdown-table table').count(),1);
- assert.equal(await page.locator('a[href="https://example.com/notes"]').getAttribute('rel'),'noopener noreferrer ugc');
+ assert.equal(await codeMessage.locator('a[href="https://example.com/notes"]').getAttribute('rel'),'noopener noreferrer ugc');
  await page.evaluate(()=>{
   const el=document.createElement('pw-markdown'); el.id='markdown-security-fixture'; el.setAttribute('source','<img src=x onerror="window.__xss=1">\n<script>window.__xss=1</script>\n[bad](javascript:alert(1))\n![remote](https://tracker.example/pixel)\n\n```unknownlang\n<script>alert(1)</script>\n```'); document.body.append(el);
  });
@@ -93,6 +139,50 @@ try {
  assert.equal(await page.evaluate(()=>window.__xss),undefined);
  assert(await page.evaluate(()=>window.PlainwireHighlight.listLanguages().length)>180);
  await page.locator('#markdown-security-fixture').evaluate(el=>el.remove());
+ await page.evaluate(()=>{location.hash='#dm/1';});
+ await page.waitForSelector('.msg');await page.waitForSelector('.link-video');
+ const ytMsg=page.locator('.msg',{hasText:'New walkthrough'});
+ await ytMsg.scrollIntoViewIfNeeded();
+ assert.equal(await ytMsg.locator('.link-video').count(),1,'youtube link gets one player card');
+ await ytMsg.locator('.link-video-play').click();
+ await ytMsg.locator('.link-video-frame iframe[src*="youtube-nocookie"][src*="dQw4w9WgXcQ"]').waitFor();
+ assert.equal(await ytMsg.locator('.link-video-frame iframe').count(),1,'poster swaps into an embedded player');
+ const ogMsg=page.locator('.msg',{hasText:'Also tracking progress here'});
+ await ogMsg.scrollIntoViewIfNeeded();
+ await ogMsg.locator('.link-embed:not(.embed-loading) .link-embed-title').waitFor();
+ assert.equal((await ogMsg.locator('.link-embed-title').textContent()),'The Project Handbook');
+ assert((await ogMsg.locator('.link-embed-site').textContent()).includes('Example Wiki'));
+ assert.equal(await ogMsg.locator('.link-embed').count(),1);
+ await page.waitForFunction(()=>{const m=[...document.querySelectorAll('.msg')].find(m=>m.textContent.includes('Nothing to see'));return m&&!m.querySelector('.link-embed, .link-video');});
+ assert(embedHits.includes('https://example.com/project'),'generic link resolves through /api/embed');
+ assert(embedHits.includes('https://gone.example/nope'),'unresolvable link still attempted then dropped');
+ assert(!embedHits.some(h=>h.includes('youtube.com')),'video cards never call the metadata proxy');
+ assert(!embedHits.includes('https://example.com/notes'),'link text differing from href is never embedded');
+ const directGif=page.locator('.msg',{hasText:'A direct GIF'});await directGif.scrollIntoViewIfNeeded();await directGif.locator('.message-gif-link .animated-image').waitFor();
+ const markdownGif=page.locator('.msg',{hasText:'Markdown image syntax'});await markdownGif.scrollIntoViewIfNeeded();await markdownGif.locator('.message-gif-link .animated-image').waitFor();
+ const staticImage=page.locator('.msg',{hasText:'A static image beside a caption'});await staticImage.scrollIntoViewIfNeeded();await staticImage.locator('.remote-image-embed .message-image').waitFor();
+ const inlineGif=page.locator('.msg',{hasText:'Text before'});await inlineGif.scrollIntoViewIfNeeded();await inlineGif.locator('.message-gif-link .animated-image').waitFor();
+ assert.equal(await directGif.locator('.link-embed').count(),0,'direct GIF renders as media instead of a generic card');
+ assert.equal(await markdownGif.locator('.message-image-source.embedded-image-source').count(),1,'Markdown image source is hidden only after its accessible media loads');
+ assert.equal(await staticImage.locator('.link-embed').count(),0,'direct image renders as media instead of a generic card');
+ assert.equal(await inlineGif.locator('pw-markdown > .message-gif-link').count(),1,'an inline attachment is moved beside its caption instead of breaking the paragraph');
+ assert((await inlineGif.locator('pw-markdown p').textContent()).includes('Text before')&&(await inlineGif.locator('pw-markdown p').textContent()).includes('text after'),'text surrounding an inline attachment stays readable');
+ assert(embedHits.includes('https://media.example/celebrate.gif')&&embedHits.includes('https://media.example/confetti.gif'),'GIFs resolve through the authenticated media proxy');
+ await page.evaluate(()=>{document.documentElement.dataset.animatedMedia='false';});
+ assert.equal(await directGif.locator('.animated-image').evaluate(el=>getComputedStyle(el).visibility),'hidden','animated-media preference pauses proxied GIFs');
+ await page.evaluate(()=>{document.documentElement.dataset.animatedMedia='true';});
+ await page.locator('#compose').fill('Caption before paste');
+ await page.locator('#compose').evaluate(el=>{el.setSelectionRange(el.value.length,el.value.length);const transfer=new DataTransfer();transfer.items.add(new File([new Uint8Array([71,73,70,56,57,97])],'pasted.gif',{type:'image/gif'}));el.dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:transfer}));});
+ await page.waitForFunction(()=>document.querySelector('#compose')?.value.includes('![pasted.gif](/api/files/pasted-gif)'));
+ await page.locator('#compose').pressSequentially('Caption after paste');
+ const pastedDraft=await page.locator('#compose').inputValue();
+ assert.equal(pastedDraft,'Caption before paste\n![pasted.gif](/api/files/pasted-gif)\nCaption after paste','pasted image data stays grouped with text before and after it');
+ assert.equal(pastedUploadType,'image/gif','clipboard GIF keeps its animated media type');
+ sockets.at(-1).send(JSON.stringify({type:'message_created',message:message(31,pastedDraft)}));
+ const pastedMessage=page.locator('[data-mid="31"]');await pastedMessage.locator('.message-gif-link .animated-image').waitFor();
+ assert((await pastedMessage.textContent()).includes('Caption before paste')&&(await pastedMessage.textContent()).includes('Caption after paste'),'pasted media and its caption render in one message');
+ await page.locator('#compose').fill('');
+ await page.screenshot({path:'test-results/link-embeds.png'});
  await page.evaluate(()=>{
   window.__oldMessage=document.querySelector('.msg');window.__wholeMessageScans=0;
   window.__queryAll=document.querySelectorAll;
@@ -118,6 +208,13 @@ try {
  assert(composeMetrics.scroll>composeMetrics.height&&composeMetrics.overflow==='auto'&&composeMetrics.height<=180,JSON.stringify(composeMetrics));
  for (const viewport of [{width:1440,height:960},{width:390,height:540}]) {
   await page.setViewportSize(viewport);
+  if(viewport.width===390){
+   const mobileCompose=await page.locator('#compose').evaluate(el=>({height:el.clientHeight,scroll:el.scrollHeight,overflow:getComputedStyle(el).overflowY}));
+   assert(mobileCompose.height<=112&&mobileCompose.scroll>mobileCompose.height&&mobileCompose.overflow==='auto',JSON.stringify({message:'mobile composer stays bounded',mobileCompose}));
+   assert(await page.locator('#messages').evaluate(el=>el.clientHeight>=120),'long drafts leave room to read chat on mobile');
+   const callLayout=await page.locator('.call-event').evaluate(card=>{const action=card.querySelector('.call-event-action').getBoundingClientRect(),box=card.getBoundingClientRect(),next=card.nextElementSibling?.getBoundingClientRect();return {actionInside:action.bottom<=box.bottom+.5,nextClear:!next||next.top>=box.bottom-.5};});
+   assert.deepEqual(callLayout,{actionInside:true,nextClear:true},'mobile missed-call action stays inside its card and clear of the next message');
+  }
   await page.getByLabel('Message formatting',{exact:true}).click();
   await page.waitForTimeout(80);
   const closeBox=await page.getByRole('button',{name:'Close formatting',exact:true}).boundingBox();
@@ -266,5 +363,5 @@ try {
  await page.screenshot({path:'test-results/group-chat-mobile.png',animations:'disabled'});
  authenticated=false;const auth=await browser.newContext({viewport:{width:1440,height:960},colorScheme:'light'});await setup(auth);const login=await auth.newPage();login.on('pageerror',e=>errors.push(e.message));await login.goto(origin);await login.waitForSelector('.auth-submit');await login.screenshot({path:'test-results/login-desktop.png'});await login.setViewportSize({width:390,height:844});await login.screenshot({path:'test-results/login-mobile.png'});
  const blocked=await browser.newContext();await setup(blocked);await blocked.addInitScript(()=>Object.defineProperty(window,'localStorage',{get(){throw new DOMException('Storage blocked','SecurityError')}}));const blockedPage=await blocked.newPage();blockedPage.on('pageerror',e=>errors.push(e.message));await blockedPage.goto(origin);await blockedPage.waitForSelector('.auth-submit');
- assert.deepEqual(errors,[],'no browser exceptions');console.log('PASS: click-select group creation and adding members, live membership refresh, long server names, functional home mark, mobile customization footer; quick switcher keyboard navigation/dismissal; sidebar resizing; workspace menu dismissal; latest-message navigation and preserved reading position; scoped media updates; settings tab scroll reset; Markdown and syntax highlighting; unsafe markup rejection; long composer scrolling; settings search; welcome preview; invite expiry/revocation; desktop/light/dark/mobile layouts; drafts across routes; concurrent sends out of order; new draft preserved; late send isolated; failed send/retry; sign-in; no runtime exceptions.');
+ assert.deepEqual(errors,[],'no browser exceptions');console.log('PASS: missed-call cards; recent-DM Markdown; mentions and autocomplete; initial latest-message positioning; bounded mobile composer; click-select group creation and adding members; live membership refresh; long server names; functional home mark; mobile customization footer; quick switcher keyboard navigation/dismissal; sidebar resizing; workspace menu dismissal; latest-message navigation and preserved reading position; scoped media updates; settings tab scroll reset; Markdown and syntax highlighting; unsafe markup rejection; settings search; welcome preview; invite expiry/revocation; desktop/light/dark/mobile layouts; drafts across routes; concurrent sends out of order; new draft preserved; late send isolated; failed send/retry; sign-in; no runtime exceptions.');
 } finally {await browser.close();server.close();}

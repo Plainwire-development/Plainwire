@@ -8,6 +8,7 @@ port module Ports exposing
     , encodeApiRequest
     , fileInput
     , onHashChange
+    , playMention
     , playNotification
     , playOutgoingRingtone
     , playRingtone
@@ -16,6 +17,7 @@ port module Ports exposing
     , setHash
     , wsReceive
     , wsSend
+    , notify
     )
 
 import Json.Decode as D
@@ -118,6 +120,12 @@ port playOutgoingRingtone : Bool -> Cmd msg
 
 
 port playNotification : Bool -> Cmd msg
+
+
+port playMention : Bool -> Cmd msg
+
+
+port notify : E.Value -> Cmd msg
 
 
 port readFile : String -> Cmd msg

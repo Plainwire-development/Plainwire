@@ -46,6 +46,28 @@ contains
     slope = (pairs((count + 1) / 2) + pairs((count + 2) / 2)) / 2
   end function robust_slope
 
+  pure function robust_deviation(values, n) result(deviation)
+    integer, intent(in) :: n
+    real(c_double), intent(in) :: values(:)
+    real(c_double) :: deviation, center, copy(max_rows), distances(max_rows), mean
+    if (n <= 1) then
+      deviation = 0
+      return
+    end if
+    if (n < 5) then
+      mean = sum(values(1:n)) / n
+      deviation = sqrt(sum((values(1:n) - mean)**2) / n)
+      return
+    end if
+    copy(1:n) = values(1:n)
+    call sort_values(copy, n)
+    center = (copy((n + 1) / 2) + copy((n + 2) / 2)) / 2
+    distances(1:n) = abs(values(1:n) - center)
+    call sort_values(distances, n)
+    deviation = 1.4826_c_double * &
+      (distances((n + 1) / 2) + distances((n + 2) / 2)) / 2
+  end function robust_deviation
+
   pure function network_score(means, jitter_p95, eligible) result(score)
     real(c_double), intent(in) :: means(:), jitter_p95
     logical, intent(in) :: eligible(:)
@@ -79,7 +101,7 @@ contains
     integer(c_int), value :: n
     real(c_double), intent(in) :: x(9, n)
     real(c_double), intent(out) :: out(output_count)
-    real(c_double) :: means(8), devs(8), slopes(8), vals(max_rows), times(max_rows), weights(max_rows)
+    real(c_double) :: means(8), devs(8), stable_devs(8), slopes(8), vals(max_rows), times(max_rows), weights(max_rows)
     real(c_double) :: recent(8), jitter_p95, recent_p95, duration, measured, burst, longest, run
     real(c_double) :: weight, evidence(8), total_span, stability_penalty
     real(c_double), parameter :: maxima(9) = [300.0_c_double, 100.0_c_double, 10000.0_c_double, &
@@ -102,6 +124,7 @@ contains
     end do
     means = missing
     devs = 0
+    stable_devs = 0
     slopes = no_trend
     counts = 0
     evidence = 0
@@ -135,6 +158,7 @@ contains
       if (weight <= 0) cycle
       means(j) = sum(vals(1:m) * weights(1:m)) / weight
       devs(j) = sqrt(sum(weights(1:m) * (vals(1:m) - means(j))**2) / weight)
+      stable_devs(j) = robust_deviation(vals, m)
       eligible(j) = m >= 3 .and. evidence(j) >= 10
       if (j <= 2 .and. eligible(j)) slopes(j) = robust_slope(vals, times, m)
       if (j <= 5) then
@@ -162,8 +186,8 @@ contains
 
     out(1) = network_score(means, jitter_p95, eligible)
     stability_penalty = 0
-    if (eligible(1)) stability_penalty = stability_penalty + 3 * devs(1)
-    if (eligible(2)) stability_penalty = stability_penalty + 2 * devs(2)
+    if (eligible(1)) stability_penalty = stability_penalty + 3 * stable_devs(1)
+    if (eligible(2)) stability_penalty = stability_penalty + 2 * stable_devs(2)
     if (eligible(1) .or. eligible(2)) out(2) = max(0.0_c_double, 100 - min(100.0_c_double, stability_penalty))
     out(3) = means(1)
     out(4) = jitter_p95

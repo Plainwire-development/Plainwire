@@ -38,6 +38,10 @@ upstream = [r[:-1] + [10] for r in good]
 assert analyze(upstream)[0] >= 95 and analyze(upstream)[14] == 50
 spike = [[t, 0, 5 if t < 20 else 200, 40, 0, 20, 24, 24, -1] for t in (0, 5, 10, 15, 20)]
 assert analyze(spike)[8] == 0, 'one outlier is not a sustained trend'
+spike_result = analyze(spike)
+assert spike_result[1] >= 95 and spike_result[3] == 200, 'one jitter spike belongs in p95 without making an otherwise steady call unstable'
+oscillating = [[t, 0, jitter, 40, 0, 20, 24, 24, -1] for t, jitter in zip((0, 5, 10, 15, 20, 25), (5, 55, 5, 55, 5, 55))]
+assert analyze(oscillating)[1] < 40, 'sustained jitter swings must still lower stability'
 rising = [[t, 0, 5 + t, 40, 0, 20, 24, 24, -1] for t in (0, 4, 11, 17, 25)]
 assert math.isclose(analyze(rising)[8], 10)
 burst = [[t, loss, 5, 40, 0, 20, 24, 24, -1] for t, loss in [(0,0), (5,5), (10,5), (15,-1), (20,5), (25,0)]]
@@ -80,4 +84,4 @@ for offset in range(0, len(p.stdout), 156):
 start = time.perf_counter()
 p = run(packet(good) * 1000)
 assert p.returncode == 0 and len(p.stdout) == 156000
-print(f'PASS: native evidence, recent/upstream scores, robust trends, burst timing, silence, 200 random windows, all truncated frame boundaries and 1,000 sequential analyses ({time.perf_counter()-start:.3f}s).')
+print(f'PASS: native evidence, recent/upstream scores, robust trends and stability, burst timing, silence, 200 random windows, all truncated frame boundaries and 1,000 sequential analyses ({time.perf_counter()-start:.3f}s).')

@@ -33,7 +33,7 @@ endif
 VERSION := $(strip $(shell cat VERSION))
 REBAR := $(REBAR3) $(if $(filter cluster,$(PROFILE)),as cluster)
 RELEASE_ROOT := _build/$(PROFILE)/rel/plainwire_relay
-FRONTEND_INPUTS := $(wildcard web/*.js scripts/build-*.mjs priv/static/*.scss priv/static/elm/src/*.elm) priv/static/index.haml priv/static/elm/elm.json scripts/build-haml.sh scripts/build-elm.sh VERSION Makefile
+FRONTEND_INPUTS := $(wildcard web/*.js scripts/build-*.mjs priv/static/*.scss priv/static/*.less priv/static/less-plugins/*.js priv/static/elm/src/*.elm) priv/static/index.haml priv/static/elm/elm.json scripts/build-haml.sh scripts/build-elm.sh VERSION Makefile
 FRONTEND_OUTPUTS := priv/static/index.html priv/static/app.css priv/static/app.js priv/static/markdown.js priv/static/highlight-all.js
 NATIVE_TARGET := $(if $(filter 1,$(NATIVE)),native)
 NATIVE_TEST := $(if $(filter 1,$(NATIVE)),test-native)

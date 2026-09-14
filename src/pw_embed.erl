@@ -8,25 +8,59 @@ fetch(Url0) ->
     Url = pw_util:bin(Url0),
     case pw_media:validate_url(Url) of
         ok ->
-            Key = {embed, pw_util:sha256_hex(Url)},
-            Now = pw_util:now_ms(),
-            case ets:lookup(pw_media_cache, Key) of
-                [{Key, Json, _, Expires}] when Expires > Now ->
-                    {ok, jsx:decode(Json, [return_maps])};
-                _ ->
-                    case http_get(Url) of
-                        {ok, Html} ->
-                            Meta = parse_og(Html, Url),
-                            Json = jsx:encode(Meta),
-                            ets:insert(pw_media_cache, {Key, Json, <<"application/json">>, Now + ?TTL_MS}),
-                            {ok, Meta};
-                        Err ->
-                            Err
-                    end
+            case image_kind(Url) of
+                none ->
+                    fetch_page(Url);
+                Kind ->
+                    {ok, image_meta(Url, Kind)}
             end;
         Err ->
             Err
     end.
+
+fetch_page(Url) ->
+    Key = {embed, pw_util:sha256_hex(Url)},
+    Now = pw_util:now_ms(),
+    case ets:lookup(pw_media_cache, Key) of
+        [{Key, Json, _, Expires}] when Expires > Now ->
+            {ok, jsx:decode(Json, [return_maps])};
+        _ ->
+            case http_get(Url) of
+                {ok, Html} ->
+                    Meta = parse_og(Html, Url),
+                    Json = jsx:encode(Meta),
+                    ets:insert(pw_media_cache, {Key, Json, <<"application/json">>, Now + ?TTL_MS}),
+                    {ok, Meta};
+                Err ->
+                    Err
+            end
+    end.
+
+image_kind(Url) ->
+    try uri_string:parse(binary_to_list(Url)) of
+        #{path := Path} ->
+            case string:lowercase(filename:extension(Path)) of
+                ".gif" -> gif;
+                ".png" -> image;
+                ".jpg" -> image;
+                ".jpeg" -> image;
+                ".webp" -> image;
+                ".avif" -> image;
+                _ -> none
+            end;
+        _ -> none
+    catch _:_ -> none
+    end.
+
+image_meta(Url, Kind) ->
+    #{
+        <<"url">> => Url,
+        <<"title">> => case Kind of gif -> <<"Animated image">>; _ -> <<"Image">> end,
+        <<"description">> => <<>>,
+        <<"image">> => pw_media:proxy_url(Url),
+        <<"site_name">> => host_of(Url),
+        <<"kind">> => atom_to_binary(Kind, utf8)
+    }.
 
 http_get(Url) ->
     case pw_http_fetch:get(Url, ?MAX_BYTES) of

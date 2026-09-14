@@ -101,6 +101,155 @@ class ScrollTools extends HTMLElement {
 }
 customElements.define('pw-scroll-tools', ScrollTools);
 
+let mentionPickerSequence = 0;
+
+class MentionPicker extends HTMLElement {
+  connectedCallback() {
+    if (this.built) return;
+    this.built = true;
+    this.abort = new AbortController();
+    this.panel = element('div', 'mention-panel');
+    const head = element('div', 'mention-panel-head');
+    const title = element('span', 'mention-panel-title', 'Mention a member');
+    const close = element('button', 'mention-panel-close', '×'); close.type = 'button'; close.setAttribute('aria-label', 'Close mentions');
+    head.append(title, close); this.panel.append(head);
+    const list = element('div', 'mention-options'); list.setAttribute('role', 'listbox'); list.setAttribute('aria-label', 'Members'); list.id = this.id || `mention-options-${++mentionPickerSequence}`;
+    this.panel.append(list);
+    const foot = element('div', 'mention-panel-foot', '↑ ↓ choose · Enter insert · Esc close');
+    this.panel.append(foot);
+    this.panel.hidden = true;
+    this.list = list;
+    this.replaceChildren(this.panel);
+    this.members = [];
+    this.query = '';
+    this.active = 0;
+    this.token = null;
+    const signals = { signal: this.abort.signal };
+    document.addEventListener('input', (event) => { if (event.target === this.composerTextarea()) this.update(); }, { capture: true, ...signals });
+    document.addEventListener('keyup', (event) => { if (event.target === this.composerTextarea()) this.update(); }, { capture: true, ...signals });
+    document.addEventListener('keydown', this.onKeydown, { capture: true, ...signals });
+    document.addEventListener('focusin', (event) => { if (!this.panel.hidden && !this.contains(event.target)) this.close(); }, signals);
+    document.addEventListener('scroll', (event) => {
+      if (!this.panel.hidden && event.target !== this.list && !this.contains(event.target)) this.close();
+    }, { capture: true, passive: true, ...signals });
+    close.addEventListener('click', () => this.close());
+    this.panel.addEventListener('mousedown', (event) => { event.preventDefault(); });
+  }
+  disconnectedCallback() { this.abort?.abort(); }
+  composerTextarea() {
+    return this.closest('.composer')?.querySelector('#compose') || null;
+  }
+  onKeydown = (event) => {
+    if (this.panel.hidden || event.isComposing || event.target !== this.composerTextarea()) return;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault(); event.stopPropagation();
+      this.move(event.key === 'ArrowDown' ? 1 : -1);
+    } else if (event.key === 'Enter' || event.key === 'Tab') {
+      event.preventDefault(); event.stopPropagation();
+      this.pick();
+    } else if (event.key === 'Escape') {
+      event.preventDefault(); event.stopPropagation();
+      this.close();
+    }
+  };
+  update() {
+    const ta = this.composerTextarea();
+    if (!ta) return this.close();
+    const value = ta.value || '';
+    const caret = Math.max(0, Math.min(value.length, ta.selectionStart ?? value.length));
+    const before = value.slice(0, caret);
+    const match = /(?:^|\s)@([\w-]*)$/.exec(before);
+    if (!match) return this.close();
+    const token = match[1].toLowerCase();
+    if (token.length > 40) return this.close();
+    this.query = token;
+    this.readMembers();
+    const matches = this.filteredMembers();
+    if (!matches.length) return this.close();
+    const atIndex = match.index + match[0].lastIndexOf('@');
+    this.token = { start: atIndex, end: caret };
+    this.active = Math.min(this.active, matches.length - 1);
+    this.render(matches);
+  }
+  readMembers() {
+    let raw;
+    try { raw = JSON.parse(this.getAttribute('data-members') || '[]'); } catch (_) { raw = []; }
+    if (!raw || !Array.isArray(raw)) raw = [];
+    this.members = raw.filter(m => m && typeof m.username === 'string' && typeof m.name === 'string').slice(0, 1000);
+  }
+  filteredMembers() {
+    const q = this.query;
+    const ranks = m => {
+      const u = m.username.toLowerCase();
+      if (u === q) return 0;
+      if (u.startsWith(q)) return 1;
+      if (m.name && m.name.toLowerCase().includes(q)) return 2;
+      return q ? -1 : 3;
+    };
+    return this.members.filter(m => !q || ranks(m) >= 0).sort((a, b) => ranks(a) - ranks(b) || a.name.localeCompare(b.name)).slice(0, 24);
+  }
+  move(step) {
+    const items = this.list.querySelectorAll('.mention-option');
+    if (!items.length) return;
+    this.active = (this.active + step + items.length) % items.length;
+    this.highlight(items);
+  }
+  highlight(items) {
+    items.forEach((item, i) => {
+      item.classList.toggle('selected', i === this.active);
+      item.setAttribute('aria-selected', String(i === this.active));
+      if (i === this.active) item.scrollIntoView({ block: 'nearest' });
+    });
+    const ta = this.composerTextarea();
+    if (ta) ta.setAttribute('aria-activedescendant', items[this.active]?.id || '');
+  }
+  render(matches) {
+    const list = this.list;
+    list.replaceChildren();
+    for (const [i, m] of matches.entries()) {
+      const row = element('button', 'mention-option'); row.type = 'button'; row.setAttribute('role', 'option'); row.id = `mention-option-${i}`; row.dataset.username = m.username;
+      row.setAttribute('aria-selected', 'false');
+      const av = element('span', 'mention-option-avatar');
+      if (m.avatar) { const img = document.createElement('img'); img.src = m.avatar; img.alt = ''; img.loading = 'lazy'; av.append(img); }
+      else { av.textContent = (m.name || m.username).slice(0, 1).toUpperCase(); }
+      const copy = element('span', 'mention-option-copy');
+      copy.append(element('span', 'mention-option-name', m.name || m.username));
+      copy.append(element('small', 'mention-option-username', '@' + m.username));
+      row.append(av, copy);
+      row.addEventListener('mouseenter', () => { this.active = i; this.highlight(list.querySelectorAll('.mention-option')); });
+      row.addEventListener('click', () => this.pick(m));
+      list.append(row);
+    }
+    const ta = this.composerTextarea();
+    if (ta) { ta.setAttribute('aria-controls', list.id); ta.setAttribute('aria-expanded', 'true'); }
+    this.highlight(list.querySelectorAll('.mention-option'));
+    this.panel.hidden = false;
+  }
+  pick(member = this.filteredMembers()[this.active]) {
+    if (!member || !this.token) return this.close();
+    const ta = this.composerTextarea();
+    if (!ta) return this.close();
+    const value = ta.value || '';
+    const before = value.slice(0, this.token.start);
+    const after = value.slice(this.token.end);
+    const inserted = value.slice(this.token.start, this.token.end).replace(/@[\w-]*$/, '@' + member.username + ' ');
+    ta.value = before + inserted + after;
+    const caret = (before + inserted).length;
+    ta.setSelectionRange(caret, caret);
+    ta.focus();
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    this.close();
+  }
+  close() {
+    this.panel.hidden = true;
+    this.token = null;
+    this.list.replaceChildren();
+    const ta = this.composerTextarea();
+    if (ta) { ta.removeAttribute('aria-expanded'); ta.removeAttribute('aria-activedescendant'); }
+  }
+}
+customElements.define('pw-mention-picker', MentionPicker);
+
 class SidebarResize extends HTMLElement {
   connectedCallback() {
     const side = this.closest('.side'); if (!side) return;

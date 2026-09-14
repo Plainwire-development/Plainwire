@@ -4,7 +4,7 @@ Plainwire Relay is a self-hostable chat app with servers, DMs, forums, voice cal
 
 It uses Erlang/OTP, Cowboy, PostgreSQL, Elm, SCSS, WebSocket, and WebRTC.
 
-Version **1.7.2-1** adds neutral charcoal surfaces, roomier server navigation, a working Home mark, searchable click-to-select group members, live member refresh, server identity previews, and mobile dialogs with persistent action buttons. See [the patch notes](RELEASE_NOTES_1.7.2-1.md).
+Version **1.7.2-2** adds neutral charcoal surfaces, roomier server navigation, a working Home mark, searchable click-to-select group members, live member refresh, server identity previews, and mobile dialogs with persistent action buttons. See [the patch notes](RELEASE_NOTES_1.7.2-2.md).
 
 The preceding 1.7.2 build includes a [broader interface and worker refresh](docs/UI_REFRESH.md): quick navigation, adjustable sidebar, improved settings and chat, fewer repeated DOM scans, and stronger call-health evidence.
 

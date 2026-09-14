@@ -97,7 +97,7 @@ handle_call({call_accept, Cid, Uid, Pid, Profile, Audience0}, _From, St0) ->
                     St3 = do_call_join(Cid, Caller, CPid, CProfile, Audience, St2),
                     {reply, ok, St3};
                 _ ->
-                    {reply, ok, do_call_join(Cid, Uid, Pid, Profile, Audience0, StBase)}
+                    {reply, {error, no_active_call}, StBase}
             end
     end;
 handle_call(_, _, St) -> {reply, ok, St}.
@@ -155,6 +155,7 @@ handle_cast({notify_user, Uid, Event}, St) ->
         call_cancelled -> Event;
         call_missed -> Event;
         call_presence -> Event;
+        mention -> Event;
         direct_message -> Event;
         channel_message -> Event;
         _ -> #{type => notification, event => Event}
@@ -195,7 +196,8 @@ handle_cast({call_ring, Cid, Uid, Pid, Profile, Targets}, St0) ->
     Key = {ring, Cid},
     StBase = evict_other_rooms(Uid, Pid, Key, St0),
     St1 = end_user_rings(end_ring(StBase, Key, call_cancelled, missed), Uid, Key),
-    Ref = erlang:send_after(?RING_MS, self(), {ring_timeout, Cid, Uid}),
+    RingMs = ring_timeout_ms(),
+    Ref = erlang:send_after(RingMs, self(), {ring_timeout, Cid, Uid}),
     Targets1 = lists:filter(fun(T) -> T =/= Uid end, Targets),
     log("call_ring", #{uid => Uid, conversation_id => Cid, target_count => length(Targets1)}),
     Ring = #{
@@ -207,8 +209,11 @@ handle_cast({call_ring, Cid, Uid, Pid, Profile, Targets}, St0) ->
         accepted => undefined,
         timer => Ref
     },
-    Pid ! {hub_json, #{type => call_ringing, conversation_id => Cid, targets => length(Targets1), profile => strip_profile(Profile)}},
-    [notify_user(T, #{type => call_incoming, conversation_id => Cid, from_user_id => Uid, profile => strip_profile(Profile)}) || T <- Targets1],
+    ExpiresAt = pw_util:now_ms() + RingMs,
+    Pid ! {hub_json, #{type => call_ringing, conversation_id => Cid, targets => length(Targets1),
+        profile => strip_profile(Profile), timeout_ms => RingMs, expires_at => ExpiresAt}},
+    [notify_user(T, #{type => call_incoming, conversation_id => Cid, from_user_id => Uid,
+        profile => strip_profile(Profile), timeout_ms => RingMs, expires_at => ExpiresAt}) || T <- Targets1],
     {noreply, St1#st{rings = maps:put(Key, Ring, St1#st.rings)}};
 handle_cast({call_decline, Cid, Uid}, St0) ->
     Key = {ring, Cid},
@@ -228,10 +233,10 @@ handle_cast({call_decline, Cid, Uid}, St0) ->
         _ ->
             {noreply, St0}
     end;
-handle_cast({call_cancel, Cid, Uid, Pid}, St0) ->
+handle_cast({call_cancel, Cid, Uid, _Pid}, St0) ->
     Key = {ring, Cid},
     case maps:get(Key, St0#st.rings, undefined) of
-        #{caller_id := Uid, caller_pid := Pid} ->
+        #{caller_id := Uid} ->
             {noreply, end_ring(St0, Key, call_cancelled, cancelled)};
         _ ->
             {noreply, St0}
@@ -284,6 +289,7 @@ handle_info({ring_timeout, Cid, Uid}, St0) ->
     Key = {ring, Cid},
     case maps:get(Key, St0#st.rings, undefined) of
         #{caller_id := Uid} ->
+            persist_missed_call(Uid, Cid),
             {noreply, end_ring(St0, Key, call_missed, timeout)};
         _ ->
             {noreply, St0}
@@ -454,9 +460,11 @@ send_active_calls(Pid, Uid, Calls) ->
 
 end_ring(St0, Key, EventType, Reason) ->
     case maps:get(Key, St0#st.rings, undefined) of
-        #{caller_pid := CPid, targets := Targets, timer := Ref} ->
+        #{caller_id := Caller, caller_pid := CPid, caller_profile := Profile,
+          targets := Targets, timer := Ref} ->
             cancel_timer(Ref),
-            Event = #{type => EventType, conversation_id => element(2, Key), reason => Reason},
+            Event = #{type => EventType, conversation_id => element(2, Key), reason => Reason,
+                from_user_id => Caller, profile => strip_profile(Profile)},
             CPid ! {hub_json, Event},
             notify_ring_parties(Targets, Event, undefined),
             St0#st{rings = maps:remove(Key, St0#st.rings)};
@@ -475,6 +483,20 @@ notify_ring_parties(Targets, Event, Skip) ->
 
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref), ok.
+
+ring_timeout_ms() ->
+    min(120000, max(10000, pw_util:env_int("PLAINWIRE_CALL_RING_MS", ?RING_MS))).
+
+persist_missed_call(Uid, Cid) ->
+    spawn(fun() ->
+        case pw_db:record_missed_call(Uid, Cid) of
+            {ok, _} -> ok;
+            {error, Reason} ->
+                logger:warning("[plainwire:hub] missed_call_not_persisted ~p",
+                    [#{uid => Uid, conversation_id => Cid, reason => Reason}])
+        end
+    end),
+    ok.
 
 relay_signal(Room, From, FromPid, To, Event) ->
     case {member_owned(Room, From, FromPid), maps:get(To, Room, undefined)} of

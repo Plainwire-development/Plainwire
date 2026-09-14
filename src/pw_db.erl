@@ -9,7 +9,7 @@
     forums/1, create_forum/4, delete_forum/2, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, delete_thread/2, reply_thread/3, vote_thread/3,
     servers/1, create_server/3, update_server/3, server/2, create_channel/4, create_channel/5,
     create_invite/4, create_invite/5, list_invites/2, revoke_invite/3, invite_options/2, invite_preview/1, join_invite/2,
-    messages/5, post_channel_message/4, delete_message/2,
+    messages/5, post_channel_message/4, delete_message/2, record_missed_call/2,
     conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4,
     add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4,
     close_conversation/2, leave_conversation/2, accept_message_request/2, deny_message_request/2,
@@ -220,6 +220,7 @@ accept_message_request(Uid, Cid) -> call({accept_message_request, Uid, Cid}).
 deny_message_request(Uid, Cid) -> call({deny_message_request, Uid, Cid}).
 mark_conversation_read(Uid, Cid) -> call({mark_conversation_read, Uid, Cid}).
 post_direct_message(Uid, Cid, Body, ReplyTo) -> call({post_direct_message, Uid, Cid, Body, ReplyTo}).
+record_missed_call(Uid, Cid) -> call({record_missed_call, Uid, Cid}).
 notifications(Uid) -> call({notifications, Uid}).
 mark_notifications_seen(Uid) -> call({mark_notifications_seen, Uid}).
 clear_notifications(Uid) -> call({clear_notifications, Uid}).
@@ -1197,7 +1198,7 @@ route({messages, Uid, Scope0, ScopeId0, Before0, After0}, Conn) ->
         true ->
             {Sql, Params} = message_sql(Scope, ScopeId, Before, After),
             {ok, Rows} = rows(Conn, Sql, Params),
-            ReplyIds = [R || [_,_,_,_,_,_,_,_,R,_] <- Rows, R =/= null, is_integer(R)],
+            ReplyIds = [R || [_,_,_,_,_,_,_,_,R|_] <- Rows, R =/= null, is_integer(R)],
             ReplyMap = batch_replied_messages(Conn, ReplyIds, Scope, ScopeId),
             {ok, [message_map_with_replies(R, ReplyMap) || R <- Rows]};
         false ->
@@ -1205,7 +1206,7 @@ route({messages, Uid, Scope0, ScopeId0, Before0, After0}, Conn) ->
     end;
 route({delete_message, Uid, Mid0}, Conn) ->
     Mid = pw_util:int(Mid0),
-    case one(Conn, "SELECT user_id, scope, scope_id FROM messages WHERE id = $1 AND deleted_at IS NULL", [Mid]) of
+    case one(Conn, "SELECT user_id, scope, scope_id FROM messages WHERE id = $1 AND kind = 'text' AND deleted_at IS NULL", [Mid]) of
         {ok, [Uid, Scope, ScopeId]} ->
             Now = pw_util:now_ms(),
             ok = exec(Conn, "UPDATE messages SET deleted_at = $1, body = '' WHERE id = $2", [Now, Mid]),
@@ -1482,6 +1483,27 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
             {ok, Msg};
         _ ->
             {error, invalid_message}
+    end;
+route({record_missed_call, Uid, Cid0}, Conn) ->
+    Cid = pw_util:int(Cid0),
+    case conversation_can_send(Conn, Uid, Cid) of
+        true ->
+            Now = pw_util:now_ms(),
+            Body = store_message(<<"Missed call">>),
+            {ok, Mid} = insert_returning(Conn,
+                "INSERT INTO messages(scope, scope_id, user_id, body, reply_to_id, created_at, kind) "
+                "VALUES('direct',$1,$2,$3,NULL,$4,'missed_call') RETURNING id",
+                [Cid, Uid, Body, Now]),
+            ok = exec(Conn, "UPDATE direct_threads SET updated_at = $1 WHERE id = $2", [Now, Cid]),
+            ok = exec(Conn, "UPDATE direct_members SET last_read_message_id = $1 WHERE thread_id = $2 AND user_id = $3", [Mid, Cid, Uid]),
+            ok = exec(Conn, "UPDATE direct_members SET hidden = false WHERE thread_id = $1", [Cid]),
+            {ok, Row} = one(Conn, message_select() ++ " WHERE m.id = $1", [Mid]),
+            Msg = message_map(Conn, Row),
+            pw_hub:broadcast({direct, Cid}, #{type => message_created, scope => direct, scope_id => Cid, message => Msg}),
+            notify_missed_call_members(Conn, Cid, Uid, Msg, Now),
+            {ok, Msg};
+        false ->
+            {error, forbidden}
     end;
 route({notifications, Uid}, Conn) ->
     {ok, Rows} = rows(Conn, "SELECT id, kind, body, url, seen, created_at FROM notifications WHERE user_id = $1 ORDER BY id DESC LIMIT 120", [Uid]),
@@ -1823,6 +1845,11 @@ migrations() -> [
     ]},
     {17, [
         "ALTER TABLE servers ADD COLUMN IF NOT EXISTS welcome_message text NOT NULL DEFAULT ''"
+    ]},
+    {18, [
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'text'",
+        "ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check",
+        "ALTER TABLE messages ADD CONSTRAINT messages_kind_check CHECK(kind IN ('text','missed_call'))"
     ]}
 ].
 
@@ -2358,10 +2385,10 @@ member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, Role, M
     #{user => user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last]),
       role => Role, muted => Muted, joined_at => Joined}.
 
-message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted]) ->
+message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind]) ->
     #{id => Id, scope => Scope, scope_id => ScopeId, user_id => Uid, username => U, display_name => D,
       avatar_url => pw_util:proxied_image(Avatar), body => load_message(Body), reply_to_id => db_null(ReplyTo),
-      created_at => Created, edited_at => db_null(Edited), deleted_at => db_null(Deleted)}.
+      created_at => Created, edited_at => db_null(Edited), deleted_at => db_null(Deleted), kind => Kind}.
 
 optional_id(Value) ->
     case pw_util:int(Value) of
@@ -2458,7 +2485,7 @@ thread_select() ->
 
 message_select() ->
     "SELECT m.id, m.scope, m.scope_id, m.user_id, u.username, u.display_name, u.avatar_url, "
-    "m.body, m.reply_to_id, m.created_at, m.edited_at, m.deleted_at FROM messages m JOIN users u ON u.id = m.user_id".
+    "m.body, m.reply_to_id, m.created_at, m.edited_at, m.deleted_at, m.kind FROM messages m JOIN users u ON u.id = m.user_id".
 
 message_sql(Scope, Id, undefined, undefined) ->
     {message_select() ++ " WHERE m.scope = $1 AND m.scope_id = $2 AND m.deleted_at IS NULL ORDER BY m.id DESC LIMIT 80", [Scope, Id]};
@@ -2563,22 +2590,49 @@ notify_thread_participants(Conn, Tid, Sender, Body, Now) ->
         "SELECT DISTINCT user_id FROM (SELECT user_id FROM threads WHERE id = $1 "
         "UNION SELECT user_id FROM replies WHERE thread_id = $1) u WHERE user_id <> $2",
         [Tid, Sender]),
+    {ok, Roster} = rows(Conn,
+        "SELECT DISTINCT u.id, u.username FROM users u JOIN "
+        "(SELECT user_id FROM threads WHERE id = $1 UNION SELECT user_id FROM replies WHERE thread_id = $1) p "
+        "ON u.id = p.user_id WHERE u.id <> $2",
+        [Tid, Sender]),
+    Mentioned = pw_mention:resolve(Body, Roster),
     Url = <<"#/thread/", (integer_to_binary(Tid))/binary>>,
+    Snippet = pw_util:clean_text(Body, 140),
     [begin
          U = only_id(R),
-         create_notification(Conn, U, <<"thread_reply">>, pw_util:clean_text(Body, 140), Url, Now),
-         pw_hub:notify_user(U, #{type => thread_reply, thread_id => Tid})
+         case lists:member(U, Mentioned) of
+             true ->
+                 notify_mention(Conn, U, Body, Url,
+                     #{type => mention, scope => thread, thread_id => Tid, body => Snippet}, Now);
+             false ->
+                 create_notification(Conn, U, <<"thread_reply">>, Snippet, Url, Now),
+                 pw_hub:notify_user(U, #{type => thread_reply, thread_id => Tid})
+         end
      end || R <- Rows],
     ok.
 
+notify_mention(Conn, Uid, Body, Url, Event, Now) ->
+    create_notification(Conn, Uid, <<"mention">>, pw_util:clean_text(Body, 180), Url, Now),
+    pw_hub:notify_user(Uid, Event).
+
 notify_channel_members(Conn, Sid, Sender, Cid, Msg, Now) ->
+    Body = maps:get(body, Msg),
     {ok, Rows} = rows(Conn, "SELECT user_id FROM server_members WHERE server_id = $1 AND user_id <> $2", [Sid, Sender]),
+    {ok, Roster} = rows(Conn,
+        "SELECT u.id, u.username FROM users u JOIN server_members sm ON sm.user_id = u.id "
+        "WHERE sm.server_id = $1 AND u.id <> $2", [Sid, Sender]),
+    Mentioned = pw_mention:resolve(Body, Roster),
+    Url = <<"#/channel/", (integer_to_binary(Cid))/binary>>,
     [begin
          U = only_id(R),
-         create_notification(Conn, U, <<"channel_message">>, maps:get(body, Msg),
-             <<"#/channel/", (integer_to_binary(Cid))/binary>>, Now),
-         %% send the row too; tabs dedupe it if the scoped event also lands.
-         pw_hub:notify_user(U, #{type => channel_message, channel_id => Cid, message => Msg})
+         case lists:member(U, Mentioned) of
+             true ->
+                 notify_mention(Conn, U, Body, Url,
+                     #{type => mention, scope => channel, scope_id => Cid, channel_id => Cid, message => Msg}, Now);
+             false ->
+                 create_notification(Conn, U, <<"channel_message">>, Body, Url, Now),
+                 pw_hub:notify_user(U, #{type => channel_message, channel_id => Cid, message => Msg})
+         end
      end || R <- Rows],
     ok.
 
@@ -2603,25 +2657,53 @@ publish_conversation_event(Conn, Cid, Event) ->
     end.
 
 notify_direct_members(Conn, Cid, Sender, Event, Now) ->
+    Msg = maps:get(message, Event, #{}),
+    PlainBody = maps:get(body, Msg, <<>>),
     {ok, Rows} = rows(Conn, "SELECT user_id, request_state FROM direct_members WHERE thread_id = $1 AND user_id <> $2 AND muted = false", [Cid, Sender]),
+    {ok, Roster} = rows(Conn,
+        "SELECT u.id, u.username FROM users u JOIN direct_members dm ON dm.user_id = u.id "
+        "WHERE dm.thread_id = $1 AND dm.request_state = 'accepted' AND u.id <> $2", [Cid, Sender]),
+    Mentioned = pw_mention:resolve(PlainBody, Roster),
+    Url = <<"#/dm/", (integer_to_binary(Cid))/binary>>,
     [begin
          [U, RequestState] = R,
          EventType = maps:get(type, Event, direct_message),
-         {Kind, Body, Url} = case {EventType, RequestState} of
-             {direct_message, <<"pending">>} -> {<<"message_request">>, <<"New message request">>, <<"#/dms">>};
-             _ -> case EventType of
-             message_request_accepted -> {<<"message_request_accepted">>, <<"Message request accepted">>, <<"#/dm/", (integer_to_binary(Cid))/binary>>};
-             conversation_closed -> {<<"conversation_closed">>, <<"Message request declined">>, <<"#/dms">>};
-             message_request -> {<<"message_request">>, <<"New message request">>, <<"#/dms">>};
-             conversation_created -> {<<"conversation_created">>, <<"New conversation">>, <<"#/dm/", (integer_to_binary(Cid))/binary>>};
-             _ -> {<<"direct_message">>, <<"New direct message">>, <<"#/dm/", (integer_to_binary(Cid))/binary>>}
-             end
-         end,
-         case Kind of
-             <<"message_request">> -> create_notification_once(Conn, U, Kind, Body, Url, Now);
-             _ -> create_notification(Conn, U, Kind, Body, Url, Now)
-         end,
-         pw_hub:notify_user(U, Event)
+         case {EventType, RequestState, lists:member(U, Mentioned)} of
+             {direct_message, <<"pending">>, _} ->
+                 create_notification_once(Conn, U, <<"message_request">>, <<"New message request">>, <<"#/dms">>, Now),
+                 pw_hub:notify_user(U, Event);
+             {direct_message, <<"accepted">>, true} ->
+                 notify_mention(Conn, U, PlainBody, Url,
+                     #{type => mention, scope => direct, scope_id => Cid, conversation_id => Cid, message => Msg}, Now);
+             {direct_message, _, _} ->
+                 create_notification(Conn, U, <<"direct_message">>, <<"New direct message">>, Url, Now),
+                 pw_hub:notify_user(U, Event);
+             {message_request, _, _} ->
+                 create_notification_once(Conn, U, <<"message_request">>, <<"New message request">>, <<"#/dms">>, Now),
+                 pw_hub:notify_user(U, Event);
+             {message_request_accepted, _, _} ->
+                 create_notification(Conn, U, <<"message_request_accepted">>, <<"Message request accepted">>, Url, Now),
+                 pw_hub:notify_user(U, Event);
+             {conversation_closed, _, _} ->
+                 create_notification(Conn, U, <<"conversation_closed">>, <<"Message request declined">>, <<"#/dms">>, Now),
+                 pw_hub:notify_user(U, Event);
+             {conversation_created, _, _} ->
+                 create_notification(Conn, U, <<"conversation_created">>, <<"New conversation">>, Url, Now),
+                 pw_hub:notify_user(U, Event)
+         end
+     end || R <- Rows],
+    ok.
+
+notify_missed_call_members(Conn, Cid, Caller, Msg, Now) ->
+    {ok, Rows} = rows(Conn,
+        "SELECT user_id FROM direct_members WHERE thread_id = $1 AND user_id <> $2 "
+        "AND request_state = 'accepted'", [Cid, Caller]),
+    Name = maps:get(display_name, Msg, <<"Someone">>),
+    Url = <<"#/dm/", (integer_to_binary(Cid))/binary>>,
+    [begin
+         U = only_id(R),
+         create_notification(Conn, U, <<"missed_call">>, <<"Missed call from ", Name/binary>>, Url, Now),
+         pw_hub:notify_user(U, #{type => direct_message, conversation_id => Cid, message => Msg})
      end || R <- Rows],
     ok.
 
@@ -2676,4 +2758,3 @@ maybe_upgrade_password_hash(Conn, Uid, Password, StoredHash) ->
                 [Hash, Salt, pw_util:now_ms(), Uid, StoredHash]),
             ok
     end.
-

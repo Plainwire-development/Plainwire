@@ -148,6 +148,7 @@ type alias Message =
     , displayName : String
     , avatarUrl : String
     , body : String
+    , kind : String
     , replyToId : Maybe Int
     , replyTo : Maybe ReplyPreview
     , createdAt : Int
@@ -421,6 +422,7 @@ type alias Model =
     , isLeader : Bool
     , tabId : String
     , subs : Set String
+    , mentionHints : Set String
     , voice : VoiceState
     , callUI : CallUI
     , activeCalls : Dict Int ActiveCall
@@ -722,6 +724,7 @@ decodeMessage =
         |> andMap (D.field "display_name" D.string)
         |> andMap (D.field "avatar_url" D.string |> defaultValue "")
         |> andMap (D.field "body" D.string)
+        |> andMap (D.field "kind" D.string |> defaultValue "text")
         |> andMap (D.field "reply_to_id" (D.nullable D.int))
         |> andMap (D.field "reply_to" (D.nullable decodeReplyPreview) |> defaultValue Nothing)
         |> andMap (D.field "created_at" D.int)
@@ -881,7 +884,7 @@ type alias SyncData r =
 
 defaultMsg : Message
 defaultMsg =
-    Message 0 "" 0 0 "" "" "" "" Nothing Nothing 0 Nothing Nothing
+    Message 0 "" 0 0 "" "" "" "" "text" Nothing Nothing 0 Nothing Nothing
 
 
 

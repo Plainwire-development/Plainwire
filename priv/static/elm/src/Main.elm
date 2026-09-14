@@ -18,6 +18,11 @@ import Task
 import Time
 import Types exposing (..)
 import Url exposing (Url)
+import View.Auth as Auth
+import View.Composer as Composer
+import View.Home as Home
+import View.Markdown as Markdown
+import View.Notifications as Notifications
 
 
 
@@ -275,6 +280,7 @@ init flags url _ =
       , isLeader = False
       , tabId = ""
       , subs = Set.empty
+      , mentionHints = Set.empty
       , voice =
             { mode = Nothing
             , id = Nothing
@@ -459,6 +465,16 @@ update msg model =
                     else
                         model.hasOlderMessages
                 , pendingConversationId = pendingId
+                , mentionHints =
+                    case active of
+                        DmView id ->
+                            Set.remove ("dm:" ++ String.fromInt id) model.mentionHints
+
+                        ChannelView id ->
+                            Set.remove ("channel:" ++ String.fromInt id) model.mentionHints
+
+                        _ ->
+                            model.mentionHints
               }
             , Cmd.batch
                 [ bridgeSend
@@ -499,7 +515,7 @@ update msg model =
         DoAuth ->
             let
                 authError =
-                    authValidationError model
+                    Auth.validationError model
 
                 path =
                     if model.authMode == "login" then
@@ -2786,6 +2802,7 @@ appendOptimisticMessage scope scopeId body model =
                         user.displayName
                         user.avatarUrl
                         body
+                        "text"
                         (Maybe.map .id model.replyTo)
                         model.replyTo
                         (if model.serverTime > 0 then
@@ -2831,6 +2848,9 @@ handleWsEvent val model =
 
         Ok ( "channel_message", _ ) ->
             handleNotifiedMessage val model
+
+        Ok ( "mention", _ ) ->
+            handleMention val model
 
         Ok ( "notification", _ ) ->
             ( model, bridgeSend (E.object [ ( "tag", E.string "silent_sync" ), ( "data", E.null ) ]) )
@@ -2972,6 +2992,48 @@ handleWsEvent val model =
 
                 Err _ ->
                     ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = model.callUI.active }, callMode = Connected }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
+
+        Ok ( "call_missed", ev ) ->
+            let
+                conversationId =
+                    D.decodeValue (D.field "conversation_id" D.int) ev |> Result.withDefault 0
+
+                callerId =
+                    D.decodeValue (D.field "from_user_id" D.int) ev |> Result.withDefault 0
+
+                callerName =
+                    D.decodeValue (D.at [ "profile", "display_name" ] D.string) ev |> Result.withDefault "Someone"
+
+                fromMe =
+                    Maybe.map .id model.me == Just callerId
+
+                message =
+                    if fromMe then
+                        "No answer"
+
+                    else
+                        "Missed call from " ++ callerName
+
+                nextVoice =
+                    if model.voice.mode == Just "call" && model.voice.id == Just conversationId then
+                        clearVoice model.voice
+
+                    else
+                        model.voice
+            in
+            ( { model
+                | callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
+                , activeCalls = Dict.remove conversationId model.activeCalls
+                , callMode = Idle
+                , voice = nextVoice
+                , toast = Just message
+              }
+            , Cmd.batch
+                [ playRingtone False
+                , playOutgoingRingtone False
+                , Process.sleep 5000 |> Task.perform (\_ -> DismissToast)
+                ]
+            )
 
         Ok ( "call_declined", _ ) ->
             ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }, callMode = Idle }, Cmd.batch [ playRingtone False, playOutgoingRingtone False ] )
@@ -3480,6 +3542,115 @@ handleNotifiedMessage ev model =
             ( model, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), playNotification model.soundEnabled ] )
 
 
+handleMention : E.Value -> Model -> ( Model, Cmd Msg )
+handleMention ev model =
+    case D.decodeValue (D.field "message" decodeMessage) ev of
+        Ok message ->
+            let
+                fromMe =
+                    Maybe.map .id model.me == Just message.userId
+
+                alreadyPresent =
+                    List.any (\existing -> existing.id == message.id) model.msg
+
+                applies =
+                    messageApplies model.active message
+
+                snippet =
+                    String.filter (\c -> c /= '\n') message.body |> String.left 160
+
+                title =
+                    if fromMe then
+                        "You were mentioned"
+
+                    else
+                        message.displayName ++ " mentioned you"
+            in
+            if fromMe || alreadyPresent then
+                ( model
+                , if applies then
+                    Cmd.batch
+                        [ playMention model.soundEnabled
+                        , bridgeSend (E.object [ ( "tag", E.string "scroll_messages_to_bottom" ), ( "data", E.null ) ])
+                        ]
+
+                  else
+                    Cmd.none
+                )
+
+            else if applies then
+                ( { model | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ] }
+                , Cmd.batch
+                    [ playMention model.soundEnabled
+                    , bridgeSend (E.object [ ( "tag", E.string "scroll_messages_to_bottom" ), ( "data", E.null ) ])
+                    ]
+                )
+
+            else
+                ( { model
+                    | mentionHints = Set.insert (mentionHintKey message) model.mentionHints
+                    , toast = Just (title ++ ": “" ++ snippet ++ "”")
+                  }
+                , Cmd.batch
+                    [ Process.sleep 5000 |> Task.perform (\_ -> DismissToast)
+                    , playMention model.soundEnabled
+                    , notify
+                        (E.object
+                            [ ( "title", E.string title )
+                            , ( "body", E.string snippet )
+                            , ( "url", E.string (mentionUrl message) )
+                            , ( "tag", E.string ("mention:" ++ String.fromInt message.id) )
+                            ]
+                        )
+                    , apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+                    ]
+                )
+
+        Err _ ->
+            case D.decodeValue (D.map2 Tuple.pair (D.field "thread_id" D.int) (D.field "body" D.string)) ev of
+                Ok ( threadId, threadBody ) ->
+                    let
+                        snippet =
+                            String.filter (\c -> c /= '\n') threadBody |> String.left 160
+                    in
+                    ( { model | toast = Just ("You were mentioned in a discussion: “" ++ snippet ++ "”") }
+                    , Cmd.batch
+                        [ Process.sleep 5000 |> Task.perform (\_ -> DismissToast)
+                        , playMention model.soundEnabled
+                        , notify
+                            (E.object
+                                [ ( "title", E.string "You were mentioned in a discussion" )
+                                , ( "body", E.string snippet )
+                                , ( "url", E.string ("#thread/" ++ String.fromInt threadId) )
+                                , ( "tag", E.string ("mention-thread:" ++ String.fromInt threadId) )
+                                ]
+                            )
+                        , apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+                        ]
+                    )
+
+                Err _ ->
+                    ( model, Cmd.none )
+
+
+mentionHintKey : Message -> String
+mentionHintKey message =
+    if message.scope == "direct" then
+        "dm:" ++ String.fromInt message.scopeId
+
+    else
+        "channel:" ++ String.fromInt message.scopeId
+
+
+mentionUrl : Message -> String
+mentionUrl message =
+    if message.scope == "direct" then
+        "#dm/" ++ String.fromInt message.scopeId
+
+    else
+        "#channel/" ++ String.fromInt message.scopeId
+
+
 handleCallPresence : E.Value -> Model -> ( Model, Cmd Msg )
 handleCallPresence ev model =
     case D.decodeValue callPresenceDecoder ev of
@@ -3743,7 +3914,7 @@ view model =
           else
             case model.me of
                 Nothing ->
-                    renderAuth model
+                    Auth.view model
 
                 Just _ ->
                     renderApp model
@@ -4988,256 +5159,12 @@ presenceAvatar statuses userId url name cls =
 
 
 
--- AUTH VIEW
-
-
-renderAuth : Model -> Html Msg
-renderAuth model =
-    div [ class "auth-shell" ]
-        [ section [ class "auth-brand-panel" ]
-            [ div [ class "auth-brand-lockup" ] [ div [ class "auth-brand-mark" ] [], span [] [ text model.appName ] ]
-            , div [ class "auth-brand-copy" ]
-                [ span [ class "eyebrow" ] [ text "Stay in the conversation" ]
-                , h1 [] [ text "A place for your people." ]
-                , p []
-                    [ text
-                        (if String.isEmpty model.instanceDescription then
-                            "Messages, calls, communities, and files on one self-hosted server."
-
-                         else
-                            model.instanceDescription
-                        )
-                    ]
-                ]
-            , div [ class "auth-capabilities", attribute "aria-label" "Plainwire features" ]
-                [ span [] [ text "Messages" ]
-                , span [] [ text "Voice" ]
-                , span [] [ text "Screen sharing" ]
-                , span [] [ text "Forums" ]
-                , span [] [ text "Files" ]
-                ]
-            ]
-        , main_ [ class "auth-form-panel" ]
-            [ div [ class "auth-form-wrap" ]
-                [ div [ class "auth-mobile-brand" ] [ div [ class "auth-brand-mark" ] [], b [] [ text model.appName ] ]
-                , div [ class "auth-heading" ]
-                    [ h2 []
-                        [ text
-                            (if model.authMode == "login" then
-                                "Sign in to " ++ model.appName
-
-                             else
-                                "Create your account"
-                            )
-                        ]
-                    , p [ class "muted" ]
-                        [ text
-                            (if model.authMode == "login" then
-                                "Sign in to continue to your conversations."
-
-                             else
-                                "Set up an account on this Plainwire instance."
-                            )
-                        ]
-                    ]
-                , div
-                    [ class
-                        ("auth-mode-switch"
-                            ++ (if model.registrationEnabled then
-                                    ""
-
-                                else
-                                    " single"
-                               )
-                        )
-                    , attribute "role" "group"
-                    , attribute "aria-label" "Account access"
-                    ]
-                    [ button
-                        [ class
-                            ("auth-mode-btn"
-                                ++ (if model.authMode == "login" then
-                                        " active"
-
-                                    else
-                                        ""
-                                   )
-                            )
-                        , onClick (AuthMode "login")
-                        ]
-                        [ text "Sign in" ]
-                    , if model.registrationEnabled then
-                        button
-                            [ class
-                                ("auth-mode-btn"
-                                    ++ (if model.authMode == "register" then
-                                            " active"
-
-                                        else
-                                            ""
-                                       )
-                                )
-                            , onClick (AuthMode "register")
-                            ]
-                            [ text "Register" ]
-
-                      else
-                        text ""
-                    ]
-                , Html.form [ class "auth-fields", onSubmit DoAuth ]
-                    [ div [ class "field" ]
-                        [ label [ attribute "for" "u" ] [ text "Username" ]
-                        , input [ id "u", type_ "text", attribute "autocomplete" "username", attribute "autocapitalize" "none", attribute "spellcheck" "false", maxlength 24, placeholder "yourname", value model.authUsername, onInput AuthUsername ] []
-                        ]
-                    , if model.authMode == "register" then
-                        div [ class "field" ]
-                            [ label [ attribute "for" "d" ] [ text "Display name" ]
-                            , input [ id "d", type_ "text", attribute "autocomplete" "name", maxlength 48, placeholder "How people see you", value model.authDisplayName, onInput AuthDisplayName ] []
-                            ]
-
-                      else
-                        text ""
-                    , div [ class "field" ]
-                        [ label [ attribute "for" "p" ] [ text "Password" ]
-                        , div [ class "auth-password-field" ]
-                            [ input
-                                [ id "p"
-                                , type_
-                                    (if model.authPasswordVisible then
-                                        "text"
-
-                                     else
-                                        "password"
-                                    )
-                                , attribute "autocomplete"
-                                    (if model.authMode == "login" then
-                                        "current-password"
-
-                                     else
-                                        "new-password"
-                                    )
-                                , maxlength 256
-                                , value model.authPassword
-                                , onInput AuthPassword
-                                ]
-                                []
-                            , button
-                                [ type_ "button"
-                                , class "auth-password-toggle"
-                                , onClick ToggleAuthPasswordVisibility
-                                , attribute "aria-label"
-                                    (if model.authPasswordVisible then
-                                        "Hide password"
-
-                                     else
-                                        "Show password"
-                                    )
-                                ]
-                                [ text
-                                    (if model.authPasswordVisible then
-                                        "Hide"
-
-                                     else
-                                        "Show"
-                                    )
-                                ]
-                            ]
-                        ]
-                    , if model.authMode == "register" then
-                        div [ class "auth-password-meter" ]
-                            [ div [ class ("auth-password-bar strength-" ++ authPasswordStrength model.authPassword) ] []
-                            , small [ class "muted" ] [ text "Use at least 10 characters. A longer unique passphrase is best." ]
-                            ]
-
-                      else
-                        text ""
-                    , if model.authMode == "register" then
-                        div [ class "field" ]
-                            [ label [ attribute "for" "pc" ] [ text "Confirm password" ]
-                            , input
-                                [ id "pc"
-                                , type_
-                                    (if model.authPasswordVisible then
-                                        "text"
-
-                                     else
-                                        "password"
-                                    )
-                                , attribute "autocomplete" "new-password"
-                                , maxlength 256
-                                , value model.authPasswordConfirm
-                                , onInput AuthPasswordConfirm
-                                ]
-                                []
-                            ]
-
-                      else
-                        text ""
-                    , case authValidationError { model | authBusy = False } of
-                        Just err ->
-                            if String.isEmpty model.authUsername && String.isEmpty model.authPassword then
-                                text ""
-
-                            else
-                                div [ class "auth-error", attribute "role" "alert" ] [ text err ]
-
-                        Nothing ->
-                            text ""
-                    , button [ type_ "submit", class "btn auth-submit", disabled (model.authBusy || not (authReady model)) ]
-                        [ text
-                            (if model.authBusy then
-                                "Working..."
-
-                             else if model.authMode == "login" then
-                                "Sign in"
-
-                             else
-                                "Create account"
-                            )
-                        ]
-                    ]
-                , p [ class "auth-footnote" ]
-                    [ text
-                        (if model.registrationEnabled then
-                            "This is a self-hosted Plainwire server."
-
-                         else
-                            "Registration is closed on this server. Sign in with an existing account."
-                        )
-                    ]
-                , div [ class "auth-instance-meta" ]
-                    [ span [] [ text ("Plainwire " ++ model.clientVersion) ]
-                    , span [ attribute "aria-hidden" "true" ] [ text "·" ]
-                    , span [] [ text "Web client" ]
-                    ]
-                ]
-            ]
-        ]
-
-
-authPasswordStrength : String -> String
-authPasswordStrength password =
-    let
-        n =
-            String.length password
-    in
-    if n >= 16 then
-        "strong"
-
-    else if n >= 10 then
-        "medium"
-
-    else
-        "weak"
-
-
-
 -- APP SHELL
 
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.7.2-1", attribute "data-ui-revision" "interface-3" ]
+    div [ class "layout", attribute "data-ui-version" "1.7.2-2", attribute "data-ui-revision" "interface-3" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -5639,8 +5566,8 @@ renderServerSide model data =
             ]
         , div [ class "search" ] [ quickJumpButton ]
         , div [ class "list server-channel-list" ]
-            (channelGroup "Text channels" uncategorizedText
-                ++ channelGroup "Voice channels" uncategorizedVoice
+            (channelGroup model "Text channels" uncategorizedText
+                ++ channelGroup model "Voice channels" uncategorizedVoice
                 ++ List.concatMap (\cat -> categoryBlock cat (List.filter (\c -> c.categoryId == Just cat.id) data.channels)) sortedCategories
             )
         , userPanel model
@@ -5648,13 +5575,13 @@ renderServerSide model data =
         ]
 
 
-channelGroup : String -> List Channel -> List (Html Msg)
-channelGroup heading channels =
+channelGroup : Model -> String -> List Channel -> List (Html Msg)
+channelGroup model heading channels =
     if List.isEmpty channels then
         []
 
     else
-        div [ class "channel-group-title" ] [ text heading ] :: List.map channelRow channels
+        div [ class "channel-group-title" ] [ text heading ] :: List.map (channelRow model) channels
 
 
 statusClass : Dict String String -> Int -> String
@@ -5935,9 +5862,14 @@ convRow c model =
         , div [ class "grow" ]
             [ div [ class "dm-row-head" ]
                 [ b [] [ text (convName c) ]
+                , if Set.member ("dm:" ++ String.fromInt c.id) model.mentionHints then
+                    span [ class "pill mention-chip" ] [ text "mentioned you" ]
+
+                  else
+                    text ""
                 , small [ class "muted" ] [ text (agoAt model.serverTime c.updatedAt) ]
                 ]
-            , small [ class "muted dm-preview" ] [ text lastText ]
+            , div [ class "muted dm-preview" ] [ Markdown.preview lastText ]
             ]
         , span
             [ class "badge"
@@ -6249,7 +6181,16 @@ renderPage : Model -> Html Msg
 renderPage model =
     case model.active of
         Home ->
-            renderHomePage model
+            Home.view
+                { conversationRow = \conversation -> convRow conversation model
+                , navigate = Go
+                , newMessage = NewDmModal
+                , newServer = Go "#new-server"
+                , openServers = ToggleServersSheet
+                , relativeTime = relativeTime
+                , sortConversations = sortConvs
+                }
+                model
 
         Forums ->
             renderForumsPage model
@@ -6291,119 +6232,10 @@ renderPage model =
             renderInvitePage model
 
         Notifications ->
-            renderNotificationsPage model
+            Notifications.view relativeTime model
 
         SearchView q ->
             renderSearchPage q model
-
-
-renderHomePage : Model -> Html Msg
-renderHomePage model =
-    let
-        unreadNotifs =
-            List.length (List.filter (\n -> not n.seen) model.notifs)
-
-        unreadDms =
-            List.sum (List.map (\c -> c.unread) model.convs)
-
-        recentConvs =
-            List.take 5 (sortConvs model.convs)
-
-        displayName =
-            case model.me of
-                Just user ->
-                    user.displayName
-
-                Nothing ->
-                    "there"
-    in
-    div [ class "home-page home-dashboard" ]
-        [ section [ class "home-welcome" ]
-            [ div [ class "home-welcome-copy" ]
-                [ span [ class "eyebrow" ] [ text "Home" ]
-                , h1 [] [ text ("Hello, " ++ displayName ++ ".") ]
-                , p [] [ text "Your conversations, all in one place." ]
-                ]
-            , div [ class "home-primary-actions" ]
-                [ button [ class "btn", onClick NewDmModal ] [ text "New message" ]
-                , button [ class "btn secondary", onClick (Go "#new-server") ] [ text "Create server" ]
-                ]
-            ]
-        , div [ class "stat-grid home-stat-grid" ]
-            [ statCard "Servers" (String.fromInt (List.length model.servers)) "communities" ToggleServersSheet
-            , statCard "Unread messages" (String.fromInt unreadDms) "direct messages" (Go "#dms")
-            , statCard "Notifications" (String.fromInt unreadNotifs) "new activity" (Go "#notifications")
-            ]
-        , div [ class "home-columns" ]
-            [ section [ class "card pad home-panel" ]
-                [ div [ class "section-head" ]
-                    [ div []
-                        [ h2 [] [ text "Recent messages" ]
-                        , p [ class "muted" ] [ text "Your latest direct conversations." ]
-                        ]
-                    , button [ class "btn ghost", onClick (Go "#dms") ] [ text "View all" ]
-                    ]
-                , div [ class "home-recent-list" ]
-                    (if List.isEmpty recentConvs then
-                        [ div [ class "empty home-empty" ] [ text "No direct messages yet. Start one when you are ready." ] ]
-
-                     else
-                        List.map (\c -> convRow c model) recentConvs
-                    )
-                ]
-            , section [ class "card pad home-panel home-activity" ]
-                [ div [ class "section-head" ]
-                    [ div []
-                        [ h2 [] [ text "Recent activity" ]
-                        , p [ class "muted" ] [ text "Mentions, replies, and requests that need your attention." ]
-                        ]
-                    , button [ class "btn ghost", onClick (Go "#notifications") ] [ text "View all" ]
-                    ]
-                , div [ class "home-activity-list" ]
-                    (if List.isEmpty model.notifs then
-                        [ div [ class "empty home-empty" ] [ text "Nothing new right now." ] ]
-
-                     else
-                        List.map (homeNotificationView model.serverTime) (List.take 5 model.notifs)
-                    )
-                , div [ class "home-quick-links" ]
-                    [ button [ class "btn secondary", onClick (Go "#forums") ] [ text "Browse forums" ]
-                    , button [ class "btn secondary", onClick (Go "#friends") ] [ text "Friends" ]
-                    ]
-                ]
-            ]
-        ]
-
-
-homeNotificationView : Int -> Notification -> Html Msg
-homeNotificationView now notification =
-    button
-        [ class
-            ("home-activity-row"
-                ++ (if notification.seen then
-                        ""
-
-                    else
-                        " unseen"
-                   )
-            )
-        , onClick (Go notification.url)
-        ]
-        [ span [ class "home-activity-mark", attribute "aria-hidden" "true" ] []
-        , span [ class "home-activity-copy" ]
-            [ b [] [ text notification.body ]
-            , small [ class "muted" ] [ text (notification.kind ++ " · " ++ relativeTime now notification.createdAt) ]
-            ]
-        ]
-
-
-statCard : String -> String -> String -> Msg -> Html Msg
-statCard label value sub msg =
-    button [ class "stat-card", onClick msg ]
-        [ span [ class "stat-value" ] [ text value ]
-        , b [] [ text label ]
-        , small [] [ text sub ]
-        ]
 
 
 renderForumsPage : Model -> Html Msg
@@ -6670,7 +6502,7 @@ renderThreadPage threadId model =
                                 , span [ class "muted" ] [ text ("@" ++ t.username ++ " · " ++ ago model.serverTime t.createdAt ++ " ago") ]
                                 ]
                             ]
-                        , div [ class "thread-post-body" ] (renderMessageBody t.body)
+                        , div [ class "thread-post-body" ] (Markdown.renderBody t.body)
                         , div [ class "thread-post-footer" ]
                             [ span [] [ text (String.fromInt t.score ++ " points") ]
                             , span [] [ text (String.fromInt t.views ++ " views") ]
@@ -6698,7 +6530,7 @@ renderThreadPage threadId model =
                     div [ class "locked-banner" ] [ text "This thread is locked. New replies are disabled." ]
 
                   else
-                    composerView ("thread:" ++ String.fromInt threadId) "Reply to thread" model
+                    Composer.view ("thread:" ++ String.fromInt threadId) "Reply to thread" model
                 ]
 
         Nothing ->
@@ -6769,7 +6601,7 @@ replyView model idx r =
                 , span [ class "muted" ] [ text (ago model.serverTime r.createdAt ++ " ago") ]
                 , span [ class "reply-number" ] [ text ("#" ++ String.fromInt (idx + 1)) ]
                 ]
-            , div [ class "reply-body" ] (renderMessageBody r.body)
+            , div [ class "reply-body" ] (Markdown.renderBody r.body)
             ]
         ]
 
@@ -7243,8 +7075,8 @@ renderServerPage model =
                                 text ""
                             ]
                         , div [ class "server-channel-card" ]
-                            (channelGroup "Text channels" textChannels
-                                ++ channelGroup "Voice channels" voiceChannels
+                            (channelGroup model "Text channels" textChannels
+                                ++ channelGroup model "Voice channels" voiceChannels
                             )
                         ]
                     , section [ class "card server-overview-panel server-member-panel" ]
@@ -7263,8 +7095,8 @@ renderServerPage model =
             div [ class "page-loading" ] [ span [ class "loading-dot" ] [], text "Loading server" ]
 
 
-channelRow : Channel -> Html Msg
-channelRow c =
+channelRow : Model -> Channel -> Html Msg
+channelRow model c =
     let
         target =
             if c.kind == "voice" then
@@ -7289,6 +7121,11 @@ channelRow c =
             []
         , div [ class "grow" ]
             [ b [] [ text c.name ]
+            , if c.kind == "text" && Set.member ("channel:" ++ String.fromInt c.id) model.mentionHints then
+                span [ class "pill mention-chip" ] [ text "mentioned" ]
+
+              else
+                text ""
             , small [ class "muted" ]
                 [ text
                     (if c.kind == "voice" then
@@ -8827,7 +8664,7 @@ renderMessagePage draftKey placeholderText model =
                                    )
                             )
                        , Html.node "pw-scroll-tools" [] []
-                       , composerView draftKey placeholderText model
+                       , Composer.view draftKey placeholderText model
                        ]
                 )
 
@@ -9354,6 +9191,10 @@ shouldGroup previous message =
         Just prev ->
             prev.userId
                 == message.userId
+                && prev.kind
+                == "text"
+                && message.kind
+                == "text"
                 && message.replyTo
                 == Nothing
                 && prev.id
@@ -9373,6 +9214,15 @@ shouldGroup previous message =
 
 messageView : Model -> Bool -> Message -> Html Msg
 messageView model grouped m =
+    if m.kind == "missed_call" then
+        missedCallView model m
+
+    else
+        textMessageView model grouped m
+
+
+textMessageView : Model -> Bool -> Message -> Html Msg
+textMessageView model grouped m =
     let
         mine =
             case model.me of
@@ -9441,7 +9291,7 @@ messageView model grouped m =
 
                 Nothing ->
                     text ""
-            , Lazy.lazy messageBodyView m.body
+            , Lazy.lazy2 Markdown.body (Maybe.withDefault "" (Maybe.map .username model.me)) m.body
             , if failed then
                 div [ class "msg-failed-bar" ]
                     [ span [ class "msg-failed-text" ] [ text "Failed to send" ]
@@ -9460,6 +9310,59 @@ messageView model grouped m =
                   else
                     text ""
                 ]
+            ]
+        ]
+
+
+missedCallView : Model -> Message -> Html Msg
+missedCallView model m =
+    let
+        mine =
+            Maybe.map .id model.me == Just m.userId
+
+        callTitle =
+            if mine then
+                "No answer"
+
+            else
+                "Missed call"
+
+        callDetail =
+            if mine then
+                "Your call was not answered"
+
+            else
+                m.displayName ++ " tried to reach you"
+
+        callAction =
+            if mine then
+                "Call again"
+
+            else
+                "Call back"
+    in
+    div
+        [ class ("msg call-event" ++ (if mine then " mine" else ""))
+        , attribute "data-mid" (String.fromInt m.id)
+        , attribute "role" "note"
+        , attribute "aria-label" (callTitle ++ ". " ++ callDetail)
+        ]
+        [ div [ class "call-event-icon", attribute "aria-hidden" "true" ]
+            [ span [ class "ui-icon ui-icon-call" ] [] ]
+        , div [ class "call-event-copy" ]
+            [ div [ class "call-event-heading" ]
+                [ b [] [ text callTitle ]
+                , span [ class "call-event-time" ] [ text (timestampText model m) ]
+                ]
+            , small [] [ text callDetail ]
+            ]
+        , button
+            [ class "btn secondary call-event-action"
+            , type_ "button"
+            , onClick (BridgeEvent "start_call" (E.int m.scopeId))
+            ]
+            [ span [ class "ui-icon ui-icon-call", attribute "aria-hidden" "true" ] []
+            , text callAction
             ]
         ]
 
@@ -9485,79 +9388,6 @@ timestampText model m =
 
     else
         agoAt model.serverTime m.createdAt ++ " ago"
-
-
-composerView : String -> String -> Model -> Html Msg
-composerView key placeholderText model =
-    div [ class "composer", attribute "data-draft" key ]
-        [ case model.replyTo of
-            Just reply ->
-                div [ class "reply-bar" ]
-                    [ span [ class "reply-to-label" ] [ text ("Replying to " ++ reply.displayName) ]
-                    , span [ class "reply-preview-text", title reply.body ] [ text ("“" ++ ellipsize 96 reply.body ++ "”") ]
-                    , button [ class "btn secondary", onClick CancelReply ] [ text "Cancel" ]
-                    ]
-
-            Nothing ->
-                text ""
-        , textarea [ id "compose", attribute "aria-label" placeholderText, maxlength 5000, rows 1, placeholder placeholderText, value model.inputText, onInput InputText, onComposerKeyDown model.chatEnterSends ] []
-        , div [ class "composer-footer" ]
-            [ button [ class "btn secondary attach-btn composer-action", type_ "button", title "Attach files or images", attribute "aria-label" "Attach files or images", onClick (BridgeEvent "pick_attachments" E.null) ]
-                [ span [ class "ui-icon ui-icon-attach", attribute "aria-hidden" "true" ] []
-                , span [ class "composer-action-label" ] [ text "Attach" ]
-                ]
-            , Html.details [ class "compose-format-help" ]
-                [ Html.summary [ attribute "aria-label" "Message formatting" ] [ span [ class "format-symbol", attribute "aria-hidden" "true" ] [ text "Aa" ], text "Format" ]
-                , div [ class "compose-format-panel", attribute "role" "region", attribute "aria-label" "Formatting tools" ]
-                    [ div [ class "format-panel-head" ]
-                        [ b [] [ text "Format your message" ]
-                        , button [ type_ "button", class "format-close", attribute "data-format-close" "", attribute "aria-label" "Close formatting" ] [ text "×" ]
-                        ]
-                    , div [ class "format-tools" ]
-                        (List.map (\( action, labelText ) -> button [ type_ "button", attribute "data-format" action ] [ text labelText ])
-                            [ ( "bold", "Bold" ), ( "italic", "Italic" ), ( "code", "Code" ), ( "quote", "Quote" ), ( "block", "Code block" ) ]
-                        )
-                    , p [ class "format-tip" ] [ text "Select text first, or start with a button. Ctrl/⌘ + B or I also works." ]
-                    , div [ class "compose-preview" ]
-                        [ small [] [ text "MESSAGE PREVIEW" ]
-                        , if String.isEmpty model.inputText then
-                            p [ class "muted" ] [ text "Your formatted message will appear here." ]
-
-                          else
-                            Html.node "pw-markdown" [ attribute "source" model.inputText ] []
-                        ]
-                    , p [ class "format-tip" ] [ text "Markdown supports lists, links, tables, and fenced code. Add a language after the opening ``` to highlight code." ]
-                    ]
-                ]
-            , small [ class "composer-count", attribute "aria-label" "Message character count" ]
-                [ text
-                    (if String.length model.inputText >= 4000 then
-                        String.fromInt (String.length model.inputText) ++ " / 5000"
-
-                     else
-                        ""
-                    )
-                ]
-            , small [ class "muted composer-hint" ]
-                [ text
-                    (if model.chatEnterSends then
-                        "Enter to send · Shift + Enter for a new line"
-
-                     else
-                        "Enter for a new line · Ctrl + Enter to send"
-                    )
-                ]
-            , button [ class "btn composer-send composer-action", disabled (String.isEmpty (String.trim model.inputText)), onClick SendMessage, attribute "aria-label" "Send message" ]
-                [ span [ class "composer-action-label" ] [ text "Send" ]
-                , span [ class "ui-icon ui-icon-send", attribute "aria-hidden" "true" ] []
-                ]
-            ]
-        ]
-
-
-messageBodyView : String -> Html Msg
-messageBodyView body =
-    div [ class "msg-body" ] (renderMessageBody body)
 
 
 draftKeyFor : ActiveRoute -> String
@@ -9596,346 +9426,6 @@ messageRequestApplies path route =
 messageRequest : Int -> String -> E.Value -> E.Value
 messageRequest requestId path body =
     E.object [ ( "method", E.string "POST" ), ( "path", E.string path ), ( "body", body ), ( "request_id", E.int requestId ) ]
-
-
-renderMessageBody : String -> List (Html Msg)
-renderMessageBody body =
-    renderRichChunks (String.lines body) [] Nothing []
-
-
-renderRichChunks : List String -> List String -> Maybe String -> List (Html Msg) -> List (Html Msg)
-renderRichChunks remaining pending fence acc =
-    let
-        flush =
-            if List.isEmpty pending then
-                acc
-
-            else
-                Html.node "pw-markdown" [ attribute "source" (String.join "\n" (List.reverse pending)) ] [] :: acc
-    in
-    case remaining of
-        [] ->
-            List.reverse flush
-
-        line :: rest ->
-            let
-                marker =
-                    String.left 3 (String.trimLeft line)
-
-                nextFence =
-                    if marker == "```" || marker == "~~~" then
-                        if fence == Just marker then
-                            Nothing
-
-                        else if fence == Nothing then
-                            Just marker
-
-                        else
-                            fence
-
-                    else
-                        fence
-            in
-            if fence == Nothing && attachmentMarkup line /= Nothing then
-                renderRichChunks rest [] nextFence (renderAttachmentLine line :: flush)
-
-            else
-                renderRichChunks rest (line :: pending) nextFence acc
-
-
-renderAttachmentLine : String -> Html Msg
-renderAttachmentLine line =
-    case attachmentMarkup line of
-        Just ( AttachmentImage, name, url ) ->
-            a [ class "message-image-link", href url, target "_blank", rel "noopener" ]
-                [ img [ class "message-image", src url, alt name, attribute "loading" "lazy" ] [] ]
-
-        Just ( AttachmentAudio, name, url ) ->
-            div [ class "media-attachment pw-media-player pw-audio-player", attribute "data-media-url" url ]
-                [ audio [ class "pw-audio-element", src url, preload "metadata" ] []
-                , button [ type_ "button", class "pw-media-play", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
-                , div [ class "pw-media-copy" ]
-                    [ div [ class "pw-media-heading" ]
-                        [ b [ class "pw-media-name", title name ] [ text name ]
-                        , a [ class "pw-media-download", href url, attribute "download" name, title "Download audio" ] [ text "Download" ]
-                        ]
-                    , div [ class "pw-media-timeline" ]
-                        [ span [ class "pw-media-time" ] [ text "0:00" ]
-                        , input [ class "pw-media-seek", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1000", step "1", attribute "aria-label" "Seek audio" ] []
-                        , span [ class "pw-media-duration" ] [ text "-:--" ]
-                        ]
-                    ]
-                , button [ type_ "button", class "pw-media-mute", attribute "data-media-action" "mute", attribute "aria-label" "Mute audio" ] [ text "Sound" ]
-                , input [ class "pw-media-volume", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1", step "0.02", attribute "aria-label" "Audio volume" ] []
-                ]
-
-        Just ( AttachmentVideo, name, url ) ->
-            div [ class "media-attachment pw-media-player pw-video-player", attribute "data-media-url" url ]
-                [ div [ class "pw-video-frame" ]
-                    [ video [ class "message-video", src url, preload "metadata", attribute "playsinline" "" ] []
-                    , button [ type_ "button", class "pw-video-center-play", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
-                    ]
-                , div [ class "pw-video-controls" ]
-                    [ button [ type_ "button", class "pw-media-play compact", attribute "data-media-action" "play", attribute "aria-label" ("Play " ++ name) ] [ text "Play" ]
-                    , span [ class "pw-media-time" ] [ text "0:00" ]
-                    , input [ class "pw-media-seek", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1000", step "1", attribute "aria-label" "Seek video" ] []
-                    , span [ class "pw-media-duration" ] [ text "-:--" ]
-                    , button [ type_ "button", class "pw-media-mute compact", attribute "data-media-action" "mute", attribute "aria-label" "Mute video" ] [ text "Sound" ]
-                    , input [ class "pw-media-volume", type_ "range", Html.Attributes.min "0", Html.Attributes.max "1", step "0.02", attribute "aria-label" "Video volume" ] []
-                    , button [ type_ "button", class "pw-media-fullscreen", attribute "data-media-action" "fullscreen", attribute "aria-label" "Fullscreen video" ] [ text "Full" ]
-                    ]
-                , div [ class "pw-video-meta" ]
-                    [ span [ title name ] [ text name ]
-                    , a [ href url, attribute "download" name, title "Download video" ] [ text "Download" ]
-                    ]
-                ]
-
-        Just ( AttachmentFile, name, url ) ->
-            a [ class "message-file", href url, target "_blank", rel "noopener" ]
-                [ span [ class "message-file-icon" ] [ text "↧" ], span [] [ text name ] ]
-
-        Nothing ->
-            Html.node "pw-markdown" [ attribute "source" line ] []
-
-
-renderTextLine : Int -> Int -> String -> Html Msg
-renderTextLine index lineCount line =
-    let
-        pieces =
-            String.split " " line
-                |> List.map renderMessageToken
-                |> List.intersperse (text " ")
-
-        ending =
-            if index < lineCount - 1 then
-                [ br [] [] ]
-
-            else
-                []
-    in
-    span [] (pieces ++ ending)
-
-
-renderMessageToken : String -> Html Msg
-renderMessageToken token =
-    let
-        url =
-            stripUrlSuffix token
-
-        suffix =
-            String.dropLeft (String.length url) token
-    in
-    if isHttpUrl url then
-        span [ class "message-link-wrap" ]
-            [ a
-                [ class "message-link"
-                , href url
-                , target "_blank"
-                , rel "noopener noreferrer"
-                , attribute "data-embed-url" url
-                ]
-                [ text url ]
-            , text suffix
-            ]
-
-    else
-        text token
-
-
-isHttpUrl : String -> Bool
-isHttpUrl value =
-    String.startsWith "https://" value || String.startsWith "http://" value
-
-
-stripUrlSuffix : String -> String
-stripUrlSuffix value =
-    case String.right 1 value of
-        "." ->
-            stripUrlSuffix (String.dropRight 1 value)
-
-        "," ->
-            stripUrlSuffix (String.dropRight 1 value)
-
-        "!" ->
-            stripUrlSuffix (String.dropRight 1 value)
-
-        "?" ->
-            stripUrlSuffix (String.dropRight 1 value)
-
-        ";" ->
-            stripUrlSuffix (String.dropRight 1 value)
-
-        ":" ->
-            stripUrlSuffix (String.dropRight 1 value)
-
-        ")" ->
-            stripUrlSuffix (String.dropRight 1 value)
-
-        "]" ->
-            stripUrlSuffix (String.dropRight 1 value)
-
-        _ ->
-            value
-
-
-type AttachmentKind
-    = AttachmentImage
-    | AttachmentAudio
-    | AttachmentVideo
-    | AttachmentFile
-
-
-attachmentMarkup : String -> Maybe ( AttachmentKind, String, String )
-attachmentMarkup line =
-    let
-        parse kind prefix endpoint =
-            if String.startsWith prefix line && String.endsWith ")" line then
-                case String.split ("](" ++ endpoint) line of
-                    [ left, idPart ] ->
-                        let
-                            name =
-                                String.dropLeft (String.length prefix) left
-
-                            ident =
-                                String.dropRight 1 idPart
-                        in
-                        if String.isEmpty name || String.isEmpty ident || String.contains "/" ident then
-                            Nothing
-
-                        else
-                            Just ( kind name, name, endpoint ++ ident )
-
-                    _ ->
-                        Nothing
-
-            else
-                Nothing
-
-        fileKind name =
-            let
-                lower =
-                    String.toLower name
-
-                has extensions =
-                    List.any (\extension -> String.endsWith extension lower) extensions
-            in
-            if has [ ".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac", ".opus" ] then
-                AttachmentAudio
-
-            else if has [ ".mp4", ".webm", ".mov", ".m4v", ".ogv" ] then
-                AttachmentVideo
-
-            else
-                AttachmentFile
-    in
-    case parse (always AttachmentImage) "![" "/api/files/" of
-        Just value ->
-            Just value
-
-        Nothing ->
-            case parse (always AttachmentImage) "![" "/api/media/" of
-                Just value ->
-                    Just value
-
-                Nothing ->
-                    parse fileKind "[" "/api/files/"
-
-
-onComposerKeyDown : Bool -> Attribute Msg
-onComposerKeyDown enterSends =
-    custom "keydown"
-        (D.map5
-            (\key shift ctrl meta composing ->
-                let
-                    shouldSend =
-                        key
-                            == "Enter"
-                            && not composing
-                            && ((enterSends && not shift) || (not enterSends && (ctrl || meta)))
-                in
-                if shouldSend then
-                    { message = SendMessage, stopPropagation = True, preventDefault = True }
-
-                else
-                    { message = NoOp, stopPropagation = False, preventDefault = False }
-            )
-            (D.field "key" D.string)
-            (D.field "shiftKey" D.bool)
-            (D.field "ctrlKey" D.bool)
-            (D.field "metaKey" D.bool)
-            (D.field "isComposing" D.bool |> defaultValue False)
-        )
-
-
-renderNotificationsPage : Model -> Html Msg
-renderNotificationsPage model =
-    let
-        unseen =
-            List.length (List.filter (\n -> not n.seen) model.notifs)
-    in
-    div [ class "notifications-page page-stack" ]
-        [ div [ class "page-heading notifications-head" ]
-            [ div []
-                [ span [ class "eyebrow" ] [ text "Inbox" ]
-                , h1 [] [ text "Notifications" ]
-                , p [ class "muted" ]
-                    [ text
-                        (if unseen == 0 then
-                            "You're caught up."
-
-                         else
-                            String.fromInt unseen
-                                ++ " unread item"
-                                ++ (if unseen == 1 then
-                                        "."
-
-                                    else
-                                        "s."
-                                   )
-                        )
-                    ]
-                ]
-            , button [ class "btn secondary", onClick ClearNotifs, disabled (List.isEmpty model.notifs) ] [ text "Clear all" ]
-            ]
-        , div [ class "card notifications-list" ]
-            (if List.isEmpty model.notifs then
-                [ div [ class "empty notifications-empty" ]
-                    [ span [ class "ui-icon ui-icon-notifications", attribute "aria-hidden" "true" ] []
-                    , h2 [] [ text "Nothing new" ]
-                    , p [] [ text "Mentions, replies, requests, and messages will appear here." ]
-                    ]
-                ]
-
-             else
-                List.map (notificationView model.serverTime) model.notifs
-            )
-        ]
-
-
-notificationView : Int -> Notification -> Html Msg
-notificationView now n =
-    a
-        [ class
-            ("notification-row"
-                ++ (if n.seen then
-                        ""
-
-                    else
-                        " unseen"
-                   )
-            )
-        , href n.url
-        , onClick (Go n.url)
-        ]
-        [ span [ class "notification-mark", attribute "aria-hidden" "true" ] []
-        , div [ class "notification-copy" ]
-            [ div [ class "notification-title-row" ]
-                [ b [] [ text n.kind ]
-                , span [ class "muted notif-time" ] [ text (relativeTime now n.createdAt) ]
-                ]
-            , p [] [ text n.body ]
-            ]
-        ]
 
 
 relativeTime : Int -> Int -> String
@@ -10171,42 +9661,6 @@ fmtErr err =
 
         _ ->
             err |> String.replace "_" " "
-
-
-authValidationError : Model -> Maybe String
-authValidationError model =
-    let
-        username =
-            String.trim model.authUsername
-
-        password =
-            model.authPassword
-    in
-    if model.authBusy then
-        Just "Please wait for the current request to finish."
-
-    else if String.length username < 3 then
-        Just "Username must be at least 3 characters."
-
-    else if String.length username > 24 then
-        Just "Username must be 24 characters or less."
-
-    else if model.authMode == "register" && String.length password < 10 then
-        Just "Password must be at least 10 characters."
-
-    else if model.authMode == "register" && model.authPasswordConfirm /= password then
-        Just "Passwords do not match."
-
-    else if model.authMode == "login" && String.isEmpty password then
-        Just "Enter your password."
-
-    else
-        Nothing
-
-
-authReady : Model -> Bool
-authReady model =
-    authValidationError { model | authBusy = False } == Nothing
 
 
 decodeApi : E.Value -> Msg

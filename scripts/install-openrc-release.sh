@@ -90,7 +90,7 @@ run_as_app() {
 info "Building frontend, Erlang, tests, and the release"
 run_as_app "cd '${REPO}' && npm ci"
 run_as_app "cd '${REPO}' && npm run build"
-grep -Fq 'Plainwire 1.7.2-1 workspace' "${REPO}/priv/static/app.css" || die "New UI CSS fingerprint is missing."
+grep -Fq 'Plainwire 1.7.2-2 workspace' "${REPO}/priv/static/app.css" || die "New UI CSS fingerprint is missing."
 grep -Fq 'data-ui-version' "${REPO}/priv/static/app.js" || die "New Elm UI fingerprint is missing."
 run_as_app "cd '${REPO}' && rebar3 compile && rebar3 eunit && rebar3 release"
 [[ -x ${RELEASE} ]] || die "Release executable was not created."
@@ -220,9 +220,9 @@ for _ in $(seq 1 30); do
 done
 curl -fsS http://127.0.0.1:8080/ >/dev/null \
     || die "Plainwire did not answer on port 8080. Check ${LOG_DIR}/plainwire-error.log"
-curl -fsS http://127.0.0.1:8080/api/version | grep -Fq '1.7.2-1' \
-    || die "Plainwire answered, but the running release is not 1.7.2-1."
-curl -fsS http://127.0.0.1:8080/assets/app.css | grep -Fq 'Plainwire 1.7.2-1 workspace' \
+curl -fsS http://127.0.0.1:8080/api/version | grep -Fq '1.7.2-2' \
+    || die "Plainwire answered, but the running release is not 1.7.2-2."
+curl -fsS http://127.0.0.1:8080/assets/app.css | grep -Fq 'Plainwire 1.7.2-2 workspace' \
     || die "Plainwire answered, but the refreshed CSS is not being served."
 curl -fsS http://127.0.0.1:8080/assets/app.js | grep -Fq 'data-ui-version' \
     || die "Plainwire answered, but the refreshed Elm frontend is not being served."

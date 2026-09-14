@@ -19,7 +19,7 @@ decode(_, _, _) -> {error, invalid_envelope}.
 allowed(heartbeat, #{type := heartbeat}) -> true;
 allowed({user, Uid}, #{type := Type}) when is_integer(Uid), Uid > 0 ->
     lists:member(Type, [friend_request, friend_accept, thread_reply, channel_message,
-                       direct_message, conversation_updated, server_updated, conversation_created,
+                       direct_message, mention, conversation_updated, server_updated, conversation_created,
                        conversation_closed, conversation_members_added, conversation_members_changed,
                        message_request, message_request_accepted, member_joined, category_created,
                        category_updated, category_deleted, categories_reordered, channel_created, channel_moved]);
