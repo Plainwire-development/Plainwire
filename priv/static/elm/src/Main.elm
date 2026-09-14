@@ -5177,7 +5177,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.7.2-2", attribute "data-ui-revision" "interface-3" ]
+    div [ class "layout", attribute "data-ui-version" "1.7.2-3", attribute "data-ui-revision" "interface-3" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]

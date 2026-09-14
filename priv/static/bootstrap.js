@@ -12,8 +12,8 @@
     idle_timeout_ms: 10 * 60 * 1000,
     compress_oversize_uploads: true,
     max_image_dimension: 4096,
-    version: '1.7.2-2',
-    asset_version: '1.7.2-2'
+    version: '1.7.2-3',
+    asset_version: '1.7.2-3'
   };
 
   const normalize = (raw) => {
@@ -40,7 +40,7 @@
   };
 
   const assetUrl = (path, config) => {
-    const version = encodeURIComponent(String(config.asset_version || config.version || '1.7.2-2'));
+    const version = encodeURIComponent(String(config.asset_version || config.version || '1.7.2-3'));
     return `${path}?v=${version}`;
   };
 
