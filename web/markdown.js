@@ -47,19 +47,31 @@ function loadHighlighter() {
     script.onload = () => { clearTimeout(timeout); resolve(globalThis.PlainwireHighlight); };
     script.onerror = () => { clearTimeout(timeout); reject(new Error('Highlight unavailable')); };
     document.head.append(script);
-  }).catch(() => null);
+  }).catch(() => {
+    highlighter = null;
+    return null;
+  });
   return highlighter;
 }
 async function highlight(code) {
-  if (code.dataset.processed || !code.isConnected) return;
-  code.dataset.processed = 'true';
+  if (code.dataset.processed || code.dataset.highlighting || !code.isConnected) return;
   const source = code.textContent;
   // Explicit languages only: trying every grammar on a chat message is costly.
-  if (source.length > 20000 || /^(text|plain|plaintext|txt)?$/.test(code.dataset.language)) return;
-  const hl = await loadHighlighter();
-  if (!code.isConnected || !hl?.getLanguage(code.dataset.language)) return;
-  try { code.innerHTML = hl.highlight(source, { language: code.dataset.language, ignoreIllegals: true }).value; }
-  catch (_) { code.textContent = source; }
+  if (source.length > 20000 || /^(text|plain|plaintext|txt)?$/.test(code.dataset.language)) {
+    code.dataset.processed = 'true';
+    return;
+  }
+  code.dataset.highlighting = 'true';
+  try {
+    const hl = await loadHighlighter();
+    if (!code.isConnected || !hl?.getLanguage(code.dataset.language)) return;
+    code.innerHTML = hl.highlight(source, { language: code.dataset.language, ignoreIllegals: true }).value;
+    code.dataset.processed = 'true';
+  } catch (_) {
+    code.textContent = source;
+  } finally {
+    delete code.dataset.highlighting;
+  }
 }
 const observer = 'IntersectionObserver' in globalThis ? new IntersectionObserver(entries => {
   for (const entry of entries) if (entry.isIntersecting) { observer.unobserve(entry.target); highlight(entry.target); }
@@ -381,7 +393,13 @@ class PlainwireMarkdown extends HTMLElement {
       catch (_) { button.textContent = 'Select to copy'; }
       setTimeout(() => { if (button.isConnected) button.textContent = 'Copy'; }, 2000);
     });
-    for (const code of this.querySelectorAll('code[data-language]')) observer ? observer.observe(code) : highlight(code);
+    for (const code of this.querySelectorAll('code[data-language]')) {
+      // Start the one shared grammar download immediately. IntersectionObserver
+      // remains an early path, while this call also guarantees that nested
+      // scrollers and content-visibility cannot strand an explicit code block.
+      if (observer) observer.observe(code);
+      highlight(code);
+    }
     if (!compact && document.documentElement.dataset.linkPreviews !== 'false') enhanceLinks(this);
     if (!compact) enhanceMentions(this);
   }

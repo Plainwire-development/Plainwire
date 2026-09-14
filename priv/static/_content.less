@@ -134,7 +134,7 @@
 }
 .message-history-sentinel,
 .message-date,
-.msg { width: min(980px, 100%); margin-inline: auto; }
+.msg { width: min(980px, 100%); margin-inline: auto; flex-shrink: 0; }
 .message-history-sentinel { padding: 7px 0; }
 .msg {
   min-width: 0;
@@ -172,6 +172,12 @@
 .msg-action { min-height: 32px; padding: 5px 10px; color: var(--text2); font-size: 11px; }
 .reply-preview { border-radius: 9px; background: var(--bg); }
 .call-event {
+  // Two-row mobile call cards are taller than the generic message intrinsic
+  // estimate. Lay these uncommon cards out fully so their action never paints
+  // over the following message while they are off screen.
+  content-visibility: visible;
+  contain-intrinsic-size: none;
+  contain: none;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
@@ -558,6 +564,193 @@
 .profile-settings-card .settings-fields { gap: 22px; padding: 26px; }
 .settings-fields > .nav-actions { bottom: -48px; padding: 18px 0; background: var(--bg2); }
 
+// Settings are one of the longest-lived surfaces in the app. Keep their
+// repeated controls on the same Less mixin so hover, focus, and borders do not
+// drift as new sections are added.
+.settings-control-surface(@background: var(--bg); @border: var(--line); @radius: @r-lg) {
+  border: 1px solid @border;
+  border-radius: @radius;
+  background: @background;
+  box-shadow: var(--shadow-xs);
+}
+
+.settings-tab-tone(@name; @tone) {
+  .settings-tab[data-setting="@{name}"] .settings-tab-icon {
+    color: @tone;
+    background: color-mix(in srgb, @tone, transparent 89%);
+  }
+}
+
+.settings-sidebar {
+  display: flex;
+  flex-direction: column;
+  width: 232px;
+  min-width: 232px;
+  padding: @sp-6 @sp-3 @sp-4;
+
+  .settings-nav-label { padding: 0 @sp-3 @sp-3; }
+  .settings-nav-separator { margin-block: @sp-2; }
+}
+
+.settings-tab {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 56px;
+  padding: 7px 9px;
+  text-align: left;
+  .settings-control-surface(transparent; transparent; @r-lg);
+  box-shadow: none;
+  transition: background-color .14s ease, border-color .14s ease, color .14s ease;
+
+  .settings-tab-icon {
+    display: grid;
+    width: 32px;
+    height: 32px;
+    place-items: center;
+    padding: 7px;
+    border-radius: @r-md;
+
+    > .ui-icon,
+    > .call-icon { width: 16px; height: 16px; min-width: 16px; color: inherit; }
+  }
+
+  .settings-tab-copy {
+    min-width: 0;
+
+    b,
+    small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    b { color: inherit; font-size: 12px; font-weight: 680; }
+    small { margin-top: 2px; color: var(--muted); font-size: 9px; font-weight: 520; }
+  }
+
+  &:hover { border-color: var(--line); background: var(--hover-soft); }
+  &.active {
+    border-color: color-mix(in srgb, var(--accent), transparent 68%);
+    background: color-mix(in srgb, var(--accent), transparent 90%);
+    box-shadow: inset 3px 0 0 var(--accent);
+
+    .settings-tab-copy small { color: var(--text2); }
+  }
+}
+
+.settings-tab-tone(profile; var(--accent));
+.settings-tab-tone(appearance; #a46fd1);
+.settings-tab-tone(chat; #3d91c8);
+.settings-tab-tone(voice; #3ca071);
+.settings-tab-tone(sound; #c78a32);
+.settings-tab-tone(privacy; #b85d72);
+.settings-tab-tone(account; var(--text2));
+
+.settings-nav-footer {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: auto 8px 0;
+  padding: 13px 10px 2px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+
+  b,
+  small { display: block; }
+  b { color: var(--text2); font-size: 10px; font-weight: 650; }
+  small { margin-top: 2px; font-size: 9px; line-height: 1.4; }
+}
+
+.settings-saved-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok), transparent 86%);
+}
+
+.settings-heading { min-width: 0; }
+.settings-subtitle { max-width: 64ch; margin: 7px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+
+.settings-search {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  padding-bottom: 10px;
+  background: linear-gradient(var(--bg2) 78%, transparent);
+}
+.settings-search-field {
+  position: relative;
+  width: min(820px, 100%);
+
+  > .ui-icon {
+    position: absolute;
+    z-index: 1;
+    top: 50%;
+    left: 14px;
+    width: 16px;
+    height: 16px;
+    color: var(--muted);
+    transform: translateY(-50%);
+    pointer-events: none;
+  }
+
+  input {
+    width: 100%;
+    padding-inline: 42px 68px;
+    .settings-control-surface(var(--bg); var(--line); @r-lg);
+
+    &:focus { border-color: color-mix(in srgb, var(--accent), var(--line) 38%); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent), transparent 88%); }
+  }
+}
+.settings-search-clear {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  min-height: 28px;
+  padding: 3px 8px;
+  border: 0;
+  border-radius: @r-sm;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+  transform: translateY(-50%);
+  cursor: pointer;
+
+  &:hover { background: var(--hover); color: var(--text1); }
+}
+
+.settings-search-results {
+  width: min(820px, 100%);
+
+  button { .settings-control-surface(var(--bg); var(--line); @r-md); box-shadow: none; }
+}
+
+.settings-card { border-color: color-mix(in srgb, var(--line), var(--text2) 5%); }
+.settings-card-head { background: linear-gradient(110deg, color-mix(in srgb, var(--accent), transparent 96%), transparent 62%); }
+.settings-panel .setting-row:last-child { border-bottom: 0; }
+.segmented-control .btn[aria-pressed="true"] { border-color: color-mix(in srgb, var(--accent), var(--line) 35%); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent), transparent 90%); }
+
+.field-label-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: @sp-3;
+
+  label { margin: 0; }
+  .field-count { color: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; }
+}
+
+.voice-settings > .settings-screen-share-control {
+  display: block;
+  margin: 20px 0 14px;
+  .settings-control-surface(var(--bg); var(--line); @r-lg);
+  box-shadow: none;
+
+  summary { min-height: 48px; padding: 14px 15px; color: var(--text1); }
+  details[open] summary { border-bottom: 1px solid var(--line); }
+}
+
 .forum-directory-hero,
 .server-hero {
   padding: clamp(24px, 4vw, 38px);
@@ -636,6 +829,10 @@ pw-screen-settings { border-radius: 11px; background: var(--bg); }
   .home-columns { grid-template-columns: 1fr; }
   .home-activity { min-height: 250px; }
   .settings-sidebar { width: 176px; min-width: 176px; }
+  .settings-tab { grid-template-columns: 28px minmax(0, 1fr); min-height: 48px; }
+  .settings-tab .settings-tab-icon { width: 28px; height: 28px; padding: 6px; }
+  .settings-tab .settings-tab-copy small,
+  .settings-nav-footer small { display: none; }
   .settings-user-chip { display: none; }
   .profile-settings-card .settings-fields { grid-template-columns: 1fr; }
 });
@@ -695,10 +892,12 @@ pw-screen-settings { border-radius: 11px; background: var(--bg); }
   .group-members-head { min-height: 58px; }
 
   .settings-page { overflow: hidden; }
+  .settings-sidebar { display: none; }
   .settings-mobile-nav { flex-shrink: 0; padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--bg); }
   .settings-mobile-tab { min-height: 42px; padding-inline: 14px; border-radius: 9px; }
   .settings-content-top { min-height: 88px; padding: 22px 18px 17px; }
   .settings-content-top h1 { font-size: 25px; }
+  .settings-subtitle { display: none; }
   .settings-search { padding: 15px 16px 0; }
   .settings-content-inner { padding: 18px 14px 32px; }
   .settings-card { margin: 0; width: 100%; border-radius: 13px; }
@@ -709,6 +908,7 @@ pw-screen-settings { border-radius: 11px; background: var(--bg); }
   .profile-settings-card .settings-banner { min-height: 126px; padding: 20px; }
   .profile-settings-card .settings-fields { grid-template-columns: 1fr; gap: 19px; padding: 20px; }
   .settings-fields > .nav-actions { bottom: -32px; }
+  .voice-settings > .settings-screen-share-control { margin-inline: 0; }
   .field input,
   .field textarea,
   .field select,

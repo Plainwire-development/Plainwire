@@ -30,6 +30,7 @@ module Types exposing
     , Status(..)
     , User
     , VoiceState
+    , VoiceUser
     , decodeCallUser
     , decodeCategory
     , decodeChannel
@@ -277,15 +278,19 @@ type alias VoiceState =
     , users : Dict Int VoiceUser
     , muted : Bool
     , deafened : Bool
+    , mutedBeforeDeafen : Bool
     , screenShare : Bool
     }
 
 
 type alias VoiceUser =
     { userId : Int
+    , displayName : String
+    , avatarUrl : String
     , muted : Bool
     , deafened : Bool
     , screen : Bool
+    , screenAudio : Bool
     , reconnecting : Bool
     }
 
@@ -300,6 +305,7 @@ type alias CallUser =
     , connectionFailed : Bool
     , reconnecting : Bool
     , screen : Bool
+    , screenAudio : Bool
     }
 
 
@@ -618,7 +624,7 @@ type Msg
     | Tick Time.Posix
     | WsStatus Bool
     | PageVisibility Bool
-    | RtcResuming String Int Bool Bool
+    | RtcResuming String Int Bool Bool Bool
     | FileUpload String (Maybe String)
     | ReadFile String
     | SettingsSearch String
@@ -904,6 +910,7 @@ decodeCallUser =
         |> andMap (D.succeed False)
         |> andMap (D.field "reconnecting" D.bool |> defaultValue False)
         |> andMap (D.field "screen" D.bool |> defaultValue False)
+        |> andMap (D.field "screen_audio" D.bool |> defaultValue False)
 
 
 encodeMessage : { body : String, replyToId : Maybe Int } -> E.Value

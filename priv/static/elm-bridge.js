@@ -137,6 +137,7 @@
   let audioUnlockToastShown = false;
   const peers = new Map();
   let screenStream = null;
+  let screenAudioMixer = null;
   let screenSenders = new Map(); // uid -> RTCRtpSender for video
   const displayMediaSupported = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
   const peerPromises = new Map();
@@ -178,7 +179,14 @@
         sessionStorage.removeItem(RTC_RESUME_KEY);
         return null;
       }
-      return { kind: value.kind, id, muted: value.muted === true, deafened: value.deafened === true, restoreMuted: value.restore_muted === true, at: value.at };
+      return {
+        kind: value.kind,
+        id,
+        muted: value.muted === true,
+        deafened: value.deafened === true,
+        mutedBeforeDeafen: value.muted_before_deafen === true || value.restore_muted === true,
+        at: value.at
+      };
     } catch (_) {
       try { sessionStorage.removeItem(RTC_RESUME_KEY); } catch (_) {}
       return null;
@@ -191,7 +199,15 @@
   };
   const persistRtcIntent = () => {
     if (!room?.joined) return;
-    resumeIntent = { kind: room.kind, id: room.id, muted: micMuted, deafened, restore_muted: mutedBeforeDeafen, at: Date.now() };
+    resumeIntent = {
+      kind: room.kind,
+      id: room.id,
+      muted: micMuted,
+      deafened,
+      muted_before_deafen: mutedBeforeDeafen,
+      restore_muted: mutedBeforeDeafen,
+      at: Date.now()
+    };
     try { sessionStorage.setItem(RTC_RESUME_KEY, JSON.stringify(resumeIntent)); } catch (_) {}
   };
   const redact = (value) => {
@@ -219,6 +235,7 @@
       websocket: ws ? ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState] : 'NONE',
       room: room ? { ...room } : null,
       user_id: meId,
+      voice_state: { muted: micMuted, deafened, muted_before_deafen: mutedBeforeDeafen },
       local_tracks: localStream ? localStream.getTracks().map((t) => ({ kind: t.kind, enabled: t.enabled, muted: t.muted, readyState: t.readyState })) : [],
       peers: Array.from(peers, ([user_id, pc]) => ({
         user_id, connection: pc.connectionState, ice: pc.iceConnectionState,
@@ -773,6 +790,7 @@
   let forcedMessageScroll = 0;
   let forcedMessageList = null;
   let forcedMessageSettle = null;
+  let pendingForcedMessageRoute = null;
   const traceMessageScroll = (event, list = forcedMessageList) => {
     window.__plainwireScrollTrace = (window.__plainwireScrollTrace || []).slice(-30);
     window.__plainwireScrollTrace.push({ event, at: Math.round(performance.now()), top: list?.scrollTop, height: list?.scrollHeight, client: list?.clientHeight, token: forcedMessageScroll });
@@ -782,6 +800,7 @@
     forcedMessageScroll += 1;
     forcedMessageList = null;
     forcedMessageSettle = null;
+    pendingForcedMessageRoute = null;
   };
 
   const trackMessageScroll = () => {
@@ -933,6 +952,12 @@
     messageDomFrame = requestAnimationFrame(() => {
       messageDomFrame = 0;
       const list = trackMessageScroll();
+      if (list && pendingForcedMessageRoute === location.hash) {
+        pendingForcedMessageRoute = null;
+        scrollMessageListToBottom(true);
+      } else if (pendingForcedMessageRoute && pendingForcedMessageRoute !== location.hash) {
+        pendingForcedMessageRoute = null;
+      }
       observeMessageHistory();
       // Visit only added subtrees, rather than rescanning every old message.
       for (const root of changedMessageRoots) {
@@ -1579,6 +1604,44 @@
   };
 
   const stopStream = (stream) => stream?.getTracks?.().forEach((track) => track.stop());
+  const disposeScreenAudioMixer = (mixer) => {
+    if (!mixer || mixer.disposed) return;
+    mixer.disposed = true;
+    try { mixer.microphoneSource.disconnect(); } catch (_) {}
+    try { mixer.screenSource.disconnect(); } catch (_) {}
+    try { mixer.destination.disconnect?.(); } catch (_) {}
+    stopStream(mixer.destination.stream);
+  };
+  const createScreenAudioMixer = (displayStream, microphoneStream = localStream) => {
+    const screenTrack = displayStream?.getAudioTracks().find((track) => track.readyState === 'live');
+    if (!screenTrack) return null;
+    const microphoneTrack = microphoneStream?.getAudioTracks().find((track) => track.readyState === 'live');
+    if (!microphoneTrack) throw new Error('No live microphone track for screen audio');
+    const ctx = audioContext();
+    if (!ctx) throw new Error('Web Audio is unavailable for screen audio');
+    const destination = ctx.createMediaStreamDestination();
+    let microphoneSource;
+    let screenSource;
+    try {
+      microphoneSource = ctx.createMediaStreamSource(new MediaStream([microphoneTrack]));
+      screenSource = ctx.createMediaStreamSource(new MediaStream([screenTrack]));
+      microphoneSource.connect(destination);
+      screenSource.connect(destination);
+      const track = destination.stream.getAudioTracks()[0];
+      if (!track) throw new Error('Could not create a mixed screen audio track');
+      ctx.resume?.().catch(() => {});
+      return { track, destination, microphoneSource, screenSource, screenTrack, disposed: false };
+    } catch (error) {
+      try { microphoneSource?.disconnect(); } catch (_) {}
+      try { screenSource?.disconnect(); } catch (_) {}
+      stopStream(destination.stream);
+      throw error;
+    }
+  };
+  const outgoingAudioTrack = (microphoneStream = localStream, mixer = screenAudioMixer) =>
+    mixer?.track?.readyState === 'live'
+      ? mixer.track
+      : microphoneStream?.getAudioTracks().find((track) => track.readyState === 'live') || null;
   const openRawMicrophone = async (mode = voiceProcessingMode) => {
     try {
       return await navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints(mode), video: false });
@@ -1847,24 +1910,36 @@
       throw new Error('No microphone track');
     }
     track.enabled = !micMuted;
+    let replacementMixer = null;
+    try {
+      replacementMixer = createScreenAudioMixer(screenStream, replacementLease.stream);
+    } catch (error) {
+      await replacementLease.release();
+      throw error;
+    }
+    const replacementTrack = outgoingAudioTrack(replacementLease.stream, replacementMixer);
     const senders = Array.from(peers.values()).filter((pc) => pc._audioSender && pc.signalingState !== 'closed')
       .map((pc) => ({ pc, sender: pc._audioSender, previous: pc._audioSender.track }));
-    const results = await Promise.allSettled(senders.map(({ sender }) => sender.replaceTrack(track)));
+    const results = await Promise.allSettled(senders.map(({ sender }) => sender.replaceTrack(replacementTrack)));
     const failed = results.find((result, i) => result.status === 'rejected' && senders[i].pc.signalingState !== 'closed');
     if (failed || changeEpoch !== microphoneEpoch) {
       // Wait for every swap before rolling back. Otherwise a slow successful swap
       // can leave a peer transmitting a stopped replacement microphone.
       await Promise.allSettled(senders.map(({ pc, sender, previous }) =>
-        pc.signalingState !== 'closed' && sender.track === track
+        pc.signalingState !== 'closed' && sender.track === replacementTrack
           ? sender.replaceTrack(changeEpoch === microphoneEpoch ? previous : localStream?.getAudioTracks()[0] || null)
           : Promise.resolve()));
+      disposeScreenAudioMixer(replacementMixer);
       await replacementLease.release();
       throw failed?.reason || new Error('microphone_request_cancelled');
     }
+    const previousMixer = screenAudioMixer;
+    screenAudioMixer = replacementMixer;
     localMicrophoneLease = replacementLease;
     localStream = replacementLease.stream;
     observeMicrophoneTracks(localStream);
     startVoiceDetection(localStream);
+    disposeScreenAudioMixer(previousMixer);
     if (previousLease) previousLease.release().catch(() => {});
     else stopStream(previousStream);
     return true;
@@ -2157,11 +2232,13 @@
       return button;
     };
 
+    const btnHide = makeWindowButton('pw-float-hide', 'Hide shared screen', 'hide');
     const btnFit = makeWindowButton('pw-float-fit', 'Center and fit window', 'fit');
     const btnFs = makeWindowButton('pw-float-fs', 'Fullscreen screen share', 'fullscreen');
-    const btnClose = makeWindowButton('pw-float-close', 'Close screen share', 'close');
+    const btnClose = makeWindowButton('pw-float-close', opts.closeLabel || 'Stop watching screen', 'close');
     const btnPip = makeWindowButton('pw-float-pip', 'Picture in picture', 'pip');
 
+    controls.appendChild(btnHide);
     controls.appendChild(btnFit);
     controls.appendChild(btnFs);
     if (document.pictureInPictureEnabled) controls.appendChild(btnPip);
@@ -2211,7 +2288,24 @@
     };
     let fitRestore = null;
     let fitted = false;
+    let visualHidden = false;
     wrapper.addEventListener('pointerdown', bringForward);
+
+    btnHide.addEventListener('click', (e) => {
+      e.stopPropagation();
+      visualHidden = !visualHidden;
+      wrapper.classList.toggle('screen-visual-hidden', visualHidden);
+      btnHide.classList.toggle('active', visualHidden);
+      btnHide.title = visualHidden ? 'Show shared screen' : 'Hide shared screen';
+      btnHide.setAttribute('aria-label', btnHide.title);
+      btnHide.setAttribute('aria-pressed', String(visualHidden));
+      if (visualHidden) {
+        if (document.fullscreenElement === wrapper) document.exitFullscreen?.().catch(() => {});
+        if (document.pictureInPictureElement === video) document.exitPictureInPicture?.().catch(() => {});
+      } else {
+        play();
+      }
+    });
 
     btnFs.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -2394,6 +2488,7 @@
   const showStageVideo = (uid, stream) => {
     const { wrapper, video, play } = ensureFloatWindow('stage-' + uid, (document.querySelector(`[data-peer-id="${uid}"] .call-user-name`)?.textContent || 'Participant') + ' · Screen', 'var(--accent,#5865f2)', {
       top: 80,
+      closeLabel: 'Stop watching screen',
       onClose: () => { watchedScreens.delete(uid); wrapper.style.display = 'none'; video.srcObject = null; }
     });
     if (stream) {
@@ -2428,6 +2523,7 @@
   const showLocalScreenPreview = (stream) => {
     const { wrapper, video, play } = ensureFloatWindow('local-preview', 'Your screen', 'var(--ok,#23a55a)', {
       top: 80,
+      closeLabel: 'Stop sharing screen',
       onClose: () => { stopScreenShare(); }
     });
     video.srcObject = stream;
@@ -2452,6 +2548,7 @@
     motion: { label: 'Smooth motion', width: 1920, height: 1080, fps: 60, bitrate: 4500000, hint: 'motion' }
   };
   let screenProfile = storage.getItem('plainwire_screen_profile') || 'balanced';
+  let shareScreenAudio = storage.getItem('plainwire_screen_audio') !== 'false';
   if (!Object.hasOwn(screenProfiles, screenProfile)) screenProfile = 'balanced';
   const screenConstraints = () => {
     const p = screenProfiles[screenProfile];
@@ -2460,7 +2557,24 @@
   class ScreenSettings extends HTMLElement {
     connectedCallback() { this.render(); }
     render() {
-      if (this.childElementCount) { this.querySelector('button').disabled = !screenStream; return; }
+      if (this.childElementCount) {
+        const active = !!screenStream;
+        const change = this.querySelector('[data-screen-change]');
+        const preview = this.querySelector('[data-screen-preview]');
+        const status = this.querySelector('[data-screen-audio-status]');
+        if (change) change.disabled = !active;
+        if (preview) preview.disabled = !active;
+        if (status) {
+          const hasAudio = active && screenStream.getAudioTracks().some((track) => track.readyState === 'live');
+          status.textContent = active
+            ? hasAudio
+              ? 'Shared audio is included with your microphone.'
+              : 'This source has no shared audio. In the browser chooser, select a tab or screen and enable audio when offered.'
+            : 'When available, tab or system audio is mixed with your microphone without changing the call connection.';
+          status.classList.toggle('active', hasAudio);
+        }
+        return;
+      }
       const details = document.createElement('details');
       const summary = document.createElement('summary'); summary.textContent = 'Screen sharing';
       const label = document.createElement('label'); label.textContent = 'Share quality';
@@ -2480,13 +2594,33 @@
         }
       });
       label.append(select);
+      const audioLabel = document.createElement('label'); audioLabel.className = 'screen-audio-option';
+      const audioToggle = document.createElement('input'); audioToggle.type = 'checkbox'; audioToggle.checked = shareScreenAudio;
+      audioToggle.setAttribute('aria-label', 'Request audio when sharing a screen');
+      const audioCopy = document.createElement('span');
+      const audioHeading = document.createElement('b'); audioHeading.textContent = 'Include shared audio';
+      const audioDescription = document.createElement('small'); audioDescription.textContent = 'Requests tab or system audio when the browser and chosen source support it.';
+      audioCopy.append(audioHeading, audioDescription);
+      audioToggle.addEventListener('change', () => {
+        shareScreenAudio = audioToggle.checked;
+        storage.setItem('plainwire_screen_audio', String(shareScreenAudio));
+        for (const control of document.querySelectorAll('pw-screen-settings .screen-audio-option input')) control.checked = shareScreenAudio;
+      });
+      audioLabel.append(audioToggle, audioCopy);
       const note = document.createElement('p');
       note.textContent = 'Text & detail keeps writing sharp. Smooth motion prefers frame rate. Group calls use lower limits to protect your upload.';
+      const audioStatus = document.createElement('p'); audioStatus.dataset.screenAudioStatus = 'true'; audioStatus.className = 'screen-audio-status';
+      audioStatus.setAttribute('role', 'status'); audioStatus.setAttribute('aria-live', 'polite');
       const hdr = document.createElement('p');
       hdr.textContent = window.matchMedia?.('(dynamic-range: high)').matches ? 'HDR display detected. Capture and stream colour depend on your browser; the viewer reports detected video colour.' : 'Colour is managed by your browser. The viewer reports HDR only when detected in the video.';
-      const change = document.createElement('button'); change.type = 'button'; change.className = 'btn secondary'; change.textContent = 'Change shared screen'; change.disabled = !screenStream;
+      const actions = document.createElement('div'); actions.className = 'screen-settings-actions';
+      const change = document.createElement('button'); change.type = 'button'; change.className = 'btn secondary'; change.textContent = 'Change shared screen'; change.dataset.screenChange = 'true'; change.disabled = !screenStream;
       change.addEventListener('click', () => startScreenShare(true));
-      details.append(summary, label, note, hdr, change); this.append(details);
+      const preview = document.createElement('button'); preview.type = 'button'; preview.className = 'btn ghost'; preview.textContent = 'Show my preview'; preview.dataset.screenPreview = 'true'; preview.disabled = !screenStream;
+      preview.addEventListener('click', () => { if (screenStream) showLocalScreenPreview(screenStream); });
+      actions.append(change, preview);
+      details.append(summary, label, audioLabel, audioStatus, note, hdr, actions); this.append(details);
+      this.render();
     }
   }
   customElements.define('pw-screen-settings', ScreenSettings);
@@ -2536,7 +2670,9 @@
     try {
       captured = await navigator.mediaDevices.getDisplayMedia({
         video: screenConstraints(),
-        audio: false,
+        audio: shareScreenAudio,
+        systemAudio: shareScreenAudio ? 'include' : 'exclude',
+        windowAudio: shareScreenAudio ? 'system' : 'exclude',
         selfBrowserSurface: 'exclude',
         surfaceSwitching: 'include'
       });
@@ -2549,37 +2685,71 @@
     if (!room || room.epoch !== epoch || screenStream !== previous) { stopStream(captured); return; }
     const videoTrack = captured.getVideoTracks()[0];
     if (!videoTrack) { stopStream(captured); return; }
+    const previousMixer = screenAudioMixer;
+    let capturedMixer = null;
+    try {
+      capturedMixer = createScreenAudioMixer(captured);
+    } catch (error) {
+      captured.getAudioTracks().forEach((track) => track.stop());
+      debug('MEDIA', 'screen_audio_mix_failed', { error: error.message }, 'warn');
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'The screen is sharing, but its audio could not be mixed.' });
+    }
+    const previousAudioTrack = outgoingAudioTrack(localStream, previousMixer);
+    const capturedAudioTrack = outgoingAudioTrack(localStream, capturedMixer);
     screenStream = captured;
+    screenAudioMixer = capturedMixer;
     videoTrack.contentHint = screenProfiles[screenProfile].hint;
     videoTrack.onended = () => { if (screenStream === captured) stopScreenShare(); };
     const targets = Array.from(peers.entries()).filter(([, pc]) => pc._videoSender && pc.signalingState !== 'closed');
     const results = await Promise.allSettled(targets.map(async ([uid, pc]) => {
-      await pc._videoSender.replaceTrack(videoTrack);
+      await Promise.all([
+        pc._videoSender.replaceTrack(videoTrack),
+        pc._audioSender && capturedAudioTrack !== previousAudioTrack
+          ? pc._audioSender.replaceTrack(capturedAudioTrack)
+          : Promise.resolve()
+      ]);
       await applyEncoderTier(pc._videoSender, peers.size + 1);
       if (room?.epoch === epoch && screenStream === captured) screenSenders.set(uid, pc._videoSender);
     }));
-    if (!room || room.epoch !== epoch || screenStream !== captured) { stopStream(captured); if (previous) stopStream(previous); return; }
+    if (!room || room.epoch !== epoch || screenStream !== captured) {
+      disposeScreenAudioMixer(capturedMixer);
+      stopStream(captured);
+      disposeScreenAudioMixer(previousMixer);
+      if (previous) stopStream(previous);
+      return;
+    }
     if (results.some((result, i) => result.status === 'rejected' && targets[i][1].signalingState !== 'closed')) {
       screenStream = previous;
-      await Promise.allSettled(targets.map(([, pc]) => pc._videoSender.replaceTrack(previous?.getVideoTracks()[0] || null)));
+      screenAudioMixer = previousMixer;
+      await Promise.allSettled(targets.map(([, pc]) => Promise.all([
+        pc._videoSender.replaceTrack(previous?.getVideoTracks()[0] || null),
+        pc._audioSender ? pc._audioSender.replaceTrack(previousAudioTrack) : Promise.resolve()
+      ])));
+      disposeScreenAudioMixer(capturedMixer);
       stopStream(captured);
       screenSenders.clear();
       if (previous) targets.forEach(([uid, pc]) => screenSenders.set(uid, pc._videoSender));
       send(app.ports.bridgeReceive, { tag: 'toast', data: previous ? 'Could not switch screens. Your previous share is unchanged.' : 'Could not start sharing. Please try again.' });
       return;
     }
+    disposeScreenAudioMixer(previousMixer);
     if (previous) stopStream(previous);
-    sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen: true } });
+    const hasScreenAudio = !!capturedMixer;
+    sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen: true, screen_audio: hasScreenAudio } });
     send(app.ports.bridgeReceive, { tag: 'screen_share_started', user_id: meId });
     showLocalScreenPreview(captured);
     updateScreenControls();
-    debug('MEDIA', 'screen_share_started', { tracks: captured.getTracks().length });
+    debug('MEDIA', 'screen_share_started', { tracks: captured.getTracks().length, shared_audio: hasScreenAudio });
   };
 
   const stopScreenShare = () => {
     if (!screenStream) return;
-    screenStream.getTracks().forEach((t) => t.stop());
+    const stoppedStream = screenStream;
+    const stoppedMixer = screenAudioMixer;
     screenStream = null;
+    screenAudioMixer = null;
+    disposeScreenAudioMixer(stoppedMixer);
+    stoppedStream.getTracks().forEach((t) => t.stop());
     updateScreenControls();
     // Restore camera video on all peer senders
     const cameraTrack = localStream && localStream.getVideoTracks()[0];
@@ -2587,12 +2757,15 @@
       if (pc._videoSender) {
         pc._videoSender.replaceTrack(cameraTrack || null).catch(() => {});
       }
+      if (pc._audioSender) {
+        pc._audioSender.replaceTrack(outgoingAudioTrack()).catch(() => {});
+      }
     });
     screenSenders.clear();
     removeLocalScreenPreview();
     // Clear screen flag on server
     if (room && ws?.readyState === WebSocket.OPEN) {
-      sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen: false } });
+      sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen: false, screen_audio: false } });
     }
     send(app.ports.bridgeReceive, { tag: 'screen_share_stopped', user_id: meId });
     send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen sharing stopped' });
@@ -2778,6 +2951,8 @@
       screenStream.getTracks().forEach((t) => t.stop());
       screenStream = null;
     }
+    disposeScreenAudioMixer(screenAudioMixer);
+    screenAudioMixer = null;
     screenSenders.clear();
     cleanupAllFloatWindows();
     screenSharers.clear();
@@ -2815,12 +2990,12 @@
     resumeInFlight = true;
     micMuted = intent.muted;
     deafened = intent.deafened;
-    mutedBeforeDeafen = intent.restoreMuted;
+    mutedBeforeDeafen = intent.mutedBeforeDeafen;
     const epoch = ++roomEpoch;
     room = { kind: intent.kind, id: intent.id, joined: false, epoch };
     send(app.ports.bridgeReceive, {
       tag: 'rtc_resuming', room_kind: intent.kind, room_id: intent.id,
-      muted: micMuted, deafened
+      muted: micMuted, deafened, muted_before_deafen: mutedBeforeDeafen
     });
     debug('RTC', 'room_resume_started', { room });
     ensureMedia()
@@ -2935,9 +3110,9 @@
     const active = pc.getTransceivers().filter((t) => !t.stopped);
     const audio = active.find((t) => t.receiver.track.kind === 'audio');
     const video = active.find((t) => t.receiver.track.kind === 'video');
-    const track = stream?.getAudioTracks().find((t) => t.readyState === 'live');
+    const track = outgoingAudioTrack(stream);
     if (!audio || !track) throw new Error('No negotiated microphone channel');
-    track.enabled = !micMuted;
+    stream?.getAudioTracks().forEach((microphoneTrack) => { microphoneTrack.enabled = !micMuted; });
     audio.direction = 'sendrecv';
     await audio.sender.replaceTrack(track);
     audio.sender.setStreams?.(stream);
@@ -3476,6 +3651,7 @@
   const setMuted = (muted) => {
     micMuted = !!muted;
     if (localStream) localStream.getAudioTracks().forEach((t) => { t.enabled = !micMuted; });
+    if (!deafened) mutedBeforeDeafen = micMuted;
     persistRtcIntent();
     publishAudioState();
     debug('MEDIA', 'microphone_muted_changed', { muted: micMuted, tracks: localStream?.getAudioTracks().length || 0 });
@@ -3496,7 +3672,7 @@
       if (room) playAllRemoteAudio();
     }
     persistRtcIntent();
-    debug('MEDIA', 'deafened_changed', { deafened });
+    debug('MEDIA', 'deafened_changed', { deafened, muted: micMuted, muted_before_deafen: mutedBeforeDeafen });
   };
 
   const enableDrag = () => {
@@ -3786,6 +3962,7 @@
     startRingtone('outgoing');
   });
   recv(app.ports.scrollTo, (selector) => {
+    cancelForcedMessageScroll();
     document.querySelector(selector)?.scrollIntoView({ block: 'center' });
   });
   recv(app.ports.readFile, (id) => {
@@ -4129,7 +4306,12 @@
       case 'scroll_messages_to_bottom':
         {
           const list = document.getElementById('messages');
-          if (!list || (!messagesPinnedToBottom && data !== true)) break;
+          if (!list) {
+            if (data === true) pendingForcedMessageRoute = location.hash;
+            break;
+          }
+          pendingForcedMessageRoute = null;
+          if (!messagesPinnedToBottom && data !== true) break;
           scrollMessageListToBottom(data === true);
           list.querySelectorAll('img, video').forEach((media) => {
             if (media.tagName === 'IMG' && media.complete) return;
@@ -4285,7 +4467,7 @@
         break;
       case 'voice_deafen':
         setDeafened(!!data);
-        if (room) sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { deafened: !!data, muted: !!data ? true : micMuted } });
+        if (room) sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { deafened, muted: micMuted } });
         break;
       case 'unlock_audio':
         audioContext()?.resume?.();

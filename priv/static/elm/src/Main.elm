@@ -158,11 +158,12 @@ bridgeDecoder =
                         D.map WsStatus (D.field "data" D.bool)
 
                     "rtc_resuming" ->
-                        D.map4 RtcResuming
+                        D.map5 RtcResuming
                             (D.field "room_kind" D.string)
                             (D.field "room_id" D.int)
                             (D.field "muted" D.bool)
                             (D.field "deafened" D.bool)
+                            (D.field "muted_before_deafen" D.bool |> defaultValue False)
 
                     "sound_preference" ->
                         D.map SetSoundPreference (D.field "data" D.bool)
@@ -295,6 +296,7 @@ init flags url _ =
             , users = Dict.empty
             , muted = False
             , deafened = False
+            , mutedBeforeDeafen = False
             , screenShare = False
             }
       , callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
@@ -915,13 +917,13 @@ update msg model =
                 Cmd.none
             )
 
-        RtcResuming roomKind roomId muted deafened ->
+        RtcResuming roomKind roomId muted deafened mutedBeforeDeafen ->
             let
                 voiceBase =
                     updateVoiceMode roomKind roomId model.voice
 
                 resumedVoice =
-                    { voiceBase | muted = muted, deafened = deafened }
+                    { voiceBase | muted = muted, deafened = deafened, mutedBeforeDeafen = mutedBeforeDeafen }
             in
             if roomKind == "call" then
                 let
@@ -2519,6 +2521,9 @@ updateVoiceMode mode id voice =
             , peers = Dict.empty
             , failedPeers = Dict.empty
             , users = Dict.empty
+            , muted = False
+            , deafened = False
+            , mutedBeforeDeafen = False
             , screenShare = False
         }
 
@@ -2533,6 +2538,9 @@ clearVoice voice =
         , peers = Dict.empty
         , failedPeers = Dict.empty
         , users = Dict.empty
+        , muted = False
+        , deafened = False
+        , mutedBeforeDeafen = False
     }
 
 
@@ -2721,16 +2729,16 @@ refreshCurrentServer model =
 
 toggleMute : VoiceState -> VoiceState
 toggleMute voice =
-    { voice | muted = not voice.muted }
+    { voice | muted = not voice.muted, mutedBeforeDeafen = not voice.muted }
 
 
 toggleDeafen : VoiceState -> VoiceState
 toggleDeafen voice =
     if voice.deafened then
-        { voice | deafened = False }
+        { voice | deafened = False, muted = voice.mutedBeforeDeafen }
 
     else
-        { voice | deafened = True, muted = True }
+        { voice | deafened = True, mutedBeforeDeafen = voice.muted, muted = True }
 
 
 sendMessage : Model -> ( Model, Cmd Msg )
@@ -2956,6 +2964,7 @@ handleWsEvent val model =
                             , connectionFailed = False
                             , reconnecting = False
                             , screen = False
+                            , screenAudio = False
                             }
 
                         peer =
@@ -3850,20 +3859,23 @@ callPresenceDecoder =
         (D.field "users" (D.list decodeCallUser))
 
 
-voiceStateDecoder : Decoder ( Int, List { userId : Int, muted : Bool, deafened : Bool, screen : Bool, reconnecting : Bool } )
+voiceStateDecoder : Decoder ( Int, List VoiceUser )
 voiceStateDecoder =
     D.map2 Tuple.pair
         (D.field "channel_id" D.int)
         (D.field "users" (D.list voiceUserDecoder))
 
 
-voiceUserDecoder : Decoder { userId : Int, muted : Bool, deafened : Bool, screen : Bool, reconnecting : Bool }
+voiceUserDecoder : Decoder VoiceUser
 voiceUserDecoder =
-    D.map5 (\uid muted deafened screen reconnecting -> { userId = uid, muted = muted, deafened = deafened, screen = screen, reconnecting = reconnecting })
+    D.map8 VoiceUser
         (D.field "user_id" D.int)
+        (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "" ])
+        (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
         (D.field "muted" D.bool |> defaultValue False)
         (D.field "deafened" D.bool |> defaultValue False)
         (D.field "screen" D.bool |> defaultValue False)
+        (D.field "screen_audio" D.bool |> defaultValue False)
         (D.field "reconnecting" D.bool |> defaultValue False)
 
 
@@ -5044,6 +5056,12 @@ renderCallUser model u =
             else if u.connectionFailed then
                 "Audio connection failed"
 
+            else if u.screen && u.screenAudio then
+                "Sharing screen · audio included"
+
+            else if u.screen then
+                "Sharing screen"
+
             else if muted then
                 "Muted"
 
@@ -5093,7 +5111,19 @@ renderCallUser model u =
                 [ text statusText ]
             ]
         , if u.screen && not isSelf then
-            button [ class "btn secondary watch-screen", attribute "data-watch-screen" (String.fromInt u.userId), onClick (BridgeEvent "watch_screen" (E.int u.userId)) ] [ text "Watch screen" ]
+            button
+                [ class "btn secondary watch-screen"
+                , attribute "data-watch-screen" (String.fromInt u.userId)
+                , title
+                    (if u.screenAudio then
+                        "Watch screen; shared audio is included"
+
+                     else
+                        "Watch screen"
+                    )
+                , onClick (BridgeEvent "watch_screen" (E.int u.userId))
+                ]
+                [ text "Watch screen" ]
 
           else
             text ""
@@ -5177,7 +5207,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.7.2-3", attribute "data-ui-revision" "interface-3" ]
+    div [ class "layout", attribute "data-ui-version" "1.7.3", attribute "data-ui-revision" "interface-3" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -7249,6 +7279,9 @@ renderVoicePage channelId model =
         shareCount =
             List.length (List.filter .screen voiceUsers)
 
+        audioShareCount =
+            List.length (List.filter (\user -> user.screen && user.screenAudio) voiceUsers)
+
         participantCount =
             List.length voiceUsers
     in
@@ -7337,7 +7370,17 @@ renderVoicePage channelId model =
             , if hasScreenShare then
                 div [ class "voice-screen-banner" ]
                     [ span [ class "screen-pulse" ] []
-                    , text (String.fromInt shareCount ++ " sharing · Choose Watch screen below")
+                    , text
+                        (String.fromInt shareCount
+                            ++ " sharing"
+                            ++ (if audioShareCount > 0 then
+                                    " · audio included"
+
+                                else
+                                    ""
+                               )
+                            ++ " · Choose Watch screen below"
+                        )
                     ]
 
               else
@@ -7362,21 +7405,31 @@ renderVoicePage channelId model =
         ]
 
 
-voiceParticipantRow : Maybe Int -> List ServerMember -> { userId : Int, muted : Bool, deafened : Bool, screen : Bool, reconnecting : Bool } -> Html Msg
+voiceParticipantRow : Maybe Int -> List ServerMember -> VoiceUser -> Html Msg
 voiceParticipantRow selfId members vu =
     let
         maybeMember =
             List.filter (\m -> m.user.id == vu.userId) members |> List.head
 
+        rosterFallbackName =
+            if String.isEmpty (String.trim vu.displayName) then
+                "User " ++ String.fromInt vu.userId
+
+            else
+                vu.displayName
+
         name =
-            maybeMember |> Maybe.map (\m -> m.user.displayName) |> Maybe.withDefault ("User " ++ String.fromInt vu.userId)
+            maybeMember |> Maybe.map (\m -> m.user.displayName) |> Maybe.withDefault rosterFallbackName
 
         avatarUrl =
-            maybeMember |> Maybe.map (\m -> m.user.avatarUrl) |> Maybe.withDefault ""
+            maybeMember |> Maybe.map (\m -> m.user.avatarUrl) |> Maybe.withDefault vu.avatarUrl
 
         stateText =
             if vu.reconnecting then
                 "Reconnecting"
+
+            else if vu.screen && vu.screenAudio then
+                "Sharing screen with audio"
 
             else if vu.screen then
                 "Sharing screen"
@@ -7407,6 +7460,9 @@ voiceParticipantRow selfId members vu =
             if vu.reconnecting then
                 "Rejoining"
 
+            else if vu.screen && vu.screenAudio then
+                "Sharing + audio"
+
             else if vu.screen then
                 "Sharing"
 
@@ -7436,7 +7492,18 @@ voiceParticipantRow selfId members vu =
             , small [ class "muted" ] [ text stateText ]
             ]
         , if vu.screen then
-            button [ class "btn secondary watch-screen", onClick (BridgeEvent "watch_screen" (E.int vu.userId)) ] [ text "Watch screen" ]
+            button
+                [ class "btn secondary watch-screen"
+                , title
+                    (if vu.screenAudio then
+                        "Watch screen; shared audio is included"
+
+                     else
+                        "Watch screen"
+                    )
+                , onClick (BridgeEvent "watch_screen" (E.int vu.userId))
+                ]
+                [ text "Watch screen" ]
 
           else
             span [ class pillClass ] [ text pillText ]
@@ -7586,113 +7653,38 @@ renderSettingsPage model =
                     ]
                 , aside [ class "settings-sidebar" ]
                     [ div [ class "settings-nav-label" ] [ text "User settings" ]
-                    , button
-                        [ type_ "button"
-                        , class
-                            ("settings-tab"
-                                ++ (if model.settingsTab == "profile" then
-                                        " active"
-
-                                    else
-                                        ""
-                                   )
-                            )
-                        , onClick (SetSettingsTab "profile")
-                        ]
-                        [ text "Profile" ]
-                    , button
-                        [ type_ "button"
-                        , class
-                            ("settings-tab"
-                                ++ (if model.settingsTab == "appearance" then
-                                        " active"
-
-                                    else
-                                        ""
-                                   )
-                            )
-                        , onClick (SetSettingsTab "appearance")
-                        ]
-                        [ text "Appearance" ]
-                    , button
-                        [ type_ "button"
-                        , class
-                            ("settings-tab"
-                                ++ (if model.settingsTab == "chat" then
-                                        " active"
-
-                                    else
-                                        ""
-                                   )
-                            )
-                        , onClick (SetSettingsTab "chat")
-                        ]
-                        [ text "Chat" ]
-                    , button
-                        [ type_ "button"
-                        , class
-                            ("settings-tab"
-                                ++ (if model.settingsTab == "voice" then
-                                        " active"
-
-                                    else
-                                        ""
-                                   )
-                            )
-                        , onClick (SetSettingsTab "voice")
-                        ]
-                        [ text "Voice & Video" ]
-                    , button
-                        [ type_ "button"
-                        , class
-                            ("settings-tab"
-                                ++ (if model.settingsTab == "sound" then
-                                        " active"
-
-                                    else
-                                        ""
-                                   )
-                            )
-                        , onClick (SetSettingsTab "sound")
-                        ]
-                        [ text "Notifications" ]
-                    , button
-                        [ type_ "button"
-                        , class
-                            ("settings-tab"
-                                ++ (if model.settingsTab == "privacy" then
-                                        " active"
-
-                                    else
-                                        ""
-                                   )
-                            )
-                        , onClick (SetSettingsTab "privacy")
-                        ]
-                        [ text "Privacy & Safety" ]
+                    , settingsDesktopTab model.settingsTab "profile" "ui-icon ui-icon-profile" "Profile" "Identity and bio"
+                    , settingsDesktopTab model.settingsTab "appearance" "ui-icon ui-icon-settings" "Appearance" "Theme and layout"
+                    , settingsDesktopTab model.settingsTab "chat" "ui-icon ui-icon-messages" "Chat" "Compose and media"
+                    , settingsDesktopTab model.settingsTab "voice" "call-icon call-icon-audio" "Voice & Video" "Devices and sharing"
+                    , settingsDesktopTab model.settingsTab "sound" "ui-icon ui-icon-notifications" "Notifications" "Alerts and sounds"
+                    , settingsDesktopTab model.settingsTab "privacy" "ui-icon ui-icon-profile" "Privacy & Safety" "Local data controls"
                     , div [ class "settings-nav-separator" ] []
-                    , button
-                        [ type_ "button"
-                        , class
-                            ("settings-tab"
-                                ++ (if model.settingsTab == "account" then
-                                        " active"
-
-                                    else
-                                        ""
-                                   )
-                            )
-                        , onClick (SetSettingsTab "account")
+                    , settingsDesktopTab model.settingsTab "account" "ui-icon ui-icon-settings" "Account" "Security and sessions"
+                    , div [ class "settings-nav-footer" ]
+                        [ span [ class "settings-saved-dot", attribute "aria-hidden" "true" ] []
+                        , div [] [ b [] [ text "Saved on this device" ], small [] [ text "Most changes apply immediately" ] ]
                         ]
-                        [ text "Account" ]
                     ]
                 , div [ class "settings-content" ]
                     [ div [ class "settings-content-top" ]
-                        [ div [] [ span [ class "eyebrow" ] [ text "Personal settings" ], h1 [] [ text (settingsTitle model.settingsTab) ] ]
+                        [ div [ class "settings-heading" ]
+                            [ span [ class "eyebrow" ] [ text "Personal settings" ]
+                            , h1 [] [ text (settingsTitle model.settingsTab) ]
+                            , p [ class "settings-subtitle" ] [ text (settingsSubtitle model.settingsTab) ]
+                            ]
                         , span [ class "settings-user-chip" ] [ avatarImg u.avatarUrl u.displayName "small", text ("@" ++ u.username) ]
                         ]
                     , div [ class "settings-search" ]
-                        [ input [ type_ "search", value model.settingsSearch, placeholder "Find a setting…", attribute "aria-label" "Find a setting", onInput SettingsSearch ] []
+                        [ div [ class "settings-search-field" ]
+                            [ span [ class "ui-icon ui-icon-search", attribute "aria-hidden" "true" ] []
+                            , input [ type_ "search", value model.settingsSearch, placeholder "Find a setting…", attribute "aria-label" "Find a setting", onInput SettingsSearch ] []
+                            , if String.isEmpty model.settingsSearch then
+                                text ""
+
+                              else
+                                button [ type_ "button", class "settings-search-clear", onClick (SettingsSearch ""), attribute "aria-label" "Clear settings search" ] [ text "Clear" ]
+                            ]
                         , renderSettingsSearch model.settingsSearch
                         ]
                     , div [ class "settings-content-inner" ]
@@ -7779,6 +7771,63 @@ settingsMobileTab current key label =
         [ text label ]
 
 
+settingsDesktopTab : String -> String -> String -> String -> String -> Html Msg
+settingsDesktopTab current key iconClass label detail =
+    button
+        [ type_ "button"
+        , class
+            ("settings-tab"
+                ++ (if current == key then
+                        " active"
+
+                    else
+                        ""
+                   )
+            )
+        , attribute "data-setting" key
+        , attribute "aria-current"
+            (if current == key then
+                "page"
+
+             else
+                "false"
+            )
+        , onClick (SetSettingsTab key)
+        ]
+        [ span [ class "settings-tab-icon", attribute "aria-hidden" "true" ]
+            [ span [ class iconClass ] [] ]
+        , span [ class "settings-tab-copy" ]
+            [ b [] [ text label ]
+            , small [ attribute "aria-hidden" "true" ] [ text detail ]
+            ]
+        ]
+
+
+settingsChoice : Bool -> String -> Msg -> Html Msg
+settingsChoice isSelected label message =
+    button
+        [ type_ "button"
+        , class
+            ("btn secondary"
+                ++ (if isSelected then
+                        " active-choice"
+
+                    else
+                        ""
+                   )
+            )
+        , onClick message
+        , attribute "aria-pressed"
+            (if isSelected then
+                "true"
+
+             else
+                "false"
+            )
+        ]
+        [ text label ]
+
+
 settingsTitle : String -> String
 settingsTitle tab =
     case tab of
@@ -7802,6 +7851,31 @@ settingsTitle tab =
 
         _ ->
             "My Profile"
+
+
+settingsSubtitle : String -> String
+settingsSubtitle tab =
+    case tab of
+        "appearance" ->
+            "Adjust the interface for this browser. Changes preview as you choose them."
+
+        "chat" ->
+            "Set how messages, links, and animated media behave."
+
+        "voice" ->
+            "Choose audio devices, test your microphone, and tune screen sharing."
+
+        "sound" ->
+            "Control browser notifications and preview every sound before enabling it."
+
+        "privacy" ->
+            "Review the data and preferences kept locally in this browser."
+
+        "account" ->
+            "Manage your sign-in, active sessions, and connection diagnostics."
+
+        _ ->
+            "Update the name, photo, banner, and bio people see across Plainwire."
 
 
 renderAccountSettings : User -> Model -> Html Msg
@@ -7847,32 +7921,8 @@ renderChatSettings model =
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Send message with Enter" ], small [ class "muted" ] [ text "Choose whether Enter sends or adds a new line." ] ]
             , div [ class "segmented-control" ]
-                [ button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.chatEnterSends then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (SetChatEnterSends True)
-                    ]
-                    [ text "Enter sends" ]
-                , button
-                    [ class
-                        ("btn secondary"
-                            ++ (if not model.chatEnterSends then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (SetChatEnterSends False)
-                    ]
-                    [ text "Ctrl/Cmd + Enter sends" ]
+                [ settingsChoice model.chatEnterSends "Enter sends" (SetChatEnterSends True)
+                , settingsChoice (not model.chatEnterSends) "Ctrl/Cmd + Enter sends" (SetChatEnterSends False)
                 ]
             ]
         , div [ class "setting-row" ]
@@ -8008,221 +8058,41 @@ renderAppearanceSettings model =
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Interface density" ], small [ class "muted" ] [ text "Compact mode fits more channels and messages on screen." ] ]
             , div [ class "segmented-control" ]
-                [ button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiDensity == "comfortable" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_density" (E.string "comfortable"))
-                    ]
-                    [ text "Comfortable" ]
-                , button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiDensity == "compact" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_density" (E.string "compact"))
-                    ]
-                    [ text "Compact" ]
+                [ settingsChoice (model.uiDensity == "comfortable") "Comfortable" (BridgeEvent "ui_density" (E.string "comfortable"))
+                , settingsChoice (model.uiDensity == "compact") "Compact" (BridgeEvent "ui_density" (E.string "compact"))
                 ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Text size" ], small [ class "muted" ] [ text "Scale the interface without changing your browser zoom." ] ]
             , div [ class "segmented-control" ]
-                [ button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiFontScale == "small" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_font_scale" (E.string "small"))
-                    ]
-                    [ text "Small" ]
-                , button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiFontScale == "default" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_font_scale" (E.string "default"))
-                    ]
-                    [ text "Default" ]
-                , button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiFontScale == "large" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_font_scale" (E.string "large"))
-                    ]
-                    [ text "Large" ]
+                [ settingsChoice (model.uiFontScale == "small") "Small" (BridgeEvent "ui_font_scale" (E.string "small"))
+                , settingsChoice (model.uiFontScale == "default") "Default" (BridgeEvent "ui_font_scale" (E.string "default"))
+                , settingsChoice (model.uiFontScale == "large") "Large" (BridgeEvent "ui_font_scale" (E.string "large"))
                 ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Accent" ], small [ class "muted" ] [ text "Choose the main interface color on this device." ] ]
             , div [ class "segmented-control" ]
-                [ button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiAccent == "blue" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_accent" (E.string "blue"))
-                    ]
-                    [ text "Blue" ]
-                , button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiAccent == "teal" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_accent" (E.string "teal"))
-                    ]
-                    [ text "Teal" ]
-                , button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiAccent == "green" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_accent" (E.string "green"))
-                    ]
-                    [ text "Green" ]
-                , button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiAccent == "amber" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_accent" (E.string "amber"))
-                    ]
-                    [ text "Amber" ]
-                , button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiAccent == "rose" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_accent" (E.string "rose"))
-                    ]
-                    [ text "Rose" ]
+                [ settingsChoice (model.uiAccent == "blue") "Blue" (BridgeEvent "ui_accent" (E.string "blue"))
+                , settingsChoice (model.uiAccent == "teal") "Teal" (BridgeEvent "ui_accent" (E.string "teal"))
+                , settingsChoice (model.uiAccent == "green") "Green" (BridgeEvent "ui_accent" (E.string "green"))
+                , settingsChoice (model.uiAccent == "amber") "Amber" (BridgeEvent "ui_accent" (E.string "amber"))
+                , settingsChoice (model.uiAccent == "rose") "Rose" (BridgeEvent "ui_accent" (E.string "rose"))
                 ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Corners" ], small [ class "muted" ] [ text "Keep the interface tight or give panels a little more rounding." ] ]
             , div [ class "segmented-control" ]
-                [ button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiCornerStyle == "compact" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_corner_style" (E.string "compact"))
-                    ]
-                    [ text "Compact" ]
-                , button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiCornerStyle == "default" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_corner_style" (E.string "default"))
-                    ]
-                    [ text "Default" ]
-                , button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.uiCornerStyle == "rounded" then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "ui_corner_style" (E.string "rounded"))
-                    ]
-                    [ text "Rounded" ]
+                [ settingsChoice (model.uiCornerStyle == "compact") "Compact" (BridgeEvent "ui_corner_style" (E.string "compact"))
+                , settingsChoice (model.uiCornerStyle == "default") "Default" (BridgeEvent "ui_corner_style" (E.string "default"))
+                , settingsChoice (model.uiCornerStyle == "rounded") "Rounded" (BridgeEvent "ui_corner_style" (E.string "rounded"))
                 ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Motion" ], small [ class "muted" ] [ text "Reduce interface animation when you prefer less movement." ] ]
             , div [ class "segmented-control" ]
-                [ button
-                    [ class
-                        ("btn secondary"
-                            ++ (if not model.reduceMotion then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "reduce_motion" (E.bool False))
-                    ]
-                    [ text "Standard" ]
-                , button
-                    [ class
-                        ("btn secondary"
-                            ++ (if model.reduceMotion then
-                                    " active-choice"
-
-                                else
-                                    ""
-                               )
-                        )
-                    , onClick (BridgeEvent "reduce_motion" (E.bool True))
-                    ]
-                    [ text "Reduced" ]
+                [ settingsChoice (not model.reduceMotion) "Standard" (BridgeEvent "reduce_motion" (E.bool False))
+                , settingsChoice model.reduceMotion "Reduced" (BridgeEvent "reduce_motion" (E.bool True))
                 ]
             ]
         ]
@@ -8311,7 +8181,7 @@ renderVoiceSettings model =
     div [ class "settings-card settings-panel voice-settings" ]
         [ div [ class "settings-card-head" ]
             [ h2 [] [ text "Voice & Video" ]
-            , p [ class "muted" ] [ text "Choose devices and verify your microphone before joining friends." ]
+            , p [ class "muted" ] [ text "Choose devices, verify your microphone, and set how screen sharing works before joining friends." ]
             ]
         , div [ class "setting-row setting-row-stack" ]
             [ div [] [ b [] [ text "Input device" ], small [ class "muted" ] [ text "The microphone used in calls and voice channels." ] ]
@@ -8419,6 +8289,7 @@ renderVoiceSettings model =
               else
                 text ""
             ]
+        , Html.node "pw-screen-settings" [ class "settings-screen-share-control" ] []
         , div [ class "voice-settings-note" ]
             [ b [] [ text "Having trouble being heard?" ]
             , p [ class "muted" ] [ text "Choose your microphone, start a test, and speak. The meter should move. Check your headset’s mute switch if it stays still. You can change devices during a call." ]
@@ -8455,11 +8326,17 @@ renderProfileSettings u model =
             ]
         , div [ class "settings-fields" ]
             [ div [ class "field" ]
-                [ label [ for "profile-display-name" ] [ text "Display name" ]
+                [ div [ class "field-label-row" ]
+                    [ label [ for "profile-display-name" ] [ text "Display name" ]
+                    , small [ class "field-count" ] [ text (String.fromInt (String.length model.profileDisplayName) ++ " / 48") ]
+                    ]
                 , input [ id "profile-display-name", value model.profileDisplayName, maxlength 48, onInput ProfileDisplayName ] []
                 ]
             , div [ class "field" ]
-                [ label [ for "profile-bio" ] [ text "Bio" ]
+                [ div [ class "field-label-row" ]
+                    [ label [ for "profile-bio" ] [ text "Bio" ]
+                    , small [ class "field-count" ] [ text (String.fromInt (String.length model.profileBio) ++ " / 600") ]
+                    ]
                 , textarea [ id "profile-bio", value model.profileBio, maxlength 600, onInput ProfileBio ] []
                 ]
             , div [ class "field" ]

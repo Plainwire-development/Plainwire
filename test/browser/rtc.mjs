@@ -31,6 +31,7 @@ const members = new Set();
 // Simulates a slow relay path: ICE candidates arrive long after offer/answer.
 let candidateDelayMs = 0;
 const roster = () => people.slice(0, 2).map(p => ({ user_id: p.id, profile: p, muted: false, deafened: false, screen: false, ...states.get(p.id) }));
+const voiceRoster = () => people.slice(0, 2).map(p => ({ user_id: p.id, profile: p, muted: false, deafened: false, screen: false, screen_audio: false, reconnecting: false }));
 async function setup(uid) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   await context.grantPermissions(['microphone']);
@@ -67,7 +68,23 @@ async function setup(uid) {
         ctx.fillRect(0, 0, 640, 360);
       }, 60);
       const stream = canvas.captureStream(15);
-      window.__screens.push({ stream, timer });
+      if (constraints.audio) {
+        const screenAudioContext = new AudioContext();
+        await screenAudioContext.resume();
+        // Use the native constructor captured above so screen audio is not
+        // counted as one of the UI sound previews in this suite.
+        const oscillator = createOscillator.call(screenAudioContext);
+        const gain = screenAudioContext.createGain();
+        const destination = screenAudioContext.createMediaStreamDestination();
+        oscillator.frequency.value = 880;
+        gain.gain.value = 0.12;
+        oscillator.connect(gain).connect(destination);
+        oscillator.start();
+        stream.addTrack(destination.stream.getAudioTracks()[0]);
+        window.__screens.push({ stream, timer, screenAudioContext, oscillator });
+      } else {
+        window.__screens.push({ stream, timer });
+      }
       return stream;
     };
     window.RTCPeerConnection = class extends NativePC {
@@ -92,7 +109,7 @@ async function setup(uid) {
   await context.route('**/api/**', async route => {
     const path = new URL(route.request().url()).pathname;
     const reply = data => route.fulfill({ json: { ok: true, data } });
-    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.2-3', asset_version: '1.7.2-3', registration_enabled: true } });
+    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.3', asset_version: '1.7.3', registration_enabled: true } });
     if (path === '/api/me') return reply({ user: people[uid - 1], csrf: 'test', server_time: now });
     if (path === '/api/sync') return reply({ ...sync, conversations: [{ ...conversations[0], peer_id: uid === 1 ? 2 : 1, peer_name: people[uid === 1 ? 1 : 0].display_name }] });
     if (path === '/api/messages') return reply([]);
@@ -113,6 +130,10 @@ async function setup(uid) {
       if (msg.type === 'call_signal') {
         const deliver = () => send(msg.to_user_id, { ...msg, conversation_id: 1, from_user_id: uid });
         return msg.signal?.kind === 'candidate' && candidateDelayMs ? setTimeout(deliver, candidateDelayMs) : deliver();
+      }
+      if (msg.type === 'voice_signal') return send(msg.to_user_id, { ...msg, channel_id: 9, from_user_id: uid });
+      if (msg.type === 'voice_join') {
+        return send(uid, { type: 'voice_state', channel_id: 9, users: voiceRoster() });
       }
       if (msg.type === 'call_ring') {
         send(uid, { type: 'call_ringing', conversation_id: 1, profile: people[uid === 1 ? 1 : 0] });
@@ -245,21 +266,39 @@ try {
   await a.waitForFunction(() => document.querySelector('#call-microphone')?.value === 'desk');
   assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track === window.__beforeFailedSwap && window.__beforeFailedSwap.readyState === 'live'), true);
 
-  // Both negotiated video directions work without sacrificing microphone audio.
+  // Screen audio is mixed onto the negotiated audio sender, preserving the
+  // existing SDP shape and microphone controls.
+  await a.evaluate(() => { window.__beforeShareAudio = window.__pcs.at(-1)._audioSender.track; });
   await a.getByRole('button', { name: 'Share', exact: true }).click();
   await a.waitForSelector('.call-sharing-row');
+  await a.waitForFunction(() => {
+    const sender = window.__pcs.at(-1)._audioSender;
+    return sender?.track && sender.track !== window.__beforeShareAudio && sender.track.readyState === 'live';
+  });
+  await a.evaluate(() => { window.__firstMixedScreenAudio = window.__pcs.at(-1)._audioSender.track; });
+  assert.equal(await a.evaluate(() => window.__displayRequests[0].audio), true, 'screen chooser requests source audio');
+  assert.equal(await a.evaluate(() => window.__screens[0].stream.getAudioTracks().length), 1, 'display capture supplies shared audio');
   await b.waitForFunction(async () => [...(await window.__pcs.at(-1).getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'video' && r.framesDecoded > 2));
   await b.getByRole('button', { name: 'Open call details', exact: true }).click();
   assert.equal(await b.locator('#call-microphone').evaluate(el => el.selectedOptions[0]?.textContent), 'System default');
+  await b.getByText('Sharing screen · audio included', { exact: true }).waitFor();
   await b.getByRole('button', { name: 'Watch screen', exact: true }).click();
   await b.waitForFunction(() => document.querySelector('#pw-float-stage-1 video')?.videoWidth > 0);
   assert.equal(await a.evaluate(() => window.__displayRequests[0].video.frameRate.max), 30);
   await a.locator('pw-screen-settings summary').click();
+  await a.getByText('Shared audio is included with your microphone.', { exact: true }).waitFor();
+  const sharedAudioBeforeMute = (await stats(b)).inbound[0].energy;
+  await a.getByRole('button', { name: 'Mute', exact: true }).click();
+  assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track.enabled), true, 'muting the microphone keeps the mixed share track live');
+  await b.waitForTimeout(400);
+  assert((await stats(b)).inbound[0].energy > sharedAudioBeforeMute, 'shared source audio continues while the microphone is muted');
+  await a.getByRole('button', { name: 'Unmute', exact: true }).click();
   await a.getByRole('combobox', { name: 'Screen sharing quality', exact: true }).selectOption('motion');
   await a.getByRole('button', { name: 'Change shared screen', exact: true }).click();
-  await a.waitForFunction(() => window.__screens.length === 2 && window.__screens[0].stream.getVideoTracks()[0].readyState === 'ended');
+  await a.waitForFunction(() => window.__screens.length === 2 && window.__screens[0].stream.getTracks().every(track => track.readyState === 'ended') && window.__firstMixedScreenAudio.readyState === 'ended');
   assert.equal(await a.evaluate(() => window.__displayRequests[1].video.frameRate.max), 60);
   assert.equal(await a.evaluate(() => window.__pcs.at(-1)._videoSender.track === window.__screens[1].stream.getVideoTracks()[0]), true);
+  assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track !== window.__firstMixedScreenAudio && window.__pcs.at(-1)._audioSender.track.readyState === 'live'), true, 'changing source replaces the audio mix atomically');
   const framesBeforeSwitch = (await stats(b)).video[0];
   await b.waitForFunction(async frames => [...(await window.__pcs.at(-1).getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'video' && r.framesDecoded > frames + 3), framesBeforeSwitch);
   // Cancellation and sender failure both leave the existing share usable.
@@ -272,11 +311,13 @@ try {
   assert.equal(await a.evaluate(() => window.__screens[1].stream.getVideoTracks()[0].readyState), 'live');
   await a.evaluate(() => {
     const sender = window.__pcs.at(-1)._videoSender, original = sender.replaceTrack.bind(sender);
+    window.__beforeFailedScreenAudio = window.__pcs.at(-1)._audioSender.track;
     sender.replaceTrack = async () => { sender.replaceTrack = original; throw new DOMException('Injected failure', 'InvalidModificationError'); };
   });
   await a.getByRole('button', { name: 'Change shared screen', exact: true }).click();
   await a.waitForFunction(() => window.__screens.length === 3 && window.__screens[2].stream.getVideoTracks()[0].readyState === 'ended');
   assert.equal(await a.evaluate(() => window.__pcs.at(-1)._videoSender.track === window.__screens[1].stream.getVideoTracks()[0] && window.__pcs.at(-1)._videoSender.track.readyState === 'live'), true);
+  assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track === window.__beforeFailedScreenAudio && window.__beforeFailedScreenAudio.readyState === 'live'), true, 'failed source change restores the previous shared audio');
   await a.locator('pw-screen-settings summary').click();
   const viewer = b.locator('#pw-float-stage-1');
   await viewer.getByRole('button', { name: 'Fill view', exact: true }).click();
@@ -297,7 +338,14 @@ try {
   assert.equal(await b.evaluate(() => window.__frameClosed), true);
   await b.evaluate(() => document.querySelector('#pw-float-stage-1 video').dispatchEvent(new Event('loadeddata')));
   assert.equal(await viewer.getAttribute('data-hdr'), 'false', 'ordinary SDR video must not be labelled HDR');
-  await b.locator('#pw-float-stage-1').getByRole('button', { name: 'Close screen share', exact: true }).click();
+  const viewerHeight = (await viewer.boundingBox()).height;
+  await viewer.getByRole('button', { name: 'Hide shared screen', exact: true }).click();
+  await b.waitForFunction(() => document.querySelector('#pw-float-stage-1')?.classList.contains('screen-visual-hidden'));
+  assert.equal(await viewer.locator('video').isVisible(), false, 'hiding a share removes the video without closing it');
+  assert((await viewer.boundingBox()).height < viewerHeight / 2, 'hidden share collapses to a compact title bar');
+  await viewer.getByRole('button', { name: 'Show shared screen', exact: true }).click();
+  await viewer.locator('video').waitFor({ state: 'visible' });
+  await viewer.getByRole('button', { name: 'Stop watching screen', exact: true }).click();
   await b.getByRole('button', { name: 'Watch screen', exact: true }).click();
   await b.waitForFunction(() => document.querySelector('#pw-float-stage-1 video')?.videoWidth > 0);
   await b.screenshot({ path: 'test-results/screen-viewer.png' });
@@ -305,7 +353,7 @@ try {
   const compactViewer = await viewer.boundingBox();
   await viewer.getByRole('button', { name: 'Center and fit window', exact: true }).click();
   assert((await viewer.boundingBox()).height > compactViewer.height + 200, 'mobile expand provides useful viewing space');
-  assert(await viewer.getByRole('button', { name: 'Close screen share', exact: true }).isVisible());
+  assert(await viewer.getByRole('button', { name: 'Stop watching screen', exact: true }).isVisible());
   await b.screenshot({ path: 'test-results/screen-mobile.png' });
   await viewer.getByRole('button', { name: 'Center and fit window', exact: true }).click();
   await b.setViewportSize({ width: 1280, height: 900 });
@@ -350,8 +398,9 @@ try {
   await b.getByRole('button', { name: 'Stop share', exact: true }).click();
   await a.waitForFunction(() => window.__pcs.at(-1)._videoSender.track === null);
   assert.equal(await a.evaluate(() => window.__screens.every(s => s.stream.getTracks().every(t => t.readyState === 'ended'))), true);
+  assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track === window.__beforeShareAudio && window.__beforeShareAudio.readyState === 'live'), true, 'stopping a share restores the microphone sender');
 
-  if (await a.locator('.toast-close').count()) await a.locator('.toast-close').click();
+  await a.locator('.toast-close').click({ timeout: 1000 }).catch(() => {});
   await mkdir('test-results', { recursive: true });
   await a.screenshot({ path: 'test-results/call-desktop.png' });
   await a.emulateMedia({ colorScheme: 'dark' });
@@ -366,20 +415,27 @@ try {
   await a.emulateMedia({ colorScheme: 'light' });
 
   // Deafen silences playback and the microphone; undeafen restores both and the
-  // call keeps flowing in both directions.
+  // call keeps flowing in both directions. A pre-existing mute is preserved.
   const remotePlayback = page => page.evaluate(() => [...document.querySelectorAll('audio[id^="remote-audio-"]')].map(el => el.muted));
   await a.getByRole('button', { name: 'Deafen', exact: true }).click();
-  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === false);
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === false && [...document.querySelectorAll('audio')].filter(el => el.srcObject).every(el => el.muted));
   assert.deepEqual(await remotePlayback(a), [true], 'deafen mutes remote playback');
   await a.getByRole('button', { name: 'Undeafen', exact: true }).click();
-  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === true);
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === true && [...document.querySelectorAll('audio')].filter(el => el.srcObject).every(el => !el.muted));
   assert.deepEqual(await remotePlayback(a), [false], 'undeafen restores remote playback');
   assert.equal(await a.getByRole('button', { name: 'Mute', exact: true }).getAttribute('aria-pressed'), 'false', 'undeafen restores the unmuted microphone');
   const beforeUndeafenEnergy = (await stats(b)).inbound[0].energy;
   await b.waitForTimeout(400);
   assert((await stats(b)).inbound[0].energy > beforeUndeafenEnergy, 'microphone is audible again after undeafening');
   assert.equal((await stats(a)).connection, 'connected', 'deafening does not disturb the connection');
-
+  await a.getByRole('button', { name: 'Mute', exact: true }).click();
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === false);
+  await a.getByRole('button', { name: 'Deafen', exact: true }).click();
+  await a.getByRole('button', { name: 'Undeafen', exact: true }).click();
+  assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track.enabled), false, 'undeafen preserves a pre-existing mute');
+  assert.deepEqual(await remotePlayback(a), [false], 'undeafen restores playback while preserving the microphone mute');
+  await a.getByRole('button', { name: 'Unmute', exact: true }).click();
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === true);
   await a.getByRole('button', { name: 'Deafen', exact: true }).click();
   await a.locator('.call-overlay').getByRole('button', { name: 'Leave', exact: true }).click();
   await b.waitForFunction(() => window.__pcs.every(pc => pc.connectionState === 'closed'));
@@ -408,7 +464,7 @@ try {
   await a.locator('.call-overlay').getByRole('button', { name: 'Leave', exact: true }).click();
   await b.waitForFunction(() => window.__pcs.every(pc => pc.connectionState === 'closed'));
   await b.locator('.call-bar [title="Leave call"]').click();
-  await a.locator('.settings-tab').filter({ hasText: /^Notifications$/ }).click();
+  await a.locator('.settings-sidebar').getByRole('button', { name: 'Notifications', exact: true }).click();
   await a.waitForSelector('.sound-preview-list');
   const toneCount = () => a.evaluate(() => window.__tones.length);
   for (const name of ['Message', 'Incoming call', 'Calling']) {
@@ -431,6 +487,20 @@ try {
   await a.getByRole('button', { name: 'Decline', exact: true }).waitFor();
   await a.waitForTimeout(100);
   assert.equal(await toneCount(), silentCount, 'disabled sounds suppress incoming ringing');
+  await a.getByRole('button', { name: 'Decline', exact: true }).click();
+
+  // Reproduce a hard refresh directly on a server voice route. The realtime
+  // roster arrives without server member data, so names must come from each
+  // roster profile instead of flashing "User (id)" until navigation changes.
+  await a.evaluate(() => sessionStorage.setItem('plainwire_rtc_room', JSON.stringify({
+    kind: 'voice', id: 9, muted: false, deafened: false, muted_before_deafen: false, at: Date.now()
+  })));
+  await a.goto(origin + '/?voice-refresh=1#voice/9');
+  await a.waitForFunction(() => document.querySelectorAll('.voice-participant').length === 2);
+  assert.deepEqual((await a.locator('.voice-participant .grow b').allTextContents()).sort(), ['Alex Morgan', 'Jamie Chen'], 'refreshed voice roster renders profile names immediately');
+  assert.equal(await a.getByText(/^User \d+$/).count(), 0, 'voice refresh never exposes numeric fallback labels');
+  await a.screenshot({ path: 'test-results/voice-refresh-roster.png' });
+  await a.getByRole('button', { name: 'Leave', exact: true }).click();
   assert.deepEqual(errors, [], 'no browser exceptions during calls and screen sharing');
-  console.log('PASS: real bidirectional RTP; missing device fallback; live input meter; mute/unmute; microphone swap and failed-swap recovery; screen sharing in both directions; visible screen viewing and reopening; quality presets; source replacement/cancellation/rollback/stop race; fullscreen and colour metadata; pointer/keyboard resizing; mobile viewer expansion; call-health measurements; mobile controls; deafened exit/rejoin; call cleanup; direct audio settings; all sound previews and disabled ringing.');
+  console.log('PASS: real bidirectional RTP; missing device fallback; live input meter; mute/unmute; deafen state restoration; microphone swap and failed-swap recovery; screen sharing with mixed audio in both directions; hide/show and reopen viewing; quality presets; source replacement/cancellation/rollback/stop race; fullscreen and colour metadata; pointer/keyboard resizing; mobile viewer expansion; call-health measurements; mobile controls; call cleanup; refreshed voice profile roster; direct audio settings; all sound previews and disabled ringing.');
 } finally { await browser.close(); server.close(); }

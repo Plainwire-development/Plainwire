@@ -454,7 +454,8 @@ clean_room_patch(Patch) ->
     %% patch means patch; changing screen should not magically unmute anyone.
     maps:from_list([
         {Key, pw_util:bool(Value)}
-        || {WireKey, Key} <- [{<<"muted">>, muted}, {<<"deafened">>, deafened}, {<<"screen">>, screen}],
+        || {WireKey, Key} <- [{<<"muted">>, muted}, {<<"deafened">>, deafened},
+                              {<<"screen">>, screen}, {<<"screen_audio">>, screen_audio}],
            {ok, Value} <- [maps:find(WireKey, Patch)]
     ]).
 

@@ -373,7 +373,7 @@ new_member(Pid, Profile, Previous) ->
     #{pid => Pid, profile => Profile,
       muted => maps:get(muted, Previous, false),
       deafened => maps:get(deafened, Previous, false),
-      screen => false, reconnecting => false}.
+      screen => false, screen_audio => false, reconnecting => false}.
 
 new_call_member(Pid, Profile, Audience, Previous) ->
     (new_member(Pid, Profile, Previous))#{
@@ -444,7 +444,13 @@ apply_room_state(Kind, Id, Uid, Pid, Patch, Profile, St0) ->
 apply_member_state(Kind, Id, Uid, Patch, Profile, Key, Rooms0, Room0, Info0, St0) ->
     Requested = maps:get(screen, Patch, maps:get(screen, Info0, false)),
     {Screen, Denied} = clamp_screen(Room0, Uid, Requested),
-    Info = maps:merge(Info0, Patch#{profile => Profile, screen => Screen}),
+    ScreenAudio = Screen andalso maps:get(screen_audio, Patch, maps:get(screen_audio, Info0, false)),
+    Deafened = maps:get(deafened, Patch, maps:get(deafened, Info0, false)),
+    %% Deafening always closes the microphone too. Keep that invariant at the
+    %% room boundary so older or modified clients cannot publish impossible UI.
+    Muted = Deafened orelse maps:get(muted, Patch, maps:get(muted, Info0, false)),
+    Info = maps:merge(Info0, Patch#{profile => Profile, muted => Muted, deafened => Deafened,
+                                   screen => Screen, screen_audio => ScreenAudio}),
     Room = maps:put(Uid, Info, Room0),
     case Denied of
         true ->
@@ -577,6 +583,7 @@ room_users(Room) ->
        muted => maps:get(muted, Info, false),
        deafened => maps:get(deafened, Info, false),
        screen => maps:get(screen, Info, false),
+       screen_audio => maps:get(screen_audio, Info, false),
        reconnecting => maps:get(reconnecting, Info, false),
        profile => strip_profile(maps:get(profile, Info, #{}))}
      || {Uid, Info} <- maps:to_list(Room)].
@@ -689,7 +696,7 @@ detach_pid_from_rooms(Pid, Rooms, Kind, Users) ->
                     Token = make_ref(),
                     Timer = erlang:send_after(reconnect_grace_ms(), self(),
                         {room_reconnect_expired, Kind, IdKey, GoneUid, Token}),
-                    Info = Info0#{pid => undefined, screen => false,
+                    Info = Info0#{pid => undefined, screen => false, screen_audio => false,
                         reconnecting => true, reconnect_token => Token,
                         reconnect_timer => Timer},
                     maps:put(GoneUid, Info, R)

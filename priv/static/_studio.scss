@@ -51,6 +51,53 @@ pw-screen-settings label { display: block; margin: 0 14px 10px; color: var(--tex
 pw-screen-settings select { display: block; width: 100%; padding: 9px; margin-top: 6px; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
 pw-screen-settings p { font-size: 11px; line-height: 1.6; color: var(--muted); margin: 10px 14px; }
 pw-screen-settings button { margin: 0 14px 14px; }
+@mixin screen-option-surface {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+pw-screen-settings {
+  .screen-audio-option {
+    @include screen-option-surface;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 11px 12px;
+
+    input {
+      width: 16px;
+      height: 16px;
+      flex: 0 0 16px;
+      margin: 2px 0 0;
+      accent-color: var(--accent);
+    }
+
+    b,
+    small { display: block; }
+    b { color: var(--text1); font-size: 11px; }
+    small { margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+  }
+
+  .screen-audio-status {
+    @include screen-option-surface;
+    padding: 9px 11px;
+
+    &.active {
+      border-color: color-mix(in srgb, var(--ok), transparent 55%);
+      background: color-mix(in srgb, var(--ok), transparent 92%);
+      color: var(--ok);
+    }
+  }
+
+  .screen-settings-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0 14px 14px;
+
+    button { margin: 0; }
+  }
+}
 @container (min-width: 560px) {
   .call-overlay-users { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .call-user-row { min-height: 126px; }
@@ -71,6 +118,14 @@ pw-screen-settings button { margin: 0 14px 14px; }
 .pw-float-btn:hover { background: #333b44; border-color: #485360; }
 .pw-float-window-icon.pip { width: 16px; height: 12px; border: 1.5px solid currentColor; border-radius: 2px; }
 .pw-float-window-icon.pip::after { content: ''; position: absolute; right: 1px; bottom: 1px; width: 7px; height: 4px; background: currentColor; }
+.pw-float-window-icon.hide::before {
+  content: '';
+  position: absolute;
+  inset: 6px 1px auto;
+  height: 1.5px;
+  border-radius: 2px;
+  background: currentColor;
+}
 .pw-float video { background: #111418; display: block; width: 100%; }
 .screen-viewer-footer { flex: 0 0 auto; display: flex; align-items: center; gap: 14px; min-height: 38px; padding: 5px 14px; border-top: 1px solid #343b43; background: #20252b; color: #b1bac4; font: 10px/1.4 ui-monospace, monospace; }
 .screen-viewer-footer button { margin-left: auto; min-height: 28px; padding: 4px 9px; white-space: nowrap; border: 1px solid #424950; border-radius: 5px; background: transparent; color: #eef2f6; font: 11px/1.4 system-ui; cursor: pointer; }
@@ -112,3 +167,17 @@ pw-screen-settings button { margin: 0 14px 14px; }
   .composer { margin-bottom: 10px; }
 }
 @media (max-height: 560px) and (min-width: 761px) { .call-overlay.expanded { min-height: 280px; } }
+
+.pw-float.screen-visual-hidden {
+  height: auto !important;
+  min-height: 0;
+  resize: none;
+
+  &::after,
+  > video,
+  > .screen-viewer-footer,
+  > .screen-play-retry { display: none; }
+
+  .pw-float-bar { border-bottom: 0; }
+  .pw-float-state span:last-child::after { content: ' · video hidden'; }
+}

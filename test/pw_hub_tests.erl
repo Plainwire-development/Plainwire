@@ -40,6 +40,52 @@ connect_seeds_own_presence_state_test() ->
     end.
 
 
+voice_roster_carries_profile_and_normalizes_media_state_test() ->
+    stop_existing_hub(),
+    {ok, Hub} = pw_hub:start_link(),
+    Parent = self(),
+    Socket = spawn(fun() -> socket_loop(Parent, voice_member) end),
+    Profile = #{id => 71, username => <<"casey">>, display_name => <<"Casey Nguyen">>,
+                avatar_url => <<"/avatar/casey">>, avatar_source_url => <<"private-source">>},
+    try
+        pw_hub:connect(71, Socket, <<"online">>),
+        _ = gen_server:call(pw_hub, sync),
+        ok = pw_hub:voice_join(901, 71, Socket, Profile),
+        Initial = only_voice_user(await_voice_roster(voice_member, 901)),
+        WireProfile = maps:get(profile, Initial),
+        ?assertEqual(<<"Casey Nguyen">>, maps:get(<<"display_name">>, WireProfile)),
+        ?assertEqual(<<"/avatar/casey">>, maps:get(<<"avatar_url">>, WireProfile)),
+        ?assertEqual(false, maps:is_key(<<"avatar_source_url">>, WireProfile)),
+        ?assertEqual(false, maps:get(screen_audio, Initial)),
+
+        %% Invalid combinations are normalized at the hub boundary: deafened
+        %% users are muted, and screen audio cannot outlive a screen share.
+        pw_hub:voice_state(901, 71, Socket,
+            #{deafened => true, muted => false, screen_audio => true}, Profile),
+        _ = gen_server:call(pw_hub, sync),
+        Deafened = only_voice_user(await_voice_roster(voice_member, 901)),
+        ?assertEqual(true, maps:get(deafened, Deafened)),
+        ?assertEqual(true, maps:get(muted, Deafened)),
+        ?assertEqual(false, maps:get(screen_audio, Deafened)),
+
+        pw_hub:voice_state(901, 71, Socket,
+            #{deafened => false, muted => false, screen => true, screen_audio => true}, Profile),
+        _ = gen_server:call(pw_hub, sync),
+        Sharing = only_voice_user(await_voice_roster(voice_member, 901)),
+        ?assertEqual(true, maps:get(screen, Sharing)),
+        ?assertEqual(true, maps:get(screen_audio, Sharing)),
+
+        pw_hub:voice_state(901, 71, Socket, #{screen => false}, Profile),
+        _ = gen_server:call(pw_hub, sync),
+        Stopped = only_voice_user(await_voice_roster(voice_member, 901)),
+        ?assertEqual(false, maps:get(screen, Stopped)),
+        ?assertEqual(false, maps:get(screen_audio, Stopped))
+    after
+        exit(Socket, kill),
+        gen_server:stop(Hub)
+    end.
+
+
 multi_session_presence_prefers_visible_session_test() ->
     stop_existing_hub(),
     {ok, Hub} = pw_hub:start_link(),
@@ -337,6 +383,18 @@ socket_loop(Parent, Tag) ->
             Parent ! {socket_event, Tag, #{type => call_state,
                 conversation_id => maps:get(<<"conversation_id">>, Json), users => Users}},
             socket_loop(Parent, Tag);
+        {hub_text, Payload, voice_state} ->
+            Json = jsx:decode(Payload, [return_maps]),
+            Users = [#{user_id => maps:get(<<"user_id">>, U),
+                       muted => maps:get(<<"muted">>, U, false),
+                       deafened => maps:get(<<"deafened">>, U, false),
+                       screen => maps:get(<<"screen">>, U, false),
+                       screen_audio => maps:get(<<"screen_audio">>, U, false),
+                       profile => maps:get(<<"profile">>, U, #{})}
+                     || U <- maps:get(<<"users">>, Json, [])],
+            Parent ! {socket_event, Tag, #{type => voice_state,
+                channel_id => maps:get(<<"channel_id">>, Json), users => Users}},
+            socket_loop(Parent, Tag);
         {hub_text, Payload, call_signal} ->
             Json = jsx:decode(Payload, [return_maps]),
             Parent ! {socket_event, Tag, #{type => call_signal,
@@ -374,6 +432,18 @@ await_call_roster(Tag, Id, Count) ->
         Count -> Event;
         _ -> await_call_roster(Tag, Id, Count)
     end.
+
+await_voice_roster(Tag, Id) ->
+    receive
+        {socket_event, Tag, #{type := voice_state, channel_id := Id} = Event} -> Event;
+        {socket_event, Tag, _Other} -> await_voice_roster(Tag, Id)
+    after 1000 ->
+        ?assert(false)
+    end.
+
+only_voice_user(Event) ->
+    [User] = maps:get(users, Event),
+    User.
 
 assert_no_event(Tag, Type, Id) ->
     receive

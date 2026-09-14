@@ -42,7 +42,7 @@ async function setup(context){
  await context.route('**/api/**',async route=>{
   const req=route.request(), url=new URL(req.url()), path=url.pathname;
   const reply=(data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify({ok:status<400,data,...(status===401?{error:'not_authenticated'}:{})})});
-  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.7.2-3',asset_version:'1.7.2-3',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
+  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.7.3',asset_version:'1.7.3',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
   if(path==='/api/me')return authenticated?reply({user:me,csrf:'test-csrf',server_time:now}):reply(null,401);
   if(path==='/api/sync')return reply(sync);
   if(path==='/api/forums')return reply([]);
@@ -213,8 +213,8 @@ try {
    const mobileCompose=await page.locator('#compose').evaluate(el=>({height:el.clientHeight,scroll:el.scrollHeight,overflow:getComputedStyle(el).overflowY}));
    assert(mobileCompose.height<=112&&mobileCompose.scroll>mobileCompose.height&&mobileCompose.overflow==='auto',JSON.stringify({message:'mobile composer stays bounded',mobileCompose}));
    assert(await page.locator('#messages').evaluate(el=>el.clientHeight>=120),'long drafts leave room to read chat on mobile');
-   const callLayout=await page.locator('.call-event').evaluate(card=>{const action=card.querySelector('.call-event-action').getBoundingClientRect(),box=card.getBoundingClientRect(),next=card.nextElementSibling?.getBoundingClientRect();return {actionInside:action.bottom<=box.bottom+.5,nextClear:!next||next.top>=box.bottom-.5};});
-   assert.deepEqual(callLayout,{actionInside:true,nextClear:true},'mobile missed-call action stays inside its card and clear of the next message');
+   const callLayout=await page.locator('.call-event').evaluate(card=>{const action=card.querySelector('.call-event-action').getBoundingClientRect(),box=card.getBoundingClientRect(),next=card.nextElementSibling?.getBoundingClientRect(),style=getComputedStyle(card);return {actionInside:action.bottom<=box.bottom+.5,nextClear:!next||next.top>=box.bottom-.5,actionBottom:action.bottom,boxBottom:box.bottom,boxHeight:box.height,display:style.display,rows:style.gridTemplateRows,overflow:style.overflow,visibility:style.contentVisibility};});
+   assert(callLayout.actionInside&&callLayout.nextClear,`mobile missed-call action stays inside its card and clear of the next message: ${JSON.stringify(callLayout)}`);
   }
   await page.getByLabel('Message formatting',{exact:true}).click();
   await page.waitForTimeout(80);
@@ -264,7 +264,7 @@ try {
  delayed=[];
  failNext=true;await page.locator('#compose').fill('Retry me');await page.locator('.composer-send').click();await page.waitForSelector('.msg.failed');
  await page.getByRole('button',{name:'Retry',exact:true}).click();await page.waitForTimeout(50);assert.equal(delayed.length,1);await delayed[0]();await page.waitForFunction(()=>!document.querySelector('.msg.pending, .msg.failed'));
- if(await page.locator('.toast-close').count())await page.locator('.toast-close').click();
+ await page.locator('.toast-close').click({timeout:1000}).catch(()=>{});
  await page.evaluate(()=>location.hash='#settings');await page.waitForSelector('.settings-page');await page.screenshot({path:'test-results/settings-desktop.png'});
  await page.locator('.settings-content').evaluate(el=>{el.scrollTop=el.scrollHeight;});
  await page.locator('.settings-sidebar').getByRole('button',{name:'Appearance',exact:true}).click();
@@ -325,7 +325,7 @@ try {
   const sendBox = await page.locator('.composer-send').boundingBox();
   const navBox = await page.locator('.mobile-nav').boundingBox();
   assert(sendBox && sendBox.y + sendBox.height <= (navBox?.height ? navBox.y : 844), `send button is not covered at ${width}`);
-  if(await page.locator('.toast-close').count())await page.locator('.toast-close').click();
+  await page.locator('.toast-close').click({timeout:1000}).catch(()=>{});
   await page.screenshot({path:`test-results/chat-${width}.png`});
  }
  await page.setViewportSize({width:1440,height:960});await page.evaluate(()=>location.hash='#dms');
@@ -360,7 +360,7 @@ try {
  assert.deepEqual(addedPeople.usernames,['morganlee']);
  await page.waitForFunction(()=>document.querySelectorAll('.group-member').length===4);
  const groupCompose=await page.locator('.composer-send').boundingBox();assert(groupCompose.y+groupCompose.height<640,'group composer stays on screen');
- if(await page.locator('.toast-close').count())await page.locator('.toast-close').click();
+ await page.locator('.toast-close').click({timeout:1000}).catch(()=>{});
  await page.screenshot({path:'test-results/group-chat-mobile.png',animations:'disabled'});
  authenticated=false;const auth=await browser.newContext({viewport:{width:1440,height:960},colorScheme:'light'});await setup(auth);const login=await auth.newPage();login.on('pageerror',e=>errors.push(e.message));await login.goto(origin);await login.waitForSelector('.auth-submit');await login.screenshot({path:'test-results/login-desktop.png'});await login.setViewportSize({width:390,height:844});await login.screenshot({path:'test-results/login-mobile.png'});
  const blocked=await browser.newContext();await setup(blocked);await blocked.addInitScript(()=>Object.defineProperty(window,'localStorage',{get(){throw new DOMException('Storage blocked','SecurityError')}}));const blockedPage=await blocked.newPage();blockedPage.on('pageerror',e=>errors.push(e.message));await blockedPage.goto(origin);await blockedPage.waitForSelector('.auth-submit');
