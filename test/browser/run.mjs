@@ -147,6 +147,7 @@ try {
  await ytMsg.locator('.link-video-play').click();
  await ytMsg.locator('.link-video-frame iframe[src*="youtube-nocookie"][src*="dQw4w9WgXcQ"]').waitFor();
  assert.equal(await ytMsg.locator('.link-video-frame iframe').count(),1,'poster swaps into an embedded player');
+ assert.equal(await ytMsg.locator('.link-video-frame iframe').getAttribute('referrerpolicy'),'strict-origin-when-cross-origin','player receives the origin so YouTube accepts the embed');
  const ogMsg=page.locator('.msg',{hasText:'Also tracking progress here'});
  await ogMsg.scrollIntoViewIfNeeded();
  await ogMsg.locator('.link-embed:not(.embed-loading) .link-embed-title').waitFor();

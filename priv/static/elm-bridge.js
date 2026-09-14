@@ -3558,15 +3558,38 @@
       }
     };
 
+    // Elm reuses the same element when the expanded panel is minimized into the
+    // compact bar, so a size written here would stick to the small bar. Track the
+    // element that carries the size, and watch class changes inside the layer
+    // because that swap adds or removes no call-layer nodes.
+    let sizedPanel = null;
+    let observedLayer = null;
+    let classFrame = 0;
+    const clearPanelSize = (panel) => {
+      panel.style.removeProperty('width');
+      panel.style.removeProperty('height');
+    };
+    const classObserver = new MutationObserver(() => {
+      if (classFrame || drag || resizing) return;
+      classFrame = requestAnimationFrame(() => { classFrame = 0; applySaved(); });
+    });
+
     const applySaved = () => {
       const node = layer();
-      if (!node) return;
+      if (node !== observedLayer) {
+        classObserver.disconnect();
+        if (node) classObserver.observe(node, { attributes: true, attributeFilter: ['class'], subtree: true });
+        observedLayer = node;
+      }
+      if (!node) { sizedPanel = null; return; }
       const panel = node.querySelector('.call-overlay.expanded');
+      if (sizedPanel && sizedPanel !== panel) { clearPanelSize(sizedPanel); sizedPanel = null; }
       if (panel) {
         if (desktop() && preferredSize) {
           panel.style.width = `${Math.min(Math.max(340, preferredSize.w), innerWidth - 24)}px`;
           panel.style.height = `${Math.min(Math.max(380, preferredSize.h), innerHeight - 24)}px`;
-        } else { panel.style.removeProperty('width'); panel.style.removeProperty('height'); }
+          sizedPanel = panel;
+        } else { clearPanelSize(panel); sizedPanel = null; }
       }
       if (!desktop()) {
         resetLayerPosition(node, false);
@@ -3616,7 +3639,7 @@
         const r = resizing, bounds = r.node.getBoundingClientRect();
         const w = Math.min(Math.max(340, r.w + ev.clientX - r.x), innerWidth - bounds.left - 12);
         const h = Math.min(Math.max(380, r.h + ev.clientY - r.y), innerHeight - bounds.top - 12);
-        r.panel.style.width = `${w}px`; r.panel.style.height = `${h}px`;
+        r.panel.style.width = `${w}px`; r.panel.style.height = `${h}px`; sizedPanel = r.panel;
         preferredSize = { w, h }; ev.preventDefault(); return;
       }
       if (!drag || drag.pointerId !== ev.pointerId) return;

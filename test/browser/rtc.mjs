@@ -182,6 +182,16 @@ try {
   assert((await a.locator('.call-overlay').boundingBox()).width > originalWidth + 150);
   assert.equal(await a.locator('.call-overlay-users').evaluate(el => getComputedStyle(el).gridTemplateColumns.split(' ').length), 2);
   assert(await a.evaluate(() => JSON.parse(localStorage.getItem('plainwire_call_size_v1')).w > 560));
+  // Minimizing a resized panel returns to the compact bar size, and reopening
+  // restores the chosen size.
+  const resizedBox = await a.locator('.call-overlay').boundingBox();
+  await a.getByRole('button', { name: 'Minimize call', exact: true }).click();
+  await a.locator('.call-bar.compact').waitFor();
+  await a.waitForFunction(() => { const bar = document.querySelector('.call-bar.compact'); return bar && !bar.style.width && !bar.style.height; });
+  assert((await a.locator('.call-bar.compact').boundingBox()).width < resizedBox.width - 100, 'minimized call bar is not left at the resized size');
+  await a.getByRole('button', { name: 'Open call details', exact: true }).click();
+  await a.waitForFunction(width => Math.abs((document.querySelector('.call-overlay.expanded')?.getBoundingClientRect().width || 0) - width) < 2, resizedBox.width);
+  await a.waitForSelector('#call-microphone');
   await a.locator('.call-overlay-title').dblclick();
   assert.equal(Math.round((await a.locator('.call-overlay').boundingBox()).width), Math.round(originalWidth));
   assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_call_size_v1')), null);

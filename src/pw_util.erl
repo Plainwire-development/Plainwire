@@ -228,8 +228,10 @@ security_headers() ->
         true -> <<"script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; ">>;
         false -> <<"script-src 'self'; worker-src 'self'; ">>
     end,
+    %% YouTube/Vimeo link cards load a poster and, after a click, the player frame.
     Csp = <<"default-src 'self'; ", ScriptPolicy/binary,
-        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; ",
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://i.ytimg.com; media-src 'self' blob:; ",
+        "frame-src https://www.youtube-nocookie.com https://player.vimeo.com; ",
         "connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'">>,
     #{
         <<"cache-control">> => <<"no-store">>,
@@ -241,7 +243,7 @@ security_headers() ->
         <<"x-permitted-cross-domain-policies">> => <<"none">>,
         <<"strict-transport-security">> => <<"max-age=31536000; includeSubDomains">>,
         <<"content-security-policy">> => Csp,
-        <<"permissions-policy">> => <<"camera=(), microphone=(self), display-capture=(self), fullscreen=(self), geolocation=(), payment=(), usb=(), browsing-topics=()">>
+        <<"permissions-policy">> => <<"camera=(), microphone=(self), display-capture=(self), fullscreen=(self \"https://www.youtube-nocookie.com\" \"https://player.vimeo.com\"), geolocation=(), payment=(), usb=(), browsing-topics=()">>
     }.
 
 proxied_image(Url0) ->

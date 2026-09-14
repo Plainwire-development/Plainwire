@@ -113,6 +113,9 @@ function embedIframe(kind) {
   iframe.setAttribute('loading', 'lazy');
   iframe.setAttribute('allow', 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
   iframe.setAttribute('allowfullscreen', '');
+  // The page policy is same-origin, which sends no Referer to the player. YouTube
+  // now refuses embeds without one (player error 153), so send just the origin.
+  iframe.referrerPolicy = 'strict-origin-when-cross-origin';
   if (kind.kind === 'youtube') {
     iframe.title = 'YouTube video player';
     iframe.src = `https://www.youtube-nocookie.com/embed/${encodeURIComponent(kind.id)}?autoplay=1&rel=0`;

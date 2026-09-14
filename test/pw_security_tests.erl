@@ -80,6 +80,14 @@ ws_signals_have_their_own_budget_test() ->
         end
     end.
 
+security_headers_allow_video_link_players_test() ->
+    Headers = pw_util:security_headers(),
+    Csp = maps:get(<<"content-security-policy">>, Headers),
+    ?assert(binary:match(Csp, <<"frame-src https://www.youtube-nocookie.com https://player.vimeo.com">>) =/= nomatch),
+    ?assert(binary:match(Csp, <<"img-src 'self' data: blob: https://i.ytimg.com">>) =/= nomatch),
+    Policy = maps:get(<<"permissions-policy">>, Headers),
+    ?assert(binary:match(Policy, <<"fullscreen=(self \"https://www.youtube-nocookie.com\"">>) =/= nomatch).
+
 %% --- room_capacity ---
 
 room_capacity_is_positive_test() ->

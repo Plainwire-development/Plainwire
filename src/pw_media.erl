@@ -1,6 +1,9 @@
 -module(pw_media).
 -behaviour(gen_server).
--export([start_link/0, proxy_url/1, fetch/2, validate_url/1, cache_data_url/1]).
+-export([start_link/0, proxy_url/1, fetch/2, fetch_page/2, validate_url/1, cache_data_url/1]).
+-ifdef(TEST).
+-export([resolve_redirect/2]).
+-endif.
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
@@ -313,25 +316,45 @@ blocked_addr({_,_,_,_,_,_,_,_}) -> false;
 blocked_addr(_) -> true.
 
 http_get(Url) ->
-    http_get_redirect(Url, ?MAX_BYTES, 5).
-
-http_get_redirect(_Url, _MaxBytes, 0) ->
-    {error, too_many_redirects};
-http_get_redirect(Url, MaxBytes, Depth) ->
-    case pw_http_fetch:get(Url, MaxBytes) of
-        {ok, Code, RespHeaders, Body} when Code >= 200, Code < 300 ->
+    case follow_redirects(Url, ?MAX_BYTES, #{}, 5) of
+        {ok, RespHeaders, Body} ->
             Type = content_type(RespHeaders),
             case allowed_type(Type) of
                 true -> {ok, Body, Type};
                 false -> {error, unsupported_type}
             end;
+        Err ->
+            Err
+    end.
+
+%% Link previews: the same SSRF check on the URL and every redirect hop, but only
+%% the start of the body is read and any content type goes back to the caller.
+fetch_page(Url, MaxBytes) ->
+    case validate_url(Url) of
+        ok ->
+            Opts = #{truncate => true, accept => "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
+                     user_agent => "Mozilla/5.0 (compatible; PlainwireLinkPreview/1.0)"},
+            case follow_redirects(Url, MaxBytes, Opts, 5) of
+                {ok, RespHeaders, Body} -> {ok, string:lowercase(content_type(RespHeaders)), Body};
+                Err -> Err
+            end;
+        Err ->
+            Err
+    end.
+
+follow_redirects(_Url, _MaxBytes, _Opts, 0) ->
+    {error, too_many_redirects};
+follow_redirects(Url, MaxBytes, Opts, Depth) ->
+    case pw_http_fetch:get(Url, MaxBytes, Opts) of
+        {ok, Code, RespHeaders, Body} when Code >= 200, Code < 300 ->
+            {ok, RespHeaders, Body};
         {ok, Code, RespHeaders, _} when Code >= 300, Code < 400 ->
             case header_value("location", RespHeaders) of
                 undefined -> {error, {http, Code}};
                 Location0 ->
                     Location = resolve_redirect(Url, pw_util:bin(Location0)),
                     case validate_url(Location) of
-                        ok -> http_get_redirect(Location, MaxBytes, Depth - 1);
+                        ok -> follow_redirects(Location, MaxBytes, Opts, Depth - 1);
                         _ -> {error, blocked_url}
                     end
             end;
@@ -341,23 +364,14 @@ http_get_redirect(Url, MaxBytes, Depth) ->
             {error, Reason}
     end.
 
-resolve_redirect(OriginalUrl, Location) when is_list(Location) ->
-    resolve_redirect(OriginalUrl, pw_util:bin(Location));
-resolve_redirect(OriginalUrl, <<"/", _/binary>> = Relative) ->
-    case uri_string:parse(binary_to_list(OriginalUrl)) of
-        #{scheme := Scheme, host := Host, port := Port} ->
-            Base = list_to_binary(uri_string:recompose(#{scheme => Scheme, host => Host, port => Port})),
-            redirect_resolve(Base, Relative);
-        #{scheme := Scheme, host := Host} ->
-            Base = list_to_binary(uri_string:recompose(#{scheme => Scheme, host => Host})),
-            redirect_resolve(Base, Relative);
-        _ -> Relative
-    end;
-resolve_redirect(_OriginalUrl, Absolute) ->
-    pw_util:bin(Absolute).
-
-redirect_resolve(Base, <<"/", Path/binary>>) ->
-    <<Base/binary, Path/binary>>.
+%% Locations may be absolute, host-relative, protocol-relative or path-relative.
+resolve_redirect(OriginalUrl, Location0) ->
+    Location = pw_util:bin(Location0),
+    try uri_string:resolve(Location, OriginalUrl) of
+        Resolved when is_binary(Resolved) -> Resolved;
+        _ -> Location
+    catch _:_ -> Location
+    end.
 
 content_type(Headers) ->
     case header_value("content-type", Headers) of

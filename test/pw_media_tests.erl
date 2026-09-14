@@ -17,6 +17,13 @@ legacy_proxy_token_is_decoded_then_validated_test() ->
     Token = pw_util:base64url(<<"http://127.0.0.1/image.png">>),
     ?assertEqual({error, blocked_url}, pw_media:fetch(1, Token)).
 
+redirect_locations_resolve_against_the_request_test() ->
+    Base = <<"https://example.com/a/page?x=1">>,
+    ?assertEqual(<<"https://other.example/next">>, pw_media:resolve_redirect(Base, <<"https://other.example/next">>)),
+    ?assertEqual(<<"https://example.com/root">>, pw_media:resolve_redirect(Base, <<"/root">>)),
+    ?assertEqual(<<"https://cdn.example/img">>, pw_media:resolve_redirect(Base, <<"//cdn.example/img">>)),
+    ?assertEqual(<<"https://example.com/a/sibling">>, pw_media:resolve_redirect(Base, "sibling")).
+
 profile_image_signatures_test() ->
     ?assert(pw_db:profile_file_signature(<<"image/jpeg">>, <<16#ff,16#d8,16#ff,0>>)),
     ?assert(pw_db:profile_file_signature(<<"image/png">>, <<16#89,"PNG",13,10,26,10,0>>)),
