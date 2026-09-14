@@ -113,6 +113,11 @@ bridgeDecoder =
                             (D.field "user_id" D.int)
                             (D.field "failed" D.bool)
 
+                    "rtc_audio_state" ->
+                        D.map2 RtcAudioState
+                            (D.field "muted" D.bool)
+                            (D.field "deafened" D.bool)
+
                     "tick" ->
                         D.succeed (Tick (Time.millisToPosix 0))
 
@@ -1226,6 +1231,14 @@ update msg model =
 
         SetCallPeerFailed roomKind roomId userId failed ->
             ( setRtcPeerFailed roomKind roomId userId failed model, Cmd.none )
+
+        RtcAudioState muted deafened ->
+            -- The bridge owns the real microphone and playback state; mirror it.
+            let
+                voice0 =
+                    model.voice
+            in
+            ( { model | voice = { voice0 | muted = muted, deafened = deafened } }, Cmd.none )
 
         RetryCallPeer userId ->
             case ( model.voice.mode, model.voice.id ) of

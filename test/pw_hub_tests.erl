@@ -149,6 +149,43 @@ missed_call_ends_ring_and_rejects_late_accept_test() ->
         gen_server:stop(Hub)
     end.
 
+crossed_ring_connects_both_callers_test() ->
+    stop_existing_hub(),
+    {ok, Hub} = pw_hub:start_link(),
+    Parent = self(),
+    One = spawn(fun() -> socket_loop(Parent, crossed_one) end),
+    Two = spawn(fun() -> socket_loop(Parent, crossed_two) end),
+    Profile1 = #{id => 1, display_name => <<"One">>, avatar_url => <<>>},
+    Profile2 = #{id => 2, display_name => <<"Two">>, avatar_url => <<>>},
+    try
+        pw_hub:connect(1, One, <<"online">>),
+        pw_hub:connect(2, Two, <<"online">>),
+        _ = gen_server:call(pw_hub, sync),
+        pw_hub:call_ring(503, 1, One, Profile1, [2]),
+        %% a repeated ring from the same socket must not cancel the call being placed
+        pw_hub:call_ring(503, 1, One, Profile1, [2]),
+        _ = gen_server:call(pw_hub, sync),
+        assert_no_event(crossed_one, call_cancelled, 503),
+
+        %% the callee presses call instead of accept: that answers the ring
+        pw_hub:call_ring(503, 2, Two, Profile2, [1]),
+        _ = gen_server:call(pw_hub, sync),
+        OneState = await_call_roster(crossed_one, 503, 2),
+        TwoState = await_call_roster(crossed_two, 503, 2),
+        ?assertEqual([1, 2], lists:sort([maps:get(user_id, U) || U <- maps:get(users, OneState)])),
+        ?assertEqual([1, 2], lists:sort([maps:get(user_id, U) || U <- maps:get(users, TwoState)])),
+        assert_no_event(crossed_two, call_cancelled, 503),
+
+        Offer = #{kind => offer, sdp => #{type => offer, sdp => <<"v=0">>}},
+        pw_hub:call_signal(503, 2, Two, 1, Offer),
+        _ = gen_server:call(pw_hub, sync),
+        ?assertEqual(Offer, maps:get(signal, await_event(crossed_one, call_signal, 503)))
+    after
+        exit(One, kill),
+        exit(Two, kill),
+        gen_server:stop(Hub)
+    end.
+
 call_presence_and_cross_room_eviction_test() ->
     stop_existing_hub(),
     {ok, Hub} = pw_hub:start_link(),
@@ -304,6 +341,11 @@ socket_loop(Parent, Tag) ->
             Json = jsx:decode(Payload, [return_maps]),
             Parent ! {socket_event, Tag, #{type => call_signal,
                 conversation_id => maps:get(<<"conversation_id">>, Json), signal => maps:get(<<"signal">>, Json)}},
+            socket_loop(Parent, Tag);
+        {hub_text, Payload, call_cancelled} ->
+            Json = jsx:decode(Payload, [return_maps]),
+            Parent ! {socket_event, Tag, #{type => call_cancelled,
+                conversation_id => maps:get(<<"conversation_id">>, Json)}},
             socket_loop(Parent, Tag);
         {hub_text, Payload, call_missed} ->
             Json = jsx:decode(Payload, [return_maps]),

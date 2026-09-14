@@ -28,6 +28,8 @@ const errors = [];
 const send = (uid, data) => sockets.get(uid)?.send(JSON.stringify(data));
 const states = new Map();
 const members = new Set();
+// Simulates a slow relay path: ICE candidates arrive long after offer/answer.
+let candidateDelayMs = 0;
 const roster = () => people.slice(0, 2).map(p => ({ user_id: p.id, profile: p, muted: false, deafened: false, screen: false, ...states.get(p.id) }));
 async function setup(uid) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
@@ -108,7 +110,10 @@ async function setup(uid) {
         return;
       }
       if (msg.type === 'ping') return send(uid, { type: 'pong' });
-      if (msg.type === 'call_signal') return send(msg.to_user_id, { ...msg, conversation_id: 1, from_user_id: uid });
+      if (msg.type === 'call_signal') {
+        const deliver = () => send(msg.to_user_id, { ...msg, conversation_id: 1, from_user_id: uid });
+        return msg.signal?.kind === 'candidate' && candidateDelayMs ? setTimeout(deliver, candidateDelayMs) : deliver();
+      }
       if (msg.type === 'call_ring') {
         send(uid, { type: 'call_ringing', conversation_id: 1, profile: people[uid === 1 ? 1 : 0] });
         send(uid === 1 ? 2 : 1, { type: 'call_incoming', conversation_id: 1, from_user_id: uid, profile: people[uid - 1] });
@@ -350,22 +355,43 @@ try {
   await a.setViewportSize({ width: 1280, height: 900 });
   await a.emulateMedia({ colorScheme: 'light' });
 
+  // Deafen silences playback and the microphone; undeafen restores both and the
+  // call keeps flowing in both directions.
+  const remotePlayback = page => page.evaluate(() => [...document.querySelectorAll('audio[id^="remote-audio-"]')].map(el => el.muted));
+  await a.getByRole('button', { name: 'Deafen', exact: true }).click();
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === false);
+  assert.deepEqual(await remotePlayback(a), [true], 'deafen mutes remote playback');
+  await a.getByRole('button', { name: 'Undeafen', exact: true }).click();
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === true);
+  assert.deepEqual(await remotePlayback(a), [false], 'undeafen restores remote playback');
+  assert.equal(await a.getByRole('button', { name: 'Mute', exact: true }).getAttribute('aria-pressed'), 'false', 'undeafen restores the unmuted microphone');
+  const beforeUndeafenEnergy = (await stats(b)).inbound[0].energy;
+  await b.waitForTimeout(400);
+  assert((await stats(b)).inbound[0].energy > beforeUndeafenEnergy, 'microphone is audible again after undeafening');
+  assert.equal((await stats(a)).connection, 'connected', 'deafening does not disturb the connection');
+
   await a.getByRole('button', { name: 'Deafen', exact: true }).click();
   await a.locator('.call-overlay').getByRole('button', { name: 'Leave', exact: true }).click();
   await b.waitForFunction(() => window.__pcs.every(pc => pc.connectionState === 'closed'));
   await b.locator('.call-overlay').getByRole('button', { name: 'Leave', exact: true }).click();
   assert.equal(await a.evaluate(() => window.__pcs.every(pc => pc.connectionState === 'closed')), true);
   assert.equal(await a.evaluate(() => window.__mics.every(m => m.stream.getTracks().every(t => t.readyState === 'ended'))), true);
+  // Candidates arrive long after the offer and answer, like a slow relay path. The
+  // call must wait for them instead of restarting ICE until it gives up.
+  candidateDelayMs = 9000;
   await b.getByRole('button', { name: 'Start call', exact: true }).click();
   await a.getByRole('button', { name: 'Accept', exact: true }).click();
   await a.waitForFunction(async () => {
     const pc = window.__pcs.at(-1);
     return pc.connectionState === 'connected' && [...(await pc.getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'audio' && r.totalAudioEnergy > 0.005);
-  });
+  }, null, { timeout: 30000 });
   await b.waitForFunction(async () => { const pc = window.__pcs.at(-1); return pc.connectionState === 'connected' && [...(await pc.getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'audio' && r.totalAudioEnergy > 0.005); });
+  candidateDelayMs = 0;
   await a.waitForFunction(() => window.__pcs.at(-1)._audioSender?.track?.readyState === 'live');
   assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track.enabled), true, 'new call starts unmuted after leaving deafened');
   assert.equal(await a.evaluate(() => [...document.querySelectorAll('audio')].filter(el => el.srcObject).every(el => !el.muted)), true, 'new call playback is not left deafened');
+  assert.equal(await a.getByRole('button', { name: 'Deafen', exact: true }).getAttribute('aria-pressed'), 'false', 'call controls are not left showing deafened');
+  assert.equal(await a.getByRole('button', { name: 'Mute', exact: true }).getAttribute('aria-pressed'), 'false', 'call controls are not left showing muted');
   await a.getByRole('button', { name: 'Open call details', exact: true }).click();
   await a.getByRole('button', { name: 'Audio settings', exact: true }).click();
   await a.waitForSelector('.voice-settings');

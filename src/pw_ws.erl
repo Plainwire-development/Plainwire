@@ -2,7 +2,7 @@
 -behaviour(cowboy_websocket).
 -export([init/2, websocket_init/1, websocket_handle/2, websocket_info/2, terminate/3]).
 -ifdef(TEST).
--export([signal_ok/1]).
+-export([signal_ok/1, message_allowed/2]).
 -endif.
 
 -define(MAX_SUBS, 200).
@@ -50,12 +50,19 @@ websocket_handle({text, Data}, State0=#{uid:=Uid}) ->
     case revalidate_session(State0) of
         {error, expired} -> {stop, State0};
         {ok, State} ->
-            case byte_size(Data) =< 65536 andalso pw_rate:allow({ws, Uid}, 240, 60000) of
+            %% coarse flood guard first; each message class then spends its own
+            %% budget so speaking indicators can't starve offers and candidates.
+            case byte_size(Data) =< 65536 andalso pw_rate:allow({ws_frames, Uid}, 1500, 60000) of
                 true ->
                     case safe_json_decode(Data) of
                         M when is_map(M) ->
-                            debug(debug_level(M), "received", #{uid => Uid, type => event_type(M), bytes => byte_size(Data), room => room_summary(State)}),
-                            handle_msg(M, State);
+                            case message_allowed(Uid, M) of
+                                true ->
+                                    debug(debug_level(M), "received", #{uid => Uid, type => event_type(M), bytes => byte_size(Data), room => room_summary(State)}),
+                                    handle_msg(M, State);
+                                false ->
+                                    reply_error(State, rate_limited)
+                            end;
                         _ ->
                             debug(warning, "invalid_json", #{uid => Uid, bytes => byte_size(Data)}),
                             {ok, State}
@@ -65,6 +72,15 @@ websocket_handle({text, Data}, State0=#{uid:=Uid}) ->
             end
     end;
 websocket_handle(_Frame, State) -> {ok, State}.
+
+%% speaking and quality samples are limited in their handlers and just dropped.
+message_allowed(_Uid, #{<<"type">> := Type}) when Type =:= <<"voice_activity">>; Type =:= <<"call_quality">> ->
+    true;
+message_allowed(Uid, #{<<"type">> := Type}) when Type =:= <<"voice_signal">>; Type =:= <<"call_signal">> ->
+    %% every ICE restart trickles a fresh batch of candidates.
+    pw_rate:allow({ws_signal, Uid}, 900, 60000);
+message_allowed(Uid, _) ->
+    pw_rate:allow({ws, Uid}, 240, 60000).
 
 handle_msg(#{<<"type">> := <<"call_quality">>, <<"request_id">> := Request,
              <<"peer_id">> := Peer, <<"samples">> := Rows}, State = #{uid := Uid})

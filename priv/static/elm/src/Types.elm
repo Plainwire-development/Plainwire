@@ -639,6 +639,7 @@ type Msg
     | ToggleCallOverlay
     | SetCallPeerConnected String Int Int Bool
     | SetCallPeerFailed String Int Int Bool
+    | RtcAudioState Bool Bool
     | RetryCallPeer Int
     | PresenceState E.Value
     | PresenceOnline Int String

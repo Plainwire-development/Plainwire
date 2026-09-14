@@ -58,6 +58,28 @@ signal_ok_rejects_huge_sdp_test() ->
 signal_ok_rejects_non_map_test() ->
     ?assertNot(pw_ws:signal_ok(<<"not a map">>)).
 
+%% --- websocket rate classes ---
+
+ws_signals_have_their_own_budget_test() ->
+    Started = case whereis(pw_rate) of
+        undefined -> {ok, RatePid} = pw_rate:start_link(), RatePid;
+        _ -> undefined
+    end,
+    try
+        Uid = erlang:unique_integer([positive]),
+        Chat = #{<<"type">> => <<"subscribe">>},
+        [?assert(pw_ws:message_allowed(Uid, Chat)) || _ <- lists:seq(1, 240)],
+        ?assertNot(pw_ws:message_allowed(Uid, Chat)),
+        %% a busy socket must still be able to finish connecting a call
+        ?assert(pw_ws:message_allowed(Uid, #{<<"type">> => <<"call_signal">>})),
+        ?assert(pw_ws:message_allowed(Uid, #{<<"type">> => <<"voice_activity">>}))
+    after
+        case Started of
+            undefined -> ok;
+            Pid -> gen_server:stop(Pid)
+        end
+    end.
+
 %% --- room_capacity ---
 
 room_capacity_is_positive_test() ->

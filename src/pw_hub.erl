@@ -78,10 +78,19 @@ handle_call({call_join, ConversationId, Uid, Pid, Profile, Audience}, _From, St0
             {reply, ok, do_call_join(ConversationId, Uid, Pid, Profile, Audience, St1)}
     end;
 handle_call({call_accept, Cid, Uid, Pid, Profile, Audience0}, _From, St0) ->
+    {Reply, St} = accept_ring(Cid, Uid, Pid, Profile, Audience0, St0),
+    {reply, Reply, St};
+handle_call(_, _, St) -> {reply, ok, St}.
+
+%% reconnecting users don't count against themselves.
+room_admits(Room, Uid) ->
+    maps:is_key(Uid, Room) orelse map_size(Room) < room_capacity().
+
+accept_ring(Cid, Uid, Pid, Profile, Audience0, St0) ->
     Room = maps:get({call, Cid}, St0#st.calls, #{}),
     case room_admits(Room, Uid) of
         false ->
-            {reply, {error, room_full}, St0};
+            {{error, room_full}, St0};
         true ->
             StBase = evict_other_rooms(Uid, Pid, {call, Cid}, St0),
             Key = {ring, Cid},
@@ -95,16 +104,11 @@ handle_call({call_accept, Cid, Uid, Pid, Profile, Audience0}, _From, St0) ->
                     Audience = lists:usort([Uid, Caller | Targets ++ Audience0]),
                     St2 = do_call_join(Cid, Uid, Pid, Profile, Audience, St1),
                     St3 = do_call_join(Cid, Caller, CPid, CProfile, Audience, St2),
-                    {reply, ok, St3};
+                    {ok, St3};
                 _ ->
-                    {reply, {error, no_active_call}, StBase}
+                    {{error, no_active_call}, StBase}
             end
-    end;
-handle_call(_, _, St) -> {reply, ok, St}.
-
-%% reconnecting users don't count against themselves.
-room_admits(Room, Uid) ->
-    maps:is_key(Uid, Room) orelse map_size(Room) < room_capacity().
+    end.
 
 handle_cast({connect, Uid, Pid, Status0}, St) ->
     monitor(process, Pid),
@@ -193,28 +197,16 @@ handle_cast({voice_signal, ChannelId, From, FromPid, To, Signal}, St) ->
     relay_signal(Room, From, FromPid, To, #{type => voice_signal, channel_id => ChannelId, from_user_id => From, signal => Signal}),
     {noreply, St};
 handle_cast({call_ring, Cid, Uid, Pid, Profile, Targets}, St0) ->
-    Key = {ring, Cid},
-    StBase = evict_other_rooms(Uid, Pid, Key, St0),
-    St1 = end_user_rings(end_ring(StBase, Key, call_cancelled, missed), Uid, Key),
-    RingMs = ring_timeout_ms(),
-    Ref = erlang:send_after(RingMs, self(), {ring_timeout, Cid, Uid}),
-    Targets1 = lists:filter(fun(T) -> T =/= Uid end, Targets),
-    log("call_ring", #{uid => Uid, conversation_id => Cid, target_count => length(Targets1)}),
-    Ring = #{
-        caller_id => Uid,
-        caller_pid => Pid,
-        caller_profile => Profile,
-        targets => Targets1,
-        declined => [],
-        accepted => undefined,
-        timer => Ref
-    },
-    ExpiresAt = pw_util:now_ms() + RingMs,
-    Pid ! {hub_json, #{type => call_ringing, conversation_id => Cid, targets => length(Targets1),
-        profile => strip_profile(Profile), timeout_ms => RingMs, expires_at => ExpiresAt}},
-    [notify_user(T, #{type => call_incoming, conversation_id => Cid, from_user_id => Uid,
-        profile => strip_profile(Profile), timeout_ms => RingMs, expires_at => ExpiresAt}) || T <- Targets1],
-    {noreply, St1#st{rings = maps:put(Key, Ring, St1#st.rings)}};
+    case maps:get({ring, Cid}, St0#st.rings, undefined) of
+        #{caller_id := Caller, targets := RingTargets} when Caller =/= Uid ->
+            case lists:member(Uid, RingTargets) of
+                %% both people pressed call. answer instead of cancelling each other.
+                true -> {noreply, answer_crossed_ring(Cid, Uid, Pid, Profile, Targets, St0)};
+                false -> {noreply, start_ring(Cid, Uid, Pid, Profile, Targets, St0)}
+            end;
+        _ ->
+            {noreply, start_ring(Cid, Uid, Pid, Profile, Targets, St0)}
+    end;
 handle_cast({call_decline, Cid, Uid}, St0) ->
     Key = {ring, Cid},
     case maps:get(Key, St0#st.rings, undefined) of
@@ -284,6 +276,49 @@ handle_cast({status_update, Uid, Pid0, Status0}, St) ->
             {noreply, St#st{pid_statuses = PidStatuses, online = Online}}
     end;
 handle_cast(_, St) -> {noreply, St}.
+
+answer_crossed_ring(Cid, Uid, Pid, Profile, Audience, St0) ->
+    log("call_ring_crossed", #{uid => Uid, conversation_id => Cid}),
+    St1 = end_user_rings(St0, Uid, {ring, Cid}),
+    case accept_ring(Cid, Uid, Pid, Profile, Audience, St1) of
+        {ok, St} -> St;
+        {{error, Reason}, St} -> notify_pid(Pid, #{type => error, error => Reason}), St
+    end.
+
+%% ringing the same conversation again from the same socket replaces the ring
+%% quietly. "your call was cancelled" would tear down the call being placed.
+replace_own_ring(St, Key, Pid) ->
+    case maps:get(Key, St#st.rings, undefined) of
+        #{caller_pid := Pid, timer := Ref} ->
+            cancel_timer(Ref),
+            St#st{rings = maps:remove(Key, St#st.rings)};
+        _ ->
+            end_ring(St, Key, call_cancelled, missed)
+    end.
+
+start_ring(Cid, Uid, Pid, Profile, Targets, St0) ->
+    Key = {ring, Cid},
+    StBase = evict_other_rooms(Uid, Pid, Key, St0),
+    St1 = end_user_rings(replace_own_ring(StBase, Key, Pid), Uid, Key),
+    RingMs = ring_timeout_ms(),
+    Ref = erlang:send_after(RingMs, self(), {ring_timeout, Cid, Uid}),
+    Targets1 = lists:filter(fun(T) -> T =/= Uid end, Targets),
+    log("call_ring", #{uid => Uid, conversation_id => Cid, target_count => length(Targets1)}),
+    Ring = #{
+        caller_id => Uid,
+        caller_pid => Pid,
+        caller_profile => Profile,
+        targets => Targets1,
+        declined => [],
+        accepted => undefined,
+        timer => Ref
+    },
+    ExpiresAt = pw_util:now_ms() + RingMs,
+    Pid ! {hub_json, #{type => call_ringing, conversation_id => Cid, targets => length(Targets1),
+        profile => strip_profile(Profile), timeout_ms => RingMs, expires_at => ExpiresAt}},
+    [notify_user(T, #{type => call_incoming, conversation_id => Cid, from_user_id => Uid,
+        profile => strip_profile(Profile), timeout_ms => RingMs, expires_at => ExpiresAt}) || T <- Targets1],
+    St1#st{rings = maps:put(Key, Ring, St1#st.rings)}.
 
 handle_info({ring_timeout, Cid, Uid}, St0) ->
     Key = {ring, Cid},

@@ -69,6 +69,8 @@
   let speakerOn = true;
   let micMuted = false;
   let deafened = false;
+  // Deafening also mutes; undeafening restores whatever the microphone was before.
+  let mutedBeforeDeafen = false;
   let selectedInputId = storage.getItem('plainwire_audio_input') || '';
   let selectedOutputId = storage.getItem('plainwire_audio_output') || '';
   const readVolume = (key, maximum) => {
@@ -139,8 +141,14 @@
   const displayMediaSupported = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
   const peerPromises = new Map();
   const signalQueues = new Map();
+  // Bumped whenever a participant's session is replaced, so queued signals from
+  // the old session cannot resurrect a peer connection.
+  const peerGenerations = new Map();
   const defaultRtcConfig = { iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }] };
   const RTC_CONNECT_CHECK_MS = 7000;
+  // Relay (TURN over TCP/TLS) paths can take well over one check interval. An ICE
+  // restart discards in-progress checks, so give checking time to finish first.
+  const RTC_ICE_CHECKING_GRACE_MS = 15000;
   const RTC_MAX_RECOVERY_ATTEMPTS = 6;
   let rtcConfig = window.PLAINWIRE_RTC_CONFIG || defaultRtcConfig;
   let rtcConfigRequest = null;
@@ -170,7 +178,7 @@
         sessionStorage.removeItem(RTC_RESUME_KEY);
         return null;
       }
-      return { kind: value.kind, id, muted: value.muted === true, deafened: value.deafened === true, at: value.at };
+      return { kind: value.kind, id, muted: value.muted === true, deafened: value.deafened === true, restoreMuted: value.restore_muted === true, at: value.at };
     } catch (_) {
       try { sessionStorage.removeItem(RTC_RESUME_KEY); } catch (_) {}
       return null;
@@ -183,7 +191,7 @@
   };
   const persistRtcIntent = () => {
     if (!room?.joined) return;
-    resumeIntent = { kind: room.kind, id: room.id, muted: micMuted, deafened, at: Date.now() };
+    resumeIntent = { kind: room.kind, id: room.id, muted: micMuted, deafened, restore_muted: mutedBeforeDeafen, at: Date.now() };
     try { sessionStorage.setItem(RTC_RESUME_KEY, JSON.stringify(resumeIntent)); } catch (_) {}
   };
   const redact = (value) => {
@@ -242,12 +250,18 @@
         rtcConfigFetchedAt = Date.now();
         rtcConfigValidUntil = Date.now() + (Number(config.turnTtlSeconds) || 3600) * 1000;
         rtcConfigNextRefresh = Date.now() + Math.max(30, Math.min(300, Number(config.refreshAfterSeconds) || 300)) * 1000;
+        const ttlMs = (Number(config.turnTtlSeconds) || 3600) * 1000;
         for (const [uid, pc] of peers) {
           if (pc.signalingState === 'closed') continue;
           try {
             pc.setConfiguration({ ...pc.getConfiguration(), iceServers: config.iceServers, iceTransportPolicy: config.iceTransportPolicy || 'all' });
-            // Updating credentials also renews an existing TURN allocation.
-            if (before !== JSON.stringify(config.iceServers) && config.turnStatus === 'ready' && room?.joined) {
+            // Short-lived TURN credentials change on every fetch. Restarting ICE on
+            // each refresh drops audio on healthy calls and throws away progress on
+            // calls still checking, so only renew relays whose credentials are about
+            // to expire. Recovery restarts pick up the new servers anyway.
+            const expiring = pc._turnValidUntil > 0 && pc._turnValidUntil - Date.now() < Math.min(600000, ttlMs / 3);
+            if (before !== JSON.stringify(config.iceServers) && config.turnStatus === 'ready' && room?.joined &&
+                pc.connectionState === 'connected' && expiring) {
               restartPeerIce(uid, pc, 'relay_credentials_refreshed', { force: true });
             }
           } catch (error) { debug('RTC', 'configuration_update_failed', { error: error.message }, 'warn'); }
@@ -1459,6 +1473,13 @@
       queued.forEach((value) => sendWs(value));
       publishPresence(true);
       if (room && room.joined && localStream) {
+        // The server told everyone we left when the old socket dropped, so they
+        // have closed their side. Start clean instead of keeping half a connection.
+        room.epoch = ++roomEpoch;
+        room.stateSynced = false;
+        peers.forEach((_, uid) => closePeer(uid));
+        peerPromises.clear();
+        signalQueues.clear();
         const join = room.kind === 'voice'
           ? { type: 'voice_join', channel_id: room.id }
           : { type: 'call_join', conversation_id: room.id };
@@ -2648,6 +2669,9 @@
     const kind = pc?._roomKind || room?.kind;
     const id = Number(pc?._roomId || room?.id || 0);
     if (!kind || !id) return;
+    // Keep the dedupe flag in step with what Elm was told. Otherwise a peer that
+    // recovers after a restart is never reported as connected again.
+    if (pc) pc._reportedConnected = !!connected;
     send(app.ports.bridgeReceive, {
       tag: 'rtc_peer_connected', room_kind: kind, room_id: id,
       user_id: Number(uid), connected: !!connected
@@ -2705,6 +2729,13 @@
     reportPeerConnection(uid, pc, false);
   };
 
+  // A participant's session was replaced or ended. Queued signals and pending
+  // peer creation from the old session become stale.
+  const replacePeerSession = (uid) => {
+    peerGenerations.set(uid, (peerGenerations.get(uid) || 0) + 1);
+    closePeer(uid);
+  };
+
   const cleanupAllFloatWindows = () => {
     floatWindows.forEach((w, id) => {
       if (w.video.srcObject) { w.video.srcObject.getTracks().forEach((t) => t.stop()); w.video.srcObject = null; }
@@ -2753,9 +2784,15 @@
     room = null;
     resumeInFlight = false;
     releaseCurrentMicrophone();
-    // Elm clears these on exit too. Resume stores its own intent before cleanup.
-    micMuted = false;
-    deafened = false;
+    // Leaving a room resets mute and deafen (resume stored its intent above).
+    // Choices made before joining anything carry into the join. Elm is told either
+    // way so its buttons can never disagree with the real audio state.
+    if (previous) {
+      micMuted = false;
+      deafened = false;
+      mutedBeforeDeafen = false;
+    }
+    publishAudioState();
     stopRingtones();
   };
 
@@ -2778,6 +2815,7 @@
     resumeInFlight = true;
     micMuted = intent.muted;
     deafened = intent.deafened;
+    mutedBeforeDeafen = intent.restoreMuted;
     const epoch = ++roomEpoch;
     room = { kind: intent.kind, id: intent.id, joined: false, epoch };
     send(app.ports.bridgeReceive, {
@@ -2805,6 +2843,12 @@
   const stopPendingCallMedia = () => {
     if (room) return;
     releaseCurrentMicrophone();
+  };
+
+  const markNegotiated = (pc) => {
+    pc._negotiated = true;
+    pc._lastNegotiationAt = Date.now();
+    pc._turnValidUntil = rtcHasTurn() ? rtcConfigValidUntil : 0;
   };
 
   const makeOffer = async (uid, pc, options = {}) => {
@@ -2874,10 +2918,11 @@
     const existing = peers.get(uid);
     if (existing && existing._roomEpoch === epoch) return existing;
     if (existing) closePeer(uid);
-    const pendingKey = `${epoch}:${uid}`;
+    const generation = peerGenerations.get(uid) || 0;
+    const pendingKey = `${epoch}:${uid}:${generation}`;
     const pending = peerPromises.get(pendingKey);
     if (pending) return pending;
-    const creation = createPeer(uid, epoch);
+    const creation = createPeer(uid, epoch, generation);
     peerPromises.set(pendingKey, creation);
     try {
       return await creation;
@@ -2913,11 +2958,12 @@
     }
   };
 
-  const createPeer = async (uid, epoch) => {
+  const createPeer = async (uid, epoch, generation) => {
+    const stale = () => !room || room.epoch !== epoch || (peerGenerations.get(uid) || 0) !== generation;
     await loadRtcConfig();
-    if (!room || room.epoch !== epoch) return null;
+    if (stale()) return null;
     const stream = await ensureMedia();
-    if (!room || room.epoch !== epoch) return null;
+    if (stale()) return null;
     if (peers.has(uid)) return peers.get(uid);
     const offerer = Number(meId) > Number(uid);
     const polite = !offerer;
@@ -2943,12 +2989,16 @@
     pc._failureReported = false;
     pc._mediaConnected = false;
     pc._remoteAudioSeen = false;
+    pc._createdAt = Date.now();
+    pc._lastNegotiationAt = 0;
+    pc._turnValidUntil = rtcHasTurn() ? rtcConfigValidUntil : 0;
     // Only the offerer creates m-lines. An answerer must bind its microphone to
     // the offered transceiver; pre-created addTransceiver senders stay unassociated.
     if (offerer) {
       pc.addTransceiver('audio', { direction: 'sendrecv' });
       pc.addTransceiver('video', { direction: 'sendrecv' });
       await bindPeerMedia(pc, stream);
+      if (stale()) { pc.close(); return null; }
     }
     pc.onnegotiationneeded = () => {
       if (!pc._offerer) return;
@@ -2987,7 +3037,7 @@
           pc._remoteMuteTimer = setTimeout(() => {
             pc._remoteMuteTimer = null;
             if (!room || pc._roomEpoch !== room.epoch || pc.signalingState === 'closed') return;
-            if (ev.track.readyState === 'live' && ev.track.muted === true) {
+            if (ev.track.readyState === 'live' && ev.track.muted === true && transportConnected()) {
               debug('RTC', 'remote_audio_stalled', { peer_user_id: uid }, 'warn');
               restartPeerIce(uid, pc, 'remote_audio_stalled', { force: true });
             }
@@ -3022,14 +3072,12 @@
         }
       }
     };
+    const transportConnected = () => pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
     const publishConnectionState = (force = false) => {
-      const transportConnected = pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
       // A WebRTC transport can be connected while the remote audio path is dead.
       // Only expose a healthy call once a live remote audio track has actually arrived.
-      const connected = transportConnected && pc._mediaConnected === true;
+      const connected = transportConnected() && pc._mediaConnected === true;
       if (!force && pc._reportedConnected === connected) return;
-      const firstConnection = connected && pc._reportedConnected !== true;
-      pc._reportedConnected = connected;
       reportPeerConnection(uid, pc, connected);
       if (connected) {
         if (pc._connectTimer) clearTimeout(pc._connectTimer);
@@ -3042,7 +3090,10 @@
         reportPeerFailure(uid, pc, false);
         audioContext()?.resume?.();
         playAllRemoteAudio();
-        if (firstConnection) send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call audio connected' });
+        if (!pc._announcedConnected) {
+          pc._announcedConnected = true;
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call audio connected' });
+        }
       }
     };
     pc._publishConnectionState = publishConnectionState;
@@ -3051,6 +3102,11 @@
       pc._mediaTimer = setTimeout(() => {
         pc._mediaTimer = null;
         if (!room || pc._roomEpoch !== room.epoch || pc.signalingState === 'closed' || pc._mediaConnected === true) return;
+        if (!transportConnected()) {
+          // No transport yet: that is the connection check's job, not a media fault.
+          armMediaWatchdog();
+          return;
+        }
         debug('RTC', 'remote_audio_missing', {
           peer_user_id: uid,
           remote_audio_seen: pc._remoteAudioSeen === true,
@@ -3061,11 +3117,17 @@
         if ((pc._reconnectAttempts || 0) < RTC_MAX_RECOVERY_ATTEMPTS) armMediaWatchdog();
       }, 10000);
     };
+    // Media gets a full watchdog period after the transport (re)connects.
+    const rearmMediaWatchdog = () => {
+      if (pc._mediaTimer) clearTimeout(pc._mediaTimer);
+      pc._mediaTimer = null;
+      armMediaWatchdog();
+    };
     pc.onconnectionstatechange = () => {
       debug('RTC', 'connection_state', { peer_user_id: uid, state: pc.connectionState });
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') pc._mediaConnected = false;
       publishConnectionState();
-      if (pc.connectionState === 'connected' && pc._mediaConnected !== true) armMediaWatchdog();
+      if (pc.connectionState === 'connected' && pc._mediaConnected !== true) rearmMediaWatchdog();
       if (pc.connectionState === 'disconnected') {
         if (pc._disconnectTimer) clearTimeout(pc._disconnectTimer);
         pc._disconnectTimer = setTimeout(() => {
@@ -3081,7 +3143,7 @@
       debug('RTC', 'ice_connection_state', { peer_user_id: uid, state: pc.iceConnectionState });
       if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') pc._mediaConnected = false;
       publishConnectionState();
-      if ((pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') && pc._mediaConnected !== true) armMediaWatchdog();
+      if ((pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') && pc._mediaConnected !== true) rearmMediaWatchdog();
       if (pc.iceConnectionState === 'failed') restartPeerIce(uid, pc, 'ice_failed');
     };
     pc.onicegatheringstatechange = () => debug('RTC', 'ice_gathering_state', { peer_user_id: uid, state: pc.iceGatheringState });
@@ -3091,13 +3153,17 @@
     publishConnectionState(true);
     const checkConnection = () => {
       pc._connectTimer = setTimeout(() => {
+        pc._connectTimer = null;
         if (pc.connectionState === 'closed' || pc._mediaConnected === true) return;
-        const transportConnected = pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
+        const signalingDone = !!pc.remoteDescription && pc.signalingState === 'stable';
+        const sinceNegotiation = Date.now() - (pc._lastNegotiationAt || pc._createdAt);
+        const stillChecking = ['new', 'checking'].includes(pc.iceConnectionState) && sinceNegotiation < RTC_ICE_CHECKING_GRACE_MS;
         debug('RTC', 'check_connection', {
           peer_user_id: uid,
           connection: pc.connectionState,
           signaling: pc.signalingState,
           ice: pc.iceConnectionState,
+          since_negotiation_ms: sinceNegotiation,
           reconnect_attempts: pc._reconnectAttempts,
           offerer: pc._offerer
         });
@@ -3105,7 +3171,16 @@
           markPeerFailed(uid, pc);
           return;
         }
-        restartPeerIce(uid, pc, transportConnected ? 'remote_audio_timeout' : 'connection_timeout', { force: transportConnected });
+        if (transportConnected()) {
+          // Transport is up but audio is not: the media watchdog owns that case.
+        } else if (!signalingDone) {
+          // Lost offer or answer: resend the pending offer or ask for a new one.
+          restartPeerIce(uid, pc, 'signaling_timeout');
+        } else if (!stillChecking) {
+          // ICE failures also restart from the state handlers; this covers a
+          // check that neither connects nor reports failure.
+          restartPeerIce(uid, pc, 'connection_timeout');
+        }
         checkConnection();
       }, RTC_CONNECT_CHECK_MS);
     };
@@ -3157,21 +3232,34 @@
     }
   };
 
-  const applySignal = async (msg) => {
+  const existingPeer = async (uid) => {
+    const epoch = room?.epoch;
+    const pc = peers.get(uid);
+    if (pc && pc._roomEpoch === epoch) return pc;
+    return (await peerPromises.get(`${epoch}:${uid}:${peerGenerations.get(uid) || 0}`)) || null;
+  };
+
+  const applySignal = async (msg, generation) => {
     const uid = Number(msg.from_user_id || msg.user_id || 0);
     const signal = msg.signal || {};
     debug('RTC', 'signal_received', { peer_user_id: uid, kind: signal.kind, message_type: msg.type });
-    if (!uid || uid === meId || !room || !eventMatchesRoom(msg)) {
+    if (!uid || uid === meId || !room || !eventMatchesRoom(msg) || (peerGenerations.get(uid) || 0) !== generation) {
       debug('RTC', 'stale_signal_ignored', { peer_user_id: uid, event_room: rtcEventRoom(msg), room });
       return;
     }
-    const pc = await ensurePeer(uid);
+    // Only an offer, or a request for one, may start a connection. A late
+    // candidate or answer from someone who already left must not create a
+    // zombie peer that retries and then reports failure.
+    const pc = signal.kind === 'offer' || signal.kind === 'renegotiate' ? await ensurePeer(uid) : await existingPeer(uid);
     if (!pc) return;
     try {
       if (signal.kind === 'renegotiate') {
         if (pc._offerer) {
+          // Answer at once if we gave up or never finished an offer. Otherwise keep
+          // the normal spacing: both sides run check timers, and back-to-back ICE
+          // restarts never leave enough time for a slow path to connect.
           if (pc._failureReported) pc._reconnectAttempts = 0;
-          pc._lastRecoveryAt = 0;
+          if (pc._failureReported || !pc.remoteDescription) pc._lastRecoveryAt = 0;
           restartPeerIce(uid, pc, 'peer_requested', { force: true });
         }
       } else if (signal.kind === 'offer') {
@@ -3203,7 +3291,7 @@
         await drainPendingCandidates(uid, pc);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        pc._negotiated = true;
+        markNegotiated(pc);
         debug('RTC', 'answer_ready', { peer_user_id: uid });
         sendSignal(uid, { kind: 'answer', sdp: pc.localDescription });
       } else if (signal.kind === 'answer') {
@@ -3215,7 +3303,7 @@
             pc._isSettingRemoteAnswerPending = false;
           }
           pc._ignoreOffer = false;
-          pc._negotiated = true;
+          markNegotiated(pc);
           debug('RTC', 'remote_answer_applied', { peer_user_id: uid });
           await drainPendingCandidates(uid, pc);
         }
@@ -3236,8 +3324,9 @@
   const handleSignal = (msg) => {
     const uid = Number(msg?.from_user_id || msg?.user_id || 0);
     const key = `${room?.epoch || 0}:${uid}`;
+    const generation = peerGenerations.get(uid) || 0;
     const previous = signalQueues.get(key) || Promise.resolve();
-    const queued = previous.catch(() => {}).then(() => applySignal(msg));
+    const queued = previous.catch(() => {}).then(() => applySignal(msg, generation));
     signalQueues.set(key, queued);
     return queued.finally(() => {
       if (signalQueues.get(key) === queued) signalQueues.delete(key);
@@ -3258,8 +3347,17 @@
     debug('RTC', 'room_joined', { kind, id, participant_count: users.length });
     await ensureMedia();
     if (!room || room.epoch !== epoch) return;
-    const ids = users.map((u) => Number(u.user_id || u.userId || u.profile?.id || 0)).filter((uid) => uid && uid !== meId);
-    const roster = new Set(ids);
+    if (!room.stateSynced) {
+      // The server forgets seat state across a fresh join or reconnect and drops
+      // changes made while ringing. Tell it what this client is actually doing.
+      room.stateSynced = true;
+      sendWs({ type: kind === 'voice' ? 'voice_state' : 'call_state', patch: { muted: micMuted, deafened, screen: !!screenStream } });
+    }
+    const userId = (u) => Number(u.user_id || u.userId || u.profile?.id || 0);
+    const roster = new Set(users.map(userId).filter((uid) => uid && uid !== meId));
+    // A reconnecting participant has no socket, so offers to them are dropped.
+    // Their rejoin announces a fresh session and the connection starts then.
+    const ids = users.filter((u) => !u.reconnecting).map(userId).filter((uid) => uid && uid !== meId);
     Array.from(peers.keys()).forEach((uid) => { if (!roster.has(uid)) closePeer(uid); });
     ids.forEach((uid) => {
       const shouldOffer = meId > uid;
@@ -3322,10 +3420,13 @@
     }
     if ((msg.type === 'call_peer_joined' || msg.type === 'voice_peer_joined') && msg.user_id && eventMatchesRoom(msg)) {
       const peerUid = Number(msg.user_id);
-      if (peerUid && peerUid !== meId && !peers.has(peerUid)) {
+      if (peerUid && peerUid !== meId) {
+        // A join is always a fresh session on their side (new tab, reload or new
+        // socket). Pairing it with our old connection's ICE/DTLS state never connects.
+        replacePeerSession(peerUid);
         const shouldOffer = meId > peerUid;
         ensurePeer(peerUid).then((pc) => {
-          if (shouldOffer) callPeer(peerUid);
+          if (shouldOffer && pc) callPeer(peerUid).catch(() => {});
           pc?._publishConnectionState?.(true);
         }).catch(() => {});
       }
@@ -3333,7 +3434,7 @@
     if ((msg.type === 'call_peer_left' || msg.type === 'voice_peer_left') && eventMatchesRoom(msg)) {
       const leftUid = Number(msg.user_id);
       screenSharers.delete(leftUid);
-      closePeer(leftUid);
+      replacePeerSession(leftUid);
     }
     if ((msg.type === 'voice_signal' || msg.type === 'call_signal') && eventMatchesRoom(msg)) handleSignal(msg).catch(() => {});
     if (['call_declined', 'call_cancelled', 'call_missed', 'call_ended'].includes(msg.type) && eventMatchesRoom(msg)) leaveRtcRoom();
@@ -3346,7 +3447,7 @@
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'That call is no longer available.' });
       return;
     }
-    if (msg.type === 'error' && resumeInFlight) {
+    if (msg.type === 'error' && resumeInFlight && !['rate_limited', 'too_many_subscriptions'].includes(msg.error)) {
       debug('RTC', 'room_resume_rejected', { error: msg.error }, 'warn');
       leaveRtcRoom();
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'That call could not be rejoined.' });
@@ -3368,17 +3469,32 @@
     }
   };
 
+  const publishAudioState = () => {
+    send(app.ports.bridgeReceive, { tag: 'rtc_audio_state', muted: micMuted, deafened });
+  };
+
   const setMuted = (muted) => {
     micMuted = !!muted;
     if (localStream) localStream.getAudioTracks().forEach((t) => { t.enabled = !micMuted; });
     persistRtcIntent();
+    publishAudioState();
     debug('MEDIA', 'microphone_muted_changed', { muted: micMuted, tracks: localStream?.getAudioTracks().length || 0 });
   };
 
   const setDeafened = (value) => {
-    deafened = !!value;
+    const next = !!value;
+    if (next === deafened) return publishAudioState();
+    deafened = next;
     document.querySelectorAll('audio[id^="remote-audio-"]').forEach((el) => { el.muted = deafened; });
-    if (deafened) setMuted(true);
+    if (deafened) {
+      mutedBeforeDeafen = micMuted;
+      setMuted(true);
+    } else {
+      // Restore the microphone as it was. Staying silently muted after undeafening
+      // looks like the other side can no longer hear you.
+      setMuted(mutedBeforeDeafen);
+      if (room) playAllRemoteAudio();
+    }
     persistRtcIntent();
     debug('MEDIA', 'deafened_changed', { deafened });
   };
