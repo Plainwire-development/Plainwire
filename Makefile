@@ -38,7 +38,7 @@ FRONTEND_OUTPUTS := priv/static/index.html priv/static/app.css priv/static/app.j
 NATIVE_TARGET := $(if $(filter 1,$(NATIVE)),native)
 NATIVE_TEST := $(if $(filter 1,$(NATIVE)),test-native)
 
-.PHONY: help doctor deps frontend backend native build verify test-health test-browser test-native test-backend test check release source package run clean browsers
+.PHONY: help doctor deps frontend backend native build verify test-health test-rtc-contract test-ui-contract test-browser test-native test-backend test check release source package run clean browsers
 # Rebar invocations and test servers are sequenced even with make -j.
 .NOTPARALLEL: check test test-browser test-backend
 
@@ -93,7 +93,13 @@ verify:
 test-health:
 	$(NODE) test/browser/call-health.mjs
 
-test-browser: frontend
+test-rtc-contract:
+	$(NPM) run test:rtc-contract
+
+test-ui-contract:
+	$(NPM) run test:ui-contract
+
+test-browser: frontend test-rtc-contract test-ui-contract
 	$(NPM) run test:browser
 	$(NPM) run test:rtc
 

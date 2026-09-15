@@ -171,6 +171,9 @@ bridgeDecoder =
                     "chat_enter_sends" ->
                         D.map SetChatEnterSends (D.field "data" D.bool)
 
+                    "shortcut" ->
+                        D.map ShortcutAction (D.field "data" D.string)
+
                     "link_previews_enabled" ->
                         D.map SetLinkPreviewsEnabled (D.field "data" D.bool)
 
@@ -319,6 +322,8 @@ init flags url _ =
       , settingsSearch = ""
       , settingsTab = "profile"
       , inputText = ""
+      , editingMessageId = Nothing
+      , editingMessageText = ""
       , sidebarOpen = False
       , serversSheetOpen = False
       , ctxMenu = Nothing
@@ -652,6 +657,12 @@ update msg model =
                     else if String.startsWith "/messages?" tag then
                         handleMessages tag val model
 
+                    else if String.startsWith "/edit_message/" tag then
+                        handleMessageUpdatedValue val { model | editingMessageId = Nothing, editingMessageText = "", toast = Just "Message edited" }
+
+                    else if String.startsWith "/forward_message/" tag then
+                        ( { model | toast = Just "Message forwarded" }, Cmd.none )
+
                     else if String.startsWith "/channels/" tag && String.endsWith "/messages" tag then
                         handleMessageSent requestId val model
 
@@ -810,6 +821,72 @@ update msg model =
         SendMessage ->
             sendMessage model
 
+        StartEditMessage m ->
+            if m.id > 0 && Maybe.map .id model.me == Just m.userId && m.forwardedFrom == Nothing then
+                ( { model | editingMessageId = Just m.id, editingMessageText = m.body, ctxMenu = Nothing }, Cmd.none )
+
+            else
+                ( model, Cmd.none )
+
+        EditMessageText body ->
+            ( { model | editingMessageText = String.left 5000 body }, Cmd.none )
+
+        CancelEditMessage ->
+            ( { model | editingMessageId = Nothing, editingMessageText = "" }, Cmd.none )
+
+        SaveEditMessage mid ->
+            let
+                body =
+                    String.trim model.editingMessageText
+            in
+            if model.editingMessageId /= Just mid then
+                ( model, Cmd.none )
+
+            else if String.isEmpty body then
+                ( { model | toast = Just "A message cannot be empty." }, Cmd.none )
+
+            else
+                ( { model | ctxMenu = Nothing }
+                , apiSend (encodeApiRequest (ApiPost ("/edit_message/" ++ String.fromInt mid) (Just (E.object [ ( "body", E.string body ) ]))))
+                )
+
+        InsertComposerText value ->
+            ( { model | modal = Nothing }
+            , bridgeSend
+                (E.object
+                    [ ( "tag", E.string "insert_composer_text" )
+                    , ( "data", E.string value )
+                    ]
+                )
+            )
+
+        OpenForwardModal m ->
+            if m.id > 0 then
+                ( { model | modal = Just ("forward_message:" ++ String.fromInt m.id), modalTitle = "", modalBody = "", ctxMenu = Nothing }, Cmd.none )
+
+            else
+                ( model, Cmd.none )
+
+        ForwardMessage mid targetScope targetId ->
+            if targetId <= 0 || not (List.member targetScope [ "direct", "channel" ]) then
+                ( { model | toast = Just "That forwarding destination is unavailable." }, Cmd.none )
+
+            else
+                ( { model | modal = Nothing }
+                , apiSend
+                    (encodeApiRequest
+                        (ApiPost ("/forward_message/" ++ String.fromInt mid)
+                            (Just
+                                (E.object
+                                    [ ( "target_scope", E.string targetScope )
+                                    , ( "target_id", E.int targetId )
+                                    ]
+                                )
+                            )
+                        )
+                    )
+                )
+
         SetReplyTo m ->
             ( { model
                 | replyTo =
@@ -883,6 +960,12 @@ update msg model =
 
         OpenUserCtx user x y ->
             ( { model | ctxMenu = Just (userContext model user x y) }, Cmd.none )
+
+        OpenServerCtx server x y ->
+            ( { model | ctxMenu = Just (serverContext server x y) }, Cmd.none )
+
+        OpenChannelCtx channel x y ->
+            ( { model | ctxMenu = Just (channelContext channel x y) }, Cmd.none )
 
         CopyText s ->
             ( { model | ctxMenu = Nothing }, copyText s )
@@ -1269,7 +1352,7 @@ update msg model =
                     { conversationId = conversationId, users = [], startTime = model.serverTime, expanded = False }
             in
             ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Just active }, callMode = Connected, voice = updateVoiceMode "call" conversationId model.voice }
-            , bridgeSend (E.object [ ( "tag", E.string "accept_call" ), ( "data", E.int conversationId ) ])
+            , bridgeSend (E.object [ ( "tag", E.string "join_call" ), ( "data", E.int conversationId ) ])
             )
 
         CallSignal _ _ ->
@@ -1701,6 +1784,132 @@ update msg model =
         MoveChannelToCategory channelId catId ->
             ( model, apiSend (encodeApiRequest (ApiPost ("/channel/" ++ String.fromInt channelId ++ "/move") (Just (E.object [ ( "category_id", maybeInt catId ) ])))) )
 
+        ShortcutAction action ->
+            case action of
+                "help" ->
+                    ( { model | modal = Just "keyboard_shortcuts", ctxMenu = Nothing }, Cmd.none )
+
+                "search" ->
+                    ( { model | modal = Just "search", ctxMenu = Nothing }, Cmd.none )
+
+                "settings" ->
+                    ( { model | ctxMenu = Nothing, modal = Nothing }, setHash "#settings" )
+
+                "notifications" ->
+                    ( { model | ctxMenu = Nothing, modal = Nothing }, setHash "#notifications" )
+
+                "new_server" ->
+                    ( { model | ctxMenu = Nothing, modal = Nothing }, setHash "#new-server" )
+
+                "upload" ->
+                    case model.active of
+                        DmView _ ->
+                            ( model, bridgeSend (E.object [ ( "tag", E.string "pick_attachments" ), ( "data", E.null ) ]) )
+
+                        ChannelView _ ->
+                            ( model, bridgeSend (E.object [ ( "tag", E.string "pick_attachments" ), ( "data", E.null ) ]) )
+
+                        _ ->
+                            ( { model | toast = Just "Open a DM or text channel before uploading files." }, Cmd.none )
+
+                "emoji_picker" ->
+                    case model.active of
+                        DmView _ ->
+                            ( { model | modal = Just "emoji_picker", ctxMenu = Nothing }, Cmd.none )
+
+                        ChannelView _ ->
+                            ( { model | modal = Just "emoji_picker", ctxMenu = Nothing }, Cmd.none )
+
+                        _ ->
+                            ( { model | toast = Just "Open a DM or text channel to use the emoji picker." }, Cmd.none )
+
+                "new_group" ->
+                    update NewDmModal model
+
+                "answer_call" ->
+                    case model.callUI.incoming of
+                        Just incoming ->
+                            update (AcceptCall incoming.conversationId) model
+
+                        Nothing ->
+                            ( model, Cmd.none )
+
+                "decline_call" ->
+                    case model.callUI.incoming of
+                        Just incoming ->
+                            update (DeclineCall incoming.conversationId) model
+
+                        Nothing ->
+                            ( model, Cmd.none )
+
+                "start_call" ->
+                    case model.active of
+                        DmView conversationId ->
+                            if model.voice.mode == Nothing then
+                                update (StartCall conversationId) model
+
+                            else if isJoinedCall conversationId model then
+                                ( { model | toast = Just "You are already connected to this call." }, Cmd.none )
+
+                            else
+                                ( { model | toast = Just "Leave the current voice session before starting another call." }, Cmd.none )
+
+                        _ ->
+                            ( { model | toast = Just "Open a DM or group conversation to start a call." }, Cmd.none )
+
+                "active_audio" ->
+                    case ( model.voice.mode, model.voice.id ) of
+                        ( Just "voice", Just channelId ) ->
+                            ( model, setHash ("#voice/" ++ String.fromInt channelId) )
+
+                        ( Just "call", Just conversationId ) ->
+                            ( model, setHash ("#dm/" ++ String.fromInt conversationId) )
+
+                        _ ->
+                            ( { model | toast = Just "You are not connected to a voice session." }, Cmd.none )
+
+                "prev_server" ->
+                    navigateServer -1 model
+
+                "next_server" ->
+                    navigateServer 1 model
+
+                "toggle_mute" ->
+                    if model.voice.mode == Nothing then
+                        ( { model | toast = Just "Join a call or voice channel before toggling mute." }, Cmd.none )
+
+                    else
+                        update (BridgeEvent "toggle_mute" E.null) model
+
+                "toggle_deafen" ->
+                    if model.voice.mode == Nothing then
+                        ( { model | toast = Just "Join a call or voice channel before toggling deafen." }, Cmd.none )
+
+                    else
+                        update (BridgeEvent "toggle_deafen" E.null) model
+
+                "next_route" ->
+                    navigateRelative 1 model
+
+                "prev_route" ->
+                    navigateRelative -1 model
+
+                "edit_last_message" ->
+                    case model.me of
+                        Just me ->
+                            model.msg
+                                |> List.reverse
+                                |> List.filter (\message -> message.id > 0 && message.userId == me.id && message.kind == "text" && message.forwardedFrom == Nothing)
+                                |> List.head
+                                |> Maybe.map (\message -> update (StartEditMessage message) model)
+                                |> Maybe.withDefault ( model, Cmd.none )
+
+                        Nothing ->
+                            ( model, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
         LoadMoreMessages ->
             if model.loadingOlderMessages || not model.hasOlderMessages then
                 ( model, Cmd.none )
@@ -1947,6 +2156,9 @@ handleMessageSent requestId val model =
                         { conversation
                             | lastBody = Just message.body
                             , lastMessageId = Just message.id
+                            , lastSenderId = message.userId
+                            , lastSenderName = message.displayName
+                            , lastSenderUsername = message.username
                             , updatedAt = message.createdAt
                             , unread = 0
                         }
@@ -2079,6 +2291,9 @@ submitModal model =
                             )
                         )
                     )
+
+            else if String.startsWith "forward_message:" kind || kind == "keyboard_shortcuts" then
+                ( model, Cmd.none )
 
             else if kind == "search" then
                 ( { model | modal = Nothing }, setHash ("#search/" ++ model.searchQuery) )
@@ -2834,6 +3049,7 @@ appendOptimisticMessage scope scopeId body model =
                         )
                         Nothing
                         Nothing
+                        Nothing
             in
             { model | msg = model.msg ++ [ optimistic ], inputText = "", replyTo = Nothing, drafts = Dict.remove (draftKeyFor model.active) model.drafts, outbox = Dict.insert optimistic.id optimistic model.outbox, nextMessageId = model.nextMessageId - 1 }
 
@@ -2860,6 +3076,9 @@ handleWsEvent val model =
     case D.decodeValue wsEventDecoder val of
         Ok ( "message_created", ev ) ->
             handleMessageCreated ev model
+
+        Ok ( "message_updated", ev ) ->
+            handleMessageUpdatedEvent ev model
 
         Ok ( "message_deleted", ev ) ->
             handleMessageDeleted ev model
@@ -3328,11 +3547,32 @@ handleWsEvent val model =
                     ( model, Cmd.none )
 
         Ok ( "error", ev ) ->
+            let
+                reason =
+                    D.decodeValue (D.field "error" D.string) ev |> Result.withDefault "unknown"
+
+                message =
+                    case reason of
+                        "rate_limited" ->
+                            "You're doing that too quickly. Try again in a moment."
+
+                        "too_many_subscriptions" ->
+                            "Too many live updates are open. Close a few views and try again."
+
+                        "forbidden" ->
+                            "You don't have permission to do that."
+
+                        "unavailable" ->
+                            "That service is temporarily unavailable. Try again."
+
+                        _ ->
+                            "Something went wrong. Please try again."
+            in
             ( model
             , bridgeSend
                 (E.object
                     [ ( "tag", E.string "toast" )
-                    , ( "data", E.string "error" )
+                    , ( "data", E.string message )
                     ]
                 )
             )
@@ -3524,7 +3764,10 @@ handleMessageCreated ev model =
                 ( model, Cmd.none )
 
             else if messageApplies model.active message then
-                ( { model | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ] }
+                ( { model
+                    | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ]
+                    , convs = List.map (updateConversationPreview message) model.convs
+                  }
                 , Cmd.batch
                     [ notification
                     , bridgeSend (E.object [ ( "tag", E.string "scroll_messages_to_bottom" ), ( "data", E.null ) ])
@@ -3550,7 +3793,10 @@ handleNotifiedMessage ev model =
                 ( model, Cmd.none )
 
             else if messageApplies model.active message then
-                ( { model | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ] }
+                ( { model
+                    | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ]
+                    , convs = List.map (updateConversationPreview message) model.convs
+                  }
                 , Cmd.batch
                     [ playNotification model.soundEnabled
                     , bridgeSend (E.object [ ( "tag", E.string "scroll_messages_to_bottom" ), ( "data", E.null ) ])
@@ -3601,7 +3847,10 @@ handleMention ev model =
                 )
 
             else if applies then
-                ( { model | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ] }
+                ( { model
+                    | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ]
+                    , convs = List.map (updateConversationPreview message) model.convs
+                  }
                 , Cmd.batch
                     [ playMention model.soundEnabled
                     , bridgeSend (E.object [ ( "tag", E.string "scroll_messages_to_bottom" ), ( "data", E.null ) ])
@@ -3765,11 +4014,96 @@ handleCallPresence ev model =
             ( model, Cmd.none )
 
 
+handleMessageUpdatedEvent : E.Value -> Model -> ( Model, Cmd Msg )
+handleMessageUpdatedEvent ev model =
+    case D.decodeValue (D.field "message" decodeMessage) ev of
+        Ok message ->
+            handleMessageUpdated message model
+
+        Err _ ->
+            ( model, Cmd.none )
+
+
+handleMessageUpdatedValue : E.Value -> Model -> ( Model, Cmd Msg )
+handleMessageUpdatedValue val model =
+    case D.decodeValue decodeMessage val of
+        Ok message ->
+            handleMessageUpdated message model
+
+        Err _ ->
+            ( model, routeCmd model.active )
+
+
+handleMessageUpdated : Message -> Model -> ( Model, Cmd Msg )
+handleMessageUpdated message model =
+    let
+        updateOne existing =
+            if existing.id == message.id then
+                message
+
+            else
+                existing
+
+    in
+    ( { model
+        | msg = List.map updateOne model.msg
+        , convs =
+            List.map
+                (\conversation ->
+                    if conversation.lastMessageId == Just message.id then
+                        updateConversationPreview message conversation
+
+                    else
+                        conversation
+                )
+                model.convs
+      }
+    , Cmd.none
+    )
+
+
+updateConversationPreview : Message -> Conversation -> Conversation
+updateConversationPreview message conversation =
+    if message.scope == "direct" && conversation.id == message.scopeId then
+        { conversation
+            | lastBody = Just message.body
+            , lastMessageId = Just message.id
+            , lastSenderId = message.userId
+            , lastSenderName = message.displayName
+            , lastSenderUsername = message.username
+            , updatedAt = Basics.max conversation.updatedAt message.createdAt
+        }
+
+    else
+        conversation
+
+
 handleMessageDeleted : E.Value -> Model -> ( Model, Cmd Msg )
 handleMessageDeleted ev model =
     case D.decodeValue (D.field "message_id" D.int) ev of
         Ok messageId ->
-            ( { model | msg = List.filter (\m -> m.id /= messageId) model.msg }, Cmd.none )
+            let
+                deletedLatest =
+                    List.any (\conversation -> conversation.lastMessageId == Just messageId) model.convs
+
+                nextEditingId =
+                    if model.editingMessageId == Just messageId then
+                        Nothing
+
+                    else
+                        model.editingMessageId
+            in
+            ( { model
+                | msg = List.filter (\m -> m.id /= messageId) model.msg
+                , editingMessageId = nextEditingId
+                , editingMessageText = if nextEditingId == Nothing then "" else model.editingMessageText
+              }
+            , if deletedLatest then
+                apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+
+              else
+                Cmd.none
+            )
 
         Err _ ->
             ( model, Cmd.none )
@@ -3980,7 +4314,15 @@ renderContextMenu model =
     case model.ctxMenu of
         Just menu ->
             div [ class "ctx-backdrop", onClick CloseCtx ]
-                [ div [ class "ctx-menu", style "left" (String.fromInt menu.x ++ "px"), style "top" (String.fromInt menu.y ++ "px") ]
+                [ div
+                    [ class "ctx-menu"
+                    , attribute "role" "menu"
+                    , attribute "aria-label" "Context menu"
+                    , attribute "data-context-x" (String.fromInt menu.x)
+                    , attribute "data-context-y" (String.fromInt menu.y)
+                    , style "left" (String.fromInt menu.x ++ "px")
+                    , style "top" (String.fromInt menu.y ++ "px")
+                    ]
                     (List.indexedMap ctxItemView menu.items)
                 ]
 
@@ -4037,6 +4379,160 @@ modalContent kind model =
             , div [ class "field" ] [ label [ attribute "for" "group-name" ] [ text "Group name · optional" ], input [ id "group-name", value model.modalTitle, maxlength 80, placeholder "Friday night, Study group…", onInput ModalTitle ] [] ]
             ]
         , modalActions "Start chat"
+        ]
+
+    else if String.startsWith "forward_message:" kind then
+        let
+            messageId =
+                String.toInt (String.dropLeft 16 kind) |> Maybe.withDefault 0
+
+            source =
+                findMessage messageId model.msg
+
+            query =
+                String.toLower (String.trim model.modalBody)
+
+            directTargets =
+                model.convs
+                    |> List.filter
+                        (\conversation ->
+                            conversation.requestState == "accepted"
+                                && (String.isEmpty query || String.contains query (String.toLower (convName conversation)))
+                        )
+                    |> List.map
+                        (\conversation ->
+                            button
+                                [ class "forward-target"
+                                , type_ "button"
+                                , onClick (ForwardMessage messageId "direct" conversation.id)
+                                ]
+                                [ convAvatar model conversation
+                                , div [ class "grow" ]
+                                    [ b [] [ text (convName conversation) ]
+                                    , small [ class "muted" ] [ text "Direct message" ]
+                                    ]
+                                , span [ class "forward-target-arrow", attribute "aria-hidden" "true" ] [ text "→" ]
+                                ]
+                        )
+
+            channelTargets =
+                model.currentServer
+                    |> Maybe.map
+                        (\data ->
+                            data.channels
+                                |> List.filter
+                                    (\channel ->
+                                        channel.kind == "text"
+                                            && (String.isEmpty query
+                                                    || String.contains query (String.toLower channel.name)
+                                                    || String.contains query (String.toLower data.server.name)
+                                               )
+                                    )
+                                |> List.map
+                                    (\channel ->
+                                        button
+                                            [ class "forward-target"
+                                            , type_ "button"
+                                            , onClick (ForwardMessage messageId "channel" channel.id)
+                                            ]
+                                            [ span [ class "forward-target-hash", attribute "aria-hidden" "true" ] [ text "#" ]
+                                            , div [ class "grow" ]
+                                                [ b [] [ text channel.name ]
+                                                , small [ class "muted" ] [ text data.server.name ]
+                                                ]
+                                            , span [ class "forward-target-arrow", attribute "aria-hidden" "true" ] [ text "→" ]
+                                            ]
+                                    )
+                        )
+                    |> Maybe.withDefault []
+        in
+        [ modalHead "Forward message" "Choose where to send it. Plainwire keeps the original author attached."
+        , div [ class "modal-body forward-modal" ]
+            [ case source of
+                Just message ->
+                    div [ class "forward-preview" ]
+                        [ span [ class "forward-preview-label" ] [ text ("From " ++ message.displayName) ]
+                        , div [ class "forward-preview-body" ] [ Markdown.preview message.body ]
+                        ]
+
+                Nothing ->
+                    div [ class "forward-preview" ] [ text "Message preview unavailable" ]
+            , div [ class "field forward-search" ]
+                [ label [ attribute "for" "forward-search" ] [ text "Find a destination" ]
+                , input
+                    [ id "forward-search"
+                    , value model.modalBody
+                    , placeholder "DM or channel name"
+                    , onInput ModalBody
+                    , attribute "autocomplete" "off"
+                    , attribute "autofocus" "true"
+                    ]
+                    []
+                ]
+            , if not (String.isEmpty query) && List.isEmpty directTargets && List.isEmpty channelTargets then
+                div [ class "forward-empty muted" ] [ text ("No destinations match “" ++ model.modalBody ++ "”.") ]
+
+              else
+                text ""
+            , if List.isEmpty directTargets then
+                text ""
+
+              else
+                div [ class "forward-section" ]
+                    [ span [ class "eyebrow" ] [ text "Direct messages" ]
+                    , div [ class "forward-targets" ] directTargets
+                    ]
+            , if List.isEmpty channelTargets then
+                text ""
+
+              else
+                div [ class "forward-section" ]
+                    [ span [ class "eyebrow" ] [ text "Current server" ]
+                    , div [ class "forward-targets" ] channelTargets
+                    ]
+            ]
+        , div [ class "modal-actions" ] [ button [ class "btn secondary", onClick CloseModal ] [ text "Cancel" ] ]
+        ]
+
+    else if kind == "keyboard_shortcuts" then
+        [ modalHead "Keyboard shortcuts" "Fast navigation and call controls, without stealing keys while you type."
+        , div [ class "modal-body shortcut-sheet" ]
+            [ shortcutRow "Quick switcher" "Ctrl / Cmd + K"
+            , shortcutRow "Open settings" "Ctrl / Cmd + ,"
+            , shortcutRow "Emoji picker" "Ctrl / Cmd + E"
+            , shortcutRow "Edit your latest message (empty composer)" "↑ / Shift + ↑"
+            , shortcutRow "Search" "Ctrl / Cmd + F"
+            , shortcutRow "Activity / mentions" "Ctrl / Cmd + I"
+            , shortcutRow "Return to previous conversation / text channel" "Ctrl / Cmd + B"
+            , shortcutRow "Create or join a server" "Ctrl / Cmd + Shift + N"
+            , shortcutRow "Previous conversation or channel" "Alt + ↑"
+            , shortcutRow "Next conversation or channel" "Alt + ↓"
+            , shortcutRow "Previous server" "Ctrl / Cmd + Alt + ←"
+            , shortcutRow "Next server" "Ctrl / Cmd + Alt + →"
+            , shortcutRow "Return to connected audio" "Ctrl / Cmd + Alt + A"
+            , shortcutRow "Toggle mute while connected" "Ctrl / Cmd + Shift + M"
+            , shortcutRow "Toggle deafen while connected" "Ctrl / Cmd + Shift + D"
+            , shortcutRow "Answer incoming call" "Ctrl / Cmd + Enter"
+            , shortcutRow "Start call in current DM" "Ctrl / Cmd + ["
+            , shortcutRow "New group conversation" "Ctrl / Cmd + Shift + T"
+            , shortcutRow "Upload files" "Ctrl / Cmd + Shift + U"
+            , shortcutRow "Focus message box" "Ctrl / Cmd + Shift + L"
+            , shortcutRow "Show shortcuts / help" "Ctrl / Cmd + Shift + H"
+            , shortcutRow "Show shortcuts" "Ctrl / Cmd + /"
+            , shortcutRow "Close menus and dialogs" "Esc"
+            , small [ class "muted shortcut-browser-note" ] [ text "Some browser-reserved shortcuts (especially Ctrl/Cmd + Shift + T) work most reliably in Plainwire Desktop." ]
+            ]
+        , div [ class "modal-actions" ] [ button [ class "btn", onClick CloseModal ] [ text "Done" ] ]
+        ]
+
+    else if kind == "emoji_picker" then
+        [ modalHead "Emoji" "Pick one, or type a shortcode such as :eyes: directly in chat."
+        , div [ class "modal-body emoji-picker" ]
+            [ div [ class "emoji-picker-grid", attribute "role" "list" ]
+                (List.map emojiPickerButton emojiPickerItems)
+            , p [ class "muted emoji-picker-hint" ]
+                [ text "Shortcodes render automatically in messages, including :eyes:, :thinking:, :fire:, :heart:, :skull:, and more." ]
+            ]
         ]
 
     else if kind == "search" then
@@ -4356,6 +4852,163 @@ modalContent kind model =
         []
 
 
+shortcutRow : String -> String -> Html Msg
+shortcutRow labelText keys =
+    div [ class "shortcut-row" ]
+        [ span [] [ text labelText ]
+        , kbd [ class "shortcut-key" ] [ text keys ]
+        ]
+
+
+emojiPickerItems : List ( String, String, String )
+emojiPickerItems =
+    [ ( "👀", ":eyes:", "Eyes" )
+    , ( "😄", ":smile:", "Smile" )
+    , ( "😂", ":joy:", "Joy" )
+    , ( "🤣", ":rofl:", "Rolling on the floor laughing" )
+    , ( "😉", ":wink:", "Wink" )
+    , ( "😍", ":heart_eyes:", "Heart eyes" )
+    , ( "🤔", ":thinking:", "Thinking" )
+    , ( "😅", ":sweat_smile:", "Sweat smile" )
+    , ( "😭", ":sob:", "Sobbing" )
+    , ( "🥺", ":pleading_face:", "Pleading" )
+    , ( "🫠", ":melting_face:", "Melting" )
+    , ( "😎", ":sunglasses:", "Sunglasses" )
+    , ( "💀", ":skull:", "Skull" )
+    , ( "🔥", ":fire:", "Fire" )
+    , ( "✨", ":sparkles:", "Sparkles" )
+    , ( "🎉", ":tada:", "Party" )
+    , ( "❤️", ":heart:", "Heart" )
+    , ( "💙", ":blue_heart:", "Blue heart" )
+    , ( "👍", ":thumbsup:", "Thumbs up" )
+    , ( "👎", ":thumbsdown:", "Thumbs down" )
+    , ( "👏", ":clap:", "Clap" )
+    , ( "🙏", ":pray:", "Pray" )
+    , ( "👋", ":wave:", "Wave" )
+    , ( "🙌", ":raised_hands:", "Raised hands" )
+    , ( "✅", ":check:", "Check" )
+    , ( "❌", ":x:", "X" )
+    , ( "⚠️", ":warning:", "Warning" )
+    , ( "🚀", ":rocket:", "Rocket" )
+    , ( "🐛", ":bug:", "Bug" )
+    , ( "📌", ":pin:", "Pin" )
+    ]
+
+
+emojiPickerButton : ( String, String, String ) -> Html Msg
+emojiPickerButton ( glyph, shortcode, labelText ) =
+    button
+        [ class "emoji-picker-item"
+        , type_ "button"
+        , title (labelText ++ " · " ++ shortcode)
+        , attribute "aria-label" (labelText ++ " " ++ shortcode)
+        , onClick (InsertComposerText glyph)
+        ]
+        [ span [ class "emoji-picker-glyph", attribute "aria-hidden" "true" ] [ text glyph ]
+        , span [ class "emoji-picker-code" ] [ text shortcode ]
+        ]
+
+
+navigateRelative : Int -> Model -> ( Model, Cmd Msg )
+navigateRelative delta model =
+    let
+        dmRoutes =
+            List.map (\conversation -> "#dm/" ++ String.fromInt conversation.id) model.convs
+
+        channelRoutes =
+            model.currentServer
+                |> Maybe.map (.channels >> List.filter (\channel -> channel.kind == "text") >> List.map (\channel -> "#channel/" ++ String.fromInt channel.id))
+                |> Maybe.withDefault []
+
+        routes =
+            dmRoutes ++ channelRoutes
+
+        current =
+            case model.active of
+                DmView id ->
+                    "#dm/" ++ String.fromInt id
+
+                ChannelView id ->
+                    "#channel/" ++ String.fromInt id
+
+                _ ->
+                    ""
+
+        currentIndex =
+            routes
+                |> List.indexedMap Tuple.pair
+                |> List.filter (\( _, route ) -> route == current)
+                |> List.head
+                |> Maybe.map Tuple.first
+                |> Maybe.withDefault -1
+
+        count =
+            List.length routes
+
+        nextIndex =
+            if count == 0 then
+                -1
+
+            else if currentIndex < 0 then
+                0
+
+            else
+                modBy count (currentIndex + delta)
+    in
+    if nextIndex < 0 then
+        ( model, Cmd.none )
+
+    else
+        case listAt nextIndex routes of
+            Just route ->
+                ( model, setHash route )
+
+            Nothing ->
+                ( model, Cmd.none )
+
+
+navigateServer : Int -> Model -> ( Model, Cmd Msg )
+navigateServer delta model =
+    let
+        ids =
+            List.map .id model.servers
+
+        currentId =
+            model.currentServer |> Maybe.map (.server >> .id)
+
+        currentIndex =
+            ids
+                |> List.indexedMap Tuple.pair
+                |> List.filter (\( _, serverId ) -> Just serverId == currentId)
+                |> List.head
+                |> Maybe.map Tuple.first
+                |> Maybe.withDefault -1
+
+        count =
+            List.length ids
+
+        nextIndex =
+            if count == 0 then
+                -1
+
+            else if currentIndex < 0 then
+                if delta < 0 then
+                    count - 1
+
+                else
+                    0
+
+            else
+                modBy count (currentIndex + delta)
+    in
+    case listAt nextIndex ids of
+        Just serverId ->
+            ( model, setHash ("#server/" ++ String.fromInt serverId) )
+
+        Nothing ->
+            ( model, Cmd.none )
+
+
 modalHead : String -> String -> Html Msg
 modalHead title subtitle =
     div [ class "modal-head" ]
@@ -4464,8 +5117,9 @@ choicePill selected label msg =
 
 ctxItemView : Int -> CtxItem -> Html Msg
 ctxItemView idx item =
-    div
-        [ class
+    button
+        [ type_ "button"
+        , class
             ("ctx-item"
                 ++ (if item.danger then
                         " ctx-danger"
@@ -4480,9 +5134,10 @@ ctxItemView idx item =
                         ""
                    )
             )
+        , attribute "role" "menuitem"
         , onClick (CtxAction idx)
         ]
-        [ span [ class "ctx-icon" ] [ text (Maybe.withDefault "" item.icon) ]
+        [ span [ class "ctx-icon", attribute "aria-hidden" "true" ] [ text (Maybe.withDefault "" item.icon) ]
         , span [] [ text item.label ]
         ]
 
@@ -4500,6 +5155,7 @@ messageContext me message x y =
 
         base =
             [ { label = "Reply", icon = Just "↩", danger = False, sep = False, msg = SetReplyTo message }
+            , { label = "Forward", icon = Just "➜", danger = False, sep = False, msg = OpenForwardModal message }
             , { label = "Copy text", icon = Just "⧉", danger = False, sep = False, msg = CopyText message.body }
             ]
 
@@ -4514,7 +5170,14 @@ messageContext me message x y =
 
         mineItems =
             if mine then
-                [ { label = "Delete message", icon = Just "×", danger = True, sep = True, msg = DeleteMessage message.id } ]
+                (if message.forwardedFrom == Nothing then
+                    [ { label = "Edit message", icon = Just "✎", danger = False, sep = True, msg = StartEditMessage message }
+                    , { label = "Delete message", icon = Just "×", danger = True, sep = False, msg = DeleteMessage message.id }
+                    ]
+
+                 else
+                    [ { label = "Delete message", icon = Just "×", danger = True, sep = True, msg = DeleteMessage message.id } ]
+                )
 
             else
                 []
@@ -4538,6 +5201,59 @@ conversationContext c x y =
         , { label = "Rename", icon = Just "✎", danger = False, sep = False, msg = EditConversationModal c }
         , { label = "Add people", icon = Just "+", danger = False, sep = False, msg = AddPeopleModal c.id }
         , closeItem
+        ]
+    , x = x
+    , y = y
+    }
+
+
+serverContext : Server -> Int -> Int -> ContextMenu
+serverContext server x y =
+    let
+        canManage =
+            server.role == "owner" || server.role == "admin"
+
+        management =
+            if canManage then
+                [ { label = "Invite people", icon = Just "+", danger = False, sep = True, msg = InviteModal server.id }
+                , { label = "Edit server", icon = Just "✎", danger = False, sep = False, msg = EditServerModal server }
+                ]
+
+            else
+                []
+    in
+    { items =
+        [ { label = "Open server", icon = Just "→", danger = False, sep = False, msg = Go ("#server/" ++ String.fromInt server.id) }
+        , { label = "Copy server name", icon = Just "⧉", danger = False, sep = False, msg = CopyText server.name }
+        ]
+            ++ management
+            ++ [ { label = "Copy server ID", icon = Just "#", danger = False, sep = True, msg = CopyText (String.fromInt server.id) } ]
+    , x = x
+    , y = y
+    }
+
+
+channelContext : Channel -> Int -> Int -> ContextMenu
+channelContext channel x y =
+    let
+        target =
+            if channel.kind == "voice" then
+                "#voice/"
+
+            else
+                "#channel/"
+
+        kindLabel =
+            if channel.kind == "voice" then
+                "voice channel"
+
+            else
+                "channel"
+    in
+    { items =
+        [ { label = "Open " ++ kindLabel, icon = Just "→", danger = False, sep = False, msg = Go (target ++ String.fromInt channel.id) }
+        , { label = "Copy channel name", icon = Just "#", danger = False, sep = False, msg = CopyText channel.name }
+        , { label = "Copy channel ID", icon = Just "⧉", danger = False, sep = True, msg = CopyText (String.fromInt channel.id) }
         ]
     , x = x
     , y = y
@@ -4686,11 +5402,24 @@ renderCompactCallBar active model =
         myId =
             Maybe.map .id model.me
 
+        activeUsers =
+            List.filter (\user -> not user.reconnecting) active.users
+
         remoteUsers =
-            List.filter (\user -> Just user.userId /= myId) active.users
+            List.filter (\user -> Just user.userId /= myId) activeUsers
 
         count =
-            List.length active.users
+            List.length activeUsers
+
+        reconnectingCount =
+            List.length active.users - count
+
+        reconnectingSuffix =
+            if reconnectingCount > 0 then
+                " · " ++ String.fromInt reconnectingCount ++ " reconnecting"
+
+            else
+                ""
 
         connectedCount =
             List.length (List.filter .connected remoteUsers)
@@ -4700,10 +5429,10 @@ renderCompactCallBar active model =
 
         countText =
             if List.isEmpty remoteUsers then
-                "Waiting for others"
+                "Waiting for others" ++ reconnectingSuffix
 
             else if failedCount > 0 then
-                "Audio failed · Open to retry"
+                "Audio failed · Open to retry" ++ reconnectingSuffix
 
             else if connectedCount == List.length remoteUsers then
                 "Audio connected · "
@@ -4715,9 +5444,10 @@ renderCompactCallBar active model =
                         else
                             ""
                        )
+                    ++ reconnectingSuffix
 
             else
-                "Connecting audio · " ++ String.fromInt connectedCount ++ "/" ++ String.fromInt (List.length remoteUsers)
+                "Connecting audio · " ++ String.fromInt connectedCount ++ "/" ++ String.fromInt (List.length remoteUsers) ++ reconnectingSuffix
 
         userAvatars =
             List.take 3 active.users
@@ -5207,7 +5937,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.7.3", attribute "data-ui-revision" "interface-3" ]
+    div [ class "layout", attribute "data-ui-version" "1.7.4", attribute "data-ui-revision" "interface-4" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -5325,6 +6055,7 @@ serverSheetRow s model =
                    )
             )
         , onClick (Go ("#server/" ++ String.fromInt s.id))
+        , onContextMenu (OpenServerCtx s)
         , attribute "aria-current"
             (if isActive then
                 "page"
@@ -5419,6 +6150,7 @@ renderServerIcon s model =
                    )
             )
         , onClick (Go ("#server/" ++ String.fromInt s.id))
+        , onContextMenu (OpenServerCtx s)
         , title s.name
         , attribute "aria-label" s.name
         , attribute "aria-current"
@@ -5577,7 +6309,7 @@ renderServerSide model data =
         ]
         [ div [ class "side-head server-side-head" ]
             [ div [ class "side-title-row" ]
-                [ div [ class "server-side-identity" ]
+                [ div [ class "server-side-identity", onContextMenu (OpenServerCtx data.server) ]
                     [ serverIcon data.server
                     , div [ class "side-title-copy" ]
                         [ h1 [ title data.server.name ] [ text data.server.name ]
@@ -5858,6 +6590,25 @@ dmHeader model =
         ]
 
 
+conversationSenderLabel : Model -> Conversation -> String
+conversationSenderLabel model conversation =
+    if conversation.lastMessageId == Nothing || conversation.lastSenderId == 0 then
+        ""
+
+    else if Maybe.map .id model.me == Just conversation.lastSenderId then
+        "You: "
+
+    else if String.isEmpty conversation.lastSenderName then
+        if String.isEmpty conversation.lastSenderUsername then
+            ""
+
+        else
+            "@" ++ conversation.lastSenderUsername ++ ": "
+
+    else
+        conversation.lastSenderName ++ ": "
+
+
 messageRequestsNav : Int -> Html Msg
 messageRequestsNav count =
     a [ class "row message-requests-nav", href "#dms", onClick (Go "#dms") ]
@@ -5880,6 +6631,9 @@ convRow c model =
 
         lastText =
             Maybe.withDefault "No messages yet" c.lastBody
+
+        senderLabel =
+            conversationSenderLabel model c
     in
     a
         [ class
@@ -5912,7 +6666,14 @@ convRow c model =
                     text ""
                 , small [ class "muted" ] [ text (agoAt model.serverTime c.updatedAt) ]
                 ]
-            , div [ class "muted dm-preview" ] [ Markdown.preview lastText ]
+            , div [ class "muted dm-preview" ]
+                [ if String.isEmpty senderLabel then
+                    text ""
+
+                  else
+                    strong [ class "dm-preview-sender" ] [ text senderLabel ]
+                , Markdown.preview lastText
+                ]
             ]
         , span
             [ class "badge"
@@ -6720,7 +7481,14 @@ messageRequestRow model conversation =
         [ convAvatar model conversation
         , div [ class "grow" ]
             [ b [] [ text (convName conversation) ]
-            , small [ class "muted dm-preview" ] [ text (Maybe.withDefault "Wants to message you" conversation.lastBody) ]
+            , small [ class "muted dm-preview" ]
+                [ if String.isEmpty (conversationSenderLabel model conversation) then
+                    text ""
+
+                  else
+                    strong [ class "dm-preview-sender" ] [ text (conversationSenderLabel model conversation) ]
+                , text (Maybe.withDefault "Wants to message you" conversation.lastBody)
+                ]
             ]
         , div [ class "request-actions" ]
             [ button [ class "btn", onClick (BridgeEvent "accept_message_request" (E.int conversation.id)) ] [ text "Accept" ]
@@ -7148,7 +7916,7 @@ channelRow model c =
             else
                 "#channel/"
     in
-    a [ class "row channel-link", href (target ++ String.fromInt c.id), onClick (Go (target ++ String.fromInt c.id)) ]
+    a [ class "row channel-link", href (target ++ String.fromInt c.id), onClick (Go (target ++ String.fromInt c.id)), onContextMenu (OpenChannelCtx c) ]
         [ span
             [ class
                 ("channel-glyph "
@@ -7208,7 +7976,7 @@ managedChannelRow canManage categories channel =
             option [ value "" ] [ text "No category" ]
                 :: List.map (\category -> option [ value (String.fromInt category.id) ] [ text category.name ]) categories
     in
-    div [ class "row", onClick (Go (target ++ String.fromInt channel.id)) ]
+    div [ class "row", onClick (Go (target ++ String.fromInt channel.id)), onContextMenu (OpenChannelCtx channel) ]
         [ span
             [ class
                 ("channel-glyph "
@@ -7283,14 +8051,27 @@ renderVoicePage channelId model =
             List.length (List.filter (\user -> user.screen && user.screenAudio) voiceUsers)
 
         participantCount =
-            List.length voiceUsers
+            List.length (List.filter (\user -> not user.reconnecting) voiceUsers)
+
+        reconnectingCount =
+            List.length voiceUsers - participantCount
+
+        participantCountText =
+            String.fromInt participantCount
+                ++ " in call"
+                ++ (if reconnectingCount > 0 then
+                        " · " ++ String.fromInt reconnectingCount ++ " reconnecting"
+
+                    else
+                        ""
+                   )
     in
     div []
         [ div [ class "card pad voice-card" ]
             [ div [ class "voice-header" ]
                 [ h2 [] [ text "Voice channel" ]
                 , if joined then
-                    span [ class "voice-count" ] [ text (String.fromInt participantCount ++ " in call") ]
+                    span [ class "voice-count" ] [ text participantCountText ]
 
                   else
                     text ""
@@ -8778,8 +9559,11 @@ renderChatHeader model =
             case List.filter (\c -> c.id == id) model.convs of
                 c :: _ ->
                     let
+                        activeCall =
+                            callForConversation id model
+
                         hasCall =
-                            callForConversation id model /= Nothing
+                            activeCall /= Nothing
 
                         joinedCall =
                             isJoinedCall id model
@@ -8809,7 +9593,10 @@ renderChatHeader model =
                             button [ class "btn call-decline chat-call-action", onClick EndCall ] [ span [ class "ui-icon ui-icon-call-end", attribute "aria-hidden" "true" ] [], span [ class "chat-call-label" ] [ text "Leave" ] ]
 
                           else if hasCall then
-                            button [ class "btn call-accept chat-call-action", onClick (JoinCall id) ] [ span [ class "ui-icon ui-icon-call", attribute "aria-hidden" "true" ] [], span [ class "chat-call-label" ] [ text "Join" ] ]
+                            button [ class "btn call-accept chat-call-action", onClick (JoinCall id) ]
+                                [ span [ class "ui-icon ui-icon-call", attribute "aria-hidden" "true" ] []
+                                , span [ class "chat-call-label" ] [ text (activeCall |> Maybe.map (\active -> callJoinShortLabel active model) |> Maybe.withDefault "Join") ]
+                                ]
 
                           else
                             button [ class "btn chat-call-action", onClick (BridgeEvent "start_call" (E.int id)), attribute "aria-label" "Start call" ] [ span [ class "ui-icon ui-icon-call", attribute "aria-hidden" "true" ] [], span [ class "chat-call-label" ] [ text "Call" ] ]
@@ -8847,28 +9634,101 @@ callForConversation conversationId model =
         Dict.get conversationId model.activeCalls
 
 
+callJoinLabel : ActiveCall -> Model -> String
+callJoinLabel active model =
+    case Maybe.map .id model.me of
+        Nothing ->
+            "Join Call"
+
+        Just myId ->
+            case List.filter (\user -> user.userId == myId) active.users |> List.head of
+                Just user ->
+                    if user.reconnecting then
+                        "Rejoin Call"
+
+                    else
+                        "Take Over Call"
+
+                Nothing ->
+                    "Join Call"
+
+
+callJoinShortLabel : ActiveCall -> Model -> String
+callJoinShortLabel active model =
+    case callJoinLabel active model of
+        "Rejoin Call" ->
+            "Rejoin"
+
+        "Take Over Call" ->
+            "Take over"
+
+        _ ->
+            "Join"
+
+
 renderDmCallBar : ActiveCall -> Model -> Html Msg
 renderDmCallBar active model =
     let
-        count =
-            List.length active.users
+        connectedCount =
+            List.length (List.filter (\user -> not user.reconnecting) active.users)
+
+        reconnectingCount =
+            List.length active.users - connectedCount
 
         joinedCall =
             isJoinedCall active.conversationId model
 
-        countText =
-            if count == 0 then
-                "No one connected"
+        selfPresence =
+            model.me
+                |> Maybe.andThen
+                    (\me ->
+                        active.users
+                            |> List.filter (\user -> user.userId == me.id)
+                            |> List.head
+                    )
+
+        remoteSeatStatus =
+            if joinedCall then
+                ""
 
             else
-                String.fromInt count
-                    ++ " participant"
-                    ++ (if count /= 1 then
-                            "s"
+                case selfPresence of
+                    Just user ->
+                        if user.reconnecting then
+                            " · Your previous session is reconnecting"
 
                         else
-                            ""
-                       )
+                            " · You are connected elsewhere"
+
+                    Nothing ->
+                        ""
+
+        countText =
+            let
+                connectedText =
+                    if connectedCount == 0 then
+                        "No one connected"
+
+                    else
+                        String.fromInt connectedCount
+                            ++ " participant"
+                            ++ (if connectedCount /= 1 then
+                                    "s"
+
+                                else
+                                    ""
+                               )
+            in
+            (if reconnectingCount > 0 then
+                connectedText
+                    ++ " · "
+                    ++ String.fromInt reconnectingCount
+                    ++ " reconnecting"
+
+             else
+                connectedText
+            )
+                ++ remoteSeatStatus
 
         duration =
             floor (toFloat (model.serverTime - active.startTime) / 1000)
@@ -8914,7 +9774,16 @@ renderDmCallBar active model =
                         minutes ++ ":" ++ seconds
 
                      else
-                        "Ready to join"
+                        case selfPresence of
+                            Just user ->
+                                if user.reconnecting then
+                                    "Ready to rejoin"
+
+                                else
+                                    "Connected elsewhere"
+
+                            Nothing ->
+                                "Ready to join"
                     )
                 ]
             , span [ class "dm-call-bar-count" ] [ text countText ]
@@ -8933,7 +9802,7 @@ renderDmCallBar active model =
                 ]
 
              else
-                [ button [ class "btn call-accept", onClick (JoinCall active.conversationId) ] [ text "Join Call" ] ]
+                [ button [ class "btn call-accept", onClick (JoinCall active.conversationId) ] [ text (callJoinLabel active model) ] ]
             )
         ]
 
@@ -9181,7 +10050,46 @@ textMessageView model grouped m =
 
                 Nothing ->
                     text ""
-            , Lazy.lazy2 Markdown.body (Maybe.withDefault "" (Maybe.map .username model.me)) m.body
+            , case m.forwardedFrom of
+                Just forwarded ->
+                    button
+                        [ class "forwarded-message-origin"
+                        , type_ "button"
+                        , onClick (ShowUserPopup forwarded.userId)
+                        , title "Open original author's profile"
+                        ]
+                        [ span [ class "forwarded-icon", attribute "aria-hidden" "true" ] [ text "↗" ]
+                        , span [] [ text ("Forwarded from " ++ forwarded.displayName) ]
+                        ]
+
+                Nothing ->
+                    text ""
+            , if model.editingMessageId == Just m.id then
+                div [ class "message-editor" ]
+                    [ textarea
+                        [ class "message-edit-input"
+                        , value model.editingMessageText
+                        , maxlength 5000
+                        , rows 3
+                        , onInput EditMessageText
+                        , attribute "aria-label" "Edit message"
+                        , attribute "data-message-editor" "true"
+                        ]
+                        []
+                    , div [ class "message-edit-actions" ]
+                        [ small [ class "muted" ] [ text "Enter to save · Esc to cancel" ]
+                        , button [ class "btn ghost", type_ "button", onClick CancelEditMessage, attribute "data-edit-cancel" "true" ] [ text "Cancel" ]
+                        , button [ class "btn", type_ "button", onClick (SaveEditMessage m.id), disabled (String.isEmpty (String.trim model.editingMessageText)), attribute "data-edit-save" "true" ] [ text "Save" ]
+                        ]
+                    ]
+
+              else
+                Lazy.lazy2 Markdown.body (Maybe.withDefault "" (Maybe.map .username model.me)) m.body
+            , if m.editedAt /= Nothing && model.editingMessageId /= Just m.id then
+                small [ class "message-edited", title "This message was edited" ] [ text "(edited)" ]
+
+              else
+                text ""
             , if failed then
                 div [ class "msg-failed-bar" ]
                     [ span [ class "msg-failed-text" ] [ text "Failed to send" ]
@@ -9191,15 +10099,25 @@ textMessageView model grouped m =
 
               else
                 text ""
-            , div [ class "msg-actions" ]
-                [ button [ class "msg-action", disabled (m.id < 0), onClick (SetReplyTo m) ] [ text "Reply" ]
-                , button [ class "msg-action", onClick (CopyText m.body) ] [ text "Copy" ]
-                , if mine && m.id > 0 then
-                    button [ class "msg-action danger", onClick (DeleteMessage m.id) ] [ text "Delete" ]
+            , if model.editingMessageId == Just m.id then
+                text ""
 
-                  else
-                    text ""
-                ]
+              else
+                div [ class "msg-actions" ]
+                    [ button [ class "msg-action", disabled (m.id < 0), onClick (SetReplyTo m) ] [ text "Reply" ]
+                    , button [ class "msg-action", disabled (m.id < 0), onClick (OpenForwardModal m) ] [ text "Forward" ]
+                    , button [ class "msg-action", onClick (CopyText m.body) ] [ text "Copy" ]
+                    , if mine && m.id > 0 && m.forwardedFrom == Nothing then
+                        button [ class "msg-action", onClick (StartEditMessage m) ] [ text "Edit" ]
+
+                      else
+                        text ""
+                    , if mine && m.id > 0 then
+                        button [ class "msg-action danger", onClick (DeleteMessage m.id) ] [ text "Delete" ]
+
+                      else
+                        text ""
+                    ]
             ]
         ]
 
@@ -9545,6 +10463,15 @@ fmtErr err =
 
         "too_many_members" ->
             "Group chats can contain up to 50 people."
+
+        "invalid_message" ->
+            "Messages cannot be empty or contain only spaces."
+
+        "invalid_target" ->
+            "That forwarding destination is no longer available."
+
+        "not_found" ->
+            "That item no longer exists. Refresh and try again."
 
         "forbidden" ->
             "That action is not allowed. A user may have blocked one of the selected accounts."

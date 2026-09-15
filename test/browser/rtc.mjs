@@ -25,6 +25,7 @@ const origin = `http://127.0.0.1:${server.address().port}`;
 const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_EXECUTABLE || undefined, args: ['--no-sandbox', '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required', '--disable-features=WebRtcHideLocalIpsWithMdns', '--allow-loopback-in-peer-connection'] });
 const sockets = new Map();
 const errors = [];
+const clientMessages = [];
 const send = (uid, data) => sockets.get(uid)?.send(JSON.stringify(data));
 const states = new Map();
 const members = new Set();
@@ -109,7 +110,7 @@ async function setup(uid) {
   await context.route('**/api/**', async route => {
     const path = new URL(route.request().url()).pathname;
     const reply = data => route.fulfill({ json: { ok: true, data } });
-    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.3', asset_version: '1.7.3', registration_enabled: true } });
+    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.4', asset_version: '1.7.4', registration_enabled: true } });
     if (path === '/api/me') return reply({ user: people[uid - 1], csrf: 'test', server_time: now });
     if (path === '/api/sync') return reply({ ...sync, conversations: [{ ...conversations[0], peer_id: uid === 1 ? 2 : 1, peer_name: people[uid === 1 ? 1 : 0].display_name }] });
     if (path === '/api/messages') return reply([]);
@@ -122,6 +123,7 @@ async function setup(uid) {
     sockets.set(uid, ws);
     ws.onMessage(raw => {
       const msg = JSON.parse(raw);
+      clientMessages.push({ uid, msg });
       if (msg.type === 'call_quality' && process.env.PLAINWIRE_TEST_NATIVE === '1') {
         nativeHealth(msg.samples).then(result => send(uid, { type: 'call_quality_result', request_id: msg.request_id, peer_id: msg.peer_id, result })).catch(error => errors.push(error.message));
         return;
@@ -145,6 +147,17 @@ async function setup(uid) {
         for (const target of [1, 2]) {
           send(target, { type: 'call_accepted', conversation_id: 1, user_id: target === 1 ? 2 : 1, profile: people[target === 1 ? 1 : 0] });
           send(target, { type: 'call_state', conversation_id: 1, users: roster() });
+        }
+      }
+      if (msg.type === 'call_join') {
+        const wasMember = members.has(uid);
+        members.add(uid);
+        const joinedRoster = roster().filter(user => members.has(user.user_id));
+        for (const target of members) {
+          if (!wasMember && target !== uid) {
+            send(target, { type: 'call_peer_joined', conversation_id: 1, user_id: uid, profile: people[uid - 1] });
+          }
+          send(target, { type: 'call_state', conversation_id: 1, users: joinedRoster });
         }
       }
       if (msg.type === 'call_state' && msg.patch) {
@@ -399,6 +412,19 @@ try {
   await a.waitForFunction(() => window.__pcs.at(-1)._videoSender.track === null);
   assert.equal(await a.evaluate(() => window.__screens.every(s => s.stream.getTracks().every(t => t.readyState === 'ended'))), true);
   assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track === window.__beforeShareAudio && window.__beforeShareAudio.readyState === 'live'), true, 'stopping a share restores the microphone sender');
+
+  // Regression: joining an already-active call is not the same protocol as
+  // accepting a ringing call. Leaving while the other participant stays should
+  // expose Join Call, send call_join, and build a fresh peer session.
+  const joinsBefore = clientMessages.filter(item => item.uid === 1 && item.msg.type === 'call_join').length;
+  const acceptsBefore = clientMessages.filter(item => item.uid === 1 && item.msg.type === 'call_accept').length;
+  await a.locator('.call-overlay').getByRole('button', { name: 'Leave', exact: true }).click();
+  await a.getByRole('button', { name: 'Join Call', exact: true }).waitFor();
+  await a.getByRole('button', { name: 'Join Call', exact: true }).click();
+  await a.waitForFunction(() => window.__pcs.at(-1)?.connectionState === 'connected', null, { timeout: 15000 });
+  await b.waitForFunction(() => window.__pcs.at(-1)?.connectionState === 'connected', null, { timeout: 15000 });
+  assert.equal(clientMessages.filter(item => item.uid === 1 && item.msg.type === 'call_join').length, joinsBefore + 1, 'existing call uses call_join');
+  assert.equal(clientMessages.filter(item => item.uid === 1 && item.msg.type === 'call_accept').length, acceptsBefore, 'existing call never sends call_accept');
 
   await a.locator('.toast-close').click({ timeout: 1000 }).catch(() => {});
   await mkdir('test-results', { recursive: true });

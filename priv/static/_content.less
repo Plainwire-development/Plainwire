@@ -502,15 +502,25 @@
   display: inline;
   padding: 1px 5px 2px;
   border-radius: 6px;
-  background: color-mix(in srgb, var(--accent), transparent 86%);
+  border: 0;
+  background: var(--pw-mention-bg, color-mix(in srgb, var(--accent), transparent 86%));
   color: var(--accent);
+  font: inherit;
   font-weight: 650;
+  line-height: inherit;
+  vertical-align: baseline;
   white-space: nowrap;
+  cursor: pointer;
 }
+.mention:hover, .mention:focus-visible {
+  background: var(--pw-mention-self-bg, color-mix(in srgb, var(--accent), transparent 76%));
+  color: var(--text1);
+}
+.mention-unresolved { opacity: .68; text-decoration: line-through; text-decoration-thickness: 1px; }
 .mention-self {
-  background: color-mix(in srgb, var(--accent), transparent 76%);
+  background: var(--pw-mention-self-bg, color-mix(in srgb, var(--accent), transparent 76%));
   color: var(--accent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent), transparent 55%);
+  box-shadow: inset 0 0 0 1px var(--pw-mention-ring, color-mix(in srgb, var(--accent), transparent 55%));
 }
 .mention-chip {
   margin-left: 6px;

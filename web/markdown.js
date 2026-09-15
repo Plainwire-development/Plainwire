@@ -35,6 +35,37 @@ md.renderer.rules.fence = (tokens, idx) => {
   return `<div class="code-block"><div class="code-heading"><span>${escape(lang || 'text')}</span><button type="button" class="code-copy" aria-label="Copy code">Copy</button></div><pre tabindex="0" aria-label="Code block"><code data-language="${escape(lang)}">${escape(token.content)}</code></pre></div>`;
 };
 
+// Familiar chat shortcodes. Transform text tokens instead of raw source so
+// code spans/blocks and URLs keep their literal contents.
+const emojiShortcodes = Object.freeze({
+  eyes: '👀', smile: '😄', grin: '😁', joy: '😂', laugh: '😂', rofl: '🤣',
+  wink: '😉', blush: '😊', heart_eyes: '😍', thinking: '🤔', neutral_face: '😐',
+  sweat_smile: '😅', sob: '😭', cry: '😢', angry: '😠', rage: '😡',
+  scream: '😱', skull: '💀', pleading_face: '🥺', melting_face: '🫠',
+  sunglasses: '😎', clown: '🤡', poop: '💩', fire: '🔥', sparkles: '✨',
+  tada: '🎉', heart: '❤️', broken_heart: '💔', blue_heart: '💙', purple_heart: '💜',
+  green_heart: '💚', yellow_heart: '💛', orange_heart: '🧡', white_heart: '🤍',
+  black_heart: '🖤', thumbsup: '👍', '+1': '👍', thumbsdown: '👎', '-1': '👎',
+  clap: '👏', pray: '🙏', wave: '👋', ok_hand: '👌', muscle: '💪',
+  point_up: '☝️', raised_hands: '🙌', handshake: '🤝', check: '✅', x: '❌',
+  warning: '⚠️', question: '❓', exclamation: '❗', star: '⭐', rocket: '🚀',
+  bug: '🐛', gear: '⚙️', lock: '🔒', unlock: '🔓', pin: '📌', bell: '🔔',
+  mute: '🔇', speaker: '🔊', microphone: '🎙️', camera: '📷', phone: '📞'
+});
+const emojiShortcodePattern = /:([a-z0-9_+\-]+):/gi;
+md.core.ruler.after('inline', 'plainwire_emoji_shortcodes', (state) => {
+  for (const token of state.tokens) {
+    if (token.type !== 'inline' || !token.children) continue;
+    let linkDepth = 0;
+    for (const child of token.children) {
+      if (child.type === 'link_open') { linkDepth += 1; continue; }
+      if (child.type === 'link_close') { linkDepth = Math.max(0, linkDepth - 1); continue; }
+      if (child.type !== 'text' || linkDepth) continue;
+      child.content = child.content.replace(emojiShortcodePattern, (full, name) => emojiShortcodes[name.toLowerCase()] || full);
+    }
+  }
+});
+
 let highlighter;
 function loadHighlighter() {
   if (!highlighter) highlighter = new Promise((resolve, reject) => {
@@ -341,10 +372,14 @@ function enhanceMentions(root) {
     let last = 0, match;
     while ((match = re.exec(value))) {
       parts.push(document.createTextNode(value.slice(last, match.index + match[1].length)));
-      const span = document.createElement('span');
-      span.className = 'mention' + (me && match[2].toLowerCase() === me ? ' mention-self' : '');
-      span.textContent = '@' + match[2];
-      parts.push(span);
+      const mention = document.createElement('button');
+      mention.type = 'button';
+      mention.className = 'mention' + (me && match[2].toLowerCase() === me ? ' mention-self' : '');
+      mention.dataset.mentionUsername = match[2];
+      mention.title = `View @${match[2]}'s profile`;
+      mention.setAttribute('aria-label', `View @${match[2]}'s profile`);
+      mention.textContent = '@' + match[2];
+      parts.push(mention);
       last = re.lastIndex;
       wrapped = true;
     }
@@ -355,6 +390,39 @@ function enhanceMentions(root) {
   }
   if (!wrapped) delete root.dataset.mentions;
 }
+
+const mentionProfileCache = new Map();
+const MENTION_PROFILE_TTL_MS = 5 * 60 * 1000;
+async function openMentionProfile(username, element) {
+  const normalized = String(username || '').trim().toLowerCase();
+  if (!normalized) return;
+  const cached = mentionProfileCache.get(normalized);
+  let userId = cached && Date.now() - cached.at < MENTION_PROFILE_TTL_MS ? cached.userId : undefined;
+  if (userId === undefined) {
+    try {
+      const response = await fetch(`/api/profile-by-username?username=${encodeURIComponent(normalized)}`, {
+        method: 'GET', credentials: 'same-origin', headers: { Accept: 'application/json' }
+      });
+      const payload = await response.json().catch(() => null);
+      userId = response.ok && payload?.ok ? Number(payload.data?.user?.id || 0) : 0;
+    } catch { userId = 0; }
+    mentionProfileCache.set(normalized, { userId, at: Date.now() });
+  }
+  if (userId > 0) {
+    location.hash = `#profile/${userId}`;
+  } else if (element?.isConnected) {
+    element.classList.add('mention-unresolved');
+    element.title = `@${username} could not be found`;
+  }
+}
+
+document.addEventListener('click', (event) => {
+  const mention = event.target.closest?.('.mention[data-mention-username]');
+  if (!mention) return;
+  event.preventDefault();
+  event.stopPropagation();
+  openMentionProfile(mention.dataset.mentionUsername, mention);
+});
 
 class PlainwireMarkdown extends HTMLElement {
   static observedAttributes = ['source', 'compact', 'data-me'];

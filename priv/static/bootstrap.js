@@ -1,6 +1,13 @@
 (() => {
   'use strict';
 
+  const bootVersion = (() => {
+    try {
+      const value = new URL(document.currentScript?.src || location.href, location.href).searchParams.get('v');
+      return value && /^\d+\.\d+\.\d+(?:-\d+)?$/.test(value) ? value : 'dev';
+    } catch (_) { return 'dev'; }
+  })();
+
   const fallback = {
     app_name: 'Plainwire',
     default_theme: 'system',
@@ -12,8 +19,8 @@
     idle_timeout_ms: 10 * 60 * 1000,
     compress_oversize_uploads: true,
     max_image_dimension: 4096,
-    version: '1.7.3',
-    asset_version: '1.7.3'
+    version: bootVersion,
+    asset_version: bootVersion
   };
 
   const normalize = (raw) => {
@@ -28,6 +35,7 @@
     window.PLAINWIRE_CLIENT_CONFIG = config;
     document.title = config.app_name;
     const root = document.documentElement;
+    root.dataset.plainwireVersion = String(config.version || bootVersion);
     if (config.default_theme === 'system') root.removeAttribute('data-theme');
     else root.setAttribute('data-theme', config.default_theme);
     const themeMeta = document.querySelector('meta[name="theme-color"]');
@@ -40,7 +48,7 @@
   };
 
   const assetUrl = (path, config) => {
-    const version = encodeURIComponent(String(config.asset_version || config.version || '1.7.3'));
+    const version = encodeURIComponent(String(config.asset_version || config.version || bootVersion));
     return `${path}?v=${version}`;
   };
 

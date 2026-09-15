@@ -123,9 +123,9 @@ handle_msg(#{<<"type">> := <<"voice_join">>, <<"channel_id">> := Cid0}, State=#{
             S1 = maybe_leave_rtc(State),
             case pw_hub:voice_join(Cid, Uid, self(), maps:get(user,Session)) of
                 ok -> {ok, S1#{voice=>Cid, call=>undefined}};
-                {error, Reason} -> reply_error(S1, Reason)
+                {error, Reason} -> reply_rtc_error(S1, Reason, voice, Cid)
             end;
-        false -> reply_error(State, forbidden)
+        false -> reply_rtc_error(State, forbidden, voice, Cid)
     end;
 handle_msg(#{<<"type">> := <<"voice_leave">>}, State) -> S1 = maybe_leave_voice(State), {ok, S1#{voice=>undefined}};
 handle_msg(#{<<"type">> := <<"voice_state">>, <<"patch">> := Patch}, State=#{uid:=Uid, session:=Session, voice:=Cid}) when is_integer(Cid), is_map(Patch) ->
@@ -141,16 +141,16 @@ handle_msg(#{<<"type">> := <<"call_ring">>, <<"conversation_id">> := Cid0}, Stat
         {ok, Targets0} ->
             case lists:filter(fun(T) -> T =/= Uid end, Targets0) of
                 [] ->
-                    reply_error(State, no_peers);
+                    reply_rtc_error(State, no_peers, call, Cid);
                 Targets ->
                     S1 = maybe_leave_rtc(State),
                     pw_hub:call_ring(Cid, Uid, self(), maps:get(user, Session), Targets),
                     {ok, S1#{voice => undefined, call => Cid}}
             end;
         false ->
-            reply_error(State, forbidden);
+            reply_rtc_error(State, forbidden, call, Cid);
         {error, _} ->
-            reply_error(State, forbidden)
+            reply_rtc_error(State, forbidden, call, Cid)
     end;
 handle_msg(#{<<"type">> := <<"call_accept">>, <<"conversation_id">> := Cid0}, State=#{uid:=Uid, session:=Session}) ->
     Cid = pw_util:int(Cid0),
@@ -159,10 +159,10 @@ handle_msg(#{<<"type">> := <<"call_accept">>, <<"conversation_id">> := Cid0}, St
             S1 = maybe_leave_rtc(State),
             case pw_hub:call_accept(Cid, Uid, self(), maps:get(user, Session), Targets) of
                 ok -> {ok, S1#{voice => undefined, call => Cid}};
-                {error, Reason} -> reply_error(S1, Reason)
+                {error, Reason} -> reply_rtc_error(S1, Reason, call, Cid)
             end;
         _ ->
-            reply_error(State, forbidden)
+            reply_rtc_error(State, forbidden, call, Cid)
     end;
 handle_msg(#{<<"type">> := <<"call_decline">>, <<"conversation_id">> := Cid0}, State=#{uid:=Uid}) ->
     Cid = pw_util:int(Cid0),
@@ -181,11 +181,11 @@ handle_msg(#{<<"type">> := <<"call_join">>, <<"conversation_id">> := Cid0}, Stat
     case pw_db:conversation_peer_ids(Uid, Cid) of
         {ok, Targets} ->
             S1 = maybe_leave_rtc(State),
-            case pw_hub:call_join(Cid, Uid, self(), maps:get(user,Session), Targets) of
+            case pw_hub:call_rejoin(Cid, Uid, self(), maps:get(user,Session), Targets) of
                 ok -> {ok, S1#{voice=>undefined, call=>Cid}};
-                {error, Reason} -> reply_error(S1, Reason)
+                {error, Reason} -> reply_rtc_error(S1, Reason, call, Cid)
             end;
-        _ -> reply_error(State, forbidden)
+        _ -> reply_rtc_error(State, forbidden, call, Cid)
     end;
 handle_msg(#{<<"type">> := <<"call_leave">>}, State) -> S1 = maybe_leave_call(State), {ok, S1#{call=>undefined}};
 handle_msg(#{<<"type">> := <<"call_state">>, <<"patch">> := Patch}, State=#{uid:=Uid, session:=Session, call:=Cid}) when is_integer(Cid), is_map(Patch) ->
@@ -414,6 +414,8 @@ safe_json_decode(Data) ->
     try jsx:decode(Data, [return_maps]) catch _:_ -> error end.
 
 reply_error(State, E) -> {reply, {text, pw_util:json(#{type=>error,error=>E})}, State}.
+reply_rtc_error(State, E, Kind, Id) ->
+    {reply, {text, pw_util:json(#{type => error, error => E, rtc_kind => Kind, rtc_id => Id})}, State}.
 maybe_leave_voice(State=#{uid:=Uid, voice:=Cid}) when is_integer(Cid) -> pw_hub:voice_leave(Cid, Uid, self()), State;
 maybe_leave_voice(State) -> State.
 maybe_leave_call(State=#{uid:=Uid, call:=Cid}) when is_integer(Cid) -> pw_hub:call_leave(Cid, Uid, self()), State;

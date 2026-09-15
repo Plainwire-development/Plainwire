@@ -16,9 +16,10 @@
     const n = Number(value);
     return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
   };
+  const bootVersion = document.documentElement.dataset.plainwireVersion || 'dev';
   const clientConfig = Object.freeze({
-    version: typeof rawClientConfig.version === 'string' ? rawClientConfig.version.slice(0, 32) : '1.6.1',
-    assetVersion: typeof rawClientConfig.asset_version === 'string' ? rawClientConfig.asset_version.slice(0, 64) : '1.6.1',
+    version: typeof rawClientConfig.version === 'string' ? rawClientConfig.version.slice(0, 32) : bootVersion,
+    assetVersion: typeof rawClientConfig.asset_version === 'string' ? rawClientConfig.asset_version.slice(0, 64) : bootVersion,
     appName: typeof rawClientConfig.app_name === 'string' && rawClientConfig.app_name.trim()
       ? rawClientConfig.app_name.trim().slice(0, 48) : 'Plainwire',
     defaultTheme: ['light', 'dark', 'system'].includes(rawClientConfig.default_theme)
@@ -64,8 +65,14 @@
   let callHealth = null;
   const RTC_RESUME_KEY = 'plainwire_rtc_room';
   const RTC_RESUME_MAX_AGE_MS = 60000;
+  const RTC_RESUME_HEARTBEAT_MS = 5000;
+  const RTC_OWNER_KEY = 'plainwire_rtc_owner_v1';
+  const RTC_OWNER_STALE_MS = 12000;
+  const rtcTabId = globalThis.crypto?.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  let rtcPersistenceTimer = null;
   let resumeAttempted = false;
   let resumeInFlight = false;
+  let pendingRtcAction = null;
   let speakerOn = true;
   let micMuted = false;
   let deafened = false;
@@ -138,6 +145,7 @@
   const peers = new Map();
   let screenStream = null;
   let screenAudioMixer = null;
+  let screenAudioSource = 'none';
   let screenSenders = new Map(); // uid -> RTCRtpSender for video
   const displayMediaSupported = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
   const peerPromises = new Map();
@@ -210,6 +218,46 @@
     };
     try { sessionStorage.setItem(RTC_RESUME_KEY, JSON.stringify(resumeIntent)); } catch (_) {}
   };
+  const readRtcOwner = () => {
+    try {
+      const value = JSON.parse(storage.getItem(RTC_OWNER_KEY) || 'null');
+      const id = Number(value?.id || 0);
+      const validKind = value?.kind === 'call' || value?.kind === 'voice';
+      const fresh = Number.isFinite(value?.at) && Date.now() - value.at <= RTC_OWNER_STALE_MS;
+      if (!value?.tab || !validKind || !Number.isInteger(id) || id <= 0 || !fresh) {
+        if (value?.tab === rtcTabId || !fresh) storage.removeItem(RTC_OWNER_KEY);
+        return null;
+      }
+      return { tab: value.tab, kind: value.kind, id, at: value.at };
+    } catch (_) { return null; }
+  };
+  const publishRtcOwner = () => {
+    if (!room?.joined) return;
+    storage.setItem(RTC_OWNER_KEY, JSON.stringify({ tab: rtcTabId, kind: room.kind, id: room.id, at: Date.now() }));
+  };
+  const clearRtcOwner = () => {
+    const owner = readRtcOwner();
+    if (!owner || owner.tab === rtcTabId) storage.removeItem(RTC_OWNER_KEY);
+  };
+  const startRtcPersistence = () => {
+    persistRtcIntent();
+    publishRtcOwner();
+    if (!rtcPersistenceTimer) {
+      rtcPersistenceTimer = setInterval(() => {
+        if (!room?.joined) return;
+        persistRtcIntent();
+        publishRtcOwner();
+      }, RTC_RESUME_HEARTBEAT_MS);
+    }
+  };
+  const stopRtcPersistence = () => {
+    clearInterval(rtcPersistenceTimer);
+    rtcPersistenceTimer = null;
+    clearRtcOwner();
+  };
+  const rtcAction = (action, kind, id, epoch) => {
+    pendingRtcAction = { action, kind, id: Number(id), epoch };
+  };
   const redact = (value) => {
     if (!value || typeof value !== 'object') return value;
     const copy = Array.isArray(value) ? [] : {};
@@ -236,6 +284,9 @@
       room: room ? { ...room } : null,
       user_id: meId,
       voice_state: { muted: micMuted, deafened, muted_before_deafen: mutedBeforeDeafen },
+      rtc_owner: readRtcOwner(),
+      pending_rtc_action: pendingRtcAction ? { ...pendingRtcAction } : null,
+      screen_share: { active: !!screenStream, audio_source: screenAudioSource, audio_mixed: screenAudioMixer?.track?.readyState === 'live' },
       local_tracks: localStream ? localStream.getTracks().map((t) => ({ kind: t.kind, enabled: t.enabled, muted: t.muted, readyState: t.readyState })) : [],
       peers: Array.from(peers, ([user_id, pc]) => ({
         user_id, connection: pc.connectionState, ice: pc.iceConnectionState,
@@ -936,7 +987,7 @@
 
   let messageDomFrame = 0;
   const changedMessageRoots = new Set();
-  let timersChanged = false, invitesChanged = false, composerChanged = false;
+  let timersChanged = false, invitesChanged = false, composerChanged = false, editorChanged = false, contextMenuChanged = false;
   const messageDomObserver = new MutationObserver((records) => {
     const contains = (node, selector) => node.matches?.(selector) || node.querySelector?.(selector);
     for (const record of records) {
@@ -945,10 +996,12 @@
         if (contains(node, '.pw-live-call-timer')) timersChanged = true;
         if (contains(node, '.invite-manager')) invitesChanged = true;
         if (contains(node, '#compose')) composerChanged = true;
+        if (node.isConnected && contains(node, '.message-edit-input')) editorChanged = true;
+        if (node.isConnected && contains(node, '.ctx-menu')) contextMenuChanged = true;
         if (node.isConnected && contains(node, '#messages, .msg-body, .pw-media-player, .message-link')) changedMessageRoots.add(node.closest('.msg-body') || node);
       }
     }
-    if (messageDomFrame || (!changedMessageRoots.size && !timersChanged && !invitesChanged && !composerChanged)) return;
+    if (messageDomFrame || (!changedMessageRoots.size && !timersChanged && !invitesChanged && !composerChanged && !editorChanged && !contextMenuChanged)) return;
     messageDomFrame = requestAnimationFrame(() => {
       messageDomFrame = 0;
       const list = trackMessageScroll();
@@ -979,7 +1032,36 @@
       if (timersChanged) updateCallTimers();
       if (invitesChanged) mountInviteManagers();
       if (composerChanged) resizeComposer(document.getElementById('compose'));
-      timersChanged = invitesChanged = composerChanged = false;
+      if (editorChanged) {
+        const editor = document.querySelector('.message-edit-input');
+        if (editor && editor.offsetParent !== null && document.activeElement !== editor) {
+          editor.focus({ preventScroll: true });
+          const end = editor.value.length;
+          editor.setSelectionRange?.(end, end);
+        }
+      }
+      if (contextMenuChanged) {
+        const menu = document.querySelector('.ctx-menu');
+        if (menu) {
+          const view = window.visualViewport;
+          const viewportLeft = view?.offsetLeft || 0;
+          const viewportTop = view?.offsetTop || 0;
+          const viewportWidth = view?.width || window.innerWidth;
+          const viewportHeight = view?.height || window.innerHeight;
+          const requestedX = Number(menu.dataset.contextX || 0);
+          const requestedY = Number(menu.dataset.contextY || 0);
+          const rect = menu.getBoundingClientRect();
+          const pad = 8;
+          const left = Math.max(viewportLeft + pad, Math.min(requestedX, viewportLeft + viewportWidth - rect.width - pad));
+          const top = Math.max(viewportTop + pad, Math.min(requestedY, viewportTop + viewportHeight - rect.height - pad));
+          menu.style.left = `${Math.round(left)}px`;
+          menu.style.top = `${Math.round(top)}px`;
+          menu.style.maxHeight = `${Math.max(80, Math.floor(viewportHeight - pad * 2))}px`;
+          menu.style.overflowY = 'auto';
+          menu.querySelector('.ctx-item')?.focus({ preventScroll: true });
+        }
+      }
+      timersChanged = invitesChanged = composerChanged = editorChanged = contextMenuChanged = false;
     });
   });
   messageDomObserver.observe(document.body, { childList: true, subtree: true });
@@ -1239,7 +1321,10 @@
     if (event.key === 'Escape' && document.querySelector('.compose-format-help[open]')) {
       event.preventDefault(); event.stopImmediatePropagation(); closeFormatting(true);
     } else if (event.target === activeComposer() && (event.ctrlKey || event.metaKey) && !event.altKey) {
-      const kind = { b: 'bold', i: 'italic', e: 'code' }[event.key.toLowerCase()];
+      // Ctrl/Cmd+E belongs to the chat-wide emoji picker, matching Discord.
+      // Keep inline code on the formatting panel so audio/emoji shortcuts never
+      // have a second meaning while the composer is focused.
+      const kind = { b: 'bold', i: 'italic' }[event.key.toLowerCase()];
       if (kind) { event.preventDefault(); event.stopPropagation(); applyFormatting(kind); }
     }
   }, true);
@@ -1252,19 +1337,22 @@
   window.visualViewport?.addEventListener('resize', scheduleFormatting, { passive: true });
   window.visualViewport?.addEventListener('scroll', scheduleFormatting, { passive: true });
 
-  const appendToComposer = (text) => {
+  const insertIntoComposer = (text, { block = false } = {}) => {
     const composer = activeComposer();
-    if (!composer) return;
+    if (!composer) return false;
     const start = composer.selectionStart ?? composer.value.length;
     const end = composer.selectionEnd ?? start;
     const before = composer.value.slice(0, start);
     const after = composer.value.slice(end);
-    const leading = before && !before.endsWith('\n') ? '\n' : '';
-    const trailing = after.startsWith('\n') ? '' : '\n';
+    const leading = block && before && !before.endsWith('\n') ? '\n' : '';
+    const trailing = block && !after.startsWith('\n') ? '\n' : '';
     composer.setRangeText(leading + text + trailing, start, end, 'end');
     composer.dispatchEvent(new Event('input', { bubbles: true }));
     composer.focus({ preventScroll: true });
+    return true;
   };
+
+  const appendToComposer = (text) => insertIntoComposer(text, { block: true });
 
   const humanBytes = (bytes) => {
     const n = Number(bytes || 0);
@@ -1495,11 +1583,12 @@
       wsQueue = [];
       debug('WS', 'connected', { queued: queued.length, room });
       send(app.ports.bridgeReceive, { tag: 'ws_status', data: true });
-      queued.forEach((value) => sendWs(value));
       publishPresence(true);
       if (room && room.joined && localStream) {
-        // The server told everyone we left when the old socket dropped, so they
-        // have closed their side. Start clean instead of keeping half a connection.
+        // The server detached the old socket and peers closed their old transport.
+        // Rejoin first, then replay only durable queued work. Old ICE/signaling and
+        // state patches belong to the dead socket session and must never race ahead
+        // of the new room seat.
         room.epoch = ++roomEpoch;
         room.stateSynced = false;
         peers.forEach((_, uid) => closePeer(uid));
@@ -1508,7 +1597,12 @@
         const join = room.kind === 'voice'
           ? { type: 'voice_join', channel_id: room.id }
           : { type: 'call_join', conversation_id: room.id };
+        rtcAction('reconnect', room.kind, room.id, room.epoch);
         sendWs(join);
+        const staleRtcTypes = new Set(['voice_signal', 'call_signal', 'voice_state', 'call_state', 'voice_activity', 'call_quality']);
+        queued.filter((value) => !staleRtcTypes.has(value?.type)).forEach((value) => sendWs(value));
+      } else {
+        queued.forEach((value) => sendWs(value));
       }
       if (wsPingTimer) clearInterval(wsPingTimer);
       wsPingTimer = setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) sendWs({ type: 'ping' }); }, 60000);
@@ -1520,8 +1614,8 @@
         if (msg.session && msg.session.user && msg.session.user.id) meId = msg.session.user.id;
         if (msg.type === 'hello') maybeResumeRtcRoom();
         handlePresenceEvent(msg);
-        handleRtcEvent(msg);
-        send(app.ports.wsReceive, msg);
+        const rtcConsumed = handleRtcEvent(msg) === true;
+        if (!rtcConsumed) send(app.ports.wsReceive, msg);
       } catch (error) { debug('WS', 'invalid_message', { error: error.message, bytes: String(event.data).length }, 'error'); }
     };
     ws.onerror = () => debug('WS', 'transport_error', { ready_state: ws?.readyState }, 'error');
@@ -1642,6 +1736,33 @@
     mixer?.track?.readyState === 'live'
       ? mixer.track
       : microphoneStream?.getAudioTracks().find((track) => track.readyState === 'live') || null;
+  const SYSTEM_AUDIO_DEVICE_RE = /(?:monitor of|output monitor|monitor source|stereo mix|what (?:u|you) hear|loopback|desktop audio|system audio)/i;
+  const captureSystemAudioFallback = async () => {
+    if (!shareScreenAudio || !navigator.mediaDevices?.enumerateDevices || !navigator.mediaDevices?.getUserMedia) return null;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const device = devices.find((item) =>
+      item.kind === 'audioinput' &&
+      item.deviceId &&
+      item.deviceId !== selectedInputId &&
+      SYSTEM_AUDIO_DEVICE_RE.test(item.label || '')
+    );
+    if (!device) return null;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: false,
+      audio: {
+        deviceId: { exact: device.deviceId },
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: { ideal: 2 },
+        sampleRate: { ideal: 48000 }
+      }
+    });
+    const track = stream.getAudioTracks().find((item) => item.readyState === 'live');
+    if (!track) { stopStream(stream); return null; }
+    try { track.contentHint = 'music'; } catch (_) {}
+    return { stream, track, label: device.label || 'system audio monitor' };
+  };
   const openRawMicrophone = async (mode = voiceProcessingMode) => {
     try {
       return await navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints(mode), video: false });
@@ -2565,11 +2686,15 @@
         if (change) change.disabled = !active;
         if (preview) preview.disabled = !active;
         if (status) {
-          const hasAudio = active && screenStream.getAudioTracks().some((track) => track.readyState === 'live');
+          const hasAudio = active && screenAudioSource !== 'none' && screenAudioMixer?.track?.readyState === 'live';
           status.textContent = active
             ? hasAudio
-              ? 'Shared audio is included with your microphone.'
-              : 'This source has no shared audio. In the browser chooser, select a tab or screen and enable audio when offered.'
+              ? screenAudioSource === 'loopback'
+                ? 'System audio is included through your system monitor/loopback input. This source can include call playback too; headphones help prevent echo.'
+                : 'Shared audio is included with your microphone.'
+              : shareScreenAudio
+                ? 'Video is sharing, but this browser/source did not expose shared audio. Try a tab with Share audio enabled or a system monitor/loopback input.'
+                : 'Shared audio is off. Your microphone is still sent normally.'
             : 'When available, tab or system audio is mixed with your microphone without changing the call connection.';
           status.classList.toggle('active', hasAudio);
         }
@@ -2685,19 +2810,40 @@
     if (!room || room.epoch !== epoch || screenStream !== previous) { stopStream(captured); return; }
     const videoTrack = captured.getVideoTracks()[0];
     if (!videoTrack) { stopStream(captured); return; }
+    let capturedAudioSource = captured.getAudioTracks().some((track) => track.readyState === 'live') ? 'display' : 'none';
+    let loopbackCapture = null;
+    if (shareScreenAudio && capturedAudioSource === 'none') {
+      try {
+        loopbackCapture = await captureSystemAudioFallback();
+        if (loopbackCapture) {
+          captured.addTrack(loopbackCapture.track);
+          capturedAudioSource = 'loopback';
+          debug('MEDIA', 'screen_audio_loopback_selected', { label: loopbackCapture.label });
+        }
+      } catch (error) {
+        stopStream(loopbackCapture?.stream);
+        debug('MEDIA', 'screen_audio_loopback_failed', { name: error.name, error: error.message }, 'warn');
+      }
+    }
+    // The user may leave while a loopback permission prompt is open too.
+    if (!room || room.epoch !== epoch || screenStream !== previous) { stopStream(captured); stopStream(loopbackCapture?.stream); return; }
     const previousMixer = screenAudioMixer;
+    const previousAudioSource = screenAudioSource;
     let capturedMixer = null;
     try {
       capturedMixer = createScreenAudioMixer(captured);
     } catch (error) {
       captured.getAudioTracks().forEach((track) => track.stop());
+      capturedAudioSource = 'none';
       debug('MEDIA', 'screen_audio_mix_failed', { error: error.message }, 'warn');
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'The screen is sharing, but its audio could not be mixed.' });
     }
+    if (!capturedMixer) capturedAudioSource = 'none';
     const previousAudioTrack = outgoingAudioTrack(localStream, previousMixer);
     const capturedAudioTrack = outgoingAudioTrack(localStream, capturedMixer);
     screenStream = captured;
     screenAudioMixer = capturedMixer;
+    screenAudioSource = capturedAudioSource;
     videoTrack.contentHint = screenProfiles[screenProfile].hint;
     videoTrack.onended = () => { if (screenStream === captured) stopScreenShare(); };
     const targets = Array.from(peers.entries()).filter(([, pc]) => pc._videoSender && pc.signalingState !== 'closed');
@@ -2721,6 +2867,7 @@
     if (results.some((result, i) => result.status === 'rejected' && targets[i][1].signalingState !== 'closed')) {
       screenStream = previous;
       screenAudioMixer = previousMixer;
+      screenAudioSource = previousAudioSource;
       await Promise.allSettled(targets.map(([, pc]) => Promise.all([
         pc._videoSender.replaceTrack(previous?.getVideoTracks()[0] || null),
         pc._audioSender ? pc._audioSender.replaceTrack(previousAudioTrack) : Promise.resolve()
@@ -2734,12 +2881,27 @@
     }
     disposeScreenAudioMixer(previousMixer);
     if (previous) stopStream(previous);
-    const hasScreenAudio = !!capturedMixer;
+    const hasScreenAudio = !!capturedMixer && capturedAudioSource !== 'none';
     sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen: true, screen_audio: hasScreenAudio } });
     send(app.ports.bridgeReceive, { tag: 'screen_share_started', user_id: meId });
     showLocalScreenPreview(captured);
     updateScreenControls();
-    debug('MEDIA', 'screen_share_started', { tracks: captured.getTracks().length, shared_audio: hasScreenAudio });
+    if (shareScreenAudio && !hasScreenAudio) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen video is live, but this browser did not provide system audio. Choose a source with Share audio enabled or expose a monitor/loopback input.' });
+    } else if (capturedAudioSource === 'loopback') {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Browser capture had no audio, so Plainwire is using your system monitor/loopback input. Headphones are recommended because loopback can include call playback.' });
+    }
+    const sharedInputTrack = capturedMixer?.screenTrack;
+    sharedInputTrack?.addEventListener?.('ended', () => {
+      if (screenStream !== captured || screenAudioMixer !== capturedMixer || screenAudioSource === 'none') return;
+      screenAudioSource = 'none';
+      updateScreenControls();
+      if (room && ws?.readyState === WebSocket.OPEN) {
+        sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen_audio: false } });
+      }
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Shared system audio stopped; screen video and microphone are still live.' });
+    });
+    debug('MEDIA', 'screen_share_started', { tracks: captured.getTracks().length, shared_audio: hasScreenAudio, audio_source: capturedAudioSource });
   };
 
   const stopScreenShare = () => {
@@ -2748,6 +2910,7 @@
     const stoppedMixer = screenAudioMixer;
     screenStream = null;
     screenAudioMixer = null;
+    screenAudioSource = 'none';
     disposeScreenAudioMixer(stoppedMixer);
     stoppedStream.getTracks().forEach((t) => t.stop());
     updateScreenControls();
@@ -2931,11 +3094,46 @@
     return !!eventRoom && roomMatches(eventRoom.kind, eventRoom.id);
   };
 
+  const rtcJoinErrorCopy = (error, action, kind) => {
+    const voice = kind === 'voice';
+    switch (error) {
+      case 'no_active_call': return action === 'accept' ? 'That incoming call has already ended.' : 'That call has ended.';
+      case 'room_full': return voice ? 'That voice channel is full.' : 'That call is full.';
+      case 'forbidden': return voice ? 'You no longer have access to that voice channel.' : 'You no longer have access to that call.';
+      case 'unavailable': return voice ? 'Voice service is temporarily unavailable. Try again.' : 'Call service is temporarily unavailable. Try again.';
+      case 'no_peers': return 'There is nobody else in this conversation to call.';
+      default: return voice ? 'Could not join voice. Please try again.' : 'Could not join the call. Please try again.';
+    }
+  };
+  const failPendingRtcAction = (msg) => {
+    if (msg.type !== 'error' || !pendingRtcAction || !room || pendingRtcAction.epoch !== room.epoch) return false;
+    if (!['no_active_call', 'room_full', 'forbidden', 'unavailable', 'no_peers'].includes(msg.error)) return false;
+    const errorKind = typeof msg.rtc_kind === 'string' ? msg.rtc_kind : '';
+    const errorId = Number(msg.rtc_id || 0);
+    if (errorKind !== pendingRtcAction.kind || errorId !== pendingRtcAction.id) {
+      debug('RTC', 'unrelated_error_while_joining', {
+        pending_kind: pendingRtcAction.kind, pending_id: pendingRtcAction.id,
+        error_kind: errorKind || '(unscoped)', error_id: errorId || 0, error: msg.error
+      }, 'warn');
+      return false;
+    }
+    const failed = { ...pendingRtcAction };
+    const copy = rtcJoinErrorCopy(msg.error, failed.action, failed.kind);
+    debug('RTC', 'room_join_rejected', { action: failed.action, kind: failed.kind, id: failed.id, error: msg.error }, 'warn');
+    leaveRtcRoom();
+    stopRingtones();
+    send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: failed.kind });
+    send(app.ports.bridgeReceive, { tag: 'toast', data: copy });
+    return true;
+  };
+
   const leaveRtcRoom = ({ notifyServer = false, preserveResume = false } = {}) => {
     const previous = room ? { ...room } : null;
     debug('RTC', 'room_leaving', { room: previous, peers: peers.size, notify_server: notifyServer, preserve_resume: preserveResume });
     if (preserveResume) persistRtcIntent();
     else clearRtcIntent();
+    stopRtcPersistence();
+    pendingRtcAction = null;
     if (notifyServer && previous) {
       if (previous.kind === 'voice') sendWs({ type: 'voice_leave' });
       else sendWs({ type: previous.joined ? 'call_leave' : 'call_cancel', conversation_id: previous.id });
@@ -2953,6 +3151,7 @@
     }
     disposeScreenAudioMixer(screenAudioMixer);
     screenAudioMixer = null;
+    screenAudioSource = 'none';
     screenSenders.clear();
     cleanupAllFloatWindows();
     screenSharers.clear();
@@ -2987,12 +3186,24 @@
     resumeAttempted = true;
     if (!intent) return clearRtcIntent();
     resumeIntent = intent;
+    const owner = readRtcOwner();
+    if (owner && owner.tab !== rtcTabId && owner.kind === intent.kind && owner.id === intent.id) {
+      debug('RTC', 'room_resume_suppressed_other_tab', { intent, owner });
+      send(app.ports.bridgeReceive, {
+        tag: 'toast',
+        data: intent.kind === 'voice'
+          ? 'This voice session is active in another Plainwire tab. Join here if you want to move it to this tab.'
+          : 'This call is active in another Plainwire tab. Use Take over if you want to move it here.'
+      });
+      return;
+    }
     resumeInFlight = true;
     micMuted = intent.muted;
     deafened = intent.deafened;
     mutedBeforeDeafen = intent.mutedBeforeDeafen;
     const epoch = ++roomEpoch;
     room = { kind: intent.kind, id: intent.id, joined: false, epoch };
+    rtcAction('resume', intent.kind, intent.id, epoch);
     send(app.ports.bridgeReceive, {
       tag: 'rtc_resuming', room_kind: intent.kind, room_id: intent.id,
       muted: micMuted, deafened, muted_before_deafen: mutedBeforeDeafen
@@ -3517,7 +3728,8 @@
     callHealth?.start();
     startRtcRefresh();
     resumeInFlight = false;
-    persistRtcIntent();
+    pendingRtcAction = null;
+    startRtcPersistence();
     const epoch = room.epoch;
     debug('RTC', 'room_joined', { kind, id, participant_count: users.length });
     await ensureMedia();
@@ -3583,6 +3795,8 @@
     }
     if (/^(voice|call)_/.test(msg.type || '')) debug('RTC', 'server_event', { message: msg });
     if (['voice_state', 'call_state', 'voice_peer_joined', 'call_peer_joined', 'call_ringing', 'call_incoming'].includes(msg.type)) markActive();
+    if (msg.type === 'call_ringing' && pendingRtcAction?.action === 'start') pendingRtcAction = null;
+    if (failPendingRtcAction(msg)) return true;
     if (msg.type === 'voice_state') {
       if (!roomMatches('voice', msg.channel_id)) return;
       joinRtcRoom('voice', msg.channel_id, msg.users || []).catch(() => {});
@@ -3614,19 +3828,6 @@
     if ((msg.type === 'voice_signal' || msg.type === 'call_signal') && eventMatchesRoom(msg)) handleSignal(msg).catch(() => {});
     if (['call_declined', 'call_cancelled', 'call_missed', 'call_ended'].includes(msg.type) && eventMatchesRoom(msg)) leaveRtcRoom();
     if (msg.type === 'call_accepted') stopRingtones();
-    if (msg.type === 'error' && msg.error === 'no_active_call' && room?.kind === 'call') {
-      debug('RTC', 'call_accept_rejected', { conversation_id: room.id }, 'warn');
-      leaveRtcRoom();
-      stopRingtones();
-      send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'call' });
-      send(app.ports.bridgeReceive, { tag: 'toast', data: 'That call is no longer available.' });
-      return;
-    }
-    if (msg.type === 'error' && resumeInFlight && !['rate_limited', 'too_many_subscriptions'].includes(msg.error)) {
-      debug('RTC', 'room_resume_rejected', { error: msg.error }, 'warn');
-      leaveRtcRoom();
-      send(app.ports.bridgeReceive, { tag: 'toast', data: 'That call could not be rejoined.' });
-    }
     if ((msg.type === 'voice_superseded' || msg.type === 'call_superseded') && eventMatchesRoom(msg)) {
       debug('RTC', 'superseded', { type: msg.type });
       leaveRtcRoom();
@@ -3927,10 +4128,183 @@
       notification.close();
     };
   });
+  // Plainwire owns in-app context menus. Keep the browser/DevTools context menu out of
+  // the application surface so right-click behaves consistently like a desktop client.
+  // This is UX only: browser DevTools remain controlled by the browser itself.
+  document.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+  }, true);
+
+  const shortcutEditableTarget = (target) => Boolean(target?.closest?.('input, textarea, select, [contenteditable="true"]'));
+  const shortcutDialogOpen = () => Boolean(document.querySelector('dialog[open], .modal'));
+  const emitShortcut = (data) => send(app.ports.bridgeReceive, { tag: 'shortcut', data });
+
   document.addEventListener('keydown', (event) => {
-    if (event.key !== 'Escape' || event.isComposing) return;
-    const close = document.querySelector('.modal .modal-head > button');
-    if (close) { event.preventDefault(); close.click(); }
+    if (event.isComposing) return;
+
+    const contextMenu = event.target?.closest?.('.ctx-menu');
+    if (contextMenu) {
+      const items = [...contextMenu.querySelectorAll('.ctx-item:not(:disabled)')];
+      const index = Math.max(0, items.indexOf(document.activeElement));
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        const delta = event.key === 'ArrowDown' ? 1 : -1;
+        items[(index + delta + items.length) % items.length]?.focus({ preventScroll: true });
+        return;
+      }
+      if (event.key === 'Home' || event.key === 'End') {
+        event.preventDefault();
+        items[event.key === 'Home' ? 0 : items.length - 1]?.focus({ preventScroll: true });
+        return;
+      }
+    }
+
+    const editor = event.target?.closest?.('textarea[data-message-editor="true"]');
+    if (editor) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        editor.closest('.message-editor')?.querySelector('[data-edit-cancel="true"]')?.click();
+        return;
+      }
+      if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        event.preventDefault();
+        editor.closest('.message-editor')?.querySelector('[data-edit-save="true"]:not(:disabled)')?.click();
+        return;
+      }
+    }
+
+    if (event.key === 'Escape') {
+      const close = document.querySelector('.modal .modal-head > button');
+      if (close) { event.preventDefault(); close.click(); return; }
+      const contextBackdrop = document.querySelector('.ctx-backdrop');
+      if (contextBackdrop) { event.preventDefault(); contextBackdrop.click(); return; }
+      // With no transient UI open, Escape doubles as Discord's incoming-call
+      // decline shortcut. Elm ignores this when there is no incoming call.
+      emitShortcut('decline_call');
+      return;
+    }
+
+    if (event.repeat) return;
+    const mod = event.ctrlKey || event.metaKey;
+    const editable = shortcutEditableTarget(event.target);
+    const key = event.key.toLowerCase();
+
+    // Discord-style quick edit: Up on an empty active composer edits the most
+    // recent editable message authored by this account. Restrict this to the
+    // actual composer so arrow navigation elsewhere is never stolen.
+    const composer = activeComposer();
+    if (!event.repeat && event.target === composer && event.key === 'ArrowUp'
+        && !mod && !event.altKey && composer.value.trim() === '') {
+      event.preventDefault();
+      emitShortcut('edit_last_message');
+      return;
+    }
+
+    // Ctrl/Cmd+K is intentionally left to <pw-quick-switcher>, which owns its
+    // search field and focus lifecycle. The shortcuts below route through Elm.
+    if (mod && event.shiftKey && key === 'm') {
+      event.preventDefault();
+      emitShortcut('toggle_mute');
+      return;
+    }
+    if (mod && event.shiftKey && key === 'd') {
+      event.preventDefault();
+      emitShortcut('toggle_deafen');
+      return;
+    }
+    if (mod && event.shiftKey && key === 'l') {
+      event.preventDefault();
+      const composer = activeComposer();
+      if (composer) composer.focus({ preventScroll: false });
+      else send(app.ports.bridgeReceive, { tag: 'toast', data: 'Open a conversation or text channel to focus the message box.' });
+      return;
+    }
+    if (mod && event.shiftKey && key === 'u' && (!editable || event.target === composer)) {
+      event.preventDefault();
+      emitShortcut('upload');
+      return;
+    }
+    if (mod && event.shiftKey && key === 'h' && !editable) {
+      event.preventDefault();
+      emitShortcut('help');
+      return;
+    }
+    if (mod && event.shiftKey && key === 'n' && !editable) {
+      event.preventDefault();
+      emitShortcut('new_server');
+      return;
+    }
+    if (mod && event.shiftKey && key === 't' && !editable) {
+      event.preventDefault();
+      emitShortcut('new_group');
+      return;
+    }
+    if (mod && event.altKey && key === 'a' && !editable) {
+      event.preventDefault();
+      emitShortcut('active_audio');
+      return;
+    }
+    if (mod && event.altKey && !editable && !shortcutDialogOpen()
+        && ['ArrowLeft', 'ArrowUp'].includes(event.key)) {
+      event.preventDefault();
+      emitShortcut('prev_server');
+      return;
+    }
+    if (mod && event.altKey && !editable && !shortcutDialogOpen()
+        && ['ArrowRight', 'ArrowDown'].includes(event.key)) {
+      event.preventDefault();
+      emitShortcut('next_server');
+      return;
+    }
+    if (mod && event.key === 'Enter' && !editable && !event.altKey) {
+      event.preventDefault();
+      emitShortcut('answer_call');
+      return;
+    }
+    if (mod && event.key === '[' && !editable && !event.altKey && !event.shiftKey) {
+      event.preventDefault();
+      emitShortcut('start_call');
+      return;
+    }
+    if (mod && key === ',' && !editable) {
+      event.preventDefault();
+      emitShortcut('settings');
+      return;
+    }
+    if (mod && key === 'e' && !event.altKey && (!editable || event.target === composer)) {
+      event.preventDefault();
+      emitShortcut('emoji_picker');
+      return;
+    }
+    if (mod && key === 'i' && !editable && !event.altKey && !event.shiftKey) {
+      event.preventDefault();
+      emitShortcut('notifications');
+      return;
+    }
+    if (mod && key === '/' && !editable) {
+      event.preventDefault();
+      emitShortcut('help');
+      return;
+    }
+    if (mod && key === 'f' && !editable && !shortcutDialogOpen()) {
+      event.preventDefault();
+      emitShortcut('search');
+      return;
+    }
+    if (mod && key === 'b' && !editable && !event.altKey && !event.shiftKey && !shortcutDialogOpen()) {
+      event.preventDefault();
+      emitShortcut('prev_route');
+      return;
+    }
+    if (event.altKey && !mod && !editable && !shortcutDialogOpen() && event.key === 'ArrowUp') {
+      event.preventDefault();
+      emitShortcut('prev_route');
+      return;
+    }
+    if (event.altKey && !mod && !editable && !shortcutDialogOpen() && event.key === 'ArrowDown') {
+      event.preventDefault();
+      emitShortcut('next_route');
+    }
   }, true);
   recv(app.ports.copyText, async (text) => {
     try {
@@ -4337,6 +4711,11 @@
       case 'pick_attachments':
         attachmentInput.click();
         break;
+      case 'insert_composer_text':
+        if (!insertIntoComposer(String(data || ''))) {
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Open a DM or text channel before inserting emoji.' });
+        }
+        break;
       case 'play_ringtone':
         startRingtone('incoming');
         break;
@@ -4387,6 +4766,7 @@
         api({ method: 'POST', path: '/conversations', body: { user_ids: [data], name: '' } }).then((res) => {
           if (res && res.id) {
             const epoch = switchRtcRoom('call', res.id);
+            rtcAction('start', 'call', res.id, epoch);
             ensureMedia()
               .then(() => {
                 if (!room || room.epoch !== epoch) return;
@@ -4405,6 +4785,7 @@
       case 'start_call':
         {
         const epoch = switchRtcRoom('call', data);
+        rtcAction('start', 'call', data, epoch);
         ensureMedia()
           .then(() => {
             if (!room || room.epoch !== epoch) return;
@@ -4422,6 +4803,7 @@
       case 'join_voice':
         {
         const epoch = switchRtcRoom('voice', data);
+        rtcAction('join', 'voice', data, epoch);
         ensureMedia()
           .then(() => { if (room?.epoch === epoch) sendWs({ type: 'voice_join', channel_id: data }); })
           .catch(() => {
@@ -4434,6 +4816,7 @@
       case 'accept_call':
         {
         const epoch = switchRtcRoom('call', data);
+        rtcAction('accept', 'call', data, epoch);
         ensureMedia()
           .then(() => {
             if (!room || room.epoch !== epoch) return;
@@ -4443,6 +4826,22 @@
           .catch(() => {
             if (room?.epoch === epoch) leaveRtcRoom();
             stopRingtones();
+            send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'call' });
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for calls.' });
+          });
+        break;
+        }
+      case 'join_call':
+        {
+        const epoch = switchRtcRoom('call', data);
+        rtcAction('join', 'call', data, epoch);
+        ensureMedia()
+          .then(() => {
+            if (!room || room.epoch !== epoch) return;
+            sendWs({ type: 'call_join', conversation_id: data });
+          })
+          .catch(() => {
+            if (room?.epoch === epoch) leaveRtcRoom();
             send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'call' });
             send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for calls.' });
           });
@@ -4704,6 +5103,26 @@
   loadVoiceProcessingConfig().then(publishAudioDevices);
   window.addEventListener('pagehide', cleanupRtcMedia);
   window.addEventListener('beforeunload', cleanupRtcMedia);
+  window.addEventListener('storage', (event) => {
+    if (event.key !== RTC_OWNER_KEY) return;
+    const owner = readRtcOwner();
+    if (room?.joined && owner && owner.tab !== rtcTabId
+        && owner.kind === room.kind && owner.id === room.id) {
+      // The replacement tab publishes ownership only after the server accepted
+      // its seat. Stop local capture immediately instead of waiting for the
+      // superseded event to travel back over this socket.
+      debug('RTC', 'room_superseded_storage', { room, owner });
+      leaveRtcRoom({ preserveResume: true });
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'This call moved to another Plainwire tab.' });
+      return;
+    }
+    if (!room && resumeIntent && !owner) {
+      // Do not auto-open the microphone in a background duplicate tab. Make the
+      // handoff visible and let the user explicitly rejoin/take over instead.
+      resumeAttempted = false;
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'The other Plainwire call tab closed. You can rejoin from this tab.' });
+    }
+  });
   window.addEventListener('pageshow', () => {
     resumeIntent = readRtcIntent();
     resumeAttempted = false;

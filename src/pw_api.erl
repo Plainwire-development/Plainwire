@@ -169,6 +169,7 @@ authed(<<"POST">>, [<<"thread">>, Id, <<"vote">>], Req0, Session, _) -> with_jso
 authed(<<"POST">>, [<<"thread">>, Id, <<"delete">>], Req, Session, _) -> result(Req, pw_db:delete_thread(uid(Session), Id));
 authed(<<"GET">>, [<<"users">>], Req, _, _) -> result(Req, pw_db:users(qs(Req, <<"q">>)));
 authed(<<"GET">>, [<<"profile">>, Id], Req, Session, _) -> result(Req, pw_db:profile(uid(Session), Id));
+authed(<<"GET">>, [<<"profile-by-username">>], Req, Session, _) -> result(Req, pw_db:profile_by_username(uid(Session), qs(Req, <<"username">>)));
 authed(<<"GET">>, [<<"friends">>], Req, Session, _) -> result(Req, pw_db:friends(uid(Session)));
 authed(<<"POST">>, [<<"friends">>, <<"request">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:friend_request(uid(Session), maps:get(<<"user_id">>,M,undefined))) end);
 authed(<<"POST">>, [<<"friends">>, <<"accept">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:friend_accept(uid(Session), maps:get(<<"user_id">>,M,undefined))) end);
@@ -210,6 +211,10 @@ authed(<<"GET">>, [<<"messages">>], Req, Session, _) -> result(Req, pw_db:messag
 authed(<<"POST">>, [<<"channels">>, Id, <<"messages">>], Req0, Session, _) ->
     with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:post_channel_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
 authed(<<"POST">>, [<<"delete_message">>, MsgId], Req, Session, _) -> result(Req, pw_db:delete_message(uid(Session), MsgId));
+authed(<<"POST">>, [<<"edit_message">>, MsgId], Req0, Session, _) ->
+    with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:edit_message(uid(Session), MsgId, maps:get(<<"body">>, M, <<>>))) end);
+authed(<<"POST">>, [<<"forward_message">>, MsgId], Req0, Session, _) ->
+    with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:forward_message(uid(Session), MsgId, maps:get(<<"target_scope">>, M, <<>>), maps:get(<<"target_id">>, M, undefined))) end);
 authed(<<"GET">>, [<<"conversations">>], Req, Session, _) -> result(Req, pw_db:conversations(uid(Session)));
 authed(<<"POST">>, [<<"conversations">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) ->
     Name = maps:get(<<"name">>, M, <<>>),

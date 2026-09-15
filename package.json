@@ -12,6 +12,8 @@
     "start:build": "bash scripts/start.sh --build",
     "test:browser": "node test/browser/run.mjs",
     "test:rtc": "node test/browser/rtc.mjs",
+    "test:rtc-contract": "node test/browser/rtc-contract.mjs",
+    "test:ui-contract": "node test/browser/ui-contract.mjs",
     "build:rich-text": "node scripts/build-rich-text.mjs",
     "test:health": "node test/browser/call-health.mjs"
   },

@@ -5,7 +5,7 @@
     notify_user/2, broadcast/2, status_update/2,
     voice_join/4, voice_leave/3, voice_state/5, voice_signal/5, voice_activity/5,
     call_ring/5, call_decline/2, call_cancel/3, call_accept/5,
-    call_join/5, call_leave/3, call_state/5, call_signal/5,
+    call_join/5, call_rejoin/5, call_leave/3, call_state/5, call_signal/5,
     room_capacity/0, share_capacity/0, status_update/3
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -42,6 +42,10 @@ call_decline(Cid, Uid) -> gen_server:cast(?MODULE, {call_decline, Cid, Uid}).
 call_cancel(Cid, Uid, Pid) -> gen_server:cast(?MODULE, {call_cancel, Cid, Uid, Pid}).
 call_accept(Cid, Uid, Pid, Profile, Audience) -> join_call({call_accept, Cid, Uid, Pid, Profile, Audience}).
 call_join(ConversationId, Uid, Pid, Profile, Audience) -> join_call({call_join, ConversationId, Uid, Pid, Profile, Audience}).
+%% Browser-side Join/Rejoin is only valid while a room still exists. Keeping this
+%% separate from call_join/5 preserves the low-level primitive used by tests and
+%% internal setup while preventing stale UI from resurrecting an ended call.
+call_rejoin(ConversationId, Uid, Pid, Profile, Audience) -> join_call({call_rejoin, ConversationId, Uid, Pid, Profile, Audience}).
 call_leave(ConversationId, Uid, Pid) -> gen_server:cast(?MODULE, {call_leave, ConversationId, Uid, Pid}).
 call_state(ConversationId, Uid, Pid, Patch, Profile) -> gen_server:cast(?MODULE, {call_state, ConversationId, Uid, Pid, Patch, Profile}).
 call_signal(ConversationId, From, FromPid, To, Signal) -> gen_server:cast(?MODULE, {call_signal, ConversationId, From, FromPid, To, Signal}).
@@ -76,6 +80,21 @@ handle_call({call_join, ConversationId, Uid, Pid, Profile, Audience}, _From, St0
         true ->
             St1 = evict_other_rooms(Uid, Pid, {call, ConversationId}, St0),
             {reply, ok, do_call_join(ConversationId, Uid, Pid, Profile, Audience, St1)}
+    end;
+handle_call({call_rejoin, ConversationId, Uid, Pid, Profile, Audience}, _From, St0) ->
+    case maps:find({call, ConversationId}, St0#st.calls) of
+        error ->
+            log("call_rejoin_rejected", #{uid => Uid, conversation_id => ConversationId, reason => no_active_call}),
+            {reply, {error, no_active_call}, St0};
+        {ok, Room} ->
+            case room_admits(Room, Uid) of
+                false ->
+                    log("call_rejoin_rejected", #{uid => Uid, conversation_id => ConversationId, reason => room_full, participants => map_size(Room)}),
+                    {reply, {error, room_full}, St0};
+                true ->
+                    St1 = evict_other_rooms(Uid, Pid, {call, ConversationId}, St0),
+                    {reply, ok, do_call_join(ConversationId, Uid, Pid, Profile, Audience, St1)}
+            end
     end;
 handle_call({call_accept, Cid, Uid, Pid, Profile, Audience0}, _From, St0) ->
     {Reply, St} = accept_ring(Cid, Uid, Pid, Profile, Audience0, St0),

@@ -13,13 +13,27 @@ python3 - <<'PY'
 from pathlib import Path
 import json
 import ast
+import re
 version = Path('VERSION').read_text().strip()
-assert version == '1.7.3'
+assert re.fullmatch(r'\d+\.\d+\.\d+(?:-\d+)?', version)
 assert f'{{vsn, "{version}"}}' in Path('src/plainwire_relay.app.src').read_text()
 assert f'{{release, {{plainwire_relay, "{version}"}}' in Path('rebar.config').read_text()
 assert f'attribute "data-ui-version" "{version}"' in Path('priv/static/elm/src/Main.elm').read_text()
 assert f'_ -> <<"{version}">>' in Path('src/pw_client_config.erl').read_text()
 assert f'?assertEqual(<<"{version}">>, maps:get(version, Config))' in Path('test/pw_client_config_tests.erl').read_text()
+assert Path(f'RELEASE_NOTES_{version}.md').is_file()
+index_haml = Path('priv/static/index.haml').read_text()
+assert index_haml.count('__PLAINWIRE_VERSION__') == 2
+build_haml = Path('scripts/build-haml.sh').read_text()
+assert "readFileSync('VERSION'" in build_haml and "replaceAll('__PLAINWIRE_VERSION__', version)" in build_haml
+build_css = Path('scripts/build-css.mjs').read_text()
+assert "readFile(resolve(root, 'VERSION')" in build_css and 'Plainwire ${version} workspace' in build_css
+bootstrap = Path('priv/static/bootstrap.js').read_text()
+assert "searchParams.get('v')" in bootstrap and 'version: bootVersion' in bootstrap and 'asset_version: bootVersion' in bootstrap
+for deploy_script in ['scripts/update-openrc-release.sh', 'scripts/install-openrc-release.sh']:
+    body = Path(deploy_script).read_text()
+    assert 'VERSION=$(<"${REPO}/VERSION")' in body
+    assert 'CSS_FINGERPRINT="Plainwire ${VERSION} workspace"' in body
 for path in [*Path('scripts').glob('*.py'), *Path('test').glob('*.py')]:
     ast.parse(path.read_text(), filename=str(path))
 json.loads(Path('package.json').read_text())

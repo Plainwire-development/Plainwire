@@ -4,12 +4,12 @@
     start_link/0,
     health/0,
     register/3, login/2, session/1, session_fast/1, logout/1, sessions/2, logout_other_sessions/2, change_password/4, me/1, update_profile/3, update_theme/2,
-    sync/2, users/1, profile/2,
+    sync/2, users/1, profile/2, profile_by_username/2,
     friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friend_unblock/2, friends/1,
     forums/1, create_forum/4, delete_forum/2, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, delete_thread/2, reply_thread/3, vote_thread/3,
     servers/1, create_server/3, update_server/3, server/2, create_channel/4, create_channel/5,
     create_invite/4, create_invite/5, list_invites/2, revoke_invite/3, invite_options/2, invite_preview/1, join_invite/2,
-    messages/5, post_channel_message/4, delete_message/2, record_missed_call/2,
+    messages/5, post_channel_message/4, delete_message/2, edit_message/3, forward_message/4, record_missed_call/2,
     conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4,
     add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4,
     close_conversation/2, leave_conversation/2, accept_message_request/2, deny_message_request/2,
@@ -169,6 +169,7 @@ update_theme(Uid, Theme) -> call({update_theme, Uid, Theme}).
 sync(Uid, Since) -> call({sync, Uid, Since}).
 users(Q) -> call({users, Q}).
 profile(Viewer, UserId) -> call({profile, Viewer, UserId}).
+profile_by_username(Viewer, Username) -> call({profile_by_username, Viewer, Username}).
 friend_request(Uid, Target) -> call({friend_request, Uid, Target}).
 friend_accept(Uid, Target) -> call({friend_accept, Uid, Target}).
 friend_remove(Uid, Target) -> call({friend_remove, Uid, Target}).
@@ -207,6 +208,8 @@ join_invite(Uid, Code) -> call({join_invite, Uid, Code}).
 messages(Uid, Scope, ScopeId, Before, After) -> call({messages, Uid, Scope, ScopeId, Before, After}).
 post_channel_message(Uid, ChannelId, Body, ReplyTo) -> call({post_channel_message, Uid, ChannelId, Body, ReplyTo}).
 delete_message(Uid, Mid) -> call({delete_message, Uid, Mid}).
+edit_message(Uid, Mid, Body) -> call({edit_message, Uid, Mid, Body}).
+forward_message(Uid, Mid, TargetScope, TargetId) -> call({forward_message, Uid, Mid, TargetScope, TargetId}).
 conversations(Uid) -> call({conversations, Uid}).
 create_conversation(Uid, Name, UserIds) -> call({create_conversation, Uid, Name, UserIds}).
 create_conversation_usernames(Uid, Name, Usernames) -> call({create_conversation_usernames, Uid, Name, Usernames}).
@@ -366,6 +369,8 @@ read_msg({revoke_invite, _, _, _}) -> false;
 read_msg({join_invite, _, _}) -> false;
 read_msg({post_channel_message, _, _, _, _}) -> false;
 read_msg({delete_message, _, _}) -> false;
+read_msg({edit_message, _, _, _}) -> false;
+read_msg({forward_message, _, _, _, _}) -> false;
 read_msg({create_conversation, _, _, _}) -> false;
 read_msg({create_conversation_usernames, _, _, _}) -> false;
 read_msg({update_conversation, _, _, _, _}) -> false;
@@ -401,6 +406,7 @@ safe_log_msg({post_channel_message, Uid, ChannelId, _, ReplyTo}) ->
     {post_channel_message, Uid, ChannelId, redacted, ReplyTo};
 safe_log_msg({post_direct_message, Uid, Cid, _, ReplyTo}) ->
     {post_direct_message, Uid, Cid, redacted, ReplyTo};
+safe_log_msg({edit_message, Uid, Mid, _}) -> {edit_message, Uid, Mid, redacted};
 safe_log_msg({create_thread, Uid, ForumId, _, _}) -> {create_thread, Uid, ForumId, redacted};
 safe_log_msg({reply_thread, Uid, ThreadId, _}) -> {reply_thread, Uid, ThreadId, redacted};
 safe_log_msg(Msg) -> Msg.
@@ -636,6 +642,12 @@ route({profile, Viewer, UserId0}, Conn) ->
             {ok, #{user => Public, relationship => Rel}};
         E ->
             E
+    end;
+route({profile_by_username, Viewer, Username0}, Conn) ->
+    Username = string:lowercase(pw_util:clean_text(Username0, 32)),
+    case one(Conn, "SELECT id FROM users WHERE lower(username) = $1 LIMIT 1", [Username]) of
+        {ok, [UserId]} -> route({profile, Viewer, UserId}, Conn);
+        _ -> {error, not_found}
     end;
 route({friend_request, Uid, Target0}, Conn) ->
     Target = pw_util:int(Target0),
@@ -1208,13 +1220,97 @@ route({delete_message, Uid, Mid0}, Conn) ->
     Mid = pw_util:int(Mid0),
     case one(Conn, "SELECT user_id, scope, scope_id FROM messages WHERE id = $1 AND kind = 'text' AND deleted_at IS NULL", [Mid]) of
         {ok, [Uid, Scope, ScopeId]} ->
-            Now = pw_util:now_ms(),
-            ok = exec(Conn, "UPDATE messages SET deleted_at = $1, body = '' WHERE id = $2", [Now, Mid]),
-            BroadcastKey = case Scope of <<"direct">> -> {direct, ScopeId}; <<"channel">> -> {channel, ScopeId} end,
-            pw_hub:broadcast(BroadcastKey, #{type => message_deleted, scope => Scope, scope_id => ScopeId, message_id => Mid}),
-            {ok, #{deleted => true}};
+            case can_modify_message_scope(Conn, Uid, Scope, ScopeId) of
+                true ->
+                    Now = pw_util:now_ms(),
+                    ok = exec(Conn, "UPDATE messages SET deleted_at = $1, body = '' WHERE id = $2", [Now, Mid]),
+                    BroadcastKey = case Scope of <<"direct">> -> {direct, ScopeId}; <<"channel">> -> {channel, ScopeId} end,
+                    pw_hub:broadcast(BroadcastKey, #{type => message_deleted, scope => Scope, scope_id => ScopeId, message_id => Mid}),
+                    {ok, #{deleted => true}};
+                false ->
+                    {error, forbidden}
+            end;
         {ok, _} ->
             {error, forbidden};
+        _ ->
+            {error, not_found}
+    end;
+route({edit_message, Uid, Mid0, Body0}, Conn) ->
+    Mid = pw_util:int(Mid0),
+    Plain = pw_util:clean_text(Body0, ?MAX_MSG),
+    Body = store_message(Plain),
+    case {message_body_valid(Plain), one(Conn, "SELECT user_id, scope, scope_id FROM messages WHERE id = $1 AND kind = 'text' AND deleted_at IS NULL AND forwarded_from_id IS NULL", [Mid])} of
+        {true, {ok, [Uid, Scope, ScopeId]}} ->
+            case can_modify_message_scope(Conn, Uid, Scope, ScopeId) of
+                true ->
+                    Now = pw_util:now_ms(),
+                    ok = exec(Conn, "UPDATE messages SET body = $1, edited_at = $2 WHERE id = $3", [Body, Now, Mid]),
+                    insert_upload_refs(Conn, Plain, Scope, ScopeId, Now),
+                    {ok, Row} = one(Conn, message_select() ++ " WHERE m.id = $1", [Mid]),
+                    Msg = message_map(Conn, Row),
+                    BroadcastKey = case Scope of <<"direct">> -> {direct, ScopeId}; <<"channel">> -> {channel, ScopeId} end,
+                    pw_hub:broadcast(BroadcastKey, #{type => message_updated, scope => Scope, scope_id => ScopeId, message => Msg}),
+                    {ok, Msg};
+                false ->
+                    {error, forbidden}
+            end;
+        {false, _} ->
+            {error, invalid_message};
+        {_, {ok, _}} ->
+            {error, forbidden};
+        _ ->
+            {error, not_found}
+    end;
+route({forward_message, Uid, Mid0, TargetScope0, TargetId0}, Conn) ->
+    Mid = pw_util:int(Mid0),
+    TargetId = pw_util:int(TargetId0),
+    TargetScope = case TargetScope0 of
+        <<"direct">> -> <<"direct">>;
+        <<"channel">> -> <<"channel">>;
+        direct -> <<"direct">>;
+        channel -> <<"channel">>;
+        _ -> invalid
+    end,
+    case one(Conn, "SELECT scope, scope_id, body, COALESCE(forwarded_from_id, id) FROM messages WHERE id = $1 AND kind = 'text' AND deleted_at IS NULL", [Mid]) of
+        {ok, [SourceScope, SourceId, StoredBody, OriginalId]} when TargetScope =/= invalid ->
+            CanReadSource = can_read_messages(Conn, Uid, SourceScope, SourceId),
+            CanSendTarget = case TargetScope of
+                <<"direct">> -> conversation_can_send(Conn, Uid, TargetId);
+                <<"channel">> -> case channel_server_member(Conn, Uid, TargetId) of {ok, _} -> true; _ -> false end
+            end,
+            case CanReadSource andalso CanSendTarget of
+                true ->
+                    Now = pw_util:now_ms(),
+                    {ok, NewId} = insert_returning(Conn,
+                        "INSERT INTO messages(scope, scope_id, user_id, body, reply_to_id, created_at, forwarded_from_id) VALUES($1,$2,$3,$4,NULL,$5,$6) RETURNING id",
+                        [TargetScope, TargetId, Uid, StoredBody, Now, OriginalId]),
+                    %% Forwarded attachment references must be granted to the target scope too.
+                    %% Keep the stored message encrypted at rest, but parse upload tokens from plaintext.
+                    insert_upload_refs(Conn, load_message(StoredBody), TargetScope, TargetId, Now),
+                    case TargetScope of
+                        <<"direct">> ->
+                            ok = exec(Conn, "UPDATE direct_threads SET updated_at = $1 WHERE id = $2", [Now, TargetId]),
+                            ok = exec(Conn, "UPDATE direct_members SET last_read_message_id = $1 WHERE thread_id = $2 AND user_id = $3", [NewId, TargetId, Uid]),
+                            ok = exec(Conn, "UPDATE direct_members SET hidden = false WHERE thread_id = $1 AND user_id <> $2", [TargetId, Uid]);
+                        <<"channel">> -> ok
+                    end,
+                    {ok, Row} = one(Conn, message_select() ++ " WHERE m.id = $1", [NewId]),
+                    Msg = message_map(Conn, Row),
+                    case TargetScope of
+                        <<"direct">> ->
+                            pw_hub:broadcast({direct, TargetId}, #{type => message_created, scope => direct, scope_id => TargetId, message => Msg}),
+                            notify_direct_members(Conn, TargetId, Uid, #{type => direct_message, conversation_id => TargetId, message => Msg}, Now, true);
+                        <<"channel">> ->
+                            {ok, Sid} = channel_server_member(Conn, Uid, TargetId),
+                            pw_hub:broadcast({channel, TargetId}, #{type => message_created, scope => channel, scope_id => TargetId, message => Msg}),
+                            notify_channel_members(Conn, Sid, Uid, TargetId, Msg, Now, true)
+                    end,
+                    {ok, Msg};
+                false ->
+                    {error, forbidden}
+            end;
+        {ok, _} ->
+            {error, invalid_target};
         _ ->
             {error, not_found}
     end;
@@ -1223,7 +1319,7 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
     Plain = pw_util:clean_text(Body0, ?MAX_MSG),
     Body = store_message(Plain),
     ReplyTo = pw_util:int(ReplyTo0),
-    case {byte_size(Body) > 0, channel_server_member(Conn, Uid, Cid), valid_reply_to(Conn, <<"channel">>, Cid, ReplyTo)} of
+    case {message_body_valid(Plain), channel_server_member(Conn, Uid, Cid), valid_reply_to(Conn, <<"channel">>, Cid, ReplyTo)} of
         {true, {ok, Sid}, true} ->
             Now = pw_util:now_ms(),
             {ok, Mid} = insert_returning(Conn,
@@ -1242,8 +1338,7 @@ route({conversations, Uid}, Conn) ->
     Sql = "SELECT dt.id, dt.name, dt.avatar_url, dt.owner_id, dt.created_at, dt.updated_at, "
           "dm.last_read_message_id, dm.muted, dm.request_state, "
           "(SELECT count(*) FROM direct_members WHERE thread_id = dt.id), "
-          "(SELECT body FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL ORDER BY id DESC LIMIT 1), "
-          "(SELECT id FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL ORDER BY id DESC LIMIT 1), "
+          "lm.body, lm.id, COALESCE(lm.user_id, 0), COALESCE(lm.display_name, ''), COALESCE(lm.username, ''), "
           "(SELECT count(*) FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL "
           "AND id > dm.last_read_message_id AND user_id <> $1), "
           "COALESCE((SELECT u.id FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
@@ -1255,6 +1350,9 @@ route({conversations, Uid}, Conn) ->
           "COALESCE((SELECT u.username FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
           "WHERE dm2.thread_id = dt.id AND dm2.user_id <> $1 ORDER BY u.display_name ASC LIMIT 1), '') "
           "FROM direct_threads dt JOIN direct_members dm ON dm.thread_id = dt.id AND dm.user_id = $1 "
+          "LEFT JOIN LATERAL (SELECT m.id, m.body, m.user_id, u.display_name, u.username "
+          "FROM messages m JOIN users u ON u.id = m.user_id WHERE m.scope = 'direct' AND m.scope_id = dt.id "
+          "AND m.deleted_at IS NULL ORDER BY m.id DESC LIMIT 1) lm ON true "
           "WHERE dm.hidden = false "
           "ORDER BY dt.updated_at DESC",
     {ok, Rows} = rows(Conn, Sql, [Uid]),
@@ -1466,7 +1564,7 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
     Plain = pw_util:clean_text(Body0, ?MAX_MSG),
     Body = store_message(Plain),
     ReplyTo = pw_util:int(ReplyTo0),
-    case {byte_size(Body) > 0, conversation_can_send(Conn, Uid, Cid), valid_reply_to(Conn, <<"direct">>, Cid, ReplyTo)} of
+    case {message_body_valid(Plain), conversation_can_send(Conn, Uid, Cid), valid_reply_to(Conn, <<"direct">>, Cid, ReplyTo)} of
         {true, true, true} ->
             Now = pw_util:now_ms(),
             {ok, Mid} = insert_returning(Conn,
@@ -1850,6 +1948,10 @@ migrations() -> [
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'text'",
         "ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check",
         "ALTER TABLE messages ADD CONSTRAINT messages_kind_check CHECK(kind IN ('text','missed_call'))"
+    ]},
+    {19, [
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_id integer REFERENCES messages(id) ON DELETE SET NULL",
+        "CREATE INDEX IF NOT EXISTS idx_messages_forwarded_from ON messages(forwarded_from_id) WHERE forwarded_from_id IS NOT NULL"
     ]}
 ].
 
@@ -1932,6 +2034,13 @@ insert_returning(Conn, Sql, Params) ->
         {error, Reason} -> {error, Reason};
         Other -> {error, Other}
     end.
+
+%% Validate the plaintext, never the encrypted representation. AES-GCM produces
+%% a non-empty envelope even for <<>>, so checking ciphertext length would let
+%% empty messages through whenever encryption-at-rest is enabled.
+message_body_valid(Body) when is_binary(Body) ->
+    byte_size(Body) > 0 andalso re:run(Body, <<"\\S">>, [{capture, none}, unicode]) =:= match;
+message_body_valid(_) -> false.
 
 store_message(Body) -> pw_crypto:encrypt(Body).
 load_message(undefined) -> <<>>;
@@ -2385,10 +2494,19 @@ member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, Role, M
     #{user => user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last]),
       role => Role, muted => Muted, joined_at => Joined}.
 
-message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind]) ->
-    #{id => Id, scope => Scope, scope_id => ScopeId, user_id => Uid, username => U, display_name => D,
+message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, _ForwardBody]) ->
+    Base = #{id => Id, scope => Scope, scope_id => ScopeId, user_id => Uid, username => U, display_name => D,
       avatar_url => pw_util:proxied_image(Avatar), body => load_message(Body), reply_to_id => db_null(ReplyTo),
-      created_at => Created, edited_at => db_null(Edited), deleted_at => db_null(Deleted), kind => Kind}.
+      created_at => Created, edited_at => db_null(Edited), deleted_at => db_null(Deleted), kind => Kind},
+    case ForwardId of
+        null -> Base;
+        %% A forward is an immutable snapshot. Never expose the *current* body
+        %% of the source message here: the source may be edited later in a
+        %% room the forward recipient cannot read. Keep the legacy `body`
+        %% field in the provenance object for wire compatibility, but make it
+        %% the forwarded snapshot rather than a live cross-scope read.
+        _ -> Base#{forwarded_from => #{id => ForwardId, user_id => ForwardUid, display_name => ForwardName, body => load_message(Body)}}
+    end.
 
 optional_id(Value) ->
     case pw_util:int(Value) of
@@ -2448,10 +2566,11 @@ batch_replied_messages(Conn, Ids, Scope, ScopeId) ->
         _ -> #{}
     end.
 
-conversation_row_map([Id, Name, Avatar, Owner, Created, Updated, LastRead, Muted, RequestState, Count, LastBody, LastMsg, Unread, PeerId, PeerName, PeerAvatar, PeerUsername]) ->
+conversation_row_map([Id, Name, Avatar, Owner, Created, Updated, LastRead, Muted, RequestState, Count, LastBody, LastMsg, LastSenderId, LastSenderName, LastSenderUsername, Unread, PeerId, PeerName, PeerAvatar, PeerUsername]) ->
     #{id => Id, name => Name, avatar_url => pw_util:proxied_image(Avatar), owner_id => Owner,
       created_at => Created, updated_at => Updated, last_read_message_id => LastRead, muted => Muted, request_state => RequestState,
       member_count => Count, last_body => load_message(LastBody), last_message_id => LastMsg, unread => Unread,
+      last_sender_id => LastSenderId, last_sender_name => LastSenderName, last_sender_username => LastSenderUsername,
       peer_id => PeerId, peer_name => PeerName, peer_avatar_url => pw_util:proxied_image(PeerAvatar), peer_username => PeerUsername}.
 
 conversation_full_map([Id, Name, Avatar, Owner, Created, Updated]) ->
@@ -2485,7 +2604,12 @@ thread_select() ->
 
 message_select() ->
     "SELECT m.id, m.scope, m.scope_id, m.user_id, u.username, u.display_name, u.avatar_url, "
-    "m.body, m.reply_to_id, m.created_at, m.edited_at, m.deleted_at, m.kind FROM messages m JOIN users u ON u.id = m.user_id".
+    "m.body, m.reply_to_id, m.created_at, m.edited_at, m.deleted_at, m.kind, "
+    %% The final column is intentionally NULL. Older decoders expect the slot,
+    %% but fetching fm.body would pull live source text across scope boundaries.
+    "m.forwarded_from_id, fm.user_id, fu.display_name, NULL "
+    "FROM messages m JOIN users u ON u.id = m.user_id "
+    "LEFT JOIN messages fm ON fm.id = m.forwarded_from_id LEFT JOIN users fu ON fu.id = fm.user_id".
 
 message_sql(Scope, Id, undefined, undefined) ->
     {message_select() ++ " WHERE m.scope = $1 AND m.scope_id = $2 AND m.deleted_at IS NULL ORDER BY m.id DESC LIMIT 80", [Scope, Id]};
@@ -2549,6 +2673,19 @@ can_read_messages(Conn, Uid, <<"channel">>, Id) ->
 can_read_messages(Conn, Uid, <<"direct">>, Id) ->
     is_conversation_member(Conn, Uid, Id) andalso not is_blocked_in_conversation(Conn, Uid, Id);
 can_read_messages(_, _, _, _) -> false.
+
+%% Editing/deleting is an ownership operation, but ownership alone must not let a
+%% departed member keep mutating history in a scope they can no longer access.
+%% For direct conversations we intentionally ignore block state here: a member
+%% may still clean up their own messages after a block, but not after leaving.
+can_modify_message_scope(Conn, Uid, <<"channel">>, Id) ->
+    case channel_server_member(Conn, Uid, Id) of
+        {ok, _} -> true;
+        _ -> false
+    end;
+can_modify_message_scope(Conn, Uid, <<"direct">>, Id) ->
+    is_conversation_member(Conn, Uid, Id);
+can_modify_message_scope(_, _, _, _) -> false.
 
 valid_reply_to(_, _, _, undefined) -> true;
 valid_reply_to(Conn, Scope, ScopeId, ReplyTo) when is_integer(ReplyTo) ->
@@ -2616,12 +2753,15 @@ notify_mention(Conn, Uid, Body, Url, Event, Now) ->
     pw_hub:notify_user(Uid, Event).
 
 notify_channel_members(Conn, Sid, Sender, Cid, Msg, Now) ->
+    notify_channel_members(Conn, Sid, Sender, Cid, Msg, Now, false).
+
+notify_channel_members(Conn, Sid, Sender, Cid, Msg, Now, SuppressMentions) ->
     Body = maps:get(body, Msg),
     {ok, Rows} = rows(Conn, "SELECT user_id FROM server_members WHERE server_id = $1 AND user_id <> $2", [Sid, Sender]),
     {ok, Roster} = rows(Conn,
         "SELECT u.id, u.username FROM users u JOIN server_members sm ON sm.user_id = u.id "
         "WHERE sm.server_id = $1 AND u.id <> $2", [Sid, Sender]),
-    Mentioned = pw_mention:resolve(Body, Roster),
+    Mentioned = case SuppressMentions of true -> []; false -> pw_mention:resolve(Body, Roster) end,
     Url = <<"#/channel/", (integer_to_binary(Cid))/binary>>,
     [begin
          U = only_id(R),
@@ -2657,13 +2797,16 @@ publish_conversation_event(Conn, Cid, Event) ->
     end.
 
 notify_direct_members(Conn, Cid, Sender, Event, Now) ->
+    notify_direct_members(Conn, Cid, Sender, Event, Now, false).
+
+notify_direct_members(Conn, Cid, Sender, Event, Now, SuppressMentions) ->
     Msg = maps:get(message, Event, #{}),
     PlainBody = maps:get(body, Msg, <<>>),
     {ok, Rows} = rows(Conn, "SELECT user_id, request_state FROM direct_members WHERE thread_id = $1 AND user_id <> $2 AND muted = false", [Cid, Sender]),
     {ok, Roster} = rows(Conn,
         "SELECT u.id, u.username FROM users u JOIN direct_members dm ON dm.user_id = u.id "
         "WHERE dm.thread_id = $1 AND dm.request_state = 'accepted' AND u.id <> $2", [Cid, Sender]),
-    Mentioned = pw_mention:resolve(PlainBody, Roster),
+    Mentioned = case SuppressMentions of true -> []; false -> pw_mention:resolve(PlainBody, Roster) end,
     Url = <<"#/dm/", (integer_to_binary(Cid))/binary>>,
     [begin
          [U, RequestState] = R,

@@ -25,7 +25,7 @@ allowed({user, Uid}, #{type := Type}) when is_integer(Uid), Uid > 0 ->
                        category_updated, category_deleted, categories_reordered, channel_created, channel_moved]);
 allowed({topic, {Kind, Id}}, #{type := Type}) when is_integer(Id), Id > 0 ->
     lists:member(Kind, [channel, direct, thread, forum, server]) andalso
-        lists:member(Type, [message_created, message_deleted, thread_created,
+        lists:member(Type, [message_created, message_updated, message_deleted, thread_created,
                           thread_deleted, thread_reply, forum_deleted, server_updated,
                           channel_updated, conversation_updated, category_created, category_updated,
                           category_deleted, categories_reordered, channel_created, channel_moved, member_joined,

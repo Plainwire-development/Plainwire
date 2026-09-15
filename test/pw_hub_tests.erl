@@ -307,6 +307,7 @@ call_refresh_reconnect_grace_test() ->
         _ = gen_server:call(pw_hub, sync),
         Profile1 = #{id => 1, display_name => <<"One">>, avatar_url => <<>>},
         Profile2 = #{id => 2, display_name => <<"Two">>, avatar_url => <<>>},
+        ?assertEqual({error, no_active_call}, pw_hub:call_rejoin(201, 1, P1b, Profile1, [2])),
         ok = pw_hub:call_join(201, 1, P1, Profile1, [2]),
         _ = await_event(observer, call_presence, 201),
         ok = pw_hub:call_join(201, 2, P2, Profile2, [1]),
@@ -317,6 +318,9 @@ call_refresh_reconnect_grace_test() ->
         _ = gen_server:call(pw_hub, sync),
         DuringRefresh = await_event(observer, call_presence, 201),
         ?assertEqual(true, maps:get(active, DuringRefresh)),
+        RefreshUsers = maps:get(users, DuringRefresh),
+        RefreshingUser = hd([U || U <- RefreshUsers, maps:get(user_id, U) =:= 1]),
+        ?assertEqual(true, maps:get(reconnecting, RefreshingUser)),
 
         %% no pid yet; signal gets ignored, hub keeps breathing
         pw_hub:call_signal(201, 2, P2, 1, #{kind => offer}),
@@ -324,7 +328,7 @@ call_refresh_reconnect_grace_test() ->
         ?assert(is_process_alive(Hub)),
 
         pw_hub:connect(1, P1b, <<"online">>),
-        ok = pw_hub:call_join(201, 1, P1b, Profile1, [2]),
+        ok = pw_hub:call_rejoin(201, 1, P1b, Profile1, [2]),
         Rejoined = await_event(observer, call_presence, 201),
         ?assertEqual(true, maps:get(active, Rejoined)),
         ?assertEqual([1, 2], lists:sort([maps:get(user_id, U) || U <- maps:get(users, Rejoined)])),

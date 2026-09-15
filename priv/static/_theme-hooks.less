@@ -1,0 +1,21 @@
+/* Theme-facing presentation hooks.
+   These stay in Less on purpose: client/theme authors can override this compact
+   token layer without having to understand component SCSS. */
+@mention-wash: 86%;
+@mention-self-wash: 76%;
+@forward-wash: 96%;
+@key-wash: 92%;
+
+:root,
+[data-theme="light"],
+[data-theme="dark"] {
+  --pw-mention-bg: color-mix(in srgb, var(--accent), transparent @mention-wash);
+  --pw-mention-self-bg: color-mix(in srgb, var(--accent), transparent @mention-self-wash);
+  --pw-mention-ring: color-mix(in srgb, var(--accent), transparent 55%);
+  --pw-forward-surface: color-mix(in srgb, var(--bg2), var(--accent) 4%);
+  --pw-forward-border: color-mix(in srgb, var(--line), var(--accent) 18%);
+  --pw-key-surface: color-mix(in srgb, var(--bg3), var(--accent) 8%);
+  --pw-emoji-surface: color-mix(in srgb, var(--bg2), var(--accent) 6%);
+  --pw-emoji-hover: color-mix(in srgb, var(--bg3), var(--accent) 12%);
+  --pw-context-shadow: 0 14px 34px color-mix(in srgb, #000, transparent 82%);
+}

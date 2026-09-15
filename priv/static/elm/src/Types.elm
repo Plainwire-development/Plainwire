@@ -127,6 +127,9 @@ type alias Conversation =
     , memberCount : Int
     , lastBody : Maybe String
     , lastMessageId : Maybe Int
+    , lastSenderId : Int
+    , lastSenderName : String
+    , lastSenderUsername : String
     , unread : Int
     , members : List MemberUser
     , peerId : Int
@@ -155,10 +158,15 @@ type alias Message =
     , createdAt : Int
     , editedAt : Maybe Int
     , deletedAt : Maybe Int
+    , forwardedFrom : Maybe ForwardPreview
     }
 
 
 type alias ReplyPreview =
+    { id : Int, userId : Int, displayName : String, body : String }
+
+
+type alias ForwardPreview =
     { id : Int, userId : Int, displayName : String, body : String }
 
 
@@ -450,6 +458,8 @@ type alias Model =
     , settingsSearch : String
     , settingsTab : String
     , inputText : String
+    , editingMessageId : Maybe Int
+    , editingMessageText : String
     , sidebarOpen : Bool
     , serversSheetOpen : Bool
     , ctxMenu : Maybe ContextMenu
@@ -567,6 +577,13 @@ type Msg
     | AttachmentReady String String
     | InputText String
     | SendMessage
+    | StartEditMessage Message
+    | EditMessageText String
+    | CancelEditMessage
+    | SaveEditMessage Int
+    | InsertComposerText String
+    | OpenForwardModal Message
+    | ForwardMessage Int String Int
     | DeleteMessage Int
     | LeaveConversation Int
     | CloseConversation Int
@@ -576,6 +593,8 @@ type Msg
     | OpenMessageCtx Message Int Int
     | OpenConvCtx Conversation Int Int
     | OpenUserCtx User Int Int
+    | OpenServerCtx Server Int Int
+    | OpenChannelCtx Channel Int Int
     | CopyText String
     | JoinInvite
     | NewDmModal
@@ -667,6 +686,7 @@ type Msg
     | ToggleMicMonitor
     | MicTestLevel Int
     | MicTestFailed String
+    | ShortcutAction String
 
 
 
@@ -703,6 +723,9 @@ decodeConversation =
         |> andMap (D.field "member_count" D.int |> defaultValue 1)
         |> andMap (D.field "last_body" (D.nullable D.string))
         |> andMap (D.field "last_message_id" (D.nullable D.int))
+        |> andMap (D.field "last_sender_id" D.int |> defaultValue 0)
+        |> andMap (D.field "last_sender_name" D.string |> defaultValue "")
+        |> andMap (D.field "last_sender_username" D.string |> defaultValue "")
         |> andMap (D.field "unread" D.int |> defaultValue 0)
         |> andMap (D.field "members" (D.list decodeMemberUser) |> defaultValue [])
         |> andMap (D.field "peer_id" D.int |> defaultValue 0)
@@ -737,6 +760,16 @@ decodeMessage =
         |> andMap (D.field "created_at" D.int)
         |> andMap (D.field "edited_at" (D.nullable D.int))
         |> andMap (D.field "deleted_at" (D.nullable D.int))
+        |> andMap (D.field "forwarded_from" (D.nullable decodeForwardPreview) |> defaultValue Nothing)
+
+
+decodeForwardPreview : D.Decoder ForwardPreview
+decodeForwardPreview =
+    D.map4 ForwardPreview
+        (D.field "id" D.int)
+        (D.field "user_id" D.int)
+        (D.field "display_name" D.string)
+        (D.field "body" D.string)
 
 
 decodeReplyPreview : D.Decoder ReplyPreview
@@ -891,7 +924,7 @@ type alias SyncData r =
 
 defaultMsg : Message
 defaultMsg =
-    Message 0 "" 0 0 "" "" "" "" "text" Nothing Nothing 0 Nothing Nothing
+    Message 0 "" 0 0 "" "" "" "" "text" Nothing Nothing 0 Nothing Nothing Nothing
 
 
 
