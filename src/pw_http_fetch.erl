@@ -62,16 +62,21 @@ collect(RequestId, HandlerPid, Headers, MaxBytes, Truncate, Chunks, Size) ->
     end.
 
 content_length_ok(Headers, MaxBytes) ->
-    case header_value("content-length", Headers) of
+    case header_value(<<"content-length">>, Headers) of
         undefined -> true;
         Len ->
-            try list_to_integer(string:trim(Len)) =< MaxBytes
-            catch _:_ -> false
+            case pw_util:int(string:trim(pw_util:bin(Len))) of
+                N when is_integer(N), N >= 0 -> N =< MaxBytes;
+                _ -> false
             end
     end.
 
-header_value(Name, Headers) ->
-    case [V || {K, V} <- Headers, string:lowercase(K) =:= Name] of
+%% OTP/httpc may expose header names and values as binaries or iolists depending
+%% on OTP version and request mode. Normalize only the name for comparison and
+%% leave the value untouched for the caller to interpret.
+header_value(Name0, Headers) ->
+    Name = string:lowercase(pw_util:bin(Name0)),
+    case [V || {K, V} <- Headers, string:lowercase(pw_util:bin(K)) =:= Name] of
         [V | _] -> V;
         [] -> undefined
     end.

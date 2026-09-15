@@ -3,6 +3,7 @@ module Main exposing (main)
 import Browser
 import Browser.Events
 import Browser.Navigation as Nav
+import Bitwise
 import Dict exposing (Dict)
 import Html exposing (..)
 import Html.Attributes exposing (..)
@@ -623,7 +624,12 @@ update msg model =
                         handleThreadVote val model
 
                     else if String.startsWith "/forum/" tag && (String.endsWith "/join" tag || String.endsWith "/leave" tag) then
-                        ( model, apiSend (encodeApiRequest (ApiGet "/forums")) )
+                        ( model
+                        , Cmd.batch
+                            [ apiSend (encodeApiRequest (ApiGet "/forums"))
+                            , routeCmd model.active
+                            ]
+                        )
 
                     else if String.startsWith "/thread/" tag && String.endsWith "/replies" tag then
                         handleReplyCreated val model
@@ -698,7 +704,7 @@ update msg model =
                     else if String.startsWith "/server/" tag && String.endsWith "/channels" tag then
                         ( { model | toast = Just "Channel created" }, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), routeCmd model.active ] )
 
-                    else if String.startsWith "/server/" tag && String.endsWith "/invites" tag then
+                    else if String.startsWith "/server/" tag && String.endsWith "/wires" tag then
                         handleInviteCreated val model
 
                     else if String.startsWith "/server/" tag then
@@ -707,10 +713,10 @@ update msg model =
                     else if String.startsWith "/profile/" tag then
                         handleProfile val model
 
-                    else if String.startsWith "/invites/" tag && String.endsWith "/join" tag then
+                    else if String.startsWith "/wires/" tag && String.endsWith "/join" tag then
                         handleInviteJoin val model
 
-                    else if String.startsWith "/invites/" tag then
+                    else if String.startsWith "/wires/" tag then
                         handleInvitePreview val model
 
                     else if tag == "/servers" then
@@ -720,7 +726,7 @@ update msg model =
                         ( model, Cmd.none )
 
         ApiError tag method requestId err ->
-            if String.startsWith "/invites/" tag && not (String.endsWith "/join" tag) then
+            if String.startsWith "/wires/" tag && not (String.endsWith "/join" tag) then
                 ( { model | invitePreview = Nothing, toast = Just (fmtErr err), modal = Just "join_invite", modalUserIds = "" }, setHash "#" )
 
             else if String.startsWith "/users?q=" tag then
@@ -956,7 +962,7 @@ update msg model =
             ( { model | ctxMenu = Just (messageContext model.me m x y) }, Cmd.none )
 
         OpenConvCtx c x y ->
-            ( { model | ctxMenu = Just (conversationContext c x y) }, Cmd.none )
+            ( { model | ctxMenu = Just (conversationContext model c x y) }, Cmd.none )
 
         OpenUserCtx user x y ->
             ( { model | ctxMenu = Just (userContext model user x y) }, Cmd.none )
@@ -1246,10 +1252,10 @@ update msg model =
         JoinInvite ->
             case model.invitePreview of
                 Just invite ->
-                    ( model, apiSend (encodeApiRequest (ApiPost ("/invites/" ++ invite.code ++ "/join") (Just (E.object [])))) )
+                    ( model, apiSend (encodeApiRequest (ApiPost ("/wires/" ++ invite.code ++ "/join") (Just (E.object [])))) )
 
                 Nothing ->
-                    ( { model | toast = Just "Open an invite link like /#invite/CODE to join." }, Cmd.none )
+                    ( { model | toast = Just "Open a Wire link like /#wire/CODE to join." }, Cmd.none )
 
         AcceptCall conversationId ->
             let
@@ -1894,6 +1900,47 @@ update msg model =
                 "prev_route" ->
                     navigateRelative -1 model
 
+                "next_unread" ->
+                    navigateUnread 1 model
+
+                "prev_unread" ->
+                    navigateUnread -1 model
+
+                "screen_share" ->
+                    if model.voice.mode == Nothing then
+                        ( { model | toast = Just "Join a call or voice channel before sharing your screen." }, Cmd.none )
+
+                    else if model.voice.screenShare then
+                        update (BridgeEvent "stop_screen_share" E.null) model
+
+                    else
+                        update (BridgeEvent "start_screen_share" E.null) model
+
+                "toggle_call_window" ->
+                    case model.callUI.active of
+                        Just _ ->
+                            update ToggleCallOverlay model
+
+                        Nothing ->
+                            ( { model | toast = Just "There is no active call window to toggle." }, Cmd.none )
+
+                "close_dm" ->
+                    case model.active of
+                        DmView conversationId ->
+                            case List.filter (\conversation -> conversation.id == conversationId) model.convs |> List.head of
+                                Just conversation ->
+                                    if conversation.memberCount == 2 then
+                                        update (CloseConversation conversationId) model
+
+                                    else
+                                        ( { model | toast = Just "Group conversations are left from their menu so you cannot close one by accident." }, Cmd.none )
+
+                                Nothing ->
+                                    ( model, Cmd.none )
+
+                        _ ->
+                            ( { model | toast = Just "Open a direct message before closing it." }, Cmd.none )
+
                 "edit_last_message" ->
                     case model.me of
                         Just me ->
@@ -2199,7 +2246,7 @@ handleCreateThread : E.Value -> Model -> ( Model, Cmd Msg )
 handleCreateThread val model =
     case D.decodeValue (D.field "id" D.int) val of
         Ok id ->
-            ( model, setHash ("#thread/" ++ String.fromInt id) )
+            ( model, setHash ("#t/" ++ String.fromInt id) )
 
         Err _ ->
             ( model, apiSend (encodeApiRequest (ApiGet "/forums")) )
@@ -2210,7 +2257,7 @@ handleCreateForum val model =
     case D.decodeValue (D.field "id" D.int) val of
         Ok id ->
             ( { model | modal = Nothing, modalTitle = "", modalBody = "", modalUserIds = "" }
-            , Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/forums")), setHash ("#forum/" ++ String.fromInt id) ]
+            , Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/forums")), setHash ("#f/" ++ String.fromInt id) ]
             )
 
         Err _ ->
@@ -2249,7 +2296,7 @@ submitModal model =
 
             else if kind == "new_forum" then
                 if String.length (String.trim model.modalTitle) < 2 then
-                    ( { model | toast = Just "Add a community name" }, Cmd.none )
+                    ( { model | toast = Just "Add a forum name" }, Cmd.none )
 
                 else
                     ( { model | modal = Nothing }
@@ -2330,7 +2377,7 @@ submitModal model =
                         ( { model | modal = Nothing }
                         , apiSend
                             (encodeApiRequest
-                                (ApiPost ("/server/" ++ String.fromInt serverId ++ "/invites")
+                                (ApiPost ("/server/" ++ String.fromInt serverId ++ "/wires")
                                     (Just
                                         (E.object
                                             [ ( "channel_id", maybeInt (String.toInt (String.trim model.modalUserIds)) )
@@ -2348,15 +2395,25 @@ submitModal model =
 
             else if kind == "join_invite" then
                 let
+                    rawWire =
+                        String.trim model.modalUserIds
+
                     code =
-                        model.modalUserIds |> String.trim |> String.split "#invite/" |> List.reverse |> List.head |> Maybe.withDefault ""
+                        if String.contains "#wire/" rawWire then
+                            rawWire |> String.split "#wire/" |> List.reverse |> List.head |> Maybe.withDefault ""
+
+                        else if String.contains "#invite/" rawWire then
+                            rawWire |> String.split "#invite/" |> List.reverse |> List.head |> Maybe.withDefault ""
+
+                        else
+                            rawWire
                 in
                 if String.isEmpty code then
-                    ( { model | toast = Just "Enter an invite code" }, Cmd.none )
+                    ( { model | toast = Just "Enter a Wire code" }, Cmd.none )
 
                 else
                     ( { model | modal = Nothing }
-                    , setHash ("#invite/" ++ code)
+                    , setHash ("#wire/" ++ code)
                     )
 
             else if String.startsWith "create_category:" kind then
@@ -2613,7 +2670,7 @@ handleInvitePreview val model =
             ( { model | invitePreview = Just invite }, Cmd.none )
 
         Err _ ->
-            ( { model | invitePreview = Nothing, toast = Just "Could not load that invite.", modal = Just "join_invite", modalUserIds = "" }, setHash "#" )
+            ( { model | invitePreview = Nothing, toast = Just "Could not load that Wire.", modal = Just "join_invite", modalUserIds = "" }, setHash "#" )
 
 
 invitePreviewDecoder : Decoder InvitePreview
@@ -2686,7 +2743,7 @@ routeCmd active =
 
         InviteView code ->
             if code /= "" then
-                apiSend (encodeApiRequest (ApiGet ("/invites/" ++ code)))
+                apiSend (encodeApiRequest (ApiGet ("/wires/" ++ code)))
 
             else
                 Cmd.none
@@ -3110,10 +3167,25 @@ handleWsEvent val model =
         Ok ( "conversation_members_changed", ev ) ->
             handleConversationStructureEvent ev model
 
+        Ok ( "conversation_member_removed", ev ) ->
+            handleConversationStructureEvent ev model
+
         Ok ( "conversation_updated", ev ) ->
             handleConversationStructureEvent ev model
 
         Ok ( "server_updated", ev ) ->
+            handleServerStructureEvent ev model
+
+        Ok ( "server_roles_updated", ev ) ->
+            handleServerStructureEvent ev model
+
+        Ok ( "server_member_roles_updated", ev ) ->
+            handleServerStructureEvent ev model
+
+        Ok ( "server_member_removed", ev ) ->
+            handleServerStructureEvent ev model
+
+        Ok ( "server_member_profile_updated", ev ) ->
             handleServerStructureEvent ev model
 
         Ok ( "channel_created", ev ) ->
@@ -3125,6 +3197,15 @@ handleWsEvent val model =
         Ok ( "thread_created", ev ) ->
             handleThreadListEvent ev model
 
+        Ok ( "thread_updated", ev ) ->
+            handleThreadRefreshEvent ev model
+
+        Ok ( "thread_reply_updated", ev ) ->
+            handleThreadRefreshEvent ev model
+
+        Ok ( "thread_reply_deleted", ev ) ->
+            handleThreadRefreshEvent ev model
+
         Ok ( "thread_deleted", ev ) ->
             handleThreadDeletedEvent ev model
 
@@ -3133,6 +3214,9 @@ handleWsEvent val model =
 
         Ok ( "thread_reply", ev ) ->
             handleThreadReplyEvent ev model
+
+        Ok ( "access_revoked", ev ) ->
+            handleAccessRevoked ev model
 
         Ok ( "call_incoming", ev ) ->
             handleCallIncoming ev model
@@ -3655,7 +3739,7 @@ handleThreadDeletedEvent ev model =
             case model.active of
                 ThreadView currentId ->
                     if currentId == threadId then
-                        ( model, setHash ("#forum/" ++ String.fromInt forumId) )
+                        ( model, setHash ("#f/" ++ String.fromInt forumId) )
 
                     else
                         ( model, Cmd.none )
@@ -3717,6 +3801,83 @@ handleThreadReplyEvent ev model =
 
         Err _ ->
             ( model, Cmd.none )
+
+
+handleThreadRefreshEvent : E.Value -> Model -> ( Model, Cmd Msg )
+handleThreadRefreshEvent ev model =
+    case D.decodeValue (D.field "thread_id" D.int) ev of
+        Ok threadId ->
+            case model.active of
+                ThreadView currentId ->
+                    if currentId == threadId then
+                        ( model, routeCmd model.active )
+
+                    else
+                        ( model, Cmd.none )
+
+                ForumView _ ->
+                    handleThreadListEvent ev model
+
+                _ ->
+                    ( model, Cmd.none )
+
+        Err _ ->
+            ( model, Cmd.none )
+
+
+handleAccessRevoked : E.Value -> Model -> ( Model, Cmd Msg )
+handleAccessRevoked ev model =
+    let
+        scope =
+            D.decodeValue (D.field "scope" D.string) ev |> Result.withDefault ""
+
+        serverId =
+            D.decodeValue (D.field "server_id" D.int) ev |> Result.toMaybe
+
+        conversationId =
+            D.decodeValue (D.field "conversation_id" D.int) ev |> Result.toMaybe
+
+        channelIds =
+            D.decodeValue (D.field "channel_ids" (D.list D.int)) ev |> Result.withDefault []
+
+        activeRevoked =
+            case ( scope, model.active ) of
+                ( "server", ServerView sid ) ->
+                    serverId == Just sid
+
+                ( "server", ChannelView cid ) ->
+                    List.member cid channelIds
+
+                ( "server", VoiceChannelView cid ) ->
+                    List.member cid channelIds
+
+                ( "direct", DmView cid ) ->
+                    conversationId == Just cid
+
+                _ ->
+                    False
+
+        nextModel =
+            case serverId of
+                Just sid ->
+                    { model | serverCache = Dict.remove sid model.serverCache }
+
+                Nothing ->
+                    model
+
+        destination =
+            if activeRevoked then
+                setHash "#dms"
+
+            else
+                Cmd.none
+    in
+    ( nextModel
+    , Cmd.batch
+        [ apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+        , destination
+        ]
+    )
 
 
 clearSupersededCall : E.Value -> Model -> ( Model, Cmd Msg )
@@ -3892,7 +4053,7 @@ handleMention ev model =
                             (E.object
                                 [ ( "title", E.string "You were mentioned in a discussion" )
                                 , ( "body", E.string snippet )
-                                , ( "url", E.string ("#thread/" ++ String.fromInt threadId) )
+                                , ( "url", E.string ("#t/" ++ String.fromInt threadId) )
                                 , ( "tag", E.string ("mention-thread:" ++ String.fromInt threadId) )
                                 ]
                             )
@@ -4363,13 +4524,13 @@ modalContent kind model =
         ]
 
     else if kind == "new_forum" then
-        [ modalHead "Create community" "Make a public r/community for focused discussions."
+        [ modalHead "Create forum" "Make a public f/forum for focused discussions."
         , div [ class "modal-body" ]
-            [ div [ class "field" ] [ label [] [ text "Community name" ], input [ value model.modalTitle, placeholder "Gaming, News, Art...", onInput ModalTitle ] [] ]
-            , div [ class "field" ] [ label [] [ text "r/ slug" ], input [ value model.modalUserIds, placeholder "gaming", onInput ModalUserIds ] [] ]
+            [ div [ class "field" ] [ label [] [ text "Forum name" ], input [ value model.modalTitle, placeholder "Gaming, News, Art...", onInput ModalTitle ] [] ]
+            , div [ class "field" ] [ label [] [ text "f/ slug" ], input [ value model.modalUserIds, placeholder "gaming", onInput ModalUserIds ] [] ]
             , div [ class "field" ] [ label [] [ text "Description" ], textarea [ value model.modalBody, placeholder "What should people post here?", onInput ModalBody ] [] ]
             ]
-        , modalActions "Create community"
+        , modalActions "Create forum"
         ]
 
     else if kind == "new_dm" then
@@ -4500,23 +4661,29 @@ modalContent kind model =
             [ shortcutRow "Quick switcher" "Ctrl / Cmd + K"
             , shortcutRow "Open settings" "Ctrl / Cmd + ,"
             , shortcutRow "Emoji picker" "Ctrl / Cmd + E"
-            , shortcutRow "Edit your latest message (empty composer)" "↑ / Shift + ↑"
+            , shortcutRow "GIF search" "Ctrl / Cmd + G"
+            , shortcutRow "Edit your latest message (empty composer)" "↑"
             , shortcutRow "Search" "Ctrl / Cmd + F"
             , shortcutRow "Activity / mentions" "Ctrl / Cmd + I"
             , shortcutRow "Return to previous conversation / text channel" "Ctrl / Cmd + B"
             , shortcutRow "Create or join a server" "Ctrl / Cmd + Shift + N"
             , shortcutRow "Previous conversation or channel" "Alt + ↑"
             , shortcutRow "Next conversation or channel" "Alt + ↓"
+            , shortcutRow "Previous unread DM" "Alt + Shift + ↑"
+            , shortcutRow "Next unread DM" "Alt + Shift + ↓"
             , shortcutRow "Previous server" "Ctrl / Cmd + Alt + ←"
             , shortcutRow "Next server" "Ctrl / Cmd + Alt + →"
             , shortcutRow "Return to connected audio" "Ctrl / Cmd + Alt + A"
             , shortcutRow "Toggle mute while connected" "Ctrl / Cmd + Shift + M"
             , shortcutRow "Toggle deafen while connected" "Ctrl / Cmd + Shift + D"
+            , shortcutRow "Toggle screen sharing" "Ctrl / Cmd + Shift + S"
+            , shortcutRow "Expand / minimize active call" "Ctrl / Cmd + Shift + C"
             , shortcutRow "Answer incoming call" "Ctrl / Cmd + Enter"
             , shortcutRow "Start call in current DM" "Ctrl / Cmd + ["
             , shortcutRow "New group conversation" "Ctrl / Cmd + Shift + T"
             , shortcutRow "Upload files" "Ctrl / Cmd + Shift + U"
             , shortcutRow "Focus message box" "Ctrl / Cmd + Shift + L"
+            , shortcutRow "Close current DM" "Ctrl / Cmd + Shift + Backspace"
             , shortcutRow "Show shortcuts / help" "Ctrl / Cmd + Shift + H"
             , shortcutRow "Show shortcuts" "Ctrl / Cmd + /"
             , shortcutRow "Close menus and dialogs" "Esc"
@@ -4596,9 +4763,9 @@ modalContent kind model =
         ]
 
     else if kind == "join_invite" then
-        [ modalHead "Join a Server" "Enter an invite code to join."
+        [ modalHead "Join a Server" "Enter a Wire code or link to join."
         , div [ class "modal-body" ]
-            [ div [ class "field" ] [ label [] [ text "Invite code" ], input [ value model.modalUserIds, placeholder "Paste an invite link or code", onInput ModalUserIds ] [] ]
+            [ div [ class "field" ] [ label [] [ text "Wire code" ], input [ value model.modalUserIds, placeholder "Paste a Wire link or code", onInput ModalUserIds ] [] ]
             ]
         , modalActions "Join"
         ]
@@ -4651,9 +4818,9 @@ modalContent kind model =
                         )
                         channels
         in
-        [ modalHead "Invite friends" "Choose where the invite opens, then copy one secure link."
+        [ modalHead "Create a Wire" "Choose where the Wire opens, then copy one secure link."
         , div [ class "modal-body" ]
-            [ div [ class "field" ] [ label [] [ text "Open invite in" ], div [ class "choice-grid invite-destination-grid" ] channelChoices ]
+            [ div [ class "field" ] [ label [] [ text "Open Wire in" ], div [ class "choice-grid invite-destination-grid" ] channelChoices ]
             , div [ class "field" ]
                 [ label [] [ text "Usage limit" ]
                 , div [ class "segmented-choice" ]
@@ -4665,7 +4832,7 @@ modalContent kind model =
                 ]
             , div [ class "field" ]
                 [ label [] [ text "Expires after" ]
-                , select [ value model.modalTitle, onInput ModalTitle, attribute "aria-label" "Invite expiration" ]
+                , select [ value model.modalTitle, onInput ModalTitle, attribute "aria-label" "Wire expiration" ]
                     [ option [ value "3600" ] [ text "1 hour" ]
                     , option [ value "86400" ] [ text "24 hours" ]
                     , option [ value "604800" ] [ text "7 days" ]
@@ -4675,7 +4842,7 @@ modalContent kind model =
             , p [ class "muted modal-hint" ] [ text "Only people with this link can join. Revoke a link below to stop new joins." ]
             , div [ class "invite-manager", attribute "data-invite-server" (String.dropLeft 7 kind) ] []
             ]
-        , modalActions "Copy invite"
+        , modalActions "Create Wire"
         ]
 
     else if String.startsWith "edit_server:" kind then
@@ -4827,15 +4994,15 @@ modalContent kind model =
                 url
         in
         if String.startsWith "error" rest then
-            [ modalHead "Invite failed" "Could not create invite."
+            [ modalHead "Wire failed" "Could not create Wire."
             , div [ class "modal-actions" ] [ button [ class "btn", onClick CloseModal ] [ text "Close" ] ]
             ]
 
         else
-            [ modalHead "Invite created" "Share this link with friends."
+            [ modalHead "Wire created" "Share this Wire with friends."
             , div [ class "modal-body" ]
                 [ div [ class "field" ]
-                    [ label [] [ text "Invite link" ]
+                    [ label [] [ text "Wire link" ]
                     , div [ class "invite-code-box" ]
                         [ input [ class "invite-code-input", readonly True, value displayLink ] []
                         , button [ class "btn", onClick (CopyText displayLink) ] [ text "Copy" ]
@@ -4960,6 +5127,45 @@ navigateRelative delta model =
 
     else
         case listAt nextIndex routes of
+            Just route ->
+                ( model, setHash route )
+
+            Nothing ->
+                ( model, Cmd.none )
+
+
+navigateUnread : Int -> Model -> ( Model, Cmd Msg )
+navigateUnread delta model =
+    let
+        routes =
+            model.convs
+                |> List.filter (\conversation -> conversation.unread > 0)
+                |> List.map (\conversation -> "#dm/" ++ String.fromInt conversation.id)
+
+        current =
+            case model.active of
+                DmView id ->
+                    "#dm/" ++ String.fromInt id
+
+                _ ->
+                    ""
+
+        currentIndex =
+            routes
+                |> List.indexedMap Tuple.pair
+                |> List.filter (\( _, route ) -> route == current)
+                |> List.head
+                |> Maybe.map Tuple.first
+                |> Maybe.withDefault (if delta < 0 then 0 else -1)
+
+        count =
+            List.length routes
+    in
+    if count == 0 then
+        ( { model | toast = Just "No unread direct messages." }, Cmd.none )
+
+    else
+        case listAt (modBy count (currentIndex + delta)) routes of
             Just route ->
                 ( model, setHash route )
 
@@ -5185,11 +5391,34 @@ messageContext me message x y =
     { items = base ++ authorItems ++ mineItems, x = x, y = y }
 
 
-conversationContext : Conversation -> Int -> Int -> ContextMenu
-conversationContext c x y =
+conversationContext : Model -> Conversation -> Int -> Int -> ContextMenu
+conversationContext _ c x y =
     let
+        isGroup =
+            c.memberCount > 2
+
+        canManageMembers =
+            isGroup && (c.groupRole == "owner" || c.groupRole == "moderator")
+
+        canRename =
+            isGroup && c.groupRole == "owner"
+
+        groupItems =
+            (if canRename then
+                [ { label = "Rename group", icon = Just "✎", danger = False, sep = False, msg = EditConversationModal c } ]
+
+             else
+                []
+            )
+                ++ (if canManageMembers then
+                        [ { label = "Add people", icon = Just "+", danger = False, sep = False, msg = AddPeopleModal c.id } ]
+
+                    else
+                        []
+                   )
+
         closeItem =
-            if c.memberCount > 2 then
+            if isGroup then
                 { label = "Leave group", icon = Just "×", danger = True, sep = True, msg = LeaveConversation c.id }
 
             else
@@ -5198,26 +5427,40 @@ conversationContext c x y =
     { items =
         [ { label = "Open", icon = Just "→", danger = False, sep = False, msg = Go ("#dm/" ++ String.fromInt c.id) }
         , { label = "Mark read", icon = Just "✓", danger = False, sep = False, msg = MarkConvRead c.id }
-        , { label = "Rename", icon = Just "✎", danger = False, sep = False, msg = EditConversationModal c }
-        , { label = "Add people", icon = Just "+", danger = False, sep = False, msg = AddPeopleModal c.id }
-        , closeItem
         ]
+            ++ groupItems
+            ++ [ closeItem ]
     , x = x
     , y = y
     }
 
 
+serverAdministratorBit : Int
+serverAdministratorBit =
+    1073741824
+
+
+serverHasPermission : Int -> Server -> Bool
+serverHasPermission permission server =
+    server.role == "owner"
+        || server.role == "admin"
+        || Bitwise.and server.permissions serverAdministratorBit /= 0
+        || Bitwise.and server.permissions permission /= 0
+
+
 serverContext : Server -> Int -> Int -> ContextMenu
 serverContext server x y =
     let
-        canManage =
-            server.role == "owner" || server.role == "admin"
+        wireItems =
+            if serverHasPermission 256 server then
+                [ { label = "Create Wire", icon = Just "+", danger = False, sep = True, msg = InviteModal server.id } ]
+
+            else
+                []
 
         management =
-            if canManage then
-                [ { label = "Invite people", icon = Just "+", danger = False, sep = True, msg = InviteModal server.id }
-                , { label = "Edit server", icon = Just "✎", danger = False, sep = False, msg = EditServerModal server }
-                ]
+            if serverHasPermission 16 server then
+                [ { label = "Edit server", icon = Just "✎", danger = False, sep = List.isEmpty wireItems, msg = EditServerModal server } ]
 
             else
                 []
@@ -5226,6 +5469,7 @@ serverContext server x y =
         [ { label = "Open server", icon = Just "→", danger = False, sep = False, msg = Go ("#server/" ++ String.fromInt server.id) }
         , { label = "Copy server name", icon = Just "⧉", danger = False, sep = False, msg = CopyText server.name }
         ]
+            ++ wireItems
             ++ management
             ++ [ { label = "Copy server ID", icon = Just "#", danger = False, sep = True, msg = CopyText (String.fromInt server.id) } ]
     , x = x
@@ -5616,11 +5860,38 @@ renderExpandedCallOverlay active model =
                     )
                 ]
                 [ callIcon icon, span [] [ text label ] ]
+
+        facepileUsers =
+            List.take 4 active.users
+
+        facepileOverflow =
+            Basics.max 0 (List.length active.users - List.length facepileUsers)
     in
     div [ class "call-overlay expanded" ]
         [ div [ class "call-overlay-header", attribute "data-call-drag-handle" "true" ]
             [ div [ class "call-overlay-heading" ]
-                [ div [ class "call-overlay-title" ] [ text "In the room" ]
+                [ div [ class "call-overlay-title-row" ]
+                    [ div [ class "call-overlay-title" ] [ text "In the room" ]
+                    , div [ class "call-overlay-facepile", attribute "aria-label" "Call participants" ]
+                        (List.map
+                            (\u ->
+                                button
+                                    [ type_ "button"
+                                    , class "call-overlay-face"
+                                    , onClick (ShowUserPopup u.userId)
+                                    , title ("Open " ++ u.displayName ++ "'s profile")
+                                    ]
+                                    [ avatarImg u.avatarUrl u.displayName "tiny" ]
+                            )
+                            facepileUsers
+                            ++ (if facepileOverflow > 0 then
+                                    [ span [ class "call-overlay-face-overflow", title (String.fromInt facepileOverflow ++ " more participants") ] [ text ("+" ++ String.fromInt facepileOverflow) ] ]
+
+                                else
+                                    []
+                               )
+                        )
+                    ]
                 , div [ class "call-overlay-meta" ]
                     [ span
                         [ class
@@ -5799,7 +6070,7 @@ renderCallUser model u =
                 "Deafened"
 
             else if isSelf then
-                "You · Ready"
+                "You · Connected"
 
             else if u.connected then
                 "Connected to you"
@@ -5815,10 +6086,16 @@ renderCallUser model u =
                 text ""
     in
     div [ class "call-user-row", attribute "data-peer-id" (String.fromInt u.userId) ]
-        [ avatarImg u.avatarUrl u.displayName avatarClass
-        , div [ class "call-user-info" ]
-            [ span [ class "call-user-name" ] [ text u.displayName ]
-            , span
+        [ button
+            [ type_ "button"
+            , class "call-user-identity"
+            , onClick (ShowUserPopup u.userId)
+            , title ("Open " ++ u.displayName ++ "'s profile")
+            ]
+            [ avatarImg u.avatarUrl u.displayName avatarClass
+            , div [ class "call-user-info" ]
+                [ span [ class "call-user-name" ] [ text u.displayName ]
+                , span
                 [ class
                     ("call-user-status"
                         ++ (if u.connectionFailed then
@@ -5838,7 +6115,8 @@ renderCallUser model u =
                            )
                     )
                 ]
-                [ text statusText ]
+                    [ text statusText ]
+                ]
             ]
         , if u.screen && not isSelf then
             button
@@ -5937,7 +6215,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.7.4", attribute "data-ui-revision" "interface-4" ]
+    div [ class "layout", attribute "data-ui-version" "1.7.5", attribute "data-ui-revision" "interface-4" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -6020,7 +6298,7 @@ renderServersSheet model =
                     )
                 , div [ class "servers-sheet-actions" ]
                     [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "Create server" ]
-                    , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with invite" ]
+                    , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with Wire" ]
                     ]
                 ]
             ]
@@ -6208,6 +6486,7 @@ renderSide model =
             ([ notifRow model
              , friendsRow model
              , dmHeader model
+             , Html.node "pw-onboarding-entry" [ attribute "data-variant" "sidebar" ] []
              ]
                 ++ (let
                         requestCount =
@@ -6270,7 +6549,7 @@ renderServerSide model data =
                         "▼ "
                     )
                 , text cat.name
-                , if canManage then
+                , if canManageChannels then
                     span [ class "category-actions" ]
                         [ button [ class "ctx-trigger", type_ "button", title ("Add a channel to " ++ cat.name), onClickStop (ChannelModalInCategory data.server.id cat.id) ] [ text "+" ]
                         , button [ class "ctx-trigger", type_ "button", title ("Edit " ++ cat.name), onClickStop (EditCategoryModal data.server.id cat) ] [ text "⋯" ]
@@ -6287,14 +6566,17 @@ renderServerSide model data =
                         [ div [ class "category-empty" ] [ text "No channels yet" ] ]
 
                     else
-                        List.map (managedChannelRow canManage data.categories) channels
+                        List.map (managedChannelRow canManageChannels data.categories) channels
                    )
 
         sortedCategories =
             List.sortBy .position data.categories
 
-        canManage =
-            data.server.role == "owner" || data.server.role == "admin"
+        canManageChannels =
+            serverHasPermission 8 data.server
+
+        canCreateWire =
+            serverHasPermission 256 data.server
     in
     aside
         [ class
@@ -6328,15 +6610,21 @@ renderServerSide model data =
                     [ span [ class "call-icon call-icon-close", attribute "aria-hidden" "true" ] [] ]
                 ]
             , div [ class "nav-actions" ]
-                (if canManage then
-                    [ button [ class "btn secondary", onClick (InviteModal data.server.id) ] [ text "Invite" ]
-                    , button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Channel" ]
-                    , button [ class "btn secondary", onClick (CreateCategoryModal data.server.id) ] [ text "Category" ]
-                    , button [ class "btn secondary", onClick (EditServerModal data.server) ] [ text "Edit" ]
-                    ]
+                ([ button [ class "btn secondary", onClick (BridgeEvent "open_server_admin" (E.int data.server.id)) ] [ text "Server settings" ] ]
+                    ++ (if canCreateWire then
+                            [ button [ class "btn secondary", onClick (InviteModal data.server.id) ] [ text "Wire" ] ]
 
-                 else
-                    []
+                        else
+                            []
+                       )
+                    ++ (if canManageChannels then
+                            [ button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Channel" ]
+                            , button [ class "btn secondary", onClick (CreateCategoryModal data.server.id) ] [ text "Category" ]
+                            ]
+
+                        else
+                            []
+                       )
                 )
             ]
         , div [ class "search" ] [ quickJumpButton ]
@@ -6434,7 +6722,7 @@ sideHead model =
             [ Html.node "summary" [] [ text "Workspace", span [ attribute "aria-hidden" "true" ] [ text "⌄" ] ]
             , div [ class "workspace-menu-items" ]
                 [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "Create server" ]
-                , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with invite" ]
+                , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with Wire" ]
                 ]
             ]
         ]
@@ -6675,16 +6963,30 @@ convRow c model =
                 , Markdown.preview lastText
                 ]
             ]
-        , span
-            [ class "badge"
-            , if c.unread == 0 then
-                attribute "data-zero" "1"
+        , span [ class "dm-row-actions" ]
+            [ span
+                [ class "badge"
+                , if c.unread == 0 then
+                    attribute "data-zero" "1"
 
-              else
-                attribute "data-zero" "0"
-            ]
-            [ if c.unread > 0 then
-                text (String.fromInt c.unread)
+                  else
+                    attribute "data-zero" "0"
+                ]
+                [ if c.unread > 0 then
+                    text (String.fromInt c.unread)
+
+                  else
+                    text ""
+                ]
+            , if c.memberCount == 2 then
+                span
+                    [ class "dm-close"
+                    , attribute "role" "button"
+                    , attribute "tabindex" "0"
+                    , title "Close DM"
+                    , onClickStop (CloseConversation c.id)
+                    ]
+                    [ text "×" ]
 
               else
                 text ""
@@ -6884,10 +7186,10 @@ topbarSubtitle model =
             "Overview"
 
         Forums ->
-            "Community discussions"
+            "Forum discussions"
 
         ForumView _ ->
-            "Community"
+            "Forum"
 
         ThreadView _ ->
             "Discussion"
@@ -6908,7 +7210,7 @@ topbarSubtitle model =
             "Preferences"
 
         NewServer ->
-            "New community"
+            "New forum"
 
         ServerView _ ->
             "Server overview"
@@ -6920,7 +7222,7 @@ topbarSubtitle model =
             "Voice channel"
 
         InviteView _ ->
-            "Server invite"
+            "Server Wire"
 
         Notifications ->
             "Mentions and activity"
@@ -6972,7 +7274,7 @@ topbarTitle model =
             "Voice"
 
         InviteView _ ->
-            "Invite"
+            "Wire"
 
         Notifications ->
             "Notifications"
@@ -7071,18 +7373,18 @@ renderForumsPage model =
         [ div [ class "forum-header-bar forum-directory-hero" ]
             [ div [ class "forum-header-title" ]
                 [ span [ class "eyebrow" ] [ text "Plainwire Forums" ]
-                , h2 [] [ text "Find your community" ]
-                , p [ class "muted" ] [ text (String.fromInt (List.length model.forums) ++ " communities for questions, ideas, and conversation") ]
+                , h2 [] [ text "Find a forum" ]
+                , p [ class "muted" ] [ text (String.fromInt (List.length model.forums) ++ " forums for questions, ideas, and conversation") ]
                 ]
             , div [ class "forum-header-actions" ]
-                [ button [ class "btn", onClick NewForumModal ] [ text "Create Community" ]
+                [ button [ class "btn", onClick NewForumModal ] [ text "Create Forum" ]
                 ]
             ]
         , div [ class "forum-search" ]
             [ input
                 [ class "forum-search-input"
                 , value model.searchQuery
-                , placeholder "Search communities..."
+                , placeholder "Search forums..."
                 , onInput SearchQuery
                 , on "keydown"
                     (D.andThen
@@ -7103,10 +7405,10 @@ renderForumsPage model =
             div [ class "empty" ]
                 [ text
                     (if String.isEmpty model.searchQuery then
-                        "No communities yet."
+                        "No forums yet."
 
                      else
-                        "No communities match your search."
+                        "No forums match your search."
                     )
                 ]
 
@@ -7156,10 +7458,10 @@ forumCard model f =
                    )
     in
     div [ class "forum-card" ]
-        [ div [ class "forum-card-top", onClick (Go ("#forum/" ++ String.fromInt f.id)) ]
+        [ div [ class "forum-card-top", onClick (Go ("#f/" ++ String.fromInt f.id)) ]
             [ span [ class "forum-card-icon" ] [ text (String.left 1 (String.toUpper f.name)) ]
             , div [ class "forum-card-info" ]
-                [ span [ class "forum-card-kicker" ] [ text ("r/" ++ f.slug) ]
+                [ span [ class "forum-card-kicker" ] [ text ("f/" ++ f.slug) ]
                 , h3 [ class "forum-card-name" ] [ text f.name ]
                 , p [ class "forum-card-desc" ] [ text (ellipsize 120 f.description) ]
                 ]
@@ -7175,7 +7477,7 @@ forumCard model f =
 
               else
                 button [ class "btn forum-join-btn", onClick (JoinForum f.id) ] [ text "Join" ]
-            , a [ class "forum-card-link", href ("#forum/" ++ String.fromInt f.id) ] [ text "View →" ]
+            , a [ class "forum-card-link", href ("#f/" ++ String.fromInt f.id) ] [ text "View →" ]
             ]
         ]
 
@@ -7193,7 +7495,7 @@ renderForumPage id model =
                     [ div [ class "forum-view-title" ]
                         [ span [ class "forum-card-icon large" ] [ text (String.left 1 (String.toUpper f.name)) ]
                         , div []
-                            [ span [ class "forum-card-kicker" ] [ text ("r/" ++ f.slug) ]
+                            [ span [ class "forum-card-kicker" ] [ text ("f/" ++ f.slug) ]
                             , h2 [] [ text f.name ]
                             , p [ class "muted" ] [ text f.description ]
                             , div [ class "forum-view-stats" ]
@@ -7203,14 +7505,21 @@ renderForumPage id model =
                             ]
                         ]
                     , div [ class "forum-view-actions" ]
-                        [ if f.joined then
+                        [ if f.ownerId == Maybe.map .id model.me then
+                            span [ class "pill forum-owner-pill" ] [ text "Owner" ]
+
+                          else if f.joined then
                             button [ class "btn forum-joined-btn", onClick (LeaveForum f.id) ] [ text "Joined" ]
 
                           else
                             button [ class "btn forum-join-btn", onClick (JoinForum f.id) ] [ text "Join" ]
-                        , button [ class "btn", onClick (NewThreadModal (Just id)) ] [ text "New Thread" ]
+                        , if f.joined then
+                            button [ class "btn", onClick (NewThreadModal (Just id)) ] [ text "New Thread" ]
+
+                          else
+                            button [ class "btn secondary", disabled True, title "Join this forum to create a thread" ] [ text "Join to post" ]
                         , if f.ownerId == Maybe.map .id model.me then
-                            button [ class "btn danger", onClick (BridgeEvent "delete_forum" (E.int f.id)) ] [ text "Delete Community" ]
+                            button [ class "btn danger", onClick (BridgeEvent "delete_forum" (E.int f.id)) ] [ text "Delete Forum" ]
 
                           else
                             text ""
@@ -7219,7 +7528,7 @@ renderForumPage id model =
 
             Nothing ->
                 div [ class "forum-view-header" ]
-                    [ h2 [] [ text "Community" ] ]
+                    [ h2 [] [ text "Forum" ] ]
         , div [ class "thread-listing" ]
             (List.map (threadRow model) model.threads
                 |> (\l ->
@@ -7235,7 +7544,7 @@ renderForumPage id model =
 
 threadRow : Model -> ForumThread -> Html Msg
 threadRow model t =
-    div [ class "reddit-thread", onClick (Go ("#thread/" ++ String.fromInt t.id)) ]
+    div [ class "forum-thread", onClick (Go ("#t/" ++ String.fromInt t.id)) ]
         [ voteColumn t
         , div [ class "thread-content" ]
             [ h3 [ class "thread-title" ]
@@ -7277,25 +7586,22 @@ renderThreadPage threadId model =
     case model.currentThread of
         Just t ->
             let
-                forumOwner =
-                    model.forums
-                        |> List.filter (\forum -> forum.id == t.forumId)
-                        |> List.head
-                        |> Maybe.andThen .ownerId
-
-                myId =
-                    Maybe.map .id model.me
-
                 canDelete =
-                    myId == Just t.userId || myId == forumOwner
+                    t.canDelete
+
+                canEdit =
+                    t.canEdit
+
+                canModerate =
+                    t.canModerate
             in
             div [ class "thread-page" ]
                 [ div [ class "thread-breadcrumb" ]
-                    [ a [ href ("#forum/" ++ String.fromInt t.forumId) ] [ text ("r/" ++ t.forumName) ]
+                    [ a [ href ("#f/" ++ String.fromInt t.forumId) ] [ text ("f/" ++ t.forumName) ]
                     , span [] [ text "›" ]
-                    , span [] [ text "Discussion" ]
+                    , span [] [ text ("t/" ++ String.fromInt t.id) ]
                     ]
-                , div [ class "post card reddit-post" ]
+                , div [ class "post card thread-post" ]
                     [ voteColumn t
                     , div [ class "post-body" ]
                         [ h1 [ class "thread-title" ] [ text t.title ]
@@ -7311,6 +7617,21 @@ renderThreadPage threadId model =
                             [ span [] [ text (String.fromInt t.score ++ " points") ]
                             , span [] [ text (String.fromInt t.views ++ " views") ]
                             , span [] [ text (String.fromInt t.replyCount ++ " replies") ]
+                            , if canEdit then
+                                button [ class "thread-action-btn", onClick (BridgeEvent "edit_thread" (E.object [ ( "id", E.int t.id ), ( "title", E.string t.title ), ( "body", E.string t.body ), ( "raw_body", E.string t.rawBody ) ])) ] [ text "Edit" ]
+
+                              else
+                                text ""
+                            , if canModerate then
+                                button [ class "thread-action-btn", onClick (BridgeEvent "moderate_thread" (E.object [ ( "id", E.int t.id ), ( "action", E.string "pin" ), ( "value", E.bool (not t.pinned) ) ])) ] [ text (if t.pinned then "Unpin" else "Pin") ]
+
+                              else
+                                text ""
+                            , if canModerate then
+                                button [ class "thread-action-btn", onClick (BridgeEvent "moderate_thread" (E.object [ ( "id", E.int t.id ), ( "action", E.string "lock" ), ( "value", E.bool (not t.locked) ) ])) ] [ text (if t.locked then "Unlock" else "Lock") ]
+
+                              else
+                                text ""
                             , if canDelete then
                                 button [ class "thread-delete-btn", onClick (BridgeEvent "delete_thread" (E.object [ ( "id", E.int t.id ), ( "forum_id", E.int t.forumId ) ])) ] [ text "Delete thread" ]
 
@@ -7333,8 +7654,14 @@ renderThreadPage threadId model =
                 , if t.locked then
                     div [ class "locked-banner" ] [ text "This thread is locked. New replies are disabled." ]
 
-                  else
+                  else if t.viewerJoined then
                     Composer.view ("thread:" ++ String.fromInt threadId) "Reply to thread" model
+
+                  else
+                    div [ class "thread-membership-gate" ]
+                        [ span [] [ text "Join this forum to reply or vote." ]
+                        , button [ class "btn", onClick (JoinForum t.forumId) ] [ text "Join forum" ]
+                        ]
                 ]
 
         Nothing ->
@@ -7369,8 +7696,9 @@ voteColumn t =
                             ""
                        )
                 )
-            , title "Upvote"
-            , onClickStop (VoteThread t.id upValue)
+            , title (if t.viewerJoined then "Upvote" else "Join this forum to vote")
+            , disabled (not t.viewerJoined)
+            , onClickStop (if t.viewerJoined then VoteThread t.id upValue else NoOp)
             ]
             [ text "▲" ]
         , span [ class "vote-count" ] [ text (String.fromInt t.score) ]
@@ -7384,8 +7712,9 @@ voteColumn t =
                             ""
                        )
                 )
-            , title "Downvote"
-            , onClickStop (VoteThread t.id downValue)
+            , title (if t.viewerJoined then "Downvote" else "Join this forum to vote")
+            , disabled (not t.viewerJoined)
+            , onClickStop (if t.viewerJoined then VoteThread t.id downValue else NoOp)
             ]
             [ text "▼" ]
         ]
@@ -7393,6 +7722,13 @@ voteColumn t =
 
 replyView : Model -> Int -> Reply -> Html Msg
 replyView model idx r =
+    let
+        canEdit =
+            r.canEdit
+
+        canDelete =
+            r.canDelete
+    in
     div [ class "post card forum-reply" ]
         [ div [ class "reply-rail" ]
             [ avatarImg r.avatarUrl r.displayName ""
@@ -7406,6 +7742,22 @@ replyView model idx r =
                 , span [ class "reply-number" ] [ text ("#" ++ String.fromInt (idx + 1)) ]
                 ]
             , div [ class "reply-body" ] (Markdown.renderBody r.body)
+            , if canEdit || canDelete then
+                div [ class "reply-actions" ]
+                    [ if canEdit then
+                        button [ class "thread-action-btn", onClick (BridgeEvent "edit_thread_reply" (E.object [ ( "id", E.int r.id ), ( "thread_id", E.int r.threadId ), ( "body", E.string r.body ), ( "raw_body", E.string r.rawBody ) ])) ] [ text "Edit" ]
+
+                      else
+                        text ""
+                    , if canDelete then
+                        button [ class "thread-delete-btn", onClick (BridgeEvent "delete_thread_reply" (E.object [ ( "id", E.int r.id ), ( "thread_id", E.int r.threadId ) ])) ] [ text "Delete" ]
+
+                      else
+                        text ""
+                    ]
+
+              else
+                text ""
             ]
         ]
 
@@ -7439,6 +7791,7 @@ renderDmsPage model =
                 ]
             , button [ class "btn", onClick NewDmModal ] [ text "New message" ]
             ]
+        , Html.node "pw-onboarding-entry" [ attribute "data-variant" "inbox" ] []
         , if List.isEmpty requests then
             text ""
 
@@ -7804,8 +8157,14 @@ renderServerPage model =
     case model.currentServer of
         Just data ->
             let
-                canManage =
-                    data.server.role == "owner" || data.server.role == "admin"
+                canManageServer =
+                    serverHasPermission 16 data.server
+
+                canManageChannels =
+                    serverHasPermission 8 data.server
+
+                canCreateWire =
+                    serverHasPermission 256 data.server
 
                 textChannels =
                     List.filter (\c -> c.kind /= "voice") data.channels
@@ -7840,7 +8199,7 @@ renderServerPage model =
                             , p []
                                 [ text
                                     (if String.isEmpty data.server.description then
-                                        "A Plainwire community."
+                                        "A Plainwire forum."
 
                                      else
                                         data.server.description
@@ -7854,12 +8213,25 @@ renderServerPage model =
                         , span [ class "server-meta-item" ] [ b [] [ text (String.fromInt (List.length voiceChannels)) ], text " voice" ]
                         , span [ class "server-role-badge" ] [ text data.server.role ]
                         ]
-                    , if canManage then
+                    , if canCreateWire || canManageChannels || canManageServer then
                         div [ class "server-hero-actions" ]
-                            [ button [ class "btn", onClick (InviteModal data.server.id) ] [ text "Invite people" ]
-                            , button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Add channel" ]
-                            , button [ class "btn secondary", onClick (EditServerModal data.server) ] [ text "Customize" ]
-                            ]
+                            ([ if canCreateWire then
+                                    button [ class "btn", onClick (InviteModal data.server.id) ] [ text "Create Wire" ]
+
+                               else
+                                    text ""
+                             , if canManageChannels then
+                                    button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Add channel" ]
+
+                               else
+                                    text ""
+                             , if canManageServer then
+                                    button [ class "btn secondary", onClick (EditServerModal data.server) ] [ text "Customize" ]
+
+                               else
+                                    text ""
+                             ]
+                            )
 
                       else
                         text ""
@@ -7879,7 +8251,7 @@ renderServerPage model =
                                 [ h2 [] [ text "Channels" ]
                                 , p [ class "muted" ] [ text "Jump into text or voice." ]
                                 ]
-                            , if canManage then
+                            , if canManageChannels then
                                 button [ class "btn ghost", onClick (ChannelModal data.server.id) ] [ text "Add" ]
 
                               else
@@ -8020,11 +8392,36 @@ managedChannelRow canManage categories channel =
 
 memberRow : Dict String String -> ServerMember -> Html Msg
 memberRow userStatuses m =
-    div [ class "row member-row clickable-user", onClick (ShowUserPopup m.user.id), onContextMenu (OpenUserCtx m.user) ]
-        [ presenceAvatar userStatuses m.user.id m.user.avatarUrl m.user.displayName ""
+    let
+        displayName =
+            if String.isEmpty (String.trim m.nickname) then
+                m.user.displayName
+            else
+                m.nickname
+
+        avatarUrl =
+            if String.isEmpty (String.trim m.serverAvatarUrl) then
+                m.user.avatarUrl
+            else
+                m.serverAvatarUrl
+
+        roleText =
+            if String.isEmpty (String.trim m.roleNames) then
+                m.role
+            else
+                m.roleNames
+
+        roleAttrs =
+            if String.isEmpty m.roleColor then
+                [ class "server-member-role" ]
+            else
+                [ class "server-member-role", style "color" m.roleColor ]
+    in
+    div [ class "row member-row clickable-user", onClick (ShowUserPopup m.user.id), onContextMenu (OpenUserCtx m.user), title (if String.isEmpty m.serverBio then displayName else m.serverBio) ]
+        [ presenceAvatar userStatuses m.user.id avatarUrl displayName ""
         , div [ class "grow" ]
-            [ b [] [ text m.user.displayName ]
-            , small [ class "muted" ] [ text ("@" ++ m.user.username ++ " · " ++ m.role) ]
+            [ b [] [ text displayName ]
+            , small [ class "muted" ] [ text ("@" ++ m.user.username ++ " · "), span roleAttrs [ text roleText ] ]
             ]
         ]
 
@@ -8200,10 +8597,28 @@ voiceParticipantRow selfId members vu =
                 vu.displayName
 
         name =
-            maybeMember |> Maybe.map (\m -> m.user.displayName) |> Maybe.withDefault rosterFallbackName
+            maybeMember
+                |> Maybe.map
+                    (\m ->
+                        if String.isEmpty (String.trim m.nickname) then
+                            m.user.displayName
+
+                        else
+                            m.nickname
+                    )
+                |> Maybe.withDefault rosterFallbackName
 
         avatarUrl =
-            maybeMember |> Maybe.map (\m -> m.user.avatarUrl) |> Maybe.withDefault vu.avatarUrl
+            maybeMember
+                |> Maybe.map
+                    (\m ->
+                        if String.isEmpty (String.trim m.serverAvatarUrl) then
+                            m.user.avatarUrl
+
+                        else
+                            m.serverAvatarUrl
+                    )
+                |> Maybe.withDefault vu.avatarUrl
 
         stateText =
             if vu.reconnecting then
@@ -8680,6 +9095,8 @@ renderAccountSettings user model =
                 [ b [] [ text "Active sessions" ], small [ class "muted" ] [ text "Review where your account is currently signed in." ] ]
             , button [ class "settings-action-card", onClick (BridgeEvent "account_diagnostics" E.null) ]
                 [ b [] [ text "Connection diagnostics" ], small [ class "muted" ] [ text "Check WebSocket, database, browser, and TURN readiness." ] ]
+            , button [ class "settings-action-card", onClick (BridgeEvent "replay_onboarding" E.null) ]
+                [ b [] [ text "Replay Plainwire tour" ], small [ class "muted" ] [ text "Walk through messages, servers, forums, calls, and shortcuts again." ] ]
             ]
         , div [ class "setting-row settings-about-row" ]
             [ div [] [ b [] [ text "Plainwire" ], small [ class "muted" ] [ text ("Version " ++ model.clientVersion) ] ]
@@ -9284,15 +9701,15 @@ renderInvitePage model =
                 , p [ class "muted" ] [ text invite.serverDescription ]
                 , p [ class "muted" ] [ text (String.fromInt invite.memberCount ++ " members") ]
                 , if invite.valid then
-                    button [ class "btn", onClick JoinInvite ] [ text "Accept invite" ]
+                    button [ class "btn", onClick JoinInvite ] [ text "Join server" ]
 
                   else
-                    p [ class "muted" ] [ text "This invite is no longer valid." ]
+                    p [ class "muted" ] [ text "This Wire is no longer valid." ]
                 , button [ class "btn secondary", onClick (Go "#") ] [ text "Back home" ]
                 ]
 
         Nothing ->
-            div [ class "empty" ] [ text "Loading invite..." ]
+            div [ class "empty" ] [ text "Loading Wire..." ]
 
 
 renderMessagePage : String -> String -> Model -> Html Msg
@@ -9513,8 +9930,19 @@ renderGroupMembers : Model -> Conversation -> Html Msg
 renderGroupMembers model conversation =
     aside [ class "group-members", attribute "aria-label" "Group members" ]
         [ div [ class "group-members-head" ]
-            [ span [ class "eyebrow" ] [ text "People" ]
-            , h3 [] [ text (String.fromInt conversation.memberCount ++ " members") ]
+            [ div []
+                [ span [ class "eyebrow" ] [ text "People" ]
+                , h3 [] [ text (String.fromInt conversation.memberCount ++ " members") ]
+                ]
+            , button [ class "btn ghost group-manage-btn", type_ "button", onClick (BridgeEvent "open_group_admin" (E.int conversation.id)) ]
+                [ text
+                    (if conversation.groupRole == "owner" || conversation.groupRole == "moderator" then
+                        "Manage"
+
+                     else
+                        "Members"
+                    )
+                ]
             ]
         , div [ class "group-members-list" ]
             (if List.isEmpty conversation.members then
@@ -9544,8 +9972,11 @@ groupMemberRow model ownerId member =
             [ b [] [ text user.displayName ]
             , small [ class "muted" ] [ text ("@" ++ user.username) ]
             ]
-        , if user.id == ownerId then
+        , if user.id == ownerId || member.role == "owner" then
             span [ class "pill group-owner" ] [ text "owner" ]
+
+          else if member.role == "moderator" then
+            span [ class "pill group-moderator" ] [ text "mod" ]
 
           else
             text ""
@@ -9583,7 +10014,7 @@ renderChatHeader model =
                                     )
                                 ]
                             ]
-                        , if c.memberCount > 2 then
+                        , if c.memberCount > 2 && (c.groupRole == "owner" || c.groupRole == "moderator") then
                             button [ class "btn secondary group-add-button", type_ "button", onClick (AddPeopleModal id), attribute "aria-label" "Add people to group", title "Add people to group" ] [ span [ class "ui-icon ui-icon-friends", attribute "aria-hidden" "true" ] [], span [ class "group-add-label" ] [ text "Add people" ] ]
 
                           else
@@ -10306,7 +10737,7 @@ searchUserView u =
 
 searchThreadView : ForumThread -> Html Msg
 searchThreadView t =
-    div [ class "row", onClick (Go ("#thread/" ++ String.fromInt t.id)) ]
+    div [ class "row", onClick (Go ("#t/" ++ String.fromInt t.id)) ]
         [ avatarImg t.avatarUrl t.displayName ""
         , div [] [ b [] [ text t.title ], small [ class "muted" ] [ text (t.forumName ++ " · " ++ t.displayName) ] ]
         ]
@@ -10347,6 +10778,12 @@ parseRoute raw =
     else if s == "notifications" then
         Notifications
 
+    else if String.startsWith "f/" s then
+        ForumView (parseInt (String.dropLeft 2 s))
+
+    else if String.startsWith "t/" s then
+        ThreadView (parseInt (String.dropLeft 2 s))
+
     else if String.startsWith "forum/" s then
         ForumView (parseInt (String.dropLeft 6 s))
 
@@ -10367,6 +10804,9 @@ parseRoute raw =
 
     else if String.startsWith "voice/" s then
         VoiceChannelView (parseInt (String.dropLeft 6 s))
+
+    else if String.startsWith "wire/" s then
+        InviteView (String.dropLeft 5 s)
 
     else if String.startsWith "invite/" s then
         InviteView (String.dropLeft 7 s)
@@ -10435,10 +10875,10 @@ fmtErr err =
             "Channel name is required."
 
         "invalid_channel" ->
-            "That invite channel does not belong to this server."
+            "That Wire channel does not belong to this server."
 
         "invalid_invite" ->
-            "That invite is invalid, expired, or has been revoked."
+            "That Wire is invalid, expired, or has been revoked."
 
         "bad_login" ->
             "Username or password is incorrect."
@@ -10469,6 +10909,27 @@ fmtErr err =
 
         "invalid_target" ->
             "That forwarding destination is no longer available."
+
+        "forum_membership_required" ->
+            "Join this forum before posting, replying, or voting."
+
+        "forum_owner_cannot_leave" ->
+            "The forum owner cannot leave their own forum."
+
+        "thread_locked" ->
+            "That thread is locked."
+
+        "role_hierarchy" ->
+            "That role or member is at or above your highest manageable role."
+
+        "owner_role_locked" ->
+            "The server or group owner role cannot be reassigned."
+
+        "too_many_roles" ->
+            "A member can have at most 50 custom roles."
+
+        "invalid_role" ->
+            "One of those roles no longer exists in this server."
 
         "not_found" ->
             "That item no longer exists. Refresh and try again."

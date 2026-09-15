@@ -110,7 +110,7 @@ async function setup(uid) {
   await context.route('**/api/**', async route => {
     const path = new URL(route.request().url()).pathname;
     const reply = data => route.fulfill({ json: { ok: true, data } });
-    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.4', asset_version: '1.7.4', registration_enabled: true } });
+    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.5', asset_version: '1.7.5', registration_enabled: true } });
     if (path === '/api/me') return reply({ user: people[uid - 1], csrf: 'test', server_time: now });
     if (path === '/api/sync') return reply({ ...sync, conversations: [{ ...conversations[0], peer_id: uid === 1 ? 2 : 1, peer_name: people[uid === 1 ? 1 : 0].display_name }] });
     if (path === '/api/messages') return reply([]);
@@ -299,7 +299,8 @@ try {
   await b.waitForFunction(() => document.querySelector('#pw-float-stage-1 video')?.videoWidth > 0);
   assert.equal(await a.evaluate(() => window.__displayRequests[0].video.frameRate.max), 30);
   await a.locator('pw-screen-settings summary').click();
-  await a.getByText('Shared audio is included with your microphone.', { exact: true }).waitFor();
+  await a.locator('[data-screen-audio-status].active').waitFor();
+  await a.getByText('Shared audio is flowing and mixed with your microphone.', { exact: true }).waitFor();
   const sharedAudioBeforeMute = (await stats(b)).inbound[0].energy;
   await a.getByRole('button', { name: 'Mute', exact: true }).click();
   assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track.enabled), true, 'muting the microphone keeps the mixed share track live');
@@ -425,6 +426,8 @@ try {
   await b.waitForFunction(() => window.__pcs.at(-1)?.connectionState === 'connected', null, { timeout: 15000 });
   assert.equal(clientMessages.filter(item => item.uid === 1 && item.msg.type === 'call_join').length, joinsBefore + 1, 'existing call uses call_join');
   assert.equal(clientMessages.filter(item => item.uid === 1 && item.msg.type === 'call_accept').length, acceptsBefore, 'existing call never sends call_accept');
+  await a.getByRole('button', { name: 'Call details', exact: true }).click();
+  await a.locator('.call-overlay').waitFor();
 
   await a.locator('.toast-close').click({ timeout: 1000 }).catch(() => {});
   await mkdir('test-results', { recursive: true });

@@ -1,6 +1,8 @@
 -module(pw_cluster).
 -behaviour(gen_server).
--export([start_link/0, send_user/2, broadcast/2, status/0, members/0]).
+-export([start_link/0, send_user/2, broadcast/2,
+         revoke_server_access/3, revoke_conversation_access/2,
+         status/0, members/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -ifdef(TEST).
 -export([start_link/2]).
@@ -14,6 +16,14 @@ start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE,
                                       {pw_cluster_config:get(), pw_cluster_partisan}, []).
 send_user(Uid, Event) -> publish({user, Uid}, Event).
 broadcast(Key, Event) -> publish({topic, Key}, Event).
+%% Access revocations are control-plane events: unlike an ordinary user notification,
+%% they must mutate the realtime hub state on the websocket-owning node.  Routing
+%% them through the same authenticated cluster envelope keeps kicks immediate even
+%% when the HTTP/API request was handled by another node.
+revoke_server_access(Uid, ServerId, ChannelIds) ->
+    publish({control, revoke_server_access}, #{uid => Uid, server_id => ServerId, channel_ids => ChannelIds}).
+revoke_conversation_access(Uid, ConversationId) ->
+    publish({control, revoke_conversation_access}, #{uid => Uid, conversation_id => ConversationId}).
 
 publish(Target, Event) ->
     %% Local delivery never waits on the cluster manager or a network connection.

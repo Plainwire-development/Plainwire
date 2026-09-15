@@ -13,6 +13,9 @@ public() ->
       app_name => clean_app_name(pw_util:env_str("PLAINWIRE_APP_NAME", <<"Plainwire">>)),
       default_theme => default_theme(),
       registration_enabled => pw_util:env_bool("PLAINWIRE_REGISTRATION_ENABLED", true),
+      gif_search_enabled => pw_klipy:enabled(),
+      gif_provider => case pw_klipy:enabled() of true -> <<"KLIPY">>; false -> <<>> end,
+      source_repository => source_repository(),
       instance_description => pw_util:clean_text(pw_util:env_str("PLAINWIRE_INSTANCE_DESCRIPTION", <<"A fast, self-hosted place to talk.">>), 120),
       upload_max_bytes => upload_max_bytes(),
       profile_image_max_bytes => profile_image_max_bytes(),
@@ -21,10 +24,21 @@ public() ->
       compress_oversize_uploads => pw_util:env_bool("PLAINWIRE_COMPRESS_OVERSIZE_UPLOADS", true),
       max_image_dimension => clamp(pw_util:env_int("PLAINWIRE_UPLOAD_IMAGE_MAX_DIMENSION", 4096), 512, 8192)}.
 
+
+source_repository() ->
+    Default = <<"https://github.com/Plainwire-development/Plainwire">>,
+    Raw = pw_util:clean_text(pw_util:env_str("PLAINWIRE_SOURCE_REPOSITORY", Default), 512),
+    %% This value becomes a browser link. Keep the public contract deliberately
+    %% narrow instead of accepting arbitrary schemes such as javascript: or file:.
+    case Raw of
+        <<"https://", Rest/binary>> when byte_size(Rest) > 0 -> Raw;
+        _ -> Default
+    end.
+
 version() ->
     case application:get_key(plainwire_relay, vsn) of
         {ok, Vsn} -> pw_util:bin(Vsn);
-        _ -> <<"1.7.4">>
+        _ -> <<"1.7.5">>
     end.
 
 asset_version() ->

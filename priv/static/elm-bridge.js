@@ -25,6 +25,10 @@
     defaultTheme: ['light', 'dark', 'system'].includes(rawClientConfig.default_theme)
       ? rawClientConfig.default_theme : 'system',
     registrationEnabled: rawClientConfig.registration_enabled !== false,
+    gifSearchEnabled: rawClientConfig.gif_search_enabled === true,
+    gifProvider: typeof rawClientConfig.gif_provider === 'string' ? rawClientConfig.gif_provider.trim().slice(0, 24) : '',
+    sourceRepository: typeof rawClientConfig.source_repository === 'string' && /^https:\/\//i.test(rawClientConfig.source_repository)
+      ? rawClientConfig.source_repository.slice(0, 512) : 'https://github.com/Plainwire-development/Plainwire',
     instanceDescription: typeof rawClientConfig.instance_description === 'string'
       ? rawClientConfig.instance_description.trim().slice(0, 120) : '',
     uploadMaxBytes: finiteInt(rawClientConfig.upload_max_bytes, 250 * 1024 * 1024, 1024 * 1024, 250 * 1024 * 1024),
@@ -34,6 +38,757 @@
     compressOversizeUploads: rawClientConfig.compress_oversize_uploads !== false,
     maxImageDimension: finiteInt(rawClientConfig.max_image_dimension, 4096, 512, 8192)
   });
+
+  let gifSearchAbort = null;
+  let gifSearchTimer = null;
+  let gifPickerNode = null;
+  const closeGifPicker = () => {
+    if (gifSearchAbort) gifSearchAbort.abort();
+    gifSearchAbort = null;
+    if (gifSearchTimer) clearTimeout(gifSearchTimer);
+    gifSearchTimer = null;
+    gifPickerNode?.remove();
+    gifPickerNode = null;
+  };
+  const registerGifShare = (id, query) => {
+    if (!id) return;
+    fetch('/api/gifs/share', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json', 'x-csrf-token': csrf },
+      body: JSON.stringify({ id, q: query || '' }),
+      cache: 'no-store'
+    }).catch(() => {});
+  };
+  const openGifPicker = () => {
+    if (!clientConfig.gifSearchEnabled) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'GIF search is not configured on this Plainwire server.' });
+      return;
+    }
+    if (!activeComposer()) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Open a DM, text channel, or thread before choosing a GIF.' });
+      return;
+    }
+
+    closeGifPicker();
+    const backdrop = document.createElement('div');
+    backdrop.className = 'gif-picker-backdrop';
+    backdrop.setAttribute('role', 'presentation');
+    const picker = document.createElement('section');
+    picker.className = 'gif-picker-shell';
+    picker.setAttribute('role', 'dialog');
+    picker.setAttribute('aria-modal', 'true');
+    picker.setAttribute('aria-label', 'Search KLIPY GIFs');
+
+    const head = document.createElement('div');
+    head.className = 'gif-picker-head';
+    const title = document.createElement('div');
+    const heading = document.createElement('strong');
+    heading.textContent = 'GIFs';
+    const provider = document.createElement('small');
+    provider.textContent = `Powered by ${clientConfig.gifProvider || 'KLIPY'}`;
+    title.append(heading, provider);
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'gif-picker-close';
+    close.setAttribute('aria-label', 'Close GIF search');
+    close.textContent = '×';
+    head.append(title, close);
+
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.className = 'gif-picker-search';
+    // KLIPY requires this exact placeholder for API integrations.
+    search.placeholder = 'Search KLIPY';
+    search.setAttribute('aria-label', 'Search KLIPY');
+    search.autocomplete = 'off';
+    search.spellcheck = true;
+
+    const chips = document.createElement('div');
+    chips.className = 'gif-picker-chips';
+    chips.setAttribute('aria-label', 'Quick GIF searches');
+    ['reaction', 'laugh', 'wow', 'yes', 'no', 'bruh'].forEach((term) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = term;
+      button.addEventListener('click', () => {
+        search.value = term;
+        search.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      chips.append(button);
+    });
+
+    const status = document.createElement('div');
+    status.className = 'gif-picker-status';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    status.textContent = 'Search KLIPY to find a GIF.';
+    const grid = document.createElement('div');
+    grid.className = 'gif-picker-grid';
+    grid.setAttribute('aria-label', 'GIF results');
+    const footer = document.createElement('div');
+    footer.className = 'gif-picker-footer';
+    const loadMore = document.createElement('button');
+    loadMore.type = 'button';
+    loadMore.className = 'btn secondary gif-picker-more';
+    loadMore.textContent = 'Load more';
+    loadMore.hidden = true;
+    footer.append(loadMore);
+
+    picker.append(head, search, chips, status, grid, footer);
+    backdrop.append(picker);
+    document.body.append(backdrop);
+    gifPickerNode = backdrop;
+
+    let next = '';
+    let activeQuery = '';
+    let requestSerial = 0;
+    let loading = false;
+    const seenIds = new Set();
+
+    const renderItem = (item, query) => {
+      if (!item?.url || !item?.id || seenIds.has(String(item.id))) return;
+      seenIds.add(String(item.id));
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'gif-picker-item';
+      button.title = item.title || 'GIF';
+      button.setAttribute('aria-label', `Insert GIF: ${item.title || 'GIF'}`);
+      if (Number(item.width) > 0 && Number(item.height) > 0) {
+        button.style.setProperty('--gif-aspect', `${Number(item.width)} / ${Number(item.height)}`);
+      }
+      const image = document.createElement('img');
+      image.loading = 'lazy';
+      image.decoding = 'async';
+      image.alt = item.title || 'GIF';
+      image.src = item.preview_url || item.url;
+      const label = document.createElement('span');
+      label.textContent = item.title || 'GIF';
+      button.append(image, label);
+      button.addEventListener('click', () => {
+        const titleText = String(item.title || 'GIF').replace(/[\[\]]/g, '').slice(0, 80);
+        if (insertIntoComposer(`![${titleText}](${item.url})`)) {
+          registerGifShare(item.id, query);
+          closeGifPicker();
+        }
+      });
+      grid.append(button);
+    };
+
+    const searchNow = async ({ append = false } = {}) => {
+      const query = search.value;
+      if (!query.trim()) {
+        if (gifSearchAbort) gifSearchAbort.abort();
+        requestSerial += 1;
+        activeQuery = '';
+        next = '';
+        loading = false;
+        seenIds.clear();
+        grid.replaceChildren();
+        loadMore.hidden = true;
+        status.textContent = 'Search KLIPY to find a GIF.';
+        grid.removeAttribute('aria-busy');
+        return;
+      }
+      if (loading || (append && !next)) return;
+
+      const position = append ? next : '';
+      if (!append) {
+        next = '';
+        activeQuery = query;
+        seenIds.clear();
+      } else if (query !== activeQuery) {
+        // The query changed while a pagination request was queued. Start over
+        // instead of appending results from two different searches.
+        return searchNow({ append: false });
+      }
+
+      gifSearchAbort?.abort();
+      const controller = new AbortController();
+      gifSearchAbort = controller;
+      const serial = ++requestSerial;
+      loading = true;
+      loadMore.disabled = true;
+      grid.setAttribute('aria-busy', 'true');
+      status.textContent = append ? 'Loading more…' : 'Searching…';
+
+      try {
+        const params = new URLSearchParams({ q: query });
+        if (position) params.set('pos', position);
+        const response = await fetch(`/api/gifs/search?${params}`, {
+          headers: { accept: 'application/json' },
+          cache: 'no-store',
+          credentials: 'same-origin',
+          signal: controller.signal
+        });
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || !payload?.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+        if (serial !== requestSerial || gifPickerNode !== backdrop) return;
+
+        const results = Array.isArray(payload.data?.results) ? payload.data.results : [];
+        if (!append) grid.replaceChildren();
+        for (const item of results) renderItem(item, query);
+        next = typeof payload.data?.next === 'string' ? payload.data.next : '';
+        loadMore.hidden = !next;
+        const visible = grid.childElementCount;
+        status.textContent = visible
+          ? `${visible} GIF${visible === 1 ? '' : 's'} from KLIPY${next ? ' · more available' : ''}`
+          : 'No GIFs matched that search.';
+      } catch (error) {
+        if (error.name === 'AbortError') return;
+        if (!append) grid.replaceChildren();
+        status.textContent = error.message === 'rate_limited' || error.message === 'provider_rate_limited'
+          ? 'GIF search is being used quickly. Try again in a moment.'
+          : 'GIF search is temporarily unavailable.';
+        debug('GIF', 'search_failed', { error: error.message }, 'warn');
+      } finally {
+        if (serial === requestSerial) {
+          loading = false;
+          loadMore.disabled = false;
+          grid.removeAttribute('aria-busy');
+        }
+      }
+    };
+
+    const queueSearch = () => {
+      if (gifSearchTimer) clearTimeout(gifSearchTimer);
+      next = '';
+      loadMore.hidden = true;
+      gifSearchTimer = setTimeout(() => searchNow({ append: false }), 260);
+    };
+    search.addEventListener('input', queueSearch);
+    loadMore.addEventListener('click', () => searchNow({ append: true }));
+    close.addEventListener('click', closeGifPicker);
+    backdrop.addEventListener('click', (event) => { if (event.target === backdrop) closeGifPicker(); });
+    backdrop.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeGifPicker();
+        return;
+      }
+      if (event.key === 'Tab') {
+        const focusable = [...picker.querySelectorAll('button:not(:disabled):not([hidden]), input:not(:disabled)')];
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable.at(-1);
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    });
+    queueMicrotask(() => search.focus());
+  };
+
+  const friendlyApiError = (code) => ({
+    forbidden: 'You do not have permission to do that.',
+    not_found: 'That item no longer exists.',
+    role_hierarchy: 'That role or member is at or above your highest manageable role.',
+    owner_role_locked: 'The owner role cannot be reassigned.',
+    too_many_roles: 'A member can have at most 50 custom roles.',
+    invalid_role: 'One of those roles no longer exists.',
+    forum_membership_required: 'Join this forum before posting, replying, or voting.',
+    forum_owner_cannot_leave: 'The forum owner cannot leave their own forum.',
+    thread_locked: 'That thread is locked.',
+    rate_limited: 'Too many requests. Wait a moment and try again.',
+    database_unavailable: 'The server database is temporarily unavailable.',
+    database_busy: 'The server is busy. Try again in a moment.',
+    request_failed: 'The request could not be completed.'
+  }[code] || String(code || 'Request failed').replaceAll('_', ' '));
+
+  const directApi = async (path, { method = 'GET', body = null, timeoutMs = 20000 } = {}) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const headers = { accept: 'application/json', 'x-csrf-token': csrf };
+    const options = { method, headers, cache: 'no-store', signal: controller.signal };
+    if (body !== null) { headers['content-type'] = 'application/json'; options.body = JSON.stringify(body); }
+    try {
+      const response = await fetch('/api' + path, options);
+      const payload = await response.json().catch(() => ({ ok: false, error: 'bad_json' }));
+      if (!response.ok || !payload.ok) {
+        const code = payload.error || `HTTP ${response.status}`;
+        const error = new Error(friendlyApiError(code));
+        error.code = code;
+        throw error;
+      }
+      return payload.data;
+    } finally { clearTimeout(timeout); }
+  };
+  const permissionBit = (data, key) => Number((data?.catalog || []).find(item => item.key === key)?.bit || 0);
+  const hasPermission = (data, key) => {
+    const permissions = Number(data?.permissions || 0);
+    const bit = permissionBit(data, key);
+    const admin = permissionBit(data, 'administrator');
+    return (admin && (permissions & admin) !== 0) || (bit && (permissions & bit) !== 0);
+  };
+  const modalShell = (titleText, subtitle = '') => {
+    const backdrop = document.createElement('div'); backdrop.className = 'admin-modal-backdrop';
+    const dialog = document.createElement('section'); dialog.className = 'admin-modal-shell'; dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-modal', 'true'); dialog.tabIndex = -1;
+    const head = document.createElement('header'); head.className = 'admin-modal-head';
+    const copy = document.createElement('div'); const title = document.createElement('h2'); title.textContent = titleText; copy.append(title);
+    if (subtitle) { const sub = document.createElement('p'); sub.textContent = subtitle; copy.append(sub); }
+    const close = document.createElement('button'); close.type = 'button'; close.className = 'admin-modal-close'; close.textContent = '×'; close.setAttribute('aria-label', 'Close');
+    head.append(copy, close);
+    const body = document.createElement('div'); body.className = 'admin-modal-body';
+    dialog.append(head, body); backdrop.append(dialog); document.body.append(backdrop);
+    const destroy = () => backdrop.remove();
+    close.addEventListener('click', destroy); backdrop.addEventListener('click', event => { if (event.target === backdrop) destroy(); });
+    backdrop.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); destroy(); } });
+    requestAnimationFrame(() => dialog.focus({ preventScroll: true }));
+    return { backdrop, dialog, body, destroy, setTitle(value) { title.textContent = value; } };
+  };
+  const makeField = (labelText, value = '', { multiline = false, type = 'text', placeholder = '', maxLength = null } = {}) => {
+    const label = document.createElement('label'); label.className = 'admin-field'; const span = document.createElement('span'); span.textContent = labelText;
+    const input = multiline ? document.createElement('textarea') : document.createElement('input');
+    if (!multiline) input.type = type; input.value = value || ''; input.placeholder = placeholder;
+    if (multiline) { input.value = value || ''; input.rows = 3; input.placeholder = placeholder; }
+    if (maxLength) input.maxLength = maxLength;
+    label.append(span, input); return { label, input };
+  };
+  const adminMessage = (container, message, kind = 'muted') => {
+    const el = document.createElement('p'); el.className = `admin-inline-message ${kind}`; el.textContent = message; container.append(el); return el;
+  };
+
+  const openGroupAdmin = async (conversationId) => {
+    if (!Number.isInteger(Number(conversationId)) || Number(conversationId) <= 0) return;
+    const shell = modalShell('Group moderation', 'Manage roles and membership without leaving the conversation.');
+    const render = async () => {
+      shell.body.replaceChildren(); adminMessage(shell.body, 'Loading group members…');
+      try {
+        const data = await directApi(`/conversation/${conversationId}`);
+        const conversation = data?.conversation || {}; const members = Array.isArray(data?.members) ? data.members : [];
+        shell.setTitle(conversation.name || 'Group moderation'); shell.body.replaceChildren();
+        const me = members.find(member => Number(member.user?.id) === Number(meId));
+        const actorRole = me?.role || me?.group_role || (Number(conversation.owner_id) === Number(meId) ? 'owner' : 'member');
+        const intro = document.createElement('div'); intro.className = 'admin-summary'; intro.innerHTML = `<strong>${members.length} members</strong><span>Your role: ${actorRole}</span>`; shell.body.append(intro);
+        const list = document.createElement('div'); list.className = 'admin-member-list';
+        const roleRank = role => ({ owner: 3, moderator: 2, member: 1 }[role] || 1);
+        for (const member of members) {
+          const user = member.user || {}; const role = member.role || member.group_role || (Number(user.id) === Number(conversation.owner_id) ? 'owner' : 'member');
+          const row = document.createElement('div'); row.className = 'admin-member-row';
+          const avatar = document.createElement(user.avatar_url ? 'img' : 'div'); avatar.className = 'admin-member-avatar';
+          if (user.avatar_url) { avatar.src = user.avatar_url; avatar.alt = ''; } else avatar.textContent = String(user.display_name || user.username || '?').slice(0, 1).toUpperCase();
+          const text = document.createElement('button'); text.type = 'button'; text.className = 'admin-member-name'; text.innerHTML = `<strong></strong><span></span>`; text.querySelector('strong').textContent = user.display_name || user.username || 'Unknown'; text.querySelector('span').textContent = `@${user.username || ''} · ${role}`; text.addEventListener('click', () => { location.hash = `#profile/${user.id}`; shell.destroy(); });
+          const actions = document.createElement('div'); actions.className = 'admin-row-actions';
+          const canManage = Number(user.id) !== Number(meId) && roleRank(actorRole) > roleRank(role) && ['owner','moderator'].includes(actorRole);
+          if (actorRole === 'owner' && Number(user.id) !== Number(meId) && role !== 'owner') {
+            const roleButton = document.createElement('button'); roleButton.type = 'button'; roleButton.className = 'btn secondary'; roleButton.textContent = role === 'moderator' ? 'Make member' : 'Make moderator';
+            roleButton.addEventListener('click', async () => {
+              roleButton.disabled = true;
+              try { await directApi(`/conversation/${conversationId}/member/${user.id}/role`, { method: 'POST', body: { role: role === 'moderator' ? 'member' : 'moderator' } }); await api({ method: 'GET', path: `/conversation/${conversationId}` }); await render(); }
+              catch (error) { send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not change role: ${error.message}` }); roleButton.disabled = false; }
+            }); actions.append(roleButton);
+          }
+          if (canManage) {
+            const kick = document.createElement('button'); kick.type = 'button'; kick.className = 'btn danger'; kick.textContent = 'Kick';
+            kick.addEventListener('click', async () => {
+              if (!window.confirm(`Remove ${user.display_name || user.username} from this group?`)) return;
+              kick.disabled = true;
+              try { await directApi(`/conversation/${conversationId}/member/${user.id}/kick`, { method: 'POST', body: {} }); await api({ method: 'GET', path: '/sync?since=0' }); await api({ method: 'GET', path: `/conversation/${conversationId}` }); await render(); }
+              catch (error) { send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not kick member: ${error.message}` }); kick.disabled = false; }
+            }); actions.append(kick);
+          }
+          row.append(avatar, text, actions); list.append(row);
+        }
+        shell.body.append(list);
+        if (actorRole === 'member') adminMessage(shell.body, 'Only the group owner and moderators can remove members. The owner can promote or demote moderators.');
+      } catch (error) {
+        shell.body.replaceChildren(); adminMessage(shell.body, `Could not load group moderation: ${error.message}`, 'error');
+      }
+    };
+    await render();
+  };
+
+  const openServerAdmin = async (serverId) => {
+    serverId = Number(serverId); if (!Number.isInteger(serverId) || serverId <= 0) return;
+    const shell = modalShell('Server settings', 'Roles, member profiles, moderation, Wires, and server identity.');
+    let state = null; let serverData = null; let activeTab = 'profile'; let lastWireUrl = '';
+    const refresh = async () => {
+      [state, serverData] = await Promise.all([directApi(`/server/${serverId}/roles`), directApi(`/server/${serverId}`)]);
+    };
+    const memberRank = (member) => {
+      if (!member) return -1;
+      if (member.legacy_role === 'owner') return 1_000_000;
+      if (member.legacy_role === 'admin') return 10_000;
+      const assigned = new Set((member.role_ids || []).map(Number));
+      return Math.max(0, ...(state?.roles || []).filter(role => assigned.has(Number(role.id))).map(role => Number(role.position) || 0));
+    };
+    const actorMember = () => (state?.members || []).find(member => Number(member.user?.id) === Number(meId));
+    const actorOwnsServer = () => actorMember()?.legacy_role === 'owner';
+    const canActOnMember = (member) => {
+      const actor = actorMember();
+      if (!actor || !member || Number(member.user?.id) === Number(meId) || member.legacy_role === 'owner') return false;
+      return actorOwnsServer() || memberRank(actor) > memberRank(member);
+    };
+    const canEditRole = (role) => {
+      if (!hasPermission(state, 'manage_roles')) return false;
+      return actorOwnsServer() || memberRank(actorMember()) > Number(role?.position || 0);
+    };
+    const canAssignRole = (role) => actorOwnsServer() || memberRank(actorMember()) > Number(role?.position || 0);
+    const actionButton = (label, handler, danger = false) => {
+      const b = document.createElement('button'); b.type = 'button'; b.className = danger ? 'btn danger' : 'btn secondary'; b.textContent = label; b.addEventListener('click', handler); return b;
+    };
+    const renderOverview = () => {
+      const server = serverData?.server || {}; const canManage = hasPermission(state, 'manage_server');
+      const wrap = document.createElement('div'); wrap.className = 'admin-form-stack';
+      const name = makeField('Server name', server.name || '', { maxLength: 80 }); const description = makeField('Description', server.description || '', { multiline: true, maxLength: 280 });
+      const icon = makeField('Icon URL', server.icon_url || '', { placeholder: 'https://…' }); const banner = makeField('Banner URL', server.banner_url || '', { placeholder: 'https://…' }); const accent = makeField('Accent color', server.accent_color || '#5865f2', { type: 'color' }); const welcome = makeField('Welcome message', server.welcome_message || '', { multiline: true, maxLength: 2000 });
+      [name,description,icon,banner,accent,welcome].forEach(field => { field.input.disabled = !canManage; wrap.append(field.label); });
+      if (canManage) wrap.append(actionButton('Save server', async event => {
+        event.currentTarget.disabled = true;
+        try { await directApi(`/server/${serverId}`, { method: 'POST', body: { name: name.input.value, description: description.input.value, icon_url: icon.input.value, banner_url: banner.input.value, accent_color: accent.input.value, welcome_message: welcome.input.value } }); await refresh(); await api({ method: 'GET', path: `/server/${serverId}` }); render(); send(app.ports.bridgeReceive, { tag: 'toast', data: 'Server updated' }); }
+        catch (error) { send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not update server: ${error.message}` }); event.currentTarget.disabled = false; }
+      })); else adminMessage(wrap, 'You can view these settings, but your roles do not grant Manage Server.');
+      return wrap;
+    };
+    const renderProfile = () => {
+      const member = (state?.members || []).find(item => Number(item.user?.id) === Number(meId));
+      const wrap = document.createElement('div'); wrap.className = 'admin-form-stack';
+      const nick = makeField('Nickname in this server', member?.nickname || '', { maxLength: 80, placeholder: member?.user?.display_name || '' });
+      const avatar = makeField('Server avatar URL', member?.server_avatar_url || '', { placeholder: 'Leave blank to use your profile avatar' });
+      const bio = makeField('Server bio', member?.server_bio || '', { multiline: true, maxLength: 280 });
+      wrap.append(nick.label, avatar.label, bio.label);
+      wrap.append(actionButton('Save server profile', async event => {
+        event.currentTarget.disabled = true;
+        try { await directApi(`/server/${serverId}/member/${meId}/profile`, { method: 'POST', body: { nickname: nick.input.value, avatar_url: avatar.input.value, bio: bio.input.value } }); await refresh(); await api({ method: 'GET', path: `/server/${serverId}` }); render(); send(app.ports.bridgeReceive, { tag: 'toast', data: 'Server profile saved' }); }
+        catch (error) { send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not save server profile: ${error.message}` }); event.currentTarget.disabled = false; }
+      }));
+      adminMessage(wrap, 'This identity is scoped to this server; your global Plainwire profile stays unchanged.');
+      return wrap;
+    };
+    const renderRoles = () => {
+      const wrap = document.createElement('div'); wrap.className = 'admin-role-stack'; const canManage = hasPermission(state, 'manage_roles');
+
+      const baseline = document.createElement('section');
+      baseline.className = 'admin-role-card admin-default-permissions';
+      const baselineHead = document.createElement('div');
+      baselineHead.className = 'admin-default-permissions-head';
+      const baselineCopy = document.createElement('div');
+      const baselineTitle = document.createElement('strong'); baselineTitle.textContent = 'Default member permissions';
+      const baselineHint = document.createElement('small'); baselineHint.textContent = 'Applied to every ordinary server member before custom roles are added.';
+      baselineCopy.append(baselineTitle, baselineHint); baselineHead.append(baselineCopy); baseline.append(baselineHead);
+      const baselineGrid = document.createElement('div'); baselineGrid.className = 'admin-permission-grid';
+      for (const permission of state?.catalog || []) {
+        if (permission.key === 'administrator') continue;
+        const label = document.createElement('label'); label.className = 'admin-permission';
+        const input = document.createElement('input'); input.type = 'checkbox';
+        input.checked = (Number(state?.default_permissions || 0) & Number(permission.bit || 0)) !== 0;
+        input.disabled = !actorOwnsServer(); input.dataset.permissionBit = String(permission.bit || 0);
+        const copy = document.createElement('span'); copy.innerHTML = '<strong></strong><small></small>';
+        copy.querySelector('strong').textContent = permission.label || permission.key;
+        copy.querySelector('small').textContent = permission.description || '';
+        label.append(input, copy); baselineGrid.append(label);
+      }
+      baseline.append(baselineGrid);
+      if (actorOwnsServer()) {
+        baseline.append(actionButton('Save default permissions', async event => {
+          let mask = 0;
+          baselineGrid.querySelectorAll('input:checked').forEach(input => { mask |= Number(input.dataset.permissionBit || 0); });
+          event.currentTarget.disabled = true;
+          try {
+            await directApi(`/server/${serverId}/default-permissions`, { method: 'POST', body: { permissions: mask } });
+            await refresh();
+            await api({ method: 'GET', path: `/server/${serverId}` });
+            render();
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Default member permissions saved' });
+          } catch (error) {
+            send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not save default permissions: ${error.message}` });
+            event.currentTarget.disabled = false;
+          }
+        }));
+      } else {
+        adminMessage(baseline, 'Only the server owner can change the permissions every member starts with.');
+      }
+      wrap.append(baseline);
+
+      if (canManage) {
+        const create = document.createElement('form'); create.className = 'admin-role-create';
+        const name = document.createElement('input'); name.placeholder = 'New role name'; name.maxLength = 40; const color = document.createElement('input'); color.type = 'color'; color.value = '#99aab5'; const submit = document.createElement('button'); submit.type = 'submit'; submit.className = 'btn'; submit.textContent = 'Create role'; create.append(name,color,submit);
+        create.addEventListener('submit', async event => { event.preventDefault(); if (name.value.trim().length < 2) return; submit.disabled = true; try { await directApi(`/server/${serverId}/roles`, { method: 'POST', body: { name: name.value.trim(), color: color.value, permissions: 0, hoist: false, mentionable: false } }); await refresh(); render(); } catch (error) { send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not create role: ${error.message}` }); submit.disabled = false; } });
+        wrap.append(create);
+      }
+      for (const role of state?.roles || []) {
+        const editable = canEditRole(role);
+        const card = document.createElement('details'); card.className = 'admin-role-card';
+        const summary = document.createElement('summary'); const dot = document.createElement('i'); dot.style.background = role.color || '#99aab5'; const text = document.createElement('span'); text.textContent = role.name; const meta = document.createElement('small'); meta.textContent = `position ${role.position}`; summary.append(dot,text,meta); card.append(summary);
+        const form = document.createElement('div'); form.className = 'admin-role-editor';
+        const name = makeField('Name', role.name, { maxLength: 40 }); const color = makeField('Color', role.color || '#99aab5', { type: 'color' }); const pos = makeField('Position', String(role.position || 1), { type: 'number' });
+        [name,color,pos].forEach(field => { field.input.disabled = !editable; form.append(field.label); });
+        const toggles = document.createElement('div'); toggles.className = 'admin-permission-grid';
+        for (const permission of state?.catalog || []) {
+          const label = document.createElement('label'); label.className = 'admin-permission'; const input = document.createElement('input'); input.type = 'checkbox'; input.checked = (Number(role.permissions || 0) & Number(permission.bit || 0)) !== 0; input.disabled = !editable || (permission.key === 'administrator' && !actorOwnsServer()); input.dataset.permissionBit = String(permission.bit || 0); const copy = document.createElement('span'); copy.innerHTML = '<strong></strong><small></small>'; copy.querySelector('strong').textContent = permission.label || permission.key; copy.querySelector('small').textContent = permission.description || ''; label.append(input,copy); toggles.append(label);
+        }
+        form.append(toggles);
+        if (editable) {
+          const actions = document.createElement('div'); actions.className = 'admin-row-actions';
+          actions.append(actionButton('Save', async event => { let mask = 0; toggles.querySelectorAll('input:checked').forEach(input => { mask |= Number(input.dataset.permissionBit || 0); }); event.currentTarget.disabled = true; try { await directApi(`/server/${serverId}/role/${role.id}`, { method: 'POST', body: { name: name.input.value, color: color.input.value, position: Number(pos.input.value || role.position), permissions: mask } }); await refresh(); render(); } catch (error) { send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not save role: ${error.message}` }); event.currentTarget.disabled = false; } }), actionButton('Delete', async () => { if (!confirm(`Delete role “${role.name}”?`)) return; try { await directApi(`/server/${serverId}/role/${role.id}/delete`, { method: 'POST', body: {} }); await refresh(); render(); } catch (error) { send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not delete role: ${error.message}` }); } }, true)); form.append(actions);
+        }
+        card.append(form); wrap.append(card);
+      }
+      if (!(state?.roles || []).length) adminMessage(wrap, canManage ? 'No custom roles yet.' : 'This server has no custom roles you can view.');
+      return wrap;
+    };
+    const renderMembers = () => {
+      const wrap = document.createElement('div'); wrap.className = 'admin-member-list'; const canRoles = hasPermission(state, 'manage_roles'); const canKick = hasPermission(state, 'kick_members'); const canProfiles = hasPermission(state, 'manage_profiles');
+      const roles = state?.roles || [];
+      for (const member of state?.members || []) {
+        const row = document.createElement('div'); row.className = 'admin-member-card'; const top = document.createElement('div'); top.className = 'admin-member-row';
+        const avatar = document.createElement(member.server_avatar_url || member.user?.avatar_url ? 'img' : 'div'); avatar.className = 'admin-member-avatar'; if (avatar instanceof HTMLImageElement) { avatar.src = member.server_avatar_url || member.user.avatar_url; avatar.alt=''; } else avatar.textContent = String(member.nickname || member.user?.display_name || '?').slice(0,1).toUpperCase();
+        const copy = document.createElement('div'); copy.className = 'admin-member-copy'; const strong=document.createElement('strong'); strong.textContent=member.nickname || member.user?.display_name || member.user?.username || 'Unknown'; const small=document.createElement('small'); small.textContent=`@${member.user?.username || ''} · ${member.legacy_role || 'member'}`; copy.append(strong,small); top.append(avatar,copy); row.append(top);
+        if (canRoles && canActOnMember(member)) {
+          const roleBox = document.createElement('div'); roleBox.className='admin-member-roles';
+          roles.forEach(role => {
+            const label=document.createElement('label'); const cb=document.createElement('input'); cb.type='checkbox';
+            cb.checked=(member.role_ids||[]).map(Number).includes(Number(role.id)); cb.dataset.roleId=String(role.id);
+            cb.disabled=!canAssignRole(role);
+            if (cb.disabled) label.title='This role is at or above your highest role.';
+            label.append(cb,document.createTextNode(role.name)); roleBox.append(label);
+          });
+          const save=actionButton('Save roles',async event=>{ const ids=[...roleBox.querySelectorAll('input:checked')].map(input=>Number(input.dataset.roleId)); event.currentTarget.disabled=true; try{ await directApi(`/server/${serverId}/member/${member.user.id}/roles`,{method:'POST',body:{role_ids:ids}}); await refresh(); render(); }catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:`Could not assign roles: ${error.message}`});event.currentTarget.disabled=false;} }); roleBox.append(save); row.append(roleBox);
+        }
+        const actions=document.createElement('div');actions.className='admin-row-actions';
+        if (canProfiles && canActOnMember(member)) actions.append(actionButton('Edit server profile',()=>{
+          const editor=modalShell(`Edit ${member.nickname || member.user?.display_name || member.user?.username || 'member'}`, 'This identity is visible only inside this server.');
+          const form=document.createElement('form');form.className='admin-form-stack';
+          const nick=makeField('Server nickname',member.nickname||'',{maxLength:80,placeholder:member.user?.display_name||''});
+          const avatarField=makeField('Server avatar URL',member.server_avatar_url||'',{placeholder:'Leave blank to use their global avatar'});
+          const bio=makeField('Server bio',member.server_bio||'',{multiline:true,maxLength:280});
+          const buttons=document.createElement('div');buttons.className='admin-row-actions';
+          const cancel=actionButton('Cancel',()=>editor.destroy()); const save=actionButton('Save profile',async event=>{event.preventDefault();save.disabled=true;try{await directApi(`/server/${serverId}/member/${member.user.id}/profile`,{method:'POST',body:{nickname:nick.input.value,bio:bio.input.value,avatar_url:avatarField.input.value}});await refresh();await api({method:'GET',path:`/server/${serverId}`});editor.destroy();render();send(app.ports.bridgeReceive,{tag:'toast',data:'Server profile updated'});}catch(error){adminMessage(form,`Could not update profile: ${error.message}`,'error');save.disabled=false;}});
+          buttons.append(cancel,save);form.append(nick.label,avatarField.label,bio.label,buttons);editor.body.append(form);
+        }));
+        if (canKick && canActOnMember(member)) actions.append(actionButton('Kick',async()=>{if(!confirm(`Kick ${member.user?.display_name||member.user?.username} from this server?`))return;try{await directApi(`/server/${serverId}/member/${member.user.id}/kick`,{method:'POST',body:{}});await refresh();await api({method:'GET',path:`/server/${serverId}`});render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:`Could not kick member: ${error.message}`});}},true));
+        if(actions.children.length)row.append(actions); wrap.append(row);
+      }
+      return wrap;
+    };
+    const renderWires = () => {
+      const wrap = document.createElement('div');
+      wrap.className = 'admin-form-stack';
+      const canCreate = hasPermission(state, 'create_wires');
+      const canManage = hasPermission(state, 'manage_wires');
+      const channels = Array.isArray(serverData?.channels) ? serverData.channels : [];
+
+      if (canCreate) {
+        const controls = document.createElement('div');
+        controls.className = 'wire-create-controls';
+
+        const destination = document.createElement('select');
+        destination.setAttribute('aria-label', 'Wire destination');
+        const home = document.createElement('option');
+        home.value = '';
+        home.textContent = 'Server home';
+        destination.append(home);
+        for (const channel of channels) {
+          const option = document.createElement('option');
+          option.value = String(channel.id);
+          option.textContent = `${channel.kind === 'voice' ? 'Voice' : 'Text'} · ${channel.name}`;
+          destination.append(option);
+        }
+
+        const expiry = document.createElement('select');
+        expiry.setAttribute('aria-label', 'Wire expiration');
+        [[3600, '1 hour'], [86400, '1 day'], [604800, '7 days'], [2592000, '30 days'], [0, 'Never']]
+          .forEach(([value, label]) => {
+            const option = document.createElement('option');
+            option.value = String(value);
+            option.textContent = label;
+            expiry.append(option);
+          });
+        expiry.value = '86400';
+
+        const uses = document.createElement('input');
+        uses.type = 'number';
+        uses.min = '0';
+        uses.max = '10000';
+        uses.step = '1';
+        uses.value = '0';
+        uses.setAttribute('aria-label', 'Wire use limit');
+        uses.title = '0 means unlimited uses';
+
+        const create = actionButton('Create Wire', async event => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          const selectedChannel = Number(destination.value);
+          const maxUses = Math.max(0, Math.min(10000, Number.parseInt(uses.value || '0', 10) || 0));
+          const expiresIn = Math.max(0, Number.parseInt(expiry.value || '86400', 10) || 0);
+          try {
+            const data = await directApi(`/server/${serverId}/wires`, {
+              method: 'POST',
+              body: {
+                channel_id: Number.isInteger(selectedChannel) && selectedChannel > 0 ? selectedChannel : null,
+                max_uses: maxUses,
+                expires_in: expiresIn
+              }
+            });
+            lastWireUrl = new URL((data?.url || `#wire/${data?.code || ''}`).replace('#invite/', '#wire/'), location.origin + '/').href;
+            let copied = false;
+            try {
+              await navigator.clipboard.writeText(lastWireUrl);
+              copied = true;
+            } catch (_) {}
+            render();
+            send(app.ports.bridgeReceive, { tag: 'toast', data: copied ? 'Wire created and copied' : 'Wire created. Use Copy Wire below.' });
+          } catch (error) {
+            send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not create Wire: ${error.message}` });
+            button.disabled = false;
+          }
+        });
+        controls.append(destination, expiry, uses, create);
+        wrap.append(controls);
+
+        if (lastWireUrl) {
+          const result = document.createElement('div');
+          result.className = 'wire-created-result';
+          const input = document.createElement('input');
+          input.readOnly = true;
+          input.value = lastWireUrl;
+          input.setAttribute('aria-label', 'Newest Wire link');
+          input.addEventListener('focus', () => input.select());
+          const copy = actionButton('Copy Wire', async () => {
+            try {
+              await navigator.clipboard.writeText(lastWireUrl);
+              send(app.ports.bridgeReceive, { tag: 'toast', data: 'Wire copied' });
+            } catch (_) {
+              input.focus();
+              input.select();
+              send(app.ports.bridgeReceive, { tag: 'toast', data: 'Select the Wire link and copy it manually.' });
+            }
+          });
+          result.append(input, copy);
+          wrap.append(result);
+        }
+      } else {
+        adminMessage(wrap, 'Your roles do not grant Create Wires.');
+      }
+
+      const list = document.createElement('div');
+      list.className = 'wire-list';
+      wrap.append(list);
+      if (canManage) {
+        list.setAttribute('aria-busy', 'true');
+        directApi(`/server/${serverId}/wires`).then(items => {
+          list.replaceChildren();
+          list.removeAttribute('aria-busy');
+          const wires = Array.isArray(items) ? items : items?.invites || [];
+          const now = Date.now();
+          for (const wire of wires) {
+            const row = document.createElement('div');
+            row.className = 'wire-row';
+            const expired = Number(wire.expires_at || 0) > 0 && Number(wire.expires_at) <= now;
+            const exhausted = Number(wire.max_uses || 0) > 0 && Number(wire.uses || 0) >= Number(wire.max_uses || 0);
+            const inactive = wire.revoked === true || expired || exhausted;
+            if (inactive) row.classList.add('inactive');
+
+            const identity = document.createElement('div');
+            identity.className = 'wire-row-identity';
+            const code = document.createElement('code');
+            code.textContent = wire.code || '';
+            const channel = channels.find(item => Number(item.id) === Number(wire.channel_id));
+            const channelText = document.createElement('small');
+            channelText.textContent = channel ? `Opens ${channel.kind === 'voice' ? 'voice' : 'text'} · ${channel.name}` : 'Opens server home';
+            identity.append(code, channelText);
+
+            const meta = document.createElement('span');
+            const usage = Number(wire.max_uses || 0) > 0 ? `${wire.uses || 0} / ${wire.max_uses} uses` : `${wire.uses || 0} uses`;
+            const stateText = wire.revoked === true ? 'revoked' : expired ? 'expired' : exhausted ? 'used up' : 'active';
+            meta.textContent = `${usage} · ${stateText}`;
+
+            const copy = actionButton('Copy', async () => {
+              const url = new URL(`#wire/${wire.code}`, location.origin + '/').href;
+              try {
+                await navigator.clipboard.writeText(url);
+                send(app.ports.bridgeReceive, { tag: 'toast', data: 'Wire copied' });
+              } catch (_) {
+                lastWireUrl = url;
+                render();
+              }
+            });
+            copy.disabled = inactive;
+
+            const revoke = actionButton('Revoke', async event => {
+              event.currentTarget.disabled = true;
+              try {
+                await directApi(`/server/${serverId}/wires/${encodeURIComponent(wire.code)}`, { method: 'DELETE' });
+                render();
+              } catch (error) {
+                send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not revoke Wire: ${error.message}` });
+                event.currentTarget.disabled = false;
+              }
+            }, true);
+            revoke.disabled = inactive;
+            row.append(identity, meta, copy, revoke);
+            list.append(row);
+          }
+          if (!list.children.length) adminMessage(list, 'No Wires have been created yet.');
+        }).catch(error => {
+          list.removeAttribute('aria-busy');
+          adminMessage(list, `Could not load Wires: ${error.message}`, 'error');
+        });
+      } else {
+        adminMessage(list, 'Your roles do not grant Manage Wires.');
+      }
+      return wrap;
+    };
+    const render = () => {
+      shell.body.replaceChildren(); const nav=document.createElement('nav');nav.className='admin-tabs';
+      const tabs=[['profile','My profile'],['overview','Overview'],['roles','Roles'],['members','Members'],['wires','Wires']];
+      tabs.forEach(([id,label])=>{const b=document.createElement('button');b.type='button';b.textContent=label;b.classList.toggle('active',activeTab===id);b.addEventListener('click',()=>{activeTab=id;render()});nav.append(b)});shell.body.append(nav);
+      const panel=document.createElement('div');panel.className='admin-panel';
+      panel.append(activeTab==='overview'?renderOverview():activeTab==='roles'?renderRoles():activeTab==='members'?renderMembers():activeTab==='wires'?renderWires():renderProfile());shell.body.append(panel);
+    };
+    try { await refresh(); shell.setTitle(serverData?.server?.name || 'Server settings'); render(); }
+    catch (error) { shell.body.replaceChildren(); adminMessage(shell.body, `Could not load server settings: ${error.message}`, 'error'); }
+  };
+
+  const reloadThread = async (threadId) => {
+    await api({ method: 'GET', path: `/thread/${Number(threadId)}` });
+  };
+  const openThreadEditor = async (data) => {
+    const threadId = Number(data?.id || 0); if (!threadId) return;
+    const shell = modalShell('Edit thread', 'Update the title or Markdown body. Existing replies are not changed.');
+    const form = document.createElement('form'); form.className = 'admin-form-stack';
+    const title = makeField('Title', String(data?.title || ''), { maxLength: 180 });
+    const body = makeField('Body (Markdown)', String(data?.raw_body || data?.body || ''), { multiline: true, maxLength: 20000 });
+    body.input.rows = 12;
+    const status = document.createElement('div'); status.className = 'admin-inline-message muted';
+    const actions = document.createElement('div'); actions.className = 'admin-row-actions';
+    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'btn secondary'; cancel.textContent = 'Cancel'; cancel.addEventListener('click', shell.destroy);
+    const save = document.createElement('button'); save.type = 'submit'; save.className = 'btn'; save.textContent = 'Save changes';
+    actions.append(cancel, save); form.append(title.label, body.label, status, actions); shell.body.append(form);
+    form.addEventListener('submit', async event => {
+      event.preventDefault(); const cleanedTitle = title.input.value.trim(), cleanedBody = body.input.value.trim();
+      if (cleanedTitle.length < 2 || !cleanedBody) { status.textContent = 'A title and body are required.'; status.className = 'admin-inline-message error'; return; }
+      save.disabled = true; status.textContent = 'Saving…'; status.className = 'admin-inline-message muted';
+      try { await directApi(`/thread/${threadId}/edit`, { method: 'POST', body: { title: cleanedTitle, body: cleanedBody } }); await reloadThread(threadId); shell.destroy(); send(app.ports.bridgeReceive,{tag:'toast',data:'Thread updated'}); }
+      catch(error){ status.textContent=`Could not save thread: ${error.message}`; status.className='admin-inline-message error'; save.disabled=false; }
+    });
+  };
+  const moderateThread = async (data) => {
+    const threadId = Number(data?.id || 0), action = String(data?.action || ''); if (!threadId || !['pin','lock'].includes(action)) return;
+    const value = Boolean(data?.value);
+    try { await directApi(`/thread/${threadId}/moderate`, { method:'POST', body:{ action, value } }); await reloadThread(threadId); send(app.ports.bridgeReceive,{tag:'toast',data:`Thread ${action === 'pin' ? (value ? 'pinned' : 'unpinned') : (value ? 'locked' : 'unlocked')}`}); }
+    catch(error){ send(app.ports.bridgeReceive,{tag:'toast',data:`Could not moderate thread: ${error.message}`}); }
+  };
+  const openReplyEditor = async (data) => {
+    const threadId=Number(data?.thread_id||0), replyId=Number(data?.id||0); if(!threadId||!replyId)return;
+    const shell=modalShell('Edit reply','Edit the original Markdown for this reply.');
+    const form=document.createElement('form');form.className='admin-form-stack';
+    const body=makeField('Reply (Markdown)',String(data?.raw_body||data?.body||''),{multiline:true,maxLength:12000});body.input.rows=9;
+    const status=document.createElement('div');status.className='admin-inline-message muted';
+    const actions=document.createElement('div');actions.className='admin-row-actions';
+    const cancel=document.createElement('button');cancel.type='button';cancel.className='btn secondary';cancel.textContent='Cancel';cancel.addEventListener('click',shell.destroy);
+    const save=document.createElement('button');save.type='submit';save.className='btn';save.textContent='Save reply';actions.append(cancel,save);form.append(body.label,status,actions);shell.body.append(form);
+    form.addEventListener('submit',async event=>{event.preventDefault();const cleaned=body.input.value.trim();if(!cleaned){status.textContent='Reply cannot be empty.';status.className='admin-inline-message error';return;}save.disabled=true;try{await directApi(`/thread/${threadId}/reply/${replyId}/edit`,{method:'POST',body:{body:cleaned}});await reloadThread(threadId);shell.destroy();send(app.ports.bridgeReceive,{tag:'toast',data:'Reply updated'});}catch(error){status.textContent=`Could not save reply: ${error.message}`;status.className='admin-inline-message error';save.disabled=false;}});
+  };
+  const deleteThreadReply = async (data) => {
+    const threadId=Number(data?.thread_id||0),replyId=Number(data?.id||0);if(!threadId||!replyId)return;
+    if(!window.confirm('Delete this reply? This cannot be undone.'))return;
+    try{await directApi(`/thread/${threadId}/reply/${replyId}/delete`,{method:'POST',body:{}});await reloadThread(threadId);send(app.ports.bridgeReceive,{tag:'toast',data:'Reply deleted'});}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:`Could not delete reply: ${error.message}`});}
+  };
+
   document.title = clientConfig.appName;
   document.documentElement.dataset.plainwireVersion = clientConfig.version;
   const app = window.Elm.Main.init({
@@ -938,37 +1693,37 @@
       inviteRoots.add(root);
       const sid = Number(root.dataset.inviteServer);
       if (!Number.isSafeInteger(sid) || sid < 1) return;
-      const heading = document.createElement('h3'); heading.textContent = 'Manage links';
+      const heading = document.createElement('h3'); heading.textContent = 'Manage Wires';
       const list = document.createElement('div'); list.className = 'invite-link-list'; list.setAttribute('aria-live', 'polite');
       root.append(heading, list);
       const refresh = async () => {
-        list.textContent = 'Loading invite links…';
+        list.textContent = 'Loading Wires…';
         try {
-          const invites = await accountApi('GET', `/server/${sid}/invites`);
+          const invites = await accountApi('GET', `/server/${sid}/wires`);
           if (!root.isConnected) return;
-          if (!Array.isArray(invites)) throw new Error('Could not load invites');
+          if (!Array.isArray(invites)) throw new Error('Could not load Wires');
           list.textContent = '';
-          if (!invites.length) { list.textContent = 'No invite links yet.'; return; }
+          if (!invites.length) { list.textContent = 'No Wires yet.'; return; }
           for (const invite of invites) {
             const row = document.createElement('div'); row.className = 'invite-link-row';
             const copy = document.createElement('div'); copy.className = 'invite-link-info';
             const expired = invite.expires_at > 0 && invite.expires_at <= Date.now();
             const used = invite.max_uses > 0 && invite.uses >= invite.max_uses;
             const inactive = invite.revoked || expired || used;
-            const title = document.createElement('b'); title.textContent = invite.revoked ? 'Revoked link' : expired ? 'Expired link' : used ? 'Use limit reached' : 'Active invite';
+            const title = document.createElement('b'); title.textContent = invite.revoked ? 'Revoked Wire' : expired ? 'Expired Wire' : used ? 'Use limit reached' : 'Active Wire';
             const detail = document.createElement('small');
             detail.textContent = `${invite.uses} / ${invite.max_uses || 'unlimited'} uses · ${invite.expires_at ? 'Expires ' + new Date(invite.expires_at).toLocaleString() : 'Never expires'}`;
             copy.append(title, detail); row.append(copy);
             if (!inactive) {
-              const copyButton = document.createElement('button'); copyButton.type = 'button'; copyButton.className = 'btn secondary'; copyButton.textContent = 'Copy'; copyButton.setAttribute('aria-label', 'Copy invite link');
+              const copyButton = document.createElement('button'); copyButton.type = 'button'; copyButton.className = 'btn secondary'; copyButton.textContent = 'Copy'; copyButton.setAttribute('aria-label', 'Copy Wire link');
               copyButton.addEventListener('click', async () => {
-                try { await navigator.clipboard.writeText(`${location.origin}/#invite/${invite.code}`); copyButton.textContent = 'Copied'; }
+                try { await navigator.clipboard.writeText(`${location.origin}/#wire/${invite.code}`); copyButton.textContent = 'Copied'; }
                 catch (_) { copyButton.textContent = 'Copy failed'; }
               });
               const revoke = document.createElement('button'); revoke.type = 'button'; revoke.className = 'btn ghost danger-text'; revoke.textContent = 'Revoke';
               revoke.addEventListener('click', async () => {
                 revoke.disabled = true;
-                try { await accountApi('DELETE', `/server/${sid}/invites/${encodeURIComponent(invite.code)}`); await refresh(); }
+                try { await accountApi('DELETE', `/server/${sid}/wires/${encodeURIComponent(invite.code)}`); await refresh(); }
                 catch (_) { revoke.disabled = false; revoke.textContent = 'Retry revoke'; }
               });
               row.append(copyButton, revoke);
@@ -977,7 +1732,7 @@
           }
         } catch (_) {
           if (!root.isConnected) return;
-          list.textContent = 'Could not load invite links. ';
+          list.textContent = 'Could not load Wires. ';
           const retry = document.createElement('button'); retry.className = 'btn secondary'; retry.type = 'button'; retry.textContent = 'Retry'; retry.addEventListener('click', refresh); list.append(retry);
         }
       };
@@ -1136,7 +1891,9 @@
     notification: [[784, 0, 250, 0.035], [1046.5, 85, 330, 0.026]],
     mention: [[880, 0, 200, 0.045], [1174.66, 110, 260, 0.05], [1567.98, 235, 340, 0.042]],
     incoming: [[523.25, 0, 430, 0.038], [659.25, 160, 430, 0.033], [783.99, 320, 540, 0.028]],
-    outgoing: [[392, 0, 300, 0.025], [523.25, 240, 380, 0.022]]
+    outgoing: [[392, 0, 300, 0.025], [523.25, 240, 380, 0.022]],
+    tour: [[659.25, 0, 130, 0.024], [783.99, 75, 170, 0.026], [987.77, 165, 230, 0.021]],
+    tourMessage: [[783.99, 0, 150, 0.021], [1046.5, 95, 220, 0.019]]
   };
   let lastMentionAt = 0;
   const playSound = (name, { preview = false } = {}) => {
@@ -1155,7 +1912,7 @@
     const play = () => {
       if (epoch !== soundEpoch || ctx.state !== 'running') return;
       if (!preview && storage.getItem('plainwire_sound_enabled') === 'false') return;
-      const group = preview ? 'preview' : name === 'notification' ? 'effect' : 'ringtone';
+      const group = preview ? 'preview' : ['incoming', 'outgoing'].includes(name) ? 'ringtone' : 'effect';
       stopSoundGroup(group);
       soundPatterns[name].forEach(([freq, delay, dur, vol]) => {
         playTone({ freq, delay, dur, vol, group });
@@ -1206,6 +1963,9 @@
     }
 
     try {
+      if (method === 'POST' && (/^\/channels\/\d+\/messages$/.test(path) || /^\/conversation\/\d+\/messages$/.test(path))) {
+        stopTypingForCurrentComposer();
+      }
       const res = await fetch('/api' + path, options);
       const json = await res.json().catch(() => ({ ok: false, error: 'bad_json' }));
       debug('API', 'response', { method, path, status: res.status, ok: !!json.ok, duration_ms: Math.round(performance.now() - requestStarted), error: json.error });
@@ -1213,8 +1973,9 @@
       if (json.ok && json.data && json.data.csrf) csrf = json.data.csrf;
       if (json.ok && json.data && json.data.user && json.data.user.id) meId = json.data.user.id;
       if (json.ok && json.data) updatePresenceWatch(json.data);
-      if (json.ok && method === 'POST' && /^\/server\/\d+\/invites$/.test(path) && typeof json.data?.url === 'string' && json.data.url.startsWith('#invite/')) {
-        json.data.url = new URL(json.data.url, location.origin + '/').href;
+      if (json.ok && method === 'POST' && path === '/logout') resetTypingState({ skipNetwork: true });
+      if (json.ok && method === 'POST' && /^\/server\/\d+\/wires$/.test(path) && typeof json.data?.url === 'string' && (json.data.url.startsWith('#wire/') || json.data.url.startsWith('#invite/'))) {
+        json.data.url = new URL(json.data.url.replace('#invite/', '#wire/'), location.origin + '/').href;
       }
       send(app.ports.apiReceive, {
         path,
@@ -1255,6 +2016,643 @@
   const activeComposer = () => {
     const composers = Array.from(document.querySelectorAll('#compose'));
     return composers.reverse().find((element) => element.offsetParent !== null) || null;
+  };
+
+  // Typing state is deliberately ephemeral: no database writes, no replay after
+  // reconnect, and no "typing forever" if a tab disappears. The sender refreshes
+  // at a low cadence while text is changing; receivers expire stale state even if
+  // an inactive packet is lost.
+  const TYPING_IDLE_MS = 5200;
+  const TYPING_REFRESH_MS = 3000;
+  const TYPING_REMOTE_TTL_MS = 7500;
+  const typingTabId = globalThis.crypto?.randomUUID?.() || `typing-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const typingRemote = new Map();
+  const typingClaims = new Map();
+  let localTyping = null;
+  let typingIdleTimer = null;
+  let typingSweepTimer = null;
+  const typingBroadcast = (() => {
+    try { return typeof BroadcastChannel === 'function' ? new BroadcastChannel('plainwire-typing-v1') : null; }
+    catch (_) { return null; }
+  })();
+
+  const parseTypingScope = (scopeKey) => {
+    const match = /^(direct|channel|thread):(\d+)$/.exec(String(scopeKey || ''));
+    if (!match) return null;
+    const id = Number(match[2]);
+    return Number.isSafeInteger(id) && id > 0 ? { key: `${match[1]}:${id}`, scope: match[1], id } : null;
+  };
+  const composerTypingScope = (composer = activeComposer()) => parseTypingScope(composer?.closest?.('.composer')?.dataset?.draft);
+  const emitTyping = (scope, active) => {
+    if (!scope) return;
+    sendWs({ type: 'typing', scope: scope.scope, scope_id: scope.id, active: active === true });
+  };
+  const announceTypingClaim = (scope, active) => {
+    const message = { tab: typingTabId, scope: scope?.key || '', active: active === true, expires: Date.now() + TYPING_IDLE_MS + 800 };
+    try { typingBroadcast?.postMessage(message); } catch (_) {}
+    if (!scope) return;
+    let claims = typingClaims.get(scope.key);
+    if (!claims) { claims = new Map(); typingClaims.set(scope.key, claims); }
+    if (active) claims.set(typingTabId, message.expires);
+    else claims.delete(typingTabId);
+  };
+  const pruneTypingClaims = (scopeKey) => {
+    const claims = typingClaims.get(scopeKey);
+    if (!claims) return false;
+    const now = Date.now();
+    for (const [tab, expires] of claims) if (expires <= now) claims.delete(tab);
+    if (!claims.size) { typingClaims.delete(scopeKey); return false; }
+    return true;
+  };
+  typingBroadcast?.addEventListener('message', (event) => {
+    const msg = event.data;
+    if (!msg || msg.tab === typingTabId || typeof msg.scope !== 'string') return;
+    const scope = parseTypingScope(msg.scope);
+    if (!scope) return;
+    let claims = typingClaims.get(scope.key);
+    if (!claims) { claims = new Map(); typingClaims.set(scope.key, claims); }
+    if (msg.active === true) claims.set(String(msg.tab || ''), Number(msg.expires) || (Date.now() + TYPING_IDLE_MS));
+    else claims.delete(String(msg.tab || ''));
+  });
+
+  const stopTyping = (scope = localTyping?.scope, { skipNetwork = false } = {}) => {
+    if (typingIdleTimer) { clearTimeout(typingIdleTimer); typingIdleTimer = null; }
+    if (!scope) { localTyping = null; return; }
+    announceTypingClaim(scope, false);
+    if (localTyping?.scope?.key === scope.key) localTyping = null;
+    if (skipNetwork) return;
+    // Give a sibling tab's BroadcastChannel claim one turn to arrive before
+    // sending inactive. Without this, one tab blurring could erase another tab's
+    // still-active indicator for the same account.
+    setTimeout(() => {
+      if (!pruneTypingClaims(scope.key)) emitTyping(scope, false);
+    }, 40);
+  };
+  const refreshLocalTyping = (composer) => {
+    const scope = composerTypingScope(composer);
+    if (!scope || !composer || !String(composer.value || '').trim()) {
+      if (localTyping) stopTyping(localTyping.scope);
+      return;
+    }
+    if (localTyping?.scope?.key && localTyping.scope.key !== scope.key) stopTyping(localTyping.scope);
+    const now = Date.now();
+    const lastSent = localTyping?.scope?.key === scope.key ? localTyping.lastSent : 0;
+    localTyping = { scope, lastSent };
+    announceTypingClaim(scope, true);
+    if (!lastSent || now - lastSent >= TYPING_REFRESH_MS) {
+      emitTyping(scope, true);
+      localTyping.lastSent = now;
+    }
+    if (typingIdleTimer) clearTimeout(typingIdleTimer);
+    typingIdleTimer = setTimeout(() => stopTyping(scope), TYPING_IDLE_MS);
+  };
+  const stopTypingForCurrentComposer = () => {
+    const scope = composerTypingScope();
+    if (scope) stopTyping(scope);
+    else if (localTyping) stopTyping(localTyping.scope);
+  };
+
+  const typingLabel = (actors) => {
+    const names = actors.map((actor) => actor.display_name || actor.username || 'Someone');
+    if (names.length === 1) return `${names[0]} is typing`;
+    if (names.length === 2) return `${names[0]} and ${names[1]} are typing`;
+    if (names.length === 3) return `${names[0]}, ${names[1]}, and ${names[2]} are typing`;
+    return `${names[0]}, ${names[1]}, and ${names.length - 2} others are typing`;
+  };
+  const typingActorsFor = (scopeKey) => {
+    const bucket = typingRemote.get(scopeKey);
+    if (!bucket) return [];
+    const now = Date.now();
+    for (const [uid, actor] of bucket) if (actor.expires <= now) bucket.delete(uid);
+    if (!bucket.size) typingRemote.delete(scopeKey);
+    return [...bucket.values()].sort((a, b) => a.startedAt - b.startedAt);
+  };
+  const refreshTypingIndicators = (scopeKey = null) => {
+    document.querySelectorAll('pw-typing-indicator').forEach((node) => {
+      if (!scopeKey || node.getAttribute('data-scope') === scopeKey) node.render?.();
+    });
+  };
+  const clearRemoteTyping = (predicate = () => true) => {
+    const changedScopes = [];
+    for (const scopeKey of typingRemote.keys()) {
+      if (predicate(scopeKey)) { typingRemote.delete(scopeKey); changedScopes.push(scopeKey); }
+    }
+    changedScopes.forEach(refreshTypingIndicators);
+  };
+  const resetTypingState = ({ skipNetwork = true } = {}) => {
+    if (localTyping) stopTyping(localTyping.scope, { skipNetwork });
+    if (typingIdleTimer) { clearTimeout(typingIdleTimer); typingIdleTimer = null; }
+    typingClaims.clear();
+    clearRemoteTyping();
+  };
+  const setSyntheticTyping = (scopeKey, actor, active) => {
+    if (!scopeKey || !actor?.user_id) return;
+    let bucket = typingRemote.get(scopeKey);
+    if (!bucket) { bucket = new Map(); typingRemote.set(scopeKey, bucket); }
+    if (active) {
+      const previous = bucket.get(String(actor.user_id));
+      bucket.set(String(actor.user_id), { ...actor, startedAt: previous?.startedAt || Date.now(), expires: Date.now() + TYPING_REMOTE_TTL_MS });
+    } else {
+      bucket.delete(String(actor.user_id));
+      if (!bucket.size) typingRemote.delete(scopeKey);
+    }
+    refreshTypingIndicators(scopeKey);
+  };
+  const handleTypingEvent = (msg) => {
+    if (msg?.type !== 'typing') return false;
+    const scope = parseTypingScope(`${msg.scope}:${msg.scope_id}`);
+    if (!scope) return true;
+    if (Number(msg.user_id) === Number(meId)) return true;
+    const actor = {
+      user_id: String(msg.user_id),
+      username: String(msg.username || ''),
+      display_name: String(msg.display_name || msg.username || 'Someone'),
+      avatar_url: String(msg.avatar_url || ''),
+      startedAt: Date.now(),
+      expires: Date.now() + TYPING_REMOTE_TTL_MS
+    };
+    setSyntheticTyping(scope.key, actor, msg.active === true);
+    return true;
+  };
+
+  class PlainwireTypingIndicator extends HTMLElement {
+    static get observedAttributes() { return ['data-scope']; }
+    connectedCallback() { this.render(); }
+    attributeChangedCallback() { this.render(); }
+    render() {
+      const actors = typingActorsFor(this.getAttribute('data-scope') || '');
+      this.replaceChildren();
+      this.classList.toggle('is-active', actors.length > 0);
+      if (!actors.length) { this.setAttribute('aria-hidden', 'true'); return; }
+      this.removeAttribute('aria-hidden');
+      const label = document.createElement('span');
+      label.className = 'typing-label';
+      label.textContent = typingLabel(actors);
+      const dots = document.createElement('span');
+      dots.className = 'typing-dots';
+      dots.setAttribute('aria-hidden', 'true');
+      dots.append(document.createElement('i'), document.createElement('i'), document.createElement('i'));
+      this.append(label, dots);
+    }
+  }
+  if (!customElements.get('pw-typing-indicator')) customElements.define('pw-typing-indicator', PlainwireTypingIndicator);
+  typingSweepTimer = setInterval(() => {
+    let changed = false;
+    for (const [scopeKey, bucket] of typingRemote) {
+      const before = bucket.size;
+      typingActorsFor(scopeKey);
+      if (bucket.size !== before) changed = true;
+    }
+    if (changed) refreshTypingIndicators();
+  }, 1000);
+
+  document.addEventListener('input', (event) => {
+    if (event.target instanceof HTMLTextAreaElement && event.target.id === 'compose') refreshLocalTyping(event.target);
+  }, true);
+  document.addEventListener('focusout', (event) => {
+    if (event.target instanceof HTMLTextAreaElement && event.target.id === 'compose') stopTyping(composerTypingScope(event.target));
+  }, true);
+  window.addEventListener('hashchange', () => { if (localTyping) stopTyping(localTyping.scope); });
+  window.addEventListener('pagehide', () => {
+    // Do not broadcast a definitive inactive packet while the document is
+    // disappearing. A sibling Plainwire tab may still be typing for this same
+    // account, and pagehide timers are not reliable enough to coordinate that
+    // handoff. Receivers already expire typing state after a short TTL; active
+    // sibling tabs keep refreshing it normally.
+    if (localTyping) stopTyping(localTyping.scope, { skipNetwork: true });
+    try { typingBroadcast?.close?.(); } catch (_) {}
+  });
+
+  // First-run onboarding lives outside the message database on purpose. Account
+  // progress is durable, but the guide's messages are delivered live only after
+  // the user opens Plainwire's welcome conversation.
+  const ONBOARDING_SCOPE = 'onboarding:0';
+  const ONBOARDING_ACTOR = {
+    user_id: 'plainwire-guide', username: 'plainwire', display_name: 'Plainwire', avatar_url: ''
+  };
+  const onboardingEntries = new Set();
+  let onboardingState = null;
+  let onboardingStateRequest = null;
+  let onboardingHopTimer = null;
+  let onboardingChatNode = null;
+  let onboardingGuideNode = null;
+  let onboardingSpotlightNode = null;
+  let onboardingSpotlightTarget = null;
+  let onboardingSpotlightRaf = 0;
+  let onboardingEpoch = 0;
+  let onboardingGuideActive = false;
+
+  const onboardingSteps = [
+    {
+      route: '#dms', selector: '.rail-btn[aria-label="Direct messages"]',
+      title: 'Your conversations live here',
+      body: 'Direct Messages keeps one-to-one chats and groups together. Unread conversations rise naturally, and the × on a one-to-one DM hides it without deleting the history.',
+      hint: 'Tip: Alt + Shift + ↑ / ↓ jumps between unread DMs.'
+    },
+    {
+      route: '#dms', selector: '.dm-inbox .page-heading .btn',
+      title: 'Start with people, not setup',
+      body: 'New message lets you start a DM or build a group. Group owners can promote moderators, remove members, and manage the conversation without leaving chat.',
+      hint: 'Groups keep explicit owner / moderator / member authority.'
+    },
+    {
+      route: '#friends', selector: '.rail-btn[aria-label="Friends"]',
+      title: 'Friends and people',
+      body: 'Friends is the cleanest place to find people you already know, handle requests, open profiles, and jump into a conversation or call.',
+      hint: 'Clicking @mentions anywhere also opens that person’s profile.'
+    },
+    {
+      route: '#new-server', selector: '.server-create-form',
+      title: 'Servers can grow with you',
+      body: 'A server starts simple, then owners can add channels, categories, colored roles, permissions, per-server profiles, moderation, voice rooms, and Wires for inviting people.',
+      hint: 'Nothing here forces you to create one right now.'
+    },
+    {
+      route: '#dms', selector: '.workspace-menu > summary',
+      title: 'Wires connect people to servers',
+      body: 'Open Workspace whenever you want to create a server or join one with a Wire. Wires are Plainwire’s server access links, with usage and expiry controls for moderators.',
+      hint: 'Old invite links still work, but new links are Wires.'
+    },
+    {
+      route: '#forums', selector: '.rail-btn[aria-label="Forums"]',
+      title: 'Longer conversations belong in f/ and t/',
+      body: 'Forums are f/ spaces and individual discussions are t/ threads. Threads support replies, editing, pinning, locking, moderation, and Markdown while keeping the interface distinctly Plainwire.',
+      hint: 'Use chat for live conversation and threads when the discussion should stay easy to revisit.'
+    },
+    {
+      route: '#dms', selector: '[data-open-switcher]',
+      title: 'Jump instead of hunting',
+      body: 'The quick switcher searches conversations, servers, channels, and destinations from one keyboard-friendly surface.',
+      hint: 'Ctrl / Cmd + K opens it from almost anywhere.'
+    },
+    {
+      route: '#settings', selector: '.rail-btn[aria-label="Settings"]',
+      title: 'Make Plainwire yours',
+      body: 'Settings covers identity, appearance, chat behavior, voice and screen-sharing devices, alerts, privacy, sessions, diagnostics, and the full shortcut sheet.',
+      hint: 'The tour can be replayed later from Account settings.'
+    },
+    {
+      route: '#notifications', selector: '.side a[href="#notifications"]',
+      title: 'Mentions and activity stay out of the way',
+      body: 'Notifications collects mentions and useful activity without turning every event into a modal. Calls and live voice still surface immediately when they need you.',
+      hint: 'Ctrl / Cmd + I opens activity quickly.'
+    }
+  ];
+
+  const reducedMotion = () => document.documentElement.dataset.reduceMotion === 'true'
+    || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
+  const updateOnboardingEntries = () => onboardingEntries.forEach(entry => entry.render?.());
+  const setOnboardingState = (state) => {
+    if (state && typeof state === 'object') onboardingState = {
+      state: String(state.state || 'complete'),
+      step: Math.max(0, Number(state.step) || 0),
+      updated_at: Number(state.updated_at) || 0
+    };
+    updateOnboardingEntries();
+    scheduleOnboardingHop();
+    return onboardingState;
+  };
+  const loadOnboardingState = async ({ force = false } = {}) => {
+    if (onboardingState && !force) return onboardingState;
+    if (onboardingStateRequest) return onboardingStateRequest;
+    onboardingStateRequest = directApi('/onboarding')
+      .then(setOnboardingState)
+      .catch((error) => {
+        debug('TOUR', 'state_load_failed', { error: error.message }, 'warn');
+        return null;
+      })
+      .finally(() => { onboardingStateRequest = null; });
+    return onboardingStateRequest;
+  };
+  const mutateOnboarding = async (action, body = null) => {
+    const state = await directApi(`/onboarding/${action}`, { method: 'POST', body });
+    return setOnboardingState(state);
+  };
+
+  const clearOnboardingHop = () => {
+    if (onboardingHopTimer) clearTimeout(onboardingHopTimer);
+    onboardingHopTimer = null;
+    onboardingEntries.forEach(entry => entry.classList.remove('is-hopping'));
+  };
+  const scheduleOnboardingHop = () => {
+    clearOnboardingHop();
+    if (!onboardingState || !['pending', 'active'].includes(onboardingState.state) || onboardingChatNode || onboardingGuideActive) return;
+    const delay = 4300 + Math.floor(Math.random() * 1700);
+    onboardingHopTimer = setTimeout(() => {
+      const visible = [...onboardingEntries].filter(entry => !entry.hidden && entry.isConnected && entry.offsetParent !== null);
+      if (visible.length) {
+        visible.forEach(entry => {
+          entry.classList.remove('is-hopping');
+          void entry.offsetWidth;
+          entry.classList.add('is-hopping');
+          setTimeout(() => entry.classList.remove('is-hopping'), reducedMotion() ? 500 : 900);
+        });
+        playSound('tour');
+      }
+      scheduleOnboardingHop();
+    }, delay);
+  };
+
+  class PlainwireOnboardingEntry extends HTMLElement {
+    connectedCallback() {
+      onboardingEntries.add(this);
+      this.render();
+      loadOnboardingState().then(() => this.render());
+    }
+    disconnectedCallback() { onboardingEntries.delete(this); }
+    render() {
+      const state = onboardingState?.state;
+      const visible = state === 'pending' || state === 'active';
+      this.hidden = !visible;
+      this.replaceChildren();
+      if (!visible) return;
+      const variant = this.dataset.variant === 'inbox' ? 'inbox' : 'sidebar';
+      this.className = `pw-onboarding-entry pw-onboarding-entry-${variant}${this.classList.contains('is-hopping') ? ' is-hopping' : ''}`;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'pw-onboarding-entry-button';
+      button.setAttribute('aria-label', onboardingState?.step > 0 ? 'Resume Plainwire welcome tour' : 'Open Plainwire welcome message');
+      const mark = document.createElement('span'); mark.className = 'pw-onboarding-mark'; mark.textContent = 'P'; mark.setAttribute('aria-hidden', 'true');
+      const copy = document.createElement('span'); copy.className = 'pw-onboarding-entry-copy';
+      const title = document.createElement('strong'); title.textContent = 'Plainwire';
+      const sub = document.createElement('small'); sub.textContent = onboardingState?.step > 0 ? 'Continue your tour' : 'Welcome — start here';
+      copy.append(title, sub);
+      const dot = document.createElement('span'); dot.className = 'pw-onboarding-unread'; dot.setAttribute('aria-hidden', 'true');
+      button.append(mark, copy, dot);
+      if (variant === 'inbox') {
+        const description = document.createElement('span');
+        description.className = 'pw-onboarding-entry-description';
+        description.textContent = 'A short interactive tour that moves with you and explains Plainwire as you use it.';
+        copy.append(description);
+      }
+      button.addEventListener('click', () => openOnboardingChat().catch((error) => {
+        send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not open the welcome tour: ${error.message}` });
+      }));
+      this.append(button);
+    }
+  }
+  if (!customElements.get('pw-onboarding-entry')) customElements.define('pw-onboarding-entry', PlainwireOnboardingEntry);
+
+  const removeTourSpotlight = () => {
+    if (onboardingSpotlightRaf) cancelAnimationFrame(onboardingSpotlightRaf);
+    onboardingSpotlightRaf = 0;
+    onboardingSpotlightTarget = null;
+    onboardingSpotlightNode?.remove();
+    onboardingSpotlightNode = null;
+  };
+  const positionTourSpotlight = () => {
+    onboardingSpotlightRaf = 0;
+    const target = onboardingSpotlightTarget;
+    const node = onboardingSpotlightNode;
+    if (!node) return;
+    if (!target?.isConnected) { removeTourSpotlight(); return; }
+    const rect = target.getBoundingClientRect();
+    const pad = 7;
+    node.style.left = `${Math.max(4, rect.left - pad)}px`;
+    node.style.top = `${Math.max(4, rect.top - pad)}px`;
+    node.style.width = `${Math.max(12, rect.width + pad * 2)}px`;
+    node.style.height = `${Math.max(12, rect.height + pad * 2)}px`;
+  };
+  const requestTourSpotlightPosition = () => {
+    if (!onboardingSpotlightRaf) onboardingSpotlightRaf = requestAnimationFrame(positionTourSpotlight);
+  };
+  const spotlightTourTarget = (target) => {
+    removeTourSpotlight();
+    if (!target) return;
+    const node = document.createElement('div');
+    node.className = 'pw-tour-spotlight';
+    node.setAttribute('aria-hidden', 'true');
+    document.body.append(node);
+    onboardingSpotlightNode = node;
+    onboardingSpotlightTarget = target;
+    target.scrollIntoView?.({ block: 'nearest', inline: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' });
+    requestTourSpotlightPosition();
+  };
+  window.addEventListener('resize', requestTourSpotlightPosition, { passive: true });
+  window.addEventListener('scroll', requestTourSpotlightPosition, { passive: true, capture: true });
+
+  const waitForTourTarget = (selector, timeoutMs = 6500) => new Promise((resolve) => {
+    const immediate = document.querySelector(selector);
+    if (immediate) return resolve(immediate);
+    let done = false;
+    const observer = new MutationObserver(() => {
+      const found = document.querySelector(selector);
+      if (found && !done) { done = true; clearTimeout(timeout); observer.disconnect(); resolve(found); }
+    });
+    const timeout = setTimeout(() => {
+      if (done) return;
+      done = true;
+      observer.disconnect();
+      resolve(document.querySelector(selector));
+    }, timeoutMs);
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'hidden'] });
+  });
+
+  const closeOnboardingChat = ({ resumeHop = true } = {}) => {
+    onboardingEpoch += 1;
+    setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, false);
+    onboardingChatNode?.remove();
+    onboardingChatNode = null;
+    if (resumeHop) scheduleOnboardingHop();
+  };
+  const closeOnboardingGuide = () => {
+    setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, false);
+    onboardingGuideNode?.remove();
+    onboardingGuideNode = null;
+    onboardingGuideActive = false;
+    removeTourSpotlight();
+  };
+
+  const onboardingBotSay = async (messages, { container, epoch, typingMs = 900 } = {}) => {
+    for (const item of messages) {
+      if (epoch !== onboardingEpoch || !container?.isConnected) return false;
+      setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, true);
+      await sleep(reducedMotion() ? Math.min(typingMs, 300) : typingMs + Math.min(650, String(item).length * 9));
+      if (epoch !== onboardingEpoch || !container?.isConnected) return false;
+      setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, false);
+      const row = document.createElement('div'); row.className = 'pw-tour-message';
+      const avatar = document.createElement('span'); avatar.className = 'pw-tour-message-avatar'; avatar.textContent = 'P'; avatar.setAttribute('aria-hidden', 'true');
+      const body = document.createElement('div'); body.className = 'pw-tour-message-body';
+      const name = document.createElement('strong'); name.textContent = 'Plainwire';
+      const bubble = document.createElement('p'); bubble.textContent = item;
+      body.append(name, bubble); row.append(avatar, body); container.append(row);
+      playSound('tourMessage');
+      container.scrollTo?.({ top: container.scrollHeight, behavior: reducedMotion() ? 'auto' : 'smooth' });
+      await sleep(reducedMotion() ? 80 : 260);
+    }
+    return true;
+  };
+
+  const makeTourAction = (label, className, handler) => {
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = className; button.textContent = label;
+    button.addEventListener('click', handler);
+    return button;
+  };
+
+  const dismissOnboarding = async () => {
+    if (!window.confirm('Skip the welcome tour? You can replay it later from Settings → Account.')) return;
+    try {
+      await mutateOnboarding('dismiss');
+      closeOnboardingChat({ resumeHop: false });
+      closeOnboardingGuide();
+      updateOnboardingEntries();
+    } catch (error) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not save that choice: ${error.message}` });
+    }
+  };
+
+  const renderOnboardingSourceCard = (container) => {
+    const card = document.createElement('div'); card.className = 'pw-tour-source-card';
+    const icon = document.createElement('span'); icon.className = 'pw-tour-source-icon'; icon.textContent = '</>'; icon.setAttribute('aria-hidden', 'true');
+    const copy = document.createElement('div');
+    const title = document.createElement('strong'); title.textContent = 'Plainwire source code';
+    const repo = document.createElement('small'); repo.textContent = clientConfig.sourceRepository;
+    copy.append(title, repo);
+    const actions = document.createElement('div'); actions.className = 'pw-tour-source-actions';
+    const open = makeTourAction('Open repository', 'btn', () => window.open(clientConfig.sourceRepository, '_blank', 'noopener,noreferrer'));
+    const copyButton = makeTourAction('Copy link', 'btn secondary', async () => {
+      try { await navigator.clipboard.writeText(clientConfig.sourceRepository); copyButton.textContent = 'Copied'; }
+      catch (_) { send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not access the clipboard.' }); }
+    });
+    actions.append(open, copyButton); card.append(icon, copy, actions); container.append(card);
+  };
+
+  const finishOnboarding = async () => {
+    closeOnboardingGuide();
+    const navigationEpoch = ++onboardingEpoch;
+    location.hash = '#dms';
+    await sleep(160);
+    if (navigationEpoch !== onboardingEpoch) return;
+    const chat = await openOnboardingChat({ final: true, skipStart: true });
+    if (!chat) return;
+    const epoch = onboardingEpoch;
+    const messages = chat.querySelector('.pw-onboarding-messages');
+    const ok = await onboardingBotSay([
+      'That’s the core of Plainwire. You can keep using it normally from here — the guide gets out of your way.',
+      'One last thing: Plainwire is open source. If you ever want to inspect it, self-host it, report an issue, or build on it, this is the real repository.'
+    ], { container: messages, epoch });
+    if (!ok) return;
+    renderOnboardingSourceCard(messages);
+    const actions = chat.querySelector('.pw-onboarding-actions');
+    actions.replaceChildren(makeTourAction('Finish', 'btn', async () => {
+      try {
+        await mutateOnboarding('complete');
+        updateOnboardingEntries();
+        const done = document.createElement('span'); done.className = 'pw-tour-complete'; done.textContent = 'Tour complete ✓';
+        actions.replaceChildren(done, makeTourAction('Close', 'btn secondary', () => closeOnboardingChat({ resumeHop: false })));
+      } catch (error) {
+        send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not save tour completion: ${error.message}` });
+      }
+    }));
+  };
+
+  const renderTourGuide = async (stepNumber, step, target, epoch) => {
+    closeOnboardingGuide();
+    if (epoch !== onboardingEpoch) return;
+    onboardingGuideActive = true;
+    clearOnboardingHop();
+    spotlightTourTarget(target);
+    const guide = document.createElement('aside'); guide.className = 'pw-tour-guide'; guide.setAttribute('role', 'dialog'); guide.setAttribute('aria-label', 'Plainwire tour guide'); guide.tabIndex = -1;
+    const head = document.createElement('div'); head.className = 'pw-tour-guide-head';
+    const mark = document.createElement('span'); mark.className = 'pw-onboarding-mark compact'; mark.textContent = 'P'; mark.setAttribute('aria-hidden', 'true');
+    const headCopy = document.createElement('div'); const brand = document.createElement('strong'); brand.textContent = 'Plainwire guide';
+    const progress = document.createElement('small'); progress.textContent = `${stepNumber} of ${onboardingSteps.length}`; headCopy.append(brand, progress);
+    const pause = document.createElement('button'); pause.type = 'button'; pause.className = 'pw-tour-guide-close'; pause.textContent = '×'; pause.setAttribute('aria-label', 'Pause tour');
+    pause.addEventListener('click', () => { closeOnboardingGuide(); scheduleOnboardingHop(); });
+    head.append(mark, headCopy, pause);
+    const body = document.createElement('div'); body.className = 'pw-tour-guide-body';
+    const typing = document.createElement('pw-typing-indicator'); typing.setAttribute('data-scope', ONBOARDING_SCOPE); body.append(typing);
+    const footer = document.createElement('div'); footer.className = 'pw-tour-guide-actions';
+    guide.append(head, body, footer); document.body.append(guide); onboardingGuideNode = guide;
+    setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, true);
+    await sleep(reducedMotion() ? 220 : 720 + Math.min(480, step.body.length * 3));
+    if (epoch !== onboardingEpoch || onboardingGuideNode !== guide) return;
+    setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, false);
+    typing.remove();
+    const title = document.createElement('h3'); title.textContent = step.title;
+    const message = document.createElement('p'); message.textContent = step.body;
+    const hint = document.createElement('small'); hint.className = 'pw-tour-guide-hint'; hint.textContent = step.hint;
+    body.append(title, message, hint); playSound('tourMessage');
+    if (stepNumber > 1) footer.append(makeTourAction('Back', 'btn secondary', () => showTourStep(stepNumber - 1)));
+    const skip = makeTourAction('Skip tour', 'btn ghost', dismissOnboarding);
+    const next = makeTourAction(stepNumber === onboardingSteps.length ? 'Back to Plainwire' : 'Next', 'btn', () => {
+      if (stepNumber === onboardingSteps.length) finishOnboarding(); else showTourStep(stepNumber + 1);
+    });
+    footer.append(skip, next);
+    guide.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') { event.preventDefault(); closeOnboardingGuide(); scheduleOnboardingHop(); }
+    });
+    requestAnimationFrame(() => { guide.classList.add('is-visible'); guide.focus({ preventScroll: true }); });
+  };
+
+  const showTourStep = async (stepNumber) => {
+    const step = onboardingSteps[stepNumber - 1];
+    if (!step) return finishOnboarding();
+    closeOnboardingChat({ resumeHop: false });
+    closeOnboardingGuide();
+    clearOnboardingHop();
+    const epoch = ++onboardingEpoch;
+    try {
+      await mutateOnboarding('progress', { step: stepNumber });
+      clearOnboardingHop();
+    } catch (error) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not save tour progress: ${error.message}` });
+      scheduleOnboardingHop();
+      return;
+    }
+    if (epoch !== onboardingEpoch) return;
+    if (location.hash !== step.route) location.hash = step.route;
+    const target = await waitForTourTarget(step.selector);
+    if (epoch !== onboardingEpoch) return;
+    await renderTourGuide(stepNumber, step, target, epoch);
+  };
+
+  const openOnboardingChat = async ({ final = false, skipStart = false } = {}) => {
+    clearOnboardingHop(); closeOnboardingGuide();
+    let state = await loadOnboardingState({ force: true });
+    if (!state) throw new Error('welcome state unavailable');
+    if (!skipStart && state.state === 'pending') state = await mutateOnboarding('start');
+    if (!final && !['pending', 'active'].includes(state.state)) return null;
+    closeOnboardingChat({ resumeHop: false });
+    const epoch = ++onboardingEpoch;
+    const main = document.querySelector('.main');
+    if (!main) throw new Error('workspace unavailable');
+    const layer = document.createElement('section'); layer.className = 'pw-onboarding-chat-layer'; layer.setAttribute('role', 'region'); layer.setAttribute('aria-label', 'Welcome to Plainwire');
+    const header = document.createElement('header'); header.className = 'pw-onboarding-chat-head';
+    const mark = document.createElement('span'); mark.className = 'pw-onboarding-mark'; mark.textContent = 'P'; mark.setAttribute('aria-hidden', 'true');
+    const title = document.createElement('div'); const h = document.createElement('h2'); h.textContent = 'Plainwire'; const sub = document.createElement('small'); sub.textContent = 'Interactive welcome tour'; title.append(h, sub);
+    const close = document.createElement('button'); close.type = 'button'; close.className = 'pw-tour-guide-close'; close.textContent = '×'; close.setAttribute('aria-label', 'Close welcome conversation');
+    close.addEventListener('click', () => closeOnboardingChat()); header.append(mark, title, close);
+    const messages = document.createElement('div'); messages.className = 'pw-onboarding-messages'; messages.setAttribute('aria-live', 'polite');
+    const typing = document.createElement('pw-typing-indicator'); typing.setAttribute('data-scope', ONBOARDING_SCOPE); messages.append(typing);
+    const actions = document.createElement('div'); actions.className = 'pw-onboarding-actions';
+    layer.append(header, messages, actions); main.append(layer); onboardingChatNode = layer;
+    requestAnimationFrame(() => layer.classList.add('is-open'));
+    if (final) return layer;
+
+    const resumeAt = Math.max(0, Number(state.step) || 0);
+    const intro = resumeAt > 0
+      ? [
+          'Welcome back. Your tour progress is still here — no need to start over.',
+          `We left off around stop ${Math.min(resumeAt, onboardingSteps.length)} of ${onboardingSteps.length}. I can jump right back there when you’re ready.`
+        ]
+      : [
+          'Hey — I’m Plainwire. Welcome aboard 👋',
+          'I can show you around without dumping a wall of tooltips on the screen.',
+          'When we leave this chat, I’ll move into a small guide in the corner, highlight the real controls, and walk with you page by page.'
+        ];
+    const ok = await onboardingBotSay(intro, { container: messages, epoch, typingMs: 760 });
+    if (!ok || epoch !== onboardingEpoch) return layer;
+    actions.replaceChildren();
+    const startLabel = resumeAt > 0 ? 'Resume tour' : 'Show me around';
+    actions.append(
+      makeTourAction(startLabel, 'btn', () => showTourStep(Math.max(1, Math.min(resumeAt || 1, onboardingSteps.length)))),
+      makeTourAction('Maybe later', 'btn secondary', () => closeOnboardingChat()),
+      makeTourAction('Skip tour', 'btn ghost', dismissOnboarding)
+    );
+    return layer;
   };
 
   const closeFormatting = (restoreFocus = false) => {
@@ -1495,6 +2893,8 @@
   const uploadFiles = async (files) => {
     const selected = Array.from(files || []);
     const uploadRoute = location.hash;
+    const uploadComposer = activeComposer();
+    const uploadFromModal = !!uploadComposer?.closest?.('.modal');
     if (selected.length > clientConfig.uploadMaxFiles) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: `Only the first ${clientConfig.uploadMaxFiles} files will be uploaded.` });
     }
@@ -1505,15 +2905,30 @@
         const safeName = String(uploaded.name || 'file').replace(/[\]()[\r\n]/g, '_');
         const markup = String(uploaded.content_type || '').startsWith('image/')
           ? `![${safeName}](${uploaded.url})` : `[${safeName}](${uploaded.url})`;
-        if (location.hash === uploadRoute) appendToComposer(markup);
-        else send(app.ports.bridgeReceive, { tag: 'attachment_ready', route: uploadRoute, data: markup });
-        send(app.ports.bridgeReceive, { tag: 'toast', data: `${safeName} ready to send` });
+        const sameComposer = uploadComposer?.isConnected && activeComposer() === uploadComposer;
+        if (sameComposer) {
+          appendToComposer(markup);
+          send(app.ports.bridgeReceive, { tag: 'toast', data: `${safeName} ready to send` });
+        } else if (!uploadFromModal) {
+          // Chat routes have durable Elm drafts, so a navigation/rerender can
+          // safely deliver the finished upload back to the route that started it.
+          send(app.ports.bridgeReceive, { tag: 'attachment_ready', route: uploadRoute, data: markup });
+          send(app.ports.bridgeReceive, { tag: 'toast', data: `${safeName} added to the original draft` });
+        } else {
+          // A modal draft has no durable route key. Never leak an attachment into
+          // an unrelated background composer if the thread modal was closed while
+          // the upload was in flight.
+          send(app.ports.bridgeReceive, { tag: 'toast', data: `${safeName} uploaded, but the thread editor was closed. Reopen it and attach the file again.` });
+        }
       } catch (error) {
         const messages = {
           file_too_large: `Files can be up to ${humanBytes(clientConfig.uploadMaxBytes)}.`,
           compression_failed: `Could not compress that file below ${humanBytes(clientConfig.uploadMaxBytes)}.`,
           compression_input_too_large: `That file is too large to compress safely in the browser. The compression limit is ${humanBytes(Math.min(Math.max(clientConfig.uploadMaxBytes * 2, clientConfig.uploadMaxBytes + 32 * 1024 * 1024), 512 * 1024 * 1024))}.`,
           upload_quota_exceeded: 'Upload quota reached. Try again later.',
+          upload_storage_unavailable: 'Upload storage is temporarily unavailable.',
+          upload_finalize_unavailable: 'The file uploaded, but finalizing it failed. Try again shortly.',
+          upload_reservation_lost: 'The upload reservation expired before finalization. Please retry.',
           too_many_concurrent_uploads: 'Too many uploads are already in progress.',
           network_error: 'Upload connection interrupted.',
           network_timeout: 'Upload timed out. Try again on a steadier connection.',
@@ -1614,14 +3029,18 @@
         if (msg.session && msg.session.user && msg.session.user.id) meId = msg.session.user.id;
         if (msg.type === 'hello') maybeResumeRtcRoom();
         handlePresenceEvent(msg);
+        const typingConsumed = handleTypingEvent(msg) === true;
         const rtcConsumed = handleRtcEvent(msg) === true;
-        if (!rtcConsumed) send(app.ports.wsReceive, msg);
+        if (!typingConsumed && !rtcConsumed) send(app.ports.wsReceive, msg);
       } catch (error) { debug('WS', 'invalid_message', { error: error.message, bytes: String(event.data).length }, 'error'); }
     };
     ws.onerror = () => debug('WS', 'transport_error', { ready_state: ws?.readyState }, 'error');
     ws.onclose = (event) => {
       if (ws !== socket) return;
       if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
+      // Typing is socket-epoch state. Never keep indicators or a local claim
+      // alive across reconnect; a later keystroke will publish a fresh claim.
+      resetTypingState({ skipNetwork: true });
       send(app.ports.bridgeReceive, { tag: 'ws_status', data: false });
       ws = null;
       wsReconnectAttempt = Math.min(wsReconnectAttempt + 1, 8);
@@ -1639,7 +3058,7 @@
 
   const queueWs = (value) => {
     if (!value || typeof value !== 'object') return;
-    if (value.type === 'ping') return;
+    if (value.type === 'ping' || value.type === 'typing') return;
     if (value.type === 'presence_update' || value.type === 'presence_watch') {
       for (let i = wsQueue.length - 1; i >= 0; i--) {
         if (wsQueue[i]?.type === value.type) {
@@ -1701,30 +3120,67 @@
   const disposeScreenAudioMixer = (mixer) => {
     if (!mixer || mixer.disposed) return;
     mixer.disposed = true;
+    try { clearInterval(mixer.energyTimer); } catch (_) {}
     try { mixer.microphoneSource.disconnect(); } catch (_) {}
     try { mixer.screenSource.disconnect(); } catch (_) {}
+    try { mixer.analyser?.disconnect(); } catch (_) {}
     try { mixer.destination.disconnect?.(); } catch (_) {}
     stopStream(mixer.destination.stream);
   };
-  const createScreenAudioMixer = (displayStream, microphoneStream = localStream) => {
+  const createScreenAudioMixer = async (displayStream, microphoneStream = localStream) => {
     const screenTrack = displayStream?.getAudioTracks().find((track) => track.readyState === 'live');
     if (!screenTrack) return null;
     const microphoneTrack = microphoneStream?.getAudioTracks().find((track) => track.readyState === 'live');
     if (!microphoneTrack) throw new Error('No live microphone track for screen audio');
     const ctx = audioContext();
     if (!ctx) throw new Error('Web Audio is unavailable for screen audio');
+    if (ctx.state === 'suspended') {
+      try { await ctx.resume(); } catch (_) {}
+    }
+    if (ctx.state !== 'running') throw new Error(`Web Audio is ${ctx.state}; interact with Plainwire and try screen audio again`);
     const destination = ctx.createMediaStreamDestination();
     let microphoneSource;
     let screenSource;
     try {
       microphoneSource = ctx.createMediaStreamSource(new MediaStream([microphoneTrack]));
       screenSource = ctx.createMediaStreamSource(new MediaStream([screenTrack]));
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.25;
       microphoneSource.connect(destination);
       screenSource.connect(destination);
+      // The analyser is diagnostic-only. The screen source remains directly
+      // connected to the outgoing mix, so metering can never mute/modify it.
+      screenSource.connect(analyser);
       const track = destination.stream.getAudioTracks()[0];
       if (!track) throw new Error('Could not create a mixed screen audio track');
-      ctx.resume?.().catch(() => {});
-      return { track, destination, microphoneSource, screenSource, screenTrack, disposed: false };
+      const mixer = {
+        track, destination, microphoneSource, screenSource, screenTrack, analyser,
+        energyTimer: null, audioDetected: false, audioEverDetected: false,
+        lastEnergyAt: 0, disposed: false
+      };
+      const samples = new Uint8Array(analyser.fftSize);
+      mixer.energyTimer = setInterval(() => {
+        if (mixer.disposed || screenTrack.readyState !== 'live') return;
+        analyser.getByteTimeDomainData(samples);
+        let sum = 0;
+        for (let i = 0; i < samples.length; i++) {
+          const value = (samples[i] - 128) / 128;
+          sum += value * value;
+        }
+        const now = performance.now();
+        const rms = Math.sqrt(sum / samples.length);
+        const wasActive = mixer.audioDetected;
+        if (rms >= 0.004) {
+          mixer.lastEnergyAt = now;
+          mixer.audioEverDetected = true;
+        }
+        // Hysteresis avoids flickering between active/quiet between packets,
+        // while still telling the user when a source that once worked is now quiet.
+        mixer.audioDetected = mixer.lastEnergyAt > 0 && now - mixer.lastEnergyAt < 1800;
+        if (wasActive !== mixer.audioDetected) updateScreenControls();
+      }, 350);
+      return mixer;
     } catch (error) {
       try { microphoneSource?.disconnect(); } catch (_) {}
       try { screenSource?.disconnect(); } catch (_) {}
@@ -1737,15 +3193,24 @@
       ? mixer.track
       : microphoneStream?.getAudioTracks().find((track) => track.readyState === 'live') || null;
   const SYSTEM_AUDIO_DEVICE_RE = /(?:monitor of|output monitor|monitor source|stereo mix|what (?:u|you) hear|loopback|desktop audio|system audio)/i;
+  let selectedScreenAudioId = storage.getItem('plainwire_screen_audio_device') || '';
+  let screenAudioDeviceLabel = '';
+  const enumerateScreenAudioInputs = async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return [];
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter((item) => item.kind === 'audioinput' && item.deviceId && item.deviceId !== selectedInputId);
+  };
   const captureSystemAudioFallback = async () => {
     if (!shareScreenAudio || !navigator.mediaDevices?.enumerateDevices || !navigator.mediaDevices?.getUserMedia) return null;
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const device = devices.find((item) =>
-      item.kind === 'audioinput' &&
-      item.deviceId &&
-      item.deviceId !== selectedInputId &&
-      SYSTEM_AUDIO_DEVICE_RE.test(item.label || '')
-    );
+    const devices = await enumerateScreenAudioInputs();
+    let device = selectedScreenAudioId ? devices.find((item) => item.deviceId === selectedScreenAudioId) : null;
+    if (!device) {
+      if (selectedScreenAudioId) {
+        selectedScreenAudioId = '';
+        storage.removeItem('plainwire_screen_audio_device');
+      }
+      device = devices.find((item) => SYSTEM_AUDIO_DEVICE_RE.test(item.label || ''));
+    }
     if (!device) return null;
     const stream = await navigator.mediaDevices.getUserMedia({
       video: false,
@@ -1761,8 +3226,109 @@
     const track = stream.getAudioTracks().find((item) => item.readyState === 'live');
     if (!track) { stopStream(stream); return null; }
     try { track.contentHint = 'music'; } catch (_) {}
-    return { stream, track, label: device.label || 'system audio monitor' };
+    const label = device.label || 'system audio monitor';
+    return { stream, track, label, deviceId: device.deviceId };
   };
+  const replaceActiveScreenAudioWithCapture = async (capture, source = 'loopback') => {
+    if (!capture?.track || capture.track.readyState !== 'live' || !screenStream || !room) {
+      stopStream(capture?.stream);
+      return false;
+    }
+    const activeScreen = screenStream;
+    const epoch = room.epoch;
+    const previousMixer = screenAudioMixer;
+    const previousSource = screenAudioSource;
+    const previousLabel = screenAudioDeviceLabel;
+    const previousAudioTrack = outgoingAudioTrack(localStream, previousMixer);
+    let nextMixer;
+    try {
+      nextMixer = await createScreenAudioMixer(new MediaStream([capture.track]));
+      if (!nextMixer) throw new Error('The selected system audio source did not provide a live track');
+    } catch (error) {
+      stopStream(capture.stream);
+      debug('MEDIA', 'screen_audio_source_mix_failed', { error: error.message }, 'warn');
+      throw error;
+    }
+    if (!room || room.epoch !== epoch || screenStream !== activeScreen) {
+      disposeScreenAudioMixer(nextMixer);
+      stopStream(capture.stream);
+      return false;
+    }
+    const nextAudioTrack = outgoingAudioTrack(localStream, nextMixer);
+    const targets = Array.from(peers.values()).filter((pc) => pc._audioSender && pc.signalingState !== 'closed');
+    const results = await Promise.allSettled(targets.map((pc) => pc._audioSender.replaceTrack(nextAudioTrack)));
+    if (!room || room.epoch !== epoch || screenStream !== activeScreen) {
+      disposeScreenAudioMixer(nextMixer);
+      stopStream(capture.stream);
+      return false;
+    }
+    if (results.some((result, index) => result.status === 'rejected' && targets[index].signalingState !== 'closed')) {
+      await Promise.allSettled(Array.from(peers.values())
+        .filter((pc) => pc._audioSender && pc.signalingState !== 'closed')
+        .map((pc) => pc._audioSender.replaceTrack(previousAudioTrack)));
+      disposeScreenAudioMixer(nextMixer);
+      stopStream(capture.stream);
+      screenAudioMixer = previousMixer;
+      screenAudioSource = previousSource;
+      screenAudioDeviceLabel = previousLabel;
+      throw new Error('Could not switch the outgoing shared-audio track for every participant');
+    }
+
+    const oldSourceTracks = activeScreen.getAudioTracks().filter((track) => track !== capture.track);
+    for (const track of oldSourceTracks) {
+      try { activeScreen.removeTrack(track); } catch (_) {}
+      try { track.stop(); } catch (_) {}
+    }
+    if (!activeScreen.getAudioTracks().includes(capture.track)) {
+      try { activeScreen.addTrack(capture.track); } catch (_) {}
+    }
+    screenAudioMixer = nextMixer;
+    screenAudioSource = source;
+    screenAudioDeviceLabel = capture.label || 'system audio source';
+    disposeScreenAudioMixer(previousMixer);
+    sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen_audio: true } });
+    updateScreenControls();
+    debug('MEDIA', 'screen_audio_source_changed', { source, label: screenAudioDeviceLabel });
+    return true;
+  };
+
+  const applySelectedScreenAudioSource = async () => {
+    if (!screenStream || !room || !shareScreenAudio) return false;
+    const capture = await captureSystemAudioFallback();
+    if (!capture) return false;
+    return replaceActiveScreenAudioWithCapture(capture, 'loopback');
+  };
+
+  const disableActiveScreenAudio = async () => {
+    if (!screenStream || !room || screenAudioSource === 'none') return true;
+    const activeScreen = screenStream;
+    const epoch = room.epoch;
+    const previousMixer = screenAudioMixer;
+    const microphoneTrack = outgoingAudioTrack(localStream, null);
+    const targets = Array.from(peers.values()).filter((pc) => pc._audioSender && pc.signalingState !== 'closed');
+    const previousAudioTrack = outgoingAudioTrack(localStream, previousMixer);
+    const results = await Promise.allSettled(targets.map((pc) => pc._audioSender.replaceTrack(microphoneTrack)));
+    if (!room || room.epoch !== epoch || screenStream !== activeScreen) return false;
+    if (results.some((result, index) => result.status === 'rejected' && targets[index].signalingState !== 'closed')) {
+      await Promise.allSettled(Array.from(peers.values())
+        .filter((pc) => pc._audioSender && pc.signalingState !== 'closed')
+        .map((pc) => pc._audioSender.replaceTrack(previousAudioTrack)));
+      return false;
+    }
+    for (const track of activeScreen.getAudioTracks()) {
+      try { activeScreen.removeTrack(track); } catch (_) {}
+      try { track.stop(); } catch (_) {}
+    }
+    screenAudioMixer = null;
+    screenAudioSource = 'none';
+    screenAudioDeviceLabel = '';
+    disposeScreenAudioMixer(previousMixer);
+    sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen_audio: false } });
+    updateScreenControls();
+    debug('MEDIA', 'screen_audio_disabled_live');
+    return true;
+  };
+
   const openRawMicrophone = async (mode = voiceProcessingMode) => {
     try {
       return await navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints(mode), video: false });
@@ -2033,7 +3599,7 @@
     track.enabled = !micMuted;
     let replacementMixer = null;
     try {
-      replacementMixer = createScreenAudioMixer(screenStream, replacementLease.stream);
+      replacementMixer = await createScreenAudioMixer(screenStream, replacementLease.stream);
     } catch (error) {
       await replacementLease.release();
       throw error;
@@ -2675,6 +4241,32 @@
     const p = screenProfiles[screenProfile];
     return { width: { ideal: p.width, max: p.width }, height: { ideal: p.height, max: p.height }, frameRate: { ideal: p.fps, max: p.fps } };
   };
+  const populateScreenAudioSourceSelect = async (select) => {
+    if (!select?.isConnected) return;
+    const previous = selectedScreenAudioId;
+    const inputs = await enumerateScreenAudioInputs().catch(() => []);
+    select.replaceChildren();
+    const automatic = document.createElement('option');
+    automatic.value = '';
+    automatic.textContent = 'Automatic · browser audio, then system monitor';
+    select.append(automatic);
+    const detected = inputs.filter((item) => SYSTEM_AUDIO_DEVICE_RE.test(item.label || ''));
+    const other = inputs.filter((item) => !SYSTEM_AUDIO_DEVICE_RE.test(item.label || ''));
+    const addGroup = (label, items) => {
+      if (!items.length) return;
+      const group = document.createElement('optgroup'); group.label = label;
+      items.forEach((item, index) => {
+        const option = document.createElement('option'); option.value = item.deviceId;
+        option.textContent = item.label || `Audio input ${index + 1}`;
+        group.append(option);
+      });
+      select.append(group);
+    };
+    addGroup('System / loopback sources', detected);
+    addGroup('Other audio inputs', other);
+    if (previous && inputs.some((item) => item.deviceId === previous)) select.value = previous;
+    else select.value = '';
+  };
   class ScreenSettings extends HTMLElement {
     connectedCallback() { this.render(); }
     render() {
@@ -2683,20 +4275,33 @@
         const change = this.querySelector('[data-screen-change]');
         const preview = this.querySelector('[data-screen-preview]');
         const status = this.querySelector('[data-screen-audio-status]');
+        const sourceSelect = this.querySelector('[data-screen-audio-source]');
+        if (sourceSelect && sourceSelect.value !== selectedScreenAudioId) sourceSelect.value = selectedScreenAudioId;
         if (change) change.disabled = !active;
         if (preview) preview.disabled = !active;
         if (status) {
-          const hasAudio = active && screenAudioSource !== 'none' && screenAudioMixer?.track?.readyState === 'live';
+          const hasAudioSource = active && screenAudioSource !== 'none' && screenAudioMixer?.track?.readyState === 'live';
+          const audioVerified = hasAudioSource && screenAudioMixer?.audioDetected === true;
+          const audioWasVerified = hasAudioSource && screenAudioMixer?.audioEverDetected === true;
           status.textContent = active
-            ? hasAudio
-              ? screenAudioSource === 'loopback'
-                ? 'System audio is included through your system monitor/loopback input. This source can include call playback too; headphones help prevent echo.'
-                : 'Shared audio is included with your microphone.'
+            ? hasAudioSource
+              ? audioVerified
+                ? screenAudioSource === 'loopback'
+                  ? `System audio is flowing through ${screenAudioDeviceLabel || 'your system monitor/loopback input'}. Headphones are recommended because loopback can include call playback.`
+                  : 'Shared audio is flowing and mixed with your microphone.'
+                : audioWasVerified
+                  ? screenAudioSource === 'loopback'
+                    ? `System audio through ${screenAudioDeviceLabel || 'your monitor/loopback input'} was verified and is currently quiet.`
+                    : 'Shared audio was verified and is currently quiet.'
+                  : screenAudioSource === 'loopback'
+                    ? `System audio source ${screenAudioDeviceLabel || 'monitor/loopback input'} is attached, but Plainwire has not detected output audio yet. Play something on the shared system to verify it.`
+                    : 'The browser supplied a shared-audio track, but Plainwire has not detected audio energy yet. Play audio in the shared tab/window to verify it.'
               : shareScreenAudio
-                ? 'Video is sharing, but this browser/source did not expose shared audio. Try a tab with Share audio enabled or a system monitor/loopback input.'
+                ? 'Video is sharing, but this browser/OS did not expose a shared-audio source. Enable Share audio in the browser picker or choose a PipeWire/Pulse monitor/loopback source.'
                 : 'Shared audio is off. Your microphone is still sent normally.'
-            : 'When available, tab or system audio is mixed with your microphone without changing the call connection.';
-          status.classList.toggle('active', hasAudio);
+            : 'When available, tab or system audio is mixed with your microphone. Plainwire verifies actual audio energy instead of assuming that a silent track works.';
+          status.classList.toggle('active', audioVerified);
+          status.classList.toggle('attached', hasAudioSource && !audioVerified);
         }
         return;
       }
@@ -2726,14 +4331,62 @@
       const audioHeading = document.createElement('b'); audioHeading.textContent = 'Include shared audio';
       const audioDescription = document.createElement('small'); audioDescription.textContent = 'Requests tab or system audio when the browser and chosen source support it.';
       audioCopy.append(audioHeading, audioDescription);
-      audioToggle.addEventListener('change', () => {
+      audioToggle.addEventListener('change', async () => {
         shareScreenAudio = audioToggle.checked;
         storage.setItem('plainwire_screen_audio', String(shareScreenAudio));
         for (const control of document.querySelectorAll('pw-screen-settings .screen-audio-option input')) control.checked = shareScreenAudio;
+        if (!screenStream) return;
+        try {
+          if (!shareScreenAudio) {
+            if (!(await disableActiveScreenAudio())) throw new Error('Could not update every participant');
+          } else if (screenAudioSource === 'none' || selectedScreenAudioId) {
+            const changed = await applySelectedScreenAudioSource();
+            if (!changed) send(app.ports.bridgeReceive, { tag: 'toast', data: 'Shared audio is enabled, but no usable system/loopback source is available. You can change the shared screen to request browser audio again.' });
+          }
+        } catch (error) {
+          shareScreenAudio = !audioToggle.checked;
+          storage.setItem('plainwire_screen_audio', String(shareScreenAudio));
+          for (const control of document.querySelectorAll('pw-screen-settings .screen-audio-option input')) control.checked = shareScreenAudio;
+          send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not change shared audio: ${error.message}` });
+        }
+        updateScreenControls();
       });
       audioLabel.append(audioToggle, audioCopy);
+      const sourceLabel = document.createElement('label'); sourceLabel.className = 'screen-audio-source';
+      const sourceHeading = document.createElement('span'); sourceHeading.textContent = 'System audio fallback source';
+      const sourceSelect = document.createElement('select'); sourceSelect.dataset.screenAudioSource = 'true';
+      sourceSelect.setAttribute('aria-label', 'System audio fallback source');
+      sourceSelect.addEventListener('change', async () => {
+        const previousId = selectedScreenAudioId;
+        selectedScreenAudioId = sourceSelect.value;
+        if (selectedScreenAudioId) storage.setItem('plainwire_screen_audio_device', selectedScreenAudioId);
+        else storage.removeItem('plainwire_screen_audio_device');
+        document.querySelectorAll('pw-screen-settings [data-screen-audio-source]').forEach((control) => { if (control !== sourceSelect) control.value = selectedScreenAudioId; });
+        if (!screenStream || !shareScreenAudio) {
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'System audio source saved.' });
+          return;
+        }
+        try {
+          if (!selectedScreenAudioId && screenAudioSource === 'display') {
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Automatic browser audio is already active.' });
+            return;
+          }
+          const changed = await applySelectedScreenAudioSource();
+          if (!changed) throw new Error('The selected source is unavailable or did not expose an audio track');
+          send(app.ports.bridgeReceive, { tag: 'toast', data: `Shared audio switched to ${screenAudioDeviceLabel}.` });
+        } catch (error) {
+          selectedScreenAudioId = previousId;
+          if (selectedScreenAudioId) storage.setItem('plainwire_screen_audio_device', selectedScreenAudioId);
+          else storage.removeItem('plainwire_screen_audio_device');
+          document.querySelectorAll('pw-screen-settings [data-screen-audio-source]').forEach((control) => { control.value = selectedScreenAudioId; });
+          send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not switch system audio: ${error.message}` });
+        }
+        updateScreenControls();
+      });
+      sourceLabel.append(sourceHeading, sourceSelect);
+      populateScreenAudioSourceSelect(sourceSelect).catch(() => {});
       const note = document.createElement('p');
-      note.textContent = 'Text & detail keeps writing sharp. Smooth motion prefers frame rate. Group calls use lower limits to protect your upload.';
+      note.textContent = 'Text & detail keeps writing sharp. Smooth motion prefers frame rate. On Linux, choose a PipeWire/Pulse monitor source here if your browser does not expose system audio directly.';
       const audioStatus = document.createElement('p'); audioStatus.dataset.screenAudioStatus = 'true'; audioStatus.className = 'screen-audio-status';
       audioStatus.setAttribute('role', 'status'); audioStatus.setAttribute('aria-live', 'polite');
       const hdr = document.createElement('p');
@@ -2744,7 +4397,7 @@
       const preview = document.createElement('button'); preview.type = 'button'; preview.className = 'btn ghost'; preview.textContent = 'Show my preview'; preview.dataset.screenPreview = 'true'; preview.disabled = !screenStream;
       preview.addEventListener('click', () => { if (screenStream) showLocalScreenPreview(screenStream); });
       actions.append(change, preview);
-      details.append(summary, label, audioLabel, audioStatus, note, hdr, actions); this.append(details);
+      details.append(summary, label, audioLabel, sourceLabel, audioStatus, note, hdr, actions); this.append(details);
       this.render();
     }
   }
@@ -2791,6 +4444,7 @@
     }
     const epoch = room.epoch;
     const previous = screenStream;
+    const previousAudioDeviceLabel = screenAudioDeviceLabel;
     let captured;
     try {
       captured = await navigator.mediaDevices.getDisplayMedia({
@@ -2811,14 +4465,24 @@
     const videoTrack = captured.getVideoTracks()[0];
     if (!videoTrack) { stopStream(captured); return; }
     let capturedAudioSource = captured.getAudioTracks().some((track) => track.readyState === 'live') ? 'display' : 'none';
+    let capturedAudioDeviceLabel = capturedAudioSource === 'display' ? (captured.getAudioTracks()[0]?.label || 'browser capture') : '';
     let loopbackCapture = null;
-    if (shareScreenAudio && capturedAudioSource === 'none') {
+    // An explicit monitor/loopback selection is authoritative. Some browsers
+    // return a live display-audio track that is silent or only captures a tab;
+    // ignoring the user's chosen PipeWire/Pulse source in that case makes the
+    // setting look broken. Automatic mode still prefers browser capture first.
+    if (shareScreenAudio && (selectedScreenAudioId || capturedAudioSource === 'none')) {
       try {
         loopbackCapture = await captureSystemAudioFallback();
         if (loopbackCapture) {
+          for (const track of captured.getAudioTracks()) {
+            captured.removeTrack(track);
+            track.stop();
+          }
           captured.addTrack(loopbackCapture.track);
           capturedAudioSource = 'loopback';
-          debug('MEDIA', 'screen_audio_loopback_selected', { label: loopbackCapture.label });
+          capturedAudioDeviceLabel = loopbackCapture.label;
+          debug('MEDIA', 'screen_audio_loopback_selected', { label: loopbackCapture.label, explicit: !!selectedScreenAudioId });
         }
       } catch (error) {
         stopStream(loopbackCapture?.stream);
@@ -2831,7 +4495,7 @@
     const previousAudioSource = screenAudioSource;
     let capturedMixer = null;
     try {
-      capturedMixer = createScreenAudioMixer(captured);
+      capturedMixer = await createScreenAudioMixer(captured);
     } catch (error) {
       captured.getAudioTracks().forEach((track) => track.stop());
       capturedAudioSource = 'none';
@@ -2844,6 +4508,7 @@
     screenStream = captured;
     screenAudioMixer = capturedMixer;
     screenAudioSource = capturedAudioSource;
+    screenAudioDeviceLabel = capturedAudioSource === 'none' ? '' : capturedAudioDeviceLabel;
     videoTrack.contentHint = screenProfiles[screenProfile].hint;
     videoTrack.onended = () => { if (screenStream === captured) stopScreenShare(); };
     const targets = Array.from(peers.entries()).filter(([, pc]) => pc._videoSender && pc.signalingState !== 'closed');
@@ -2868,14 +4533,19 @@
       screenStream = previous;
       screenAudioMixer = previousMixer;
       screenAudioSource = previousAudioSource;
-      await Promise.allSettled(targets.map(([, pc]) => Promise.all([
-        pc._videoSender.replaceTrack(previous?.getVideoTracks()[0] || null),
+      screenAudioDeviceLabel = previousAudioDeviceLabel;
+      // Re-snapshot peers for rollback. A participant can join while the screen
+      // chooser/replacement promises are pending; limiting rollback to the old
+      // target list would leave that new peer watching the rejected capture.
+      const rollbackPeers = Array.from(peers.entries()).filter(([, pc]) => pc.signalingState !== 'closed');
+      await Promise.allSettled(rollbackPeers.map(([, pc]) => Promise.all([
+        pc._videoSender ? pc._videoSender.replaceTrack(previous?.getVideoTracks()[0] || null) : Promise.resolve(),
         pc._audioSender ? pc._audioSender.replaceTrack(previousAudioTrack) : Promise.resolve()
       ])));
       disposeScreenAudioMixer(capturedMixer);
       stopStream(captured);
       screenSenders.clear();
-      if (previous) targets.forEach(([uid, pc]) => screenSenders.set(uid, pc._videoSender));
+      if (previous) rollbackPeers.forEach(([uid, pc]) => { if (pc._videoSender) screenSenders.set(uid, pc._videoSender); });
       send(app.ports.bridgeReceive, { tag: 'toast', data: previous ? 'Could not switch screens. Your previous share is unchanged.' : 'Could not start sharing. Please try again.' });
       return;
     }
@@ -2889,12 +4559,18 @@
     if (shareScreenAudio && !hasScreenAudio) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Screen video is live, but this browser did not provide system audio. Choose a source with Share audio enabled or expose a monitor/loopback input.' });
     } else if (capturedAudioSource === 'loopback') {
-      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Browser capture had no audio, so Plainwire is using your system monitor/loopback input. Headphones are recommended because loopback can include call playback.' });
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Plainwire is using your system monitor/loopback input for shared audio. Headphones are recommended because loopback can include call playback.' });
     }
     const sharedInputTrack = capturedMixer?.screenTrack;
     sharedInputTrack?.addEventListener?.('ended', () => {
       if (screenStream !== captured || screenAudioMixer !== capturedMixer || screenAudioSource === 'none') return;
       screenAudioSource = 'none';
+      screenAudioDeviceLabel = '';
+      screenAudioMixer = null;
+      const microphoneTrack = outgoingAudioTrack(localStream, null);
+      Promise.allSettled(Array.from(peers.values(), pc =>
+        pc._audioSender ? pc._audioSender.replaceTrack(microphoneTrack) : Promise.resolve()
+      )).finally(() => disposeScreenAudioMixer(capturedMixer));
       updateScreenControls();
       if (room && ws?.readyState === WebSocket.OPEN) {
         sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen_audio: false } });
@@ -2911,6 +4587,7 @@
     screenStream = null;
     screenAudioMixer = null;
     screenAudioSource = 'none';
+    screenAudioDeviceLabel = '';
     disposeScreenAudioMixer(stoppedMixer);
     stoppedStream.getTracks().forEach((t) => t.stop());
     updateScreenControls();
@@ -3056,6 +4733,8 @@
       if (pc._disconnectTimer) clearTimeout(pc._disconnectTimer);
       if (pc._remoteMuteTimer) clearTimeout(pc._remoteMuteTimer);
       if (pc._mediaTimer) clearTimeout(pc._mediaTimer);
+      if (pc._statsTimer) clearInterval(pc._statsTimer);
+      pc._statsTimer = null;
       pc.close();
     }
     peers.delete(uid);
@@ -3375,6 +5054,10 @@
     pc._failureReported = false;
     pc._mediaConnected = false;
     pc._remoteAudioSeen = false;
+    pc._remoteAudioTrack = null;
+    pc._lastInboundBytes = null;
+    pc._lastInboundPackets = null;
+    pc._lastRtpProgressAt = 0;
     pc._createdAt = Date.now();
     pc._lastNegotiationAt = 0;
     pc._turnValidUntil = rtcHasTurn() ? rtcConfigValidUntil : 0;
@@ -3399,69 +5082,17 @@
         sendSignal(uid, { kind: 'candidate', candidate: ev.candidate });
       } else debug('RTC', 'ice_gathering_complete', { peer_user_id: uid });
     };
-    pc.ontrack = (ev) => {
-      debug('RTC', 'remote_track', { peer_user_id: uid, kind: ev.track.kind, muted: ev.track.muted, ready_state: ev.track.readyState, streams: ev.streams?.length || 0 });
-      if (ev.track.kind === 'audio') {
-        pc._remoteAudioSeen = true;
-        const audio = remoteAudio(uid);
-        const markMediaConnected = () => {
-          const healthy = ev.track.readyState === 'live' && ev.track.muted !== true;
-          pc._mediaConnected = healthy;
-          if (healthy) {
-            if (pc._remoteMuteTimer) clearTimeout(pc._remoteMuteTimer);
-            if (pc._mediaTimer) clearTimeout(pc._mediaTimer);
-            pc._remoteMuteTimer = null;
-            pc._mediaTimer = null;
-            pc._publishConnectionState?.();
-            playRemoteAudio(audio);
-          }
-        };
-        const scheduleMutedRecovery = () => {
-          pc._mediaConnected = false;
-          pc._publishConnectionState?.();
-          if (pc._remoteMuteTimer) clearTimeout(pc._remoteMuteTimer);
-          pc._remoteMuteTimer = setTimeout(() => {
-            pc._remoteMuteTimer = null;
-            if (!room || pc._roomEpoch !== room.epoch || pc.signalingState === 'closed') return;
-            if (ev.track.readyState === 'live' && ev.track.muted === true && transportConnected()) {
-              debug('RTC', 'remote_audio_stalled', { peer_user_id: uid }, 'warn');
-              restartPeerIce(uid, pc, 'remote_audio_stalled', { force: true });
-            }
-          }, 7000);
-        };
-        ev.track.addEventListener?.('unmute', markMediaConnected);
-        ev.track.addEventListener?.('mute', scheduleMutedRecovery);
-        ev.track.addEventListener?.('ended', () => {
-          pc._mediaConnected = false;
-          pc._publishConnectionState?.(true);
-          restartPeerIce(uid, pc, 'remote_audio_ended', { force: true });
-        });
-        audio.srcObject = new MediaStream([ev.track]);
-        audio.muted = deafened;
-        ['loadedmetadata', 'canplay', 'playing'].forEach((eventName) => {
-          audio.addEventListener(eventName, () => {
-            markMediaConnected();
-            if (!deafened) playRemoteAudio(audio);
-          }, { passive: true });
-        });
-        if (ev.track.muted) scheduleMutedRecovery();
-        else markMediaConnected();
-        playRemoteAudio(audio);
-        applySpeaker();
-      } else if (ev.track.kind === 'video') {
-        // Store stream for later  -  stage video only shown for screen sharers
-        if (!pc._videoStreams) pc._videoStreams = new Map();
-        const stream = new MediaStream([ev.track]);
-        pc._videoStreams.set(ev.track.id, stream);
-        if (screenSharers.has(uid) && watchedScreens.has(uid)) {
-          showStageVideo(uid, stream);
-        }
-      }
-    };
     const transportConnected = () => pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
+    const liveRemoteAudioTrack = () => {
+      const receiverTrack = pc.getReceivers?.().map((receiver) => receiver.track).find((track) => track?.kind === 'audio' && track.readyState === 'live');
+      if (receiverTrack) return receiverTrack;
+      return pc._remoteAudioTrack?.readyState === 'live' ? pc._remoteAudioTrack : null;
+    };
     const publishConnectionState = (force = false) => {
-      // A WebRTC transport can be connected while the remote audio path is dead.
-      // Only expose a healthy call once a live remote audio track has actually arrived.
+      // "Connected" means the RTC transport is up and a live remote audio
+      // receiver exists. MediaStreamTrack.muted is deliberately NOT part of
+      // this decision: browsers can toggle it during silence, PipeWire graph
+      // changes and source switches while audio is still healthy/audible.
       const connected = transportConnected() && pc._mediaConnected === true;
       if (!force && pc._reportedConnected === connected) return;
       reportPeerConnection(uid, pc, connected);
@@ -3483,6 +5114,106 @@
       }
     };
     pc._publishConnectionState = publishConnectionState;
+    const markRemoteAudioHealthy = (reason = 'receiver_live') => {
+      const track = liveRemoteAudioTrack();
+      if (!track || !transportConnected() || pc.signalingState === 'closed') return false;
+      pc._remoteAudioTrack = track;
+      pc._remoteAudioSeen = true;
+      pc._mediaConnected = true;
+      if (pc._remoteMuteTimer) clearTimeout(pc._remoteMuteTimer);
+      if (pc._mediaTimer) clearTimeout(pc._mediaTimer);
+      pc._remoteMuteTimer = null;
+      pc._mediaTimer = null;
+      publishConnectionState();
+      const audio = remoteAudio(uid);
+      if (!deafened) playRemoteAudio(audio);
+      debug('RTC', 'remote_audio_healthy', { peer_user_id: uid, reason, track_muted: track.muted === true });
+      return true;
+    };
+    const sampleInboundAudio = async () => {
+      if (pc.signalingState === 'closed') return;
+      const track = liveRemoteAudioTrack();
+      if (transportConnected() && track) markRemoteAudioHealthy('live_receiver');
+      try {
+        const receiver = pc.getReceivers?.().find((item) => item.track?.kind === 'audio');
+        const stats = receiver?.getStats ? await receiver.getStats() : await pc.getStats();
+        let inbound = null;
+        stats?.forEach?.((report) => {
+          if (report.type === 'inbound-rtp' && !report.isRemote && (report.kind === 'audio' || report.mediaType === 'audio')) inbound = report;
+        });
+        if (!inbound) return;
+        const bytes = Number(inbound.bytesReceived || 0);
+        const packets = Number(inbound.packetsReceived || 0);
+        const progressed = (pc._lastInboundBytes !== null && bytes > pc._lastInboundBytes) ||
+          (pc._lastInboundPackets !== null && packets > pc._lastInboundPackets);
+        pc._lastInboundBytes = bytes;
+        pc._lastInboundPackets = packets;
+        if (progressed) {
+          pc._lastRtpProgressAt = Date.now();
+          markRemoteAudioHealthy('rtp_progress');
+        }
+      } catch (error) {
+        debug('RTC', 'remote_audio_stats_failed', { peer_user_id: uid, error: error.message }, 'warn');
+      }
+    };
+    const startInboundAudioMonitor = () => {
+      if (pc._statsTimer || pc.signalingState === 'closed') return;
+      pc._statsTimer = setInterval(() => { sampleInboundAudio().catch(() => {}); }, 2000);
+      sampleInboundAudio().catch(() => {});
+    };
+    const reconcileRemoteAudio = (reason) => {
+      if (transportConnected() && liveRemoteAudioTrack()) markRemoteAudioHealthy(reason);
+      startInboundAudioMonitor();
+    };
+    pc.ontrack = (ev) => {
+      debug('RTC', 'remote_track', { peer_user_id: uid, kind: ev.track.kind, muted: ev.track.muted, ready_state: ev.track.readyState, streams: ev.streams?.length || 0 });
+      if (ev.track.kind === 'audio') {
+        pc._remoteAudioSeen = true;
+        pc._remoteAudioTrack = ev.track;
+        const audio = remoteAudio(uid);
+        ev.track.addEventListener?.('unmute', () => {
+          debug('RTC', 'remote_track_unmuted', { peer_user_id: uid });
+          reconcileRemoteAudio('track_unmute');
+        });
+        ev.track.addEventListener?.('mute', () => {
+          // `mute` only says the source temporarily has no media available. It
+          // is not a call-disconnect signal, so keep the transport healthy and
+          // let receiver/ICE state decide whether recovery is needed.
+          debug('RTC', 'remote_track_temporarily_muted', { peer_user_id: uid });
+          if (pc._remoteMuteTimer) clearTimeout(pc._remoteMuteTimer);
+          pc._remoteMuteTimer = setTimeout(() => {
+            pc._remoteMuteTimer = null;
+            if (!room || pc._roomEpoch !== room.epoch || pc.signalingState === 'closed') return;
+            reconcileRemoteAudio('muted_recheck');
+          }, 3000);
+        });
+        ev.track.addEventListener?.('ended', () => {
+          if (pc._remoteAudioTrack === ev.track) pc._remoteAudioTrack = null;
+          pc._mediaConnected = false;
+          publishConnectionState(true);
+          restartPeerIce(uid, pc, 'remote_audio_ended', { force: true });
+        });
+        audio.srcObject = new MediaStream([ev.track]);
+        audio.muted = deafened;
+        ['loadedmetadata', 'canplay', 'playing'].forEach((eventName) => {
+          audio.addEventListener(eventName, () => {
+            reconcileRemoteAudio(`audio_${eventName}`);
+            if (!deafened) playRemoteAudio(audio);
+          }, { passive: true });
+        });
+        reconcileRemoteAudio('track_received');
+        playRemoteAudio(audio);
+        applySpeaker();
+      } else if (ev.track.kind === 'video') {
+        // Store stream for later  -  stage video only shown for screen sharers
+        if (!pc._videoStreams) pc._videoStreams = new Map();
+        const stream = new MediaStream([ev.track]);
+        pc._videoStreams.set(ev.track.id, stream);
+        if (screenSharers.has(uid) && watchedScreens.has(uid)) {
+          showStageVideo(uid, stream);
+        }
+      }
+    };
     const armMediaWatchdog = () => {
       if (pc._mediaConnected === true || pc._mediaTimer || pc.signalingState === 'closed') return;
       pc._mediaTimer = setTimeout(() => {
@@ -3491,6 +5222,12 @@
         if (!transportConnected()) {
           // No transport yet: that is the connection check's job, not a media fault.
           armMediaWatchdog();
+          return;
+        }
+        if (liveRemoteAudioTrack()) {
+          // Event ordering can deliver ontrack before ICE/DTLS becomes
+          // connected. Reconcile here rather than needlessly restarting ICE.
+          markRemoteAudioHealthy('watchdog_live_receiver');
           return;
         }
         debug('RTC', 'remote_audio_missing', {
@@ -3507,11 +5244,13 @@
     const rearmMediaWatchdog = () => {
       if (pc._mediaTimer) clearTimeout(pc._mediaTimer);
       pc._mediaTimer = null;
-      armMediaWatchdog();
+      reconcileRemoteAudio('transport_reconcile');
+      if (pc._mediaConnected !== true) armMediaWatchdog();
     };
     pc.onconnectionstatechange = () => {
       debug('RTC', 'connection_state', { peer_user_id: uid, state: pc.connectionState });
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') pc._mediaConnected = false;
+      if (pc.connectionState === 'connected') reconcileRemoteAudio('connection_connected');
       publishConnectionState();
       if (pc.connectionState === 'connected' && pc._mediaConnected !== true) rearmMediaWatchdog();
       if (pc.connectionState === 'disconnected') {
@@ -3528,6 +5267,7 @@
     pc.oniceconnectionstatechange = () => {
       debug('RTC', 'ice_connection_state', { peer_user_id: uid, state: pc.iceConnectionState });
       if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') pc._mediaConnected = false;
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') reconcileRemoteAudio('ice_connected');
       publishConnectionState();
       if ((pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') && pc._mediaConnected !== true) rearmMediaWatchdog();
       if (pc.iceConnectionState === 'failed') restartPeerIce(uid, pc, 'ice_failed');
@@ -3833,6 +5573,24 @@
       leaveRtcRoom();
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Another tab has taken over this session.' });
     }
+    if (msg.type === 'access_revoked') {
+      if (msg.scope === 'direct' && Number(msg.conversation_id) > 0) {
+        const key = `direct:${Number(msg.conversation_id)}`;
+        clearRemoteTyping((scopeKey) => scopeKey === key);
+        if (localTyping?.scope?.key === key) stopTyping(localTyping.scope, { skipNetwork: true });
+      } else if (msg.scope === 'server' && Array.isArray(msg.channel_ids)) {
+        const revoked = new Set(msg.channel_ids.map(Number).filter((id) => Number.isInteger(id) && id > 0).map((id) => `channel:${id}`));
+        clearRemoteTyping((scopeKey) => revoked.has(scopeKey));
+        if (localTyping?.scope?.key && revoked.has(localTyping.scope.key)) stopTyping(localTyping.scope, { skipNetwork: true });
+      }
+      const revokedRtc = (msg.scope === 'server' && room?.kind === 'voice' && Array.isArray(msg.channel_ids) && msg.channel_ids.map(Number).includes(Number(room.id)))
+        || (msg.scope === 'direct' && room?.kind === 'call' && Number(msg.conversation_id) === Number(room.id));
+      if (revokedRtc) {
+        debug('RTC', 'access_revoked', { scope: msg.scope, room });
+        leaveRtcRoom();
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call ended because access to this room changed.' });
+      }
+    }
     if ((msg.type === 'voice_ejected' || msg.type === 'call_ejected') && eventMatchesRoom(msg)) {
       // signaling is gone, but the P2P stream needs an actual shove.
       debug('RTC', 'access_revoked', { type: msg.type, room });
@@ -4128,11 +5886,85 @@
       notification.close();
     };
   });
-  // Plainwire owns in-app context menus. Keep the browser/DevTools context menu out of
-  // the application surface so right-click behaves consistently like a desktop client.
-  // This is UX only: browser DevTools remain controlled by the browser itself.
+  // Plainwire owns in-app context menus. Keep browser chrome out of the app,
+  // but do not sacrifice ordinary desktop editing actions: inputs/links/images get
+  // a small native-feeling fallback menu when Elm did not open a richer menu.
+  let fallbackContextMenu = null;
+  const closeFallbackContextMenu = () => { fallbackContextMenu?.remove(); fallbackContextMenu = null; };
+  const setTextControlValue = (control, value, start, end) => {
+    if (typeof control.setRangeText === 'function') control.setRangeText(value, start, end, 'end');
+    else control.value = control.value.slice(0, start) + value + control.value.slice(end);
+    control.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+  };
+  const openFallbackContextMenu = (target, x, y) => {
+    closeFallbackContextMenu();
+    const editable = target?.closest?.('input:not([type="button"]):not([type="submit"]), textarea, [contenteditable="true"]');
+    const link = target?.closest?.('a[href]');
+    const image = target?.closest?.('img[src]');
+    const selectedText = String(window.getSelection?.()?.toString?.() || '').trim();
+    const actions = [];
+    if (editable) {
+      const textControl = editable instanceof HTMLInputElement || editable instanceof HTMLTextAreaElement;
+      const selected = textControl ? editable.value.slice(editable.selectionStart || 0, editable.selectionEnd || 0) : String(window.getSelection?.()?.toString?.() || '');
+      actions.push(['Cut', async () => {
+        if (!selected) return;
+        try { await navigator.clipboard.writeText(selected); } catch (_) {}
+        if (textControl) setTextControlValue(editable, '', editable.selectionStart || 0, editable.selectionEnd || 0);
+        else document.execCommand?.('delete');
+      }, !selected]);
+      actions.push(['Copy', async () => { if (selected) await navigator.clipboard.writeText(selected).catch(() => {}); }, !selected]);
+      actions.push(['Paste', async () => {
+        try {
+          const value = await navigator.clipboard.readText();
+          if (textControl) setTextControlValue(editable, value, editable.selectionStart || 0, editable.selectionEnd || 0);
+          else document.execCommand?.('insertText', false, value);
+        } catch (_) { send(app.ports.bridgeReceive, { tag: 'toast', data: 'Clipboard paste permission was not available.' }); }
+      }, !navigator.clipboard?.readText]);
+      actions.push(['Select all', () => { if (textControl) editable.select(); else { const range = document.createRange(); range.selectNodeContents(editable); const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range); } }, false]);
+    } else if (selectedText) {
+      actions.push(['Copy selection', () => navigator.clipboard.writeText(selectedText).catch(() => {}), false]);
+    }
+    if (link) {
+      let href = '';
+      try { href = new URL(link.href, location.href).href; } catch (_) {}
+      if (href) {
+        actions.push(['Open link in new tab', () => window.open(href, '_blank', 'noopener,noreferrer'), false]);
+        actions.push(['Copy link', () => navigator.clipboard.writeText(href).catch(() => {}), false]);
+      }
+    }
+    if (image) {
+      let src = '';
+      try { src = new URL(image.currentSrc || image.src, location.href).href; } catch (_) {}
+      if (src) {
+        actions.push(['Open image in new tab', () => window.open(src, '_blank', 'noopener,noreferrer'), false]);
+        actions.push(['Copy image address', () => navigator.clipboard.writeText(src).catch(() => {}), false]);
+      }
+    }
+    if (!actions.length) return;
+    const menu = document.createElement('div'); menu.className = 'fallback-context-menu'; menu.setAttribute('role', 'menu'); menu.tabIndex = -1;
+    actions.forEach(([label, action, disabled]) => {
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = label; button.disabled = !!disabled; button.setAttribute('role', 'menuitem');
+      button.addEventListener('click', async () => { closeFallbackContextMenu(); await action(); }); menu.append(button);
+    });
+    document.body.append(menu); fallbackContextMenu = menu;
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(x, innerWidth - rect.width - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(y, innerHeight - rect.height - 8))}px`;
+    menu.querySelector('button:not(:disabled)')?.focus({ preventScroll: true });
+  };
   document.addEventListener('contextmenu', (event) => {
     event.preventDefault();
+    const target = event.target;
+    const x = event.clientX, y = event.clientY;
+    closeFallbackContextMenu();
+    requestAnimationFrame(() => {
+      // Elm message/user/server/channel menus win. Only supply the generic
+      // desktop menu if no richer Plainwire menu appeared for this gesture.
+      if (!document.querySelector('.ctx-menu')) openFallbackContextMenu(target, x, y);
+    });
+  }, true);
+  document.addEventListener('pointerdown', event => {
+    if (fallbackContextMenu && !fallbackContextMenu.contains(event.target)) closeFallbackContextMenu();
   }, true);
 
   const shortcutEditableTarget = (target) => Boolean(target?.closest?.('input, textarea, select, [contenteditable="true"]'));
@@ -4224,6 +6056,21 @@
       emitShortcut('upload');
       return;
     }
+    if (mod && event.shiftKey && key === 's' && !editable) {
+      event.preventDefault();
+      emitShortcut('screen_share');
+      return;
+    }
+    if (mod && event.shiftKey && key === 'c' && !editable) {
+      event.preventDefault();
+      emitShortcut('toggle_call_window');
+      return;
+    }
+    if (mod && event.shiftKey && event.key === 'Backspace' && !editable) {
+      event.preventDefault();
+      emitShortcut('close_dm');
+      return;
+    }
     if (mod && event.shiftKey && key === 'h' && !editable) {
       event.preventDefault();
       emitShortcut('help');
@@ -4271,6 +6118,11 @@
       emitShortcut('settings');
       return;
     }
+    if (mod && key === 'g' && !event.altKey && (!editable || event.target === composer)) {
+      event.preventDefault();
+      openGifPicker();
+      return;
+    }
     if (mod && key === 'e' && !event.altKey && (!editable || event.target === composer)) {
       event.preventDefault();
       emitShortcut('emoji_picker');
@@ -4296,19 +6148,29 @@
       emitShortcut('prev_route');
       return;
     }
-    if (event.altKey && !mod && !editable && !shortcutDialogOpen() && event.key === 'ArrowUp') {
+    if (event.altKey && event.shiftKey && !mod && !editable && !shortcutDialogOpen() && event.key === 'ArrowUp') {
+      event.preventDefault();
+      emitShortcut('prev_unread');
+      return;
+    }
+    if (event.altKey && event.shiftKey && !mod && !editable && !shortcutDialogOpen() && event.key === 'ArrowDown') {
+      event.preventDefault();
+      emitShortcut('next_unread');
+      return;
+    }
+    if (event.altKey && !event.shiftKey && !mod && !editable && !shortcutDialogOpen() && event.key === 'ArrowUp') {
       event.preventDefault();
       emitShortcut('prev_route');
       return;
     }
-    if (event.altKey && !mod && !editable && !shortcutDialogOpen() && event.key === 'ArrowDown') {
+    if (event.altKey && !event.shiftKey && !mod && !editable && !shortcutDialogOpen() && event.key === 'ArrowDown') {
       event.preventDefault();
       emitShortcut('next_route');
     }
   }, true);
   recv(app.ports.copyText, async (text) => {
     try {
-      await navigator.clipboard.writeText(text.startsWith('#invite/') ? new URL(text, location.origin + '/').href : text);
+      await navigator.clipboard.writeText((text.startsWith('#wire/') || text.startsWith('#invite/')) ? new URL(text.replace('#invite/','#wire/'), location.origin + '/').href : text);
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Copied to clipboard' });
     } catch (_) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not copy. Select the text and copy it manually.' });
@@ -4652,6 +6514,10 @@
     await refresh();
   };
 
+  // Entries render hidden until this resolves. Auth screens contain no entry,
+  // so an unauthenticated 401 here is harmless and is retried once the app renders.
+  queueMicrotask(() => loadOnboardingState());
+
   recv(app.ports.bridgeSend, ({ tag, data }) => {
     debug('ELM', 'command', { tag, data });
     switch (tag) {
@@ -4710,6 +6576,32 @@
         break;
       case 'pick_attachments':
         attachmentInput.click();
+        break;
+      case 'open_gif_picker':
+        openGifPicker();
+        break;
+      case 'replay_onboarding':
+        mutateOnboarding('replay').then(() => openOnboardingChat()).catch((error) => {
+          send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not start the tour: ${error.message}` });
+        });
+        break;
+      case 'open_server_admin':
+        openServerAdmin(Number(data)).catch(error => send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not open server settings: ${error.message}` }));
+        break;
+      case 'open_group_admin':
+        openGroupAdmin(Number(data)).catch(error => send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not open group moderation: ${error.message}` }));
+        break;
+      case 'edit_thread':
+        openThreadEditor(data).catch(error => send(app.ports.bridgeReceive,{tag:'toast',data:`Could not edit thread: ${error.message}`}));
+        break;
+      case 'moderate_thread':
+        moderateThread(data);
+        break;
+      case 'edit_thread_reply':
+        openReplyEditor(data).catch(error => send(app.ports.bridgeReceive,{tag:'toast',data:`Could not edit reply: ${error.message}`}));
+        break;
+      case 'delete_thread_reply':
+        deleteThreadReply(data);
         break;
       case 'insert_composer_text':
         if (!insertIntoComposer(String(data || ''))) {
@@ -4888,7 +6780,7 @@
         location.reload();
         break;
       case 'delete_forum':
-        if (window.confirm('Delete this community and every thread and reply inside it? This cannot be undone.')) {
+        if (window.confirm('Delete this forum and every thread and reply inside it? This cannot be undone.')) {
           api({ method: 'POST', path: '/forum/' + data + '/delete', body: {} }).then((res) => {
             if (res && res.deleted) location.hash = '#forums';
           });
@@ -4897,7 +6789,7 @@
       case 'delete_thread':
         if (data?.id && window.confirm('Delete this thread and all of its replies? This cannot be undone.')) {
           api({ method: 'POST', path: '/thread/' + data.id + '/delete', body: {} }).then((res) => {
-            if (res && res.deleted) location.hash = '#forum/' + (res.forum_id || data.forum_id);
+            if (res && res.deleted) location.hash = '#f/' + (res.forum_id || data.forum_id);
           });
         }
         break;

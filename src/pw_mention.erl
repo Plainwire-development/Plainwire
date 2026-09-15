@@ -13,7 +13,17 @@ tokens(Body0) ->
     end.
 
 resolve(Body, Users) ->
-    Mentioned = lists:foldl(fun(T, Acc) -> maps:put(T, true, Acc) end, #{}, tokens(Body)),
+    %% @everyone and @here are reserved control mentions. They are deliberately
+    %% excluded from ordinary username resolution so an account named
+    %% "everyone" cannot accidentally receive special-mention traffic.
+    Mentioned = lists:foldl(
+        fun(T, Acc) ->
+            case T of
+                <<"everyone">> -> Acc;
+                <<"here">> -> Acc;
+                _ -> maps:put(T, true, Acc)
+            end
+        end, #{}, tokens(Body)),
     [Uid || {Uid, Username} <- Users, maps:is_key(pw_util:normalize_username(Username), Mentioned)].
 
 strip_fences(Body) ->

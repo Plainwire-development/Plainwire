@@ -161,3 +161,13 @@ pw-input-volume output, pw-user-volume output { font-variant-numeric: tabular-nu
 .voice-participant pw-user-volume, .voice-participant pw-input-volume { flex: 1 0 100%; padding-left: 44px; }
 /* Transient feedback must remain dismissible while call details are open. */
 .toast { z-index: 1200; }
+
+/* Lucide's headphone silhouette is optically bottom-heavy in square controls.
+   A one-pixel optical correction keeps it centered beside mic/screen icons. */
+.call-control .call-icon-audio,
+.call-bar-controls .call-icon-audio,
+.call-overlay-controls .call-icon-audio,
+.dm-call-bar-controls .call-icon-audio,
+.icon-btn .call-icon-audio {
+  transform: translateY(-1px);
+}

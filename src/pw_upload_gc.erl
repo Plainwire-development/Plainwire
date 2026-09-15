@@ -1,6 +1,6 @@
 -module(pw_upload_gc).
 -behaviour(gen_server).
--export([start_link/0, lookup/2, invalidate_user/1, acquire/2, release/2]).
+-export([start_link/0, lookup/2, invalidate_user/1, invalidate_upload/1, acquire/2, release/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -8,7 +8,15 @@ start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 %% auth cache is per user+upload. sharing that answer would be quite the bug.
 lookup(Uid, Id) ->
     Now = erlang:monotonic_time(millisecond),
-    case authorized(Uid, Id, Now) of
+    %% In the supported multi-node topology any HTTP API node may answer a file
+    %% request, while permission changes can commit on a different API node. There
+    %% is intentionally no all-API-node cache-broadcast bus, so cluster mode must
+    %% consult PostgreSQL for authorization instead of trusting a node-local allow.
+    Auth = case auth_cache_enabled() of
+        true -> authorized(Uid, Id, Now);
+        false -> unknown
+    end,
+    case Auth of
         {ok, false} -> {error, forbidden};
         {ok, true} ->
             case ets:lookup(pw_upload_metadata_cache, Id) of
@@ -23,9 +31,12 @@ fetch(Uid, Id, Now) ->
     case Value of
         {ok, _} ->
             ets:insert(pw_upload_metadata_cache, {Id, Value, Now + 300000}),
-            ets:insert(pw_upload_authz_cache, {{Uid, Id}, true, Now + 300000});
+            maybe_cache_authorization(Uid, Id, true, Now + 300000);
         {error, forbidden} ->
-            ets:insert(pw_upload_authz_cache, {{Uid, Id}, false, Now + 60000});
+            %% Denials are deliberately not cached. Permission grants (joining a
+            %% server/group, unblocking, a newly shared reference) should become
+            %% visible immediately without requiring a complete invalidation bus.
+            ok;
         _ ->
             ok
     end,
@@ -33,8 +44,25 @@ fetch(Uid, Id, Now) ->
 
 authorized(Uid, Id, Now) ->
     case ets:lookup(pw_upload_authz_cache, {Uid, Id}) of
-        [{_, Allowed, Expires}] when Expires > Now -> {ok, Allowed};
+        [{_, true, Expires}] when Expires > Now -> {ok, true};
+        [{_, false, _}] ->
+            %% Old negative entries may survive a hot code upgrade. New builds do
+            %% not create them, and they must not delay newly granted access.
+            ets:delete(pw_upload_authz_cache, {Uid, Id}),
+            unknown;
         _ -> unknown
+    end.
+
+maybe_cache_authorization(Uid, Id, Allowed, Expires) ->
+    case auth_cache_enabled() of
+        true -> ets:insert(pw_upload_authz_cache, {{Uid, Id}, Allowed, Expires});
+        false -> ok
+    end.
+
+auth_cache_enabled() ->
+    case pw_cluster_config:get() of
+        #{backend := partisan} -> false;
+        _ -> true
     end.
 
 %% membership changed, so this user's cached yes/no answers are stale.
@@ -43,6 +71,12 @@ invalidate_user(Uid) when is_integer(Uid) ->
     catch error:badarg -> ok end,
     ok;
 invalidate_user(_) -> ok.
+
+invalidate_upload(Id) when is_binary(Id) ->
+    try ets:match_delete(pw_upload_authz_cache, {{'_', Id}, '_', '_'})
+    catch error:badarg -> ok end,
+    ok;
+invalidate_upload(_) -> ok.
 
 acquire(Uid, Size) when is_integer(Size), Size > 0 ->
     GlobalMax = max(1, pw_util:env_int("PLAINWIRE_UPLOAD_CONCURRENCY", 64)),
@@ -80,10 +114,13 @@ init([]) ->
     {ok, #{}}.
 
 handle_info(sweep, State) ->
-    Now = pw_util:now_ms(),
+    WallNow = pw_util:now_ms(),
+    MonoNow = erlang:monotonic_time(millisecond),
     RetentionDays = max(1, pw_util:env_int("PLAINWIRE_UPLOAD_RETENTION_DAYS", 90)),
-    %% profile files stay; stale_uploads filters them out.
-    case pw_db:stale_uploads(Now - 86400000, Now - RetentionDays * 86400000) of
+    %% Database timestamps are wall-clock values; ETS cache expiry is deliberately
+    %% monotonic. Mixing the two makes every cache entry look expired after a sweep.
+    %% Profile files stay; stale_uploads filters them out.
+    case pw_db:stale_uploads(WallNow - 86400000, WallNow - RetentionDays * 86400000) of
         {ok, Items} ->
             lists:foreach(fun(#{id := Id, path := Path}) ->
                 _ = file:delete(binary_to_list(Path)),
@@ -93,7 +130,7 @@ handle_info(sweep, State) ->
             end, Items);
         _ -> ok
     end,
-    Expiry = [{{'_', '_', '$1'}, [{'<', '$1', erlang:monotonic_time(millisecond)}], [true]}],
+    Expiry = [{{'_', '_', '$1'}, [{'<', '$1', MonoNow}], [true]}],
     _ = ets:select_delete(pw_upload_metadata_cache, Expiry),
     _ = ets:select_delete(pw_upload_authz_cache, Expiry),
     erlang:send_after(3600000, self(), sweep),

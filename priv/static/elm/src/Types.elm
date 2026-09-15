@@ -124,6 +124,7 @@ type alias Conversation =
     , lastReadMessageId : Int
     , muted : Bool
     , requestState : String
+    , groupRole : String
     , memberCount : Int
     , lastBody : Maybe String
     , lastMessageId : Maybe Int
@@ -195,6 +196,7 @@ type alias ForumThread =
     , avatarUrl : String
     , title : String
     , body : String
+    , rawBody : String
     , createdAt : Int
     , updatedAt : Int
     , replyCount : Int
@@ -203,6 +205,10 @@ type alias ForumThread =
     , pinned : Bool
     , score : Int
     , userVote : Int
+    , canEdit : Bool
+    , canDelete : Bool
+    , canModerate : Bool
+    , viewerJoined : Bool
     }
 
 
@@ -214,8 +220,11 @@ type alias Reply =
     , displayName : String
     , avatarUrl : String
     , body : String
+    , rawBody : String
     , createdAt : Int
     , updatedAt : Int
+    , canEdit : Bool
+    , canDelete : Bool
     }
 
 
@@ -231,6 +240,7 @@ type alias Server =
     , role : String
     , memberCount : Int
     , createdAt : Int
+    , permissions : Int
     }
 
 
@@ -256,7 +266,16 @@ type alias Category =
 
 
 type alias ServerMember =
-    { user : User, role : String, muted : Bool, joinedAt : Int }
+    { user : User
+    , role : String
+    , muted : Bool
+    , joinedAt : Int
+    , nickname : String
+    , serverAvatarUrl : String
+    , serverBio : String
+    , roleColor : String
+    , roleNames : String
+    }
 
 
 type alias Friend =
@@ -720,6 +739,7 @@ decodeConversation =
         |> andMap (D.field "last_read_message_id" D.int |> defaultValue 0)
         |> andMap (D.field "muted" D.bool |> defaultValue False)
         |> andMap (D.field "request_state" D.string |> defaultValue "accepted")
+        |> andMap (D.field "group_role" D.string |> defaultValue "member")
         |> andMap (D.field "member_count" D.int |> defaultValue 1)
         |> andMap (D.field "last_body" (D.nullable D.string))
         |> andMap (D.field "last_message_id" (D.nullable D.int))
@@ -812,6 +832,7 @@ decodeThread =
         |> andMap (D.field "avatar_url" D.string |> defaultValue "")
         |> andMap (D.field "title" D.string)
         |> andMap (D.field "body" D.string |> defaultValue "")
+        |> andMap (D.field "raw_body" D.string |> defaultValue "")
         |> andMap (D.field "created_at" D.int)
         |> andMap (D.field "updated_at" D.int)
         |> andMap (D.field "reply_count" D.int |> defaultValue 0)
@@ -820,6 +841,10 @@ decodeThread =
         |> andMap (D.field "pinned" D.bool |> defaultValue False)
         |> andMap (D.field "score" D.int |> defaultValue 0)
         |> andMap (D.field "user_vote" D.int |> defaultValue 0)
+        |> andMap (D.field "can_edit" D.bool |> defaultValue False)
+        |> andMap (D.field "can_delete" D.bool |> defaultValue False)
+        |> andMap (D.field "can_moderate" D.bool |> defaultValue False)
+        |> andMap (D.field "viewer_joined" D.bool |> defaultValue False)
 
 
 decodeReply : D.Decoder Reply
@@ -832,8 +857,11 @@ decodeReply =
         |> andMap (D.field "display_name" D.string)
         |> andMap (D.field "avatar_url" D.string |> defaultValue "")
         |> andMap (D.field "body" D.string)
+        |> andMap (D.field "raw_body" D.string |> defaultValue "")
         |> andMap (D.field "created_at" D.int)
         |> andMap (D.field "updated_at" D.int)
+        |> andMap (D.field "can_edit" D.bool |> defaultValue False)
+        |> andMap (D.field "can_delete" D.bool |> defaultValue False)
 
 
 decodeServer : D.Decoder Server
@@ -850,6 +878,7 @@ decodeServer =
         |> andMap (D.field "role" D.string |> defaultValue "member")
         |> andMap (D.field "member_count" D.int |> defaultValue 1)
         |> andMap (D.field "created_at" D.int)
+        |> andMap (D.field "permissions" D.int |> defaultValue 0)
 
 
 decodeChannel : D.Decoder Channel
@@ -877,11 +906,16 @@ decodeCategory =
 
 decodeServerMember : D.Decoder ServerMember
 decodeServerMember =
-    D.map4 ServerMember
-        (D.field "user" decodeUser)
-        (D.field "role" D.string)
-        (D.field "muted" D.bool |> defaultValue False)
-        (D.field "joined_at" D.int |> defaultValue 0)
+    D.succeed ServerMember
+        |> andMap (D.field "user" decodeUser)
+        |> andMap (D.field "role" D.string |> defaultValue "member")
+        |> andMap (D.field "muted" D.bool |> defaultValue False)
+        |> andMap (D.field "joined_at" D.int |> defaultValue 0)
+        |> andMap (D.field "nickname" D.string |> defaultValue "")
+        |> andMap (D.field "server_avatar_url" D.string |> defaultValue "")
+        |> andMap (D.field "server_bio" D.string |> defaultValue "")
+        |> andMap (D.field "role_color" D.string |> defaultValue "")
+        |> andMap (D.field "role_names" D.string |> defaultValue "")
 
 
 decodeFriend : D.Decoder Friend

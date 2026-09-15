@@ -39,6 +39,12 @@ view key placeholderText model =
             , attribute "data-members" (mentionCandidatesJson model)
             ]
             []
+        , Html.node "pw-typing-indicator"
+            [ attribute "data-scope" key
+            , attribute "aria-live" "polite"
+            , attribute "aria-atomic" "true"
+            ]
+            []
         , div [ class "composer-footer" ]
             [ button
                 [ class "btn secondary attach-btn composer-action"
@@ -49,6 +55,16 @@ view key placeholderText model =
                 ]
                 [ span [ class "ui-icon ui-icon-attach", attribute "aria-hidden" "true" ] []
                 , span [ class "composer-action-label" ] [ text "Attach" ]
+                ]
+            , button
+                [ class "btn secondary composer-action gif-action"
+                , type_ "button"
+                , title "Search GIFs (Ctrl / Cmd + G)"
+                , attribute "aria-label" "Search GIFs"
+                , onClick (BridgeEvent "open_gif_picker" E.null)
+                ]
+                [ span [ class "composer-action-gif", attribute "aria-hidden" "true" ] [ text "GIF" ]
+                , span [ class "composer-action-label" ] [ text "GIF" ]
                 ]
             , Html.details [ class "compose-format-help" ]
                 [ Html.summary [ attribute "aria-label" "Message formatting" ]

@@ -16,19 +16,22 @@ If you just want to use Plainwire, you should not need to worry about any of tha
 
 ## Features
 
-* Servers and channels
+* Servers and channels with custom roles and per-server profiles
 * Direct messages and group chats
-* Forums and threads
+* Forums and threads using f/ and t/ navigation
 * Voice calls
 * Screen sharing with optional shared audio and collapsible viewers
 * File uploads
-* Profiles, friends, blocking, and presence
+* Profiles, friends, blocking, presence, and realtime typing
 * Message replies and Markdown
 * Light, dark, and system themes
 * Audio device selection and mic testing
 * Mobile and desktop layouts
 * PostgreSQL-backed persistence
 * STUN and TURN support for calls
+* Wires for sharing/joining servers, with legacy invite-link compatibility
+* Optional server-proxied KLIPY GIF search
+* A resumable first-run Plainwire guide for new accounts
 
 Plainwire is not end-to-end encrypted. Messages may be encrypted at rest, but the server must still be able to read them while operating the service.
 
@@ -105,6 +108,33 @@ PLAINWIRE_REGISTRATION_ENABLED=true
 
 See `.env.example` for the full list.
 
+### First-run guide and source link
+
+Fresh accounts receive Plainwire's interactive first-run guide. Existing accounts are not forced back through onboarding after an upgrade. Set the repository URL shown by Help/onboarding with:
+
+```sh
+PLAINWIRE_SOURCE_REPOSITORY=https://github.com/Plainwire-development/Plainwire
+```
+
+Only an HTTPS repository URL is exposed to the browser; private server credentials are not part of client config.
+
+### GIF search
+
+KLIPY integration is optional. Configure the provider key only on the server:
+
+```sh
+PLAINWIRE_KLIPY_API_KEY=replace-with-your-server-side-key
+PLAINWIRE_KLIPY_CONTENT_FILTER=medium
+PLAINWIRE_KLIPY_COUNTRY=US
+PLAINWIRE_KLIPY_LOCALE=en_US
+```
+
+The API key is used by the backend proxy and is never sent to the browser. Plainwire still works normally when KLIPY is disabled.
+
+### Roles, server profiles, and Wires
+
+Server owners can define custom roles and permission sets, and members can use server-specific nickname/avatar/bio details. Moderation and hierarchy checks are enforced by the backend even when a client is modified. Server share/join links are called **Wires**; older inbound invite URLs remain accepted for compatibility.
+
 ### Voice calls
 
 For reliable calls outside a local network, configure a TURN server.
@@ -151,6 +181,8 @@ npm run test:rtc
 
 More detailed build information is in [docs/BUILDING.md](docs/BUILDING.md).
 
+Portable source archives intentionally omit generated `app.js`, `app.css`, `index.html`, and rich-text bundles. `make build` recreates them from the locked npm dependencies and the current `VERSION`, which prevents a source archive from carrying stale frontend output.
+
 ## Optional components
 
 Plainwire has a few optional backend components that are not required for a normal installation.
@@ -189,10 +221,11 @@ Deployment and update instructions are kept in [deploy/README.md](deploy/README.
 
 ## Version
 
-Current release: **1.7.4**
+Current release: **1.7.5**
 
 Release-specific changes are kept in the release notes rather than this README:
 
+* [1.7.5 release notes](RELEASE_NOTES_1.7.5.md)
 * [1.7.4 release notes](RELEASE_NOTES_1.7.4.md)
 * [1.7.3 release notes](RELEASE_NOTES_1.7.3.md)
 * [1.7.2 release notes](RELEASE_NOTES_1.7.2.md)

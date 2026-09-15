@@ -6,7 +6,7 @@
 -endif.
 
 init(Req0, _) ->
-    Id = lists:last([S || S <- binary:split(cowboy_req:path(Req0), <<"/">>, [global]), S =/= <<>>]),
+    Id = path_id(cowboy_req:path(Req0)),
     case {cowboy_req:method(Req0), authenticated_uid(Req0)} of
         {<<"GET">>, {ok, Uid}} -> serve(Req0, Uid, Id, false);
         {<<"HEAD">>, {ok, Uid}} -> serve(Req0, Uid, Id, true);
@@ -53,6 +53,14 @@ serve(Req0, Uid, Id, Head) ->
             end;
         _ -> pw_util:err_json(Req0, 404, <<"file_not_found">>)
     end.
+
+path_id(Path) when is_binary(Path) ->
+    Segs = [S || S <- binary:split(Path, <<"/">>, [global]), S =/= <<>>],
+    case lists:reverse(Segs) of
+        [Id | _] -> Id;
+        [] -> <<>>
+    end;
+path_id(_) -> <<>>.
 
 valid_id(Id) when byte_size(Id) >= 24, byte_size(Id) =< 64 ->
     lists:all(fun(C) ->

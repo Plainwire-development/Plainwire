@@ -2,6 +2,7 @@
 -behaviour(gen_server).
 -export([
     start_link/0, connect/2, connect/3, disconnect/1, subscribe/2, unsubscribe_all/1, watch_presence/2,
+    revoke_server_access/3, revoke_conversation_access/2,
     notify_user/2, broadcast/2, status_update/2,
     voice_join/4, voice_leave/3, voice_state/5, voice_signal/5, voice_activity/5,
     call_ring/5, call_decline/2, call_cancel/3, call_accept/5,
@@ -27,6 +28,8 @@ disconnect(Pid) -> gen_server:cast(?MODULE, {disconnect, Pid}).
 subscribe(Pid, Key) -> gen_server:cast(?MODULE, {subscribe, Pid, Key}).
 unsubscribe_all(Pid) -> gen_server:cast(?MODULE, {unsubscribe_all, Pid}).
 watch_presence(Pid, Uids) -> gen_server:cast(?MODULE, {watch_presence, Pid, Uids}).
+revoke_server_access(Uid, ServerId, ChannelIds) -> gen_server:cast(?MODULE, {revoke_server_access, Uid, ServerId, ChannelIds}).
+revoke_conversation_access(Uid, ConversationId) -> gen_server:cast(?MODULE, {revoke_conversation_access, Uid, ConversationId}).
 notify_user(Uid, Event) -> pw_cluster:send_user(Uid, Event).
 broadcast(Key, Event) -> pw_cluster:broadcast(Key, Event).
 status_update(Uid, Status) -> gen_server:cast(?MODULE, {status_update, Uid, undefined, Status}).
@@ -152,6 +155,22 @@ handle_cast({disconnect, Pid}, St) ->
     {noreply, remove_pid(Pid, St)};
 handle_cast({unsubscribe_all, Pid}, St) -> {noreply, St#st{subs = remove_from_all(Pid, St#st.subs)}};
 handle_cast({subscribe, Pid, Key}, St) -> {noreply, St#st{subs = add_to_set(Key, Pid, St#st.subs)}};
+handle_cast({revoke_server_access, Uid, ServerId, ChannelIds0}, St0) ->
+    ChannelIds = lists:usort([Id || Id <- ChannelIds0, is_integer(Id), Id > 0]),
+    Pids = maps:get(Uid, St0#st.users, []),
+    Keys = [{server, ServerId} | [{channel, Id} || Id <- ChannelIds]],
+    Subs = lists:foldl(fun(Key, Acc) -> remove_pids_from_key(Key, Pids, Acc) end, St0#st.subs, Keys),
+    Voices = lists:foldl(fun(ChannelId, Acc) -> remove_user_from_room_now(voice, ChannelId, Uid, Acc, St0#st.users) end, St0#st.voices, ChannelIds),
+    send_many(Pids, #{type => access_revoked, scope => server, server_id => ServerId, channel_ids => ChannelIds}),
+    log("server_access_revoked", #{uid => Uid, server_id => ServerId, tabs => length(Pids), channels => length(ChannelIds)}),
+    {noreply, St0#st{subs = Subs, voices = Voices}};
+handle_cast({revoke_conversation_access, Uid, ConversationId}, St0) ->
+    Pids = maps:get(Uid, St0#st.users, []),
+    Subs = remove_pids_from_key({direct, ConversationId}, Pids, St0#st.subs),
+    Calls = remove_user_from_room_now(call, ConversationId, Uid, St0#st.calls, St0#st.users),
+    send_many(Pids, #{type => access_revoked, scope => direct, conversation_id => ConversationId}),
+    log("conversation_access_revoked", #{uid => Uid, conversation_id => ConversationId, tabs => length(Pids)}),
+    {noreply, St0#st{subs = Subs, calls = Calls}};
 handle_cast({watch_presence, Pid, Uids0}, St0) ->
     Requested = [U || U <- Uids0, is_integer(U), U > 0],
     %% include self. older clients somehow made themselves look offline.
@@ -595,6 +614,32 @@ remove_from_all(Pid, Map) ->
             Remaining -> maps:put(Key, Remaining, Acc)
         end
     end, #{}, Map).
+remove_pids_from_key(Key, Pids, Map) ->
+    case maps:get(Key, Map, []) of
+        [] -> Map;
+        Existing ->
+            Remaining = [Pid || Pid <- Existing, not lists:member(Pid, Pids)],
+            case Remaining of
+                [] -> maps:remove(Key, Map);
+                _ -> maps:put(Key, Remaining, Map)
+            end
+    end.
+
+remove_user_from_room_now(Kind, Id, Uid, Rooms0, Users) ->
+    Key = {Kind, Id},
+    Room0 = maps:get(Key, Rooms0, #{}),
+    case maps:take(Uid, Room0) of
+        error -> Rooms0;
+        {Info, Room} ->
+            cancel_member_reconnect(Info),
+            send_many(room_pids(Room), peer_left_event(Kind, Id, Uid)),
+            send_many(room_pids(Room), state_event(Kind, Id, Room)),
+            case Kind of
+                call -> send_call_presence(Id, Room, room_audience(Room0), Users);
+                voice -> ok
+            end,
+            put_or_remove(Key, Room, Rooms0)
+    end.
 put_or_remove(Key, Room, Map) when map_size(Room) =:= 0 -> maps:remove(Key, Map);
 put_or_remove(Key, Room, Map) -> maps:put(Key, Room, Map).
 room_users(Room) ->

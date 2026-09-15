@@ -22,11 +22,11 @@ assert.match(markdown, /profile-by-username\?username=/, 'clicking a mention res
 
 assert.match(api, /\[<<"edit_message">>, MsgId\]/, 'edit endpoint is exposed');
 assert.match(api, /\[<<"forward_message">>, MsgId\]/, 'forward endpoint is exposed');
-assert.match(db, /UPDATE messages SET body = \$1, edited_at = \$2/, 'edits are persisted server-side');
+assert.match(db, /UPDATE messages SET body\s*=\s*\$1,\s*edited_at\s*=\s*\$2/, 'edits are persisted server-side');
 assert.match(db, /forwarded_from_id/, 'forward provenance is persisted');
 assert.match(db, /forwarded_from_id IS NULL/, 'forwarded snapshots cannot be edited and misattributed');
 assert.match(db, /can_modify_message_scope/, 'message edits and deletes require current scope membership');
-assert.match(db, /COALESCE\(forwarded_from_id, id\)/, 're-forwarding preserves the original provenance root');
+assert.match(db, /COALESCE\(forwarded_from_id\s*,\s*id\)/, 're-forwarding preserves the original provenance root');
 assert.match(db, /fu\.display_name, NULL/, 'forward provenance never fetches the live source body across scopes');
 assert.match(db, /forwarded_from => #\{id => ForwardId[\s\S]*body => load_message\(Body\)/, 'forward provenance exposes only the forwarded snapshot body');
 assert.match(db, /SuppressMentions/, 'forwarded content cannot re-fire mentions in the destination');

@@ -13,18 +13,26 @@ init(Req0, _) ->
 
 upload(Req0, Session) ->
     Max = min(?MAX_FILE, pw_client_config:upload_max_bytes()),
-    Size = content_length(Req0),
     Uid = maps:get(id, maps:get(user, Session)),
-    ValidSize = is_integer(Size) andalso Size > 0 andalso Size =< Max,
-    case {pw_util:require_csrf(Req0, Session), ValidSize,
-          pw_rate:allow({upload, Uid}, 120, 10800000)} of
-        {false, _, _} -> pw_util:err_json(Req0, 403, <<"bad_csrf">>);
-        {_, false, _} -> pw_util:err_json(Req0, 413, <<"file_too_large">>);
-        {_, _, false} -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
-        {true, true, true} ->
-            case pw_upload_gc:acquire(Uid, Size) of
-                ok -> try begin_upload(Req0, Uid, Size) after pw_upload_gc:release(Uid, Size) end;
-                {error, busy} -> pw_util:err_json(Req0, 429, <<"too_many_concurrent_uploads">>)
+    case pw_util:require_csrf(Req0, Session) of
+        false -> pw_util:err_json(Req0, 403, <<"bad_csrf">>);
+        true ->
+            case content_length(Req0, Max) of
+                missing -> pw_util:err_json(Req0, 411, <<"content_length_required">>);
+                invalid -> pw_util:err_json(Req0, 400, <<"invalid_content_length">>);
+                too_large -> pw_util:err_json(Req0, 413, <<"file_too_large">>);
+                {ok, Size} ->
+                    case pw_rate:allow({upload, Uid}, 120, 10800000) of
+                        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+                        true ->
+                            case pw_upload_gc:acquire(Uid, Size) of
+                                ok ->
+                                    try begin_upload(Req0, Uid, Size)
+                                    after pw_upload_gc:release(Uid, Size) end;
+                                {error, busy} ->
+                                    pw_util:err_json(Req0, 429, <<"too_many_concurrent_uploads">>)
+                            end
+                    end
             end
     end.
 
@@ -35,7 +43,12 @@ begin_upload(Req0, Uid, Size) ->
     Dir = upload_dir(),
     Path = filename:join(Dir, binary_to_list(Id)),
     Tmp = Path ++ ".part",
-    ok = filelib:ensure_dir(Tmp),
+    case filelib:ensure_dir(Tmp) of
+        ok -> begin_upload_reserved(Req0, Uid, Size, Id, Name, Type, Path, Tmp);
+        {error, _} -> pw_util:err_json(Req0, 503, <<"upload_storage_unavailable">>)
+    end.
+
+begin_upload_reserved(Req0, Uid, Size, Id, Name, Type, Path, Tmp) ->
     case pw_db:begin_upload(Uid, Id, Name, Type, Size, list_to_binary(Path)) of
         {ok, reserved} ->
             case stream_to_file(Req0, Tmp, Size) of
@@ -46,15 +59,26 @@ begin_upload(Req0, Uid, Size) ->
                                 ok ->
                                     pw_util:ok_json(Req1, #{ok => true, data => #{id => Id, name => Name,
                                         content_type => Type, size => Size, url => <<"/api/files/", Id/binary>>}});
+                                {error, not_found} ->
+                                    %% A missing pending reservation is definitive: do not leave an
+                                    %% orphaned finalized file that the database sweeper cannot discover.
+                                    _ = file:delete(Path),
+                                    pw_util:err_json(Req1, 409, <<"upload_reservation_lost">>);
                                 {error, _} ->
                                     %% The database write can be ambiguous if a connection dies after
                                     %% PostgreSQL commits. Keep the finalized file in place so either the
                                     %% ready row remains usable or the stale-upload sweeper removes it.
                                     pw_util:err_json(Req1, 503, <<"upload_finalize_unavailable">>)
                             end;
-                        {error, _} -> fail_upload(Uid, Id, Tmp, Req1)
+                        {error, _} ->
+                            fail_upload(Uid, Id, Tmp, Req1, 503, <<"upload_storage_unavailable">>)
                     end;
-                {error, Req1} -> fail_upload(Uid, Id, Tmp, Req1)
+                {error, size_mismatch, Req1} ->
+                    fail_upload(Uid, Id, Tmp, Req1, 400, <<"upload_size_mismatch">>);
+                {error, malformed_body, Req1} ->
+                    fail_upload(Uid, Id, Tmp, Req1, 400, <<"invalid_upload_body">>);
+                {error, storage, Req1} ->
+                    fail_upload(Uid, Id, Tmp, Req1, 503, <<"upload_storage_unavailable">>)
             end;
         {error, quota_exceeded} -> pw_util:err_json(Req0, 429, <<"upload_quota_exceeded">>);
         {error, _} -> pw_util:err_json(Req0, 503, <<"upload_unavailable">>)
@@ -66,35 +90,43 @@ stream_to_file(Req0, Tmp, Expected) ->
             Ctx = crypto:hash_init(sha256),
             try stream_chunks(Req0, Io, Expected, 0, Ctx)
             after file:close(Io) end;
-        {error, _} -> {error, Req0}
+        {error, _} -> {error, storage, Req0}
     end.
 
 stream_chunks(Req0, Io, Expected, Read, Ctx) ->
-    case cowboy_req:read_body(Req0, #{length => 1048576, period => 30000}) of
-        {more, Data, Req1} ->
+    try cowboy_req:read_body(Req0, #{length => 1048576, period => 30000}) of
+        {more, Data, Req1} when is_binary(Data) ->
             Total = Read + byte_size(Data),
             case Total =< Expected of
                 true ->
-                    ok = file:write(Io, Data),
-                    stream_chunks(Req1, Io, Expected, Total, crypto:hash_update(Ctx, Data));
+                    case file:write(Io, Data) of
+                        ok -> stream_chunks(Req1, Io, Expected, Total, crypto:hash_update(Ctx, Data));
+                        {error, _} -> {error, storage, Req1}
+                    end;
                 false ->
-                    {error, Req1}
+                    {error, size_mismatch, Req1}
             end;
-        {ok, Data, Req1} ->
+        {ok, Data, Req1} when is_binary(Data) ->
             Total = Read + byte_size(Data),
             case Total =:= Expected of
                 true ->
-                    ok = file:write(Io, Data),
-                    {ok, Req1, pw_util:hex_binary(crypto:hash_final(crypto:hash_update(Ctx, Data)))};
+                    case file:write(Io, Data) of
+                        ok -> {ok, Req1, pw_util:hex_binary(crypto:hash_final(crypto:hash_update(Ctx, Data)))};
+                        {error, _} -> {error, storage, Req1}
+                    end;
                 false ->
-                    {error, Req1}
-            end
+                    {error, size_mismatch, Req1}
+            end;
+        _ ->
+            {error, malformed_body, Req0}
+    catch
+        _:_ -> {error, malformed_body, Req0}
     end.
 
-fail_upload(Uid, Id, Tmp, Req) ->
+fail_upload(Uid, Id, Tmp, Req, Status, Code) ->
     _ = file:delete(Tmp),
     _ = pw_db:abort_upload(Uid, Id),
-    pw_util:err_json(Req, 500, <<"upload_failed">>).
+    pw_util:err_json(Req, Status, Code).
 
 auth(Req) ->
     case pw_util:cookie_value(Req, <<"pw_session">>) of
@@ -102,8 +134,17 @@ auth(Req) ->
         Token -> case pw_db:session_fast(Token) of {ok, S} -> {ok, S}; _ -> pw_db:session(Token) end
     end.
 
-content_length(Req) ->
-    pw_util:int(cowboy_req:header(<<"content-length">>, Req, <<>>)).
+content_length(Req, Max) ->
+    case cowboy_req:header(<<"content-length">>, Req, undefined) of
+        undefined -> missing;
+        <<>> -> missing;
+        Raw ->
+            case pw_util:int(Raw) of
+                Size when is_integer(Size), Size > 0, Size =< Max -> {ok, Size};
+                Size when is_integer(Size), Size > Max -> too_large;
+                _ -> invalid
+            end
+    end.
 
 upload_dir() -> binary_to_list(pw_util:env_str("PLAINWIRE_UPLOAD_DIR", <<"data/uploads/">>)).
 

@@ -8,6 +8,9 @@ node --check priv/static/call-health.js
 node --check web/markdown.js
 node --check web/interface.js
 node --check scripts/build-rich-text.mjs
+npm run test:rtc-contract
+npm run test:ui-contract
+npm run test:release-contract
 for script in scripts/*.sh; do bash -n "${script}"; done
 python3 - <<'PY'
 from pathlib import Path
@@ -36,8 +39,31 @@ for deploy_script in ['scripts/update-openrc-release.sh', 'scripts/install-openr
     assert 'CSS_FINGERPRINT="Plainwire ${VERSION} workspace"' in body
 for path in [*Path('scripts').glob('*.py'), *Path('test').glob('*.py')]:
     ast.parse(path.read_text(), filename=str(path))
-json.loads(Path('package.json').read_text())
-json.loads(Path('priv/static/elm/elm.json').read_text())
+for path in Path('src').glob('*.erl'):
+    body = path.read_text()
+    # Catch accidental duplicated standalone result expressions such as two
+    # consecutive `{error, forbidden}` terms inside one case arm. Erlang's real
+    # compiler remains the authority; this protects source-only verification too.
+    duplicate_result = re.search(r'(?m)^\s*(\{(?:error|ok),\s*[^\n]+\})\s*\n\s*\1\s*$', body)
+    assert not duplicate_result, f'duplicated Erlang result expression in {path}: {duplicate_result.group(1)}'
+db_source = Path('src/pw_db.erl').read_text()
+migration_ids = [int(v) for v in re.findall(r'(?m)^\s*\{(\d+), \[', db_source)]
+assert migration_ids == list(range(1, max(migration_ids) + 1)), f'non-contiguous or duplicate DB migrations: {migration_ids}'
+package = json.loads(Path('package.json').read_text())
+lock = json.loads(Path('package-lock.json').read_text())
+elm_manifest = json.loads(Path('priv/static/elm/elm.json').read_text())
+assert package['devDependencies']['elm'] == '0.19.1-6'
+assert lock['packages']['']['devDependencies']['elm'] == '0.19.1-6'
+assert package.get('engines', {}).get('node') == '>=20.19'
+assert lock['packages'][''].get('engines', {}).get('node') == '>=20.19'
+assert package['allowScripts'] == {
+    '@parcel/watcher@2.5.6': True,
+    'elm@0.19.1-6': True,
+    'esbuild@0.28.2': True,
+}
+assert lock['packages']['node_modules/less']['version'] == '4.9.1'
+assert 'node_modules/image-size' not in lock['packages']
+assert lock['packages']['node_modules/probe-image-size']['version'] == '7.4.0'
 print('Source manifests, release versions, JavaScript and shell syntax passed.')
 PY
 printf 'Run npm run build for frontend compilation, npm run test:browser and npm run test:rtc for browser regressions, and rebar3 eunit for backend tests.\n'

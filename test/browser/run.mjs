@@ -42,13 +42,13 @@ async function setup(context){
  await context.route('**/api/**',async route=>{
   const req=route.request(), url=new URL(req.url()), path=url.pathname;
   const reply=(data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify({ok:status<400,data,...(status===401?{error:'not_authenticated'}:{})})});
-  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.7.4',asset_version:'1.7.4',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
+  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.7.5',asset_version:'1.7.5',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
   if(path==='/api/me')return authenticated?reply({user:me,csrf:'test-csrf',server_time:now}):reply(null,401);
   if(path==='/api/sync')return reply(sync);
   if(path==='/api/forums')return reply([]);
-  if(path==='/api/server/1/invites' && req.method()==='GET')return reply([{code:'test-link',max_uses:10,uses:2,expires_at:now+86400000,created_at:now,revoked:inviteRevoked}]);
-  if(path==='/api/server/1/invites' && req.method()==='POST'){inviteOptions=req.postDataJSON();return reply({code:'new-link',url:'#invite/new-link',expires_at:now+3600000});}
-  if(path==='/api/server/1/invites/test-link' && req.method()==='DELETE'){inviteRevoked=true;return reply({});}
+  if(path==='/api/server/1/wires' && req.method()==='GET')return reply([{code:'test-link',max_uses:10,uses:2,expires_at:now+86400000,created_at:now,revoked:inviteRevoked}]);
+  if(path==='/api/server/1/wires' && req.method()==='POST'){inviteOptions=req.postDataJSON();return reply({code:'new-link',url:'#wire/new-link',expires_at:now+3600000});}
+  if(path==='/api/server/1/wires/test-link' && req.method()==='DELETE'){inviteRevoked=true;return reply({});}
   if(path==='/api/server/1'){if(req.method()==='POST')testServer={...testServer,...req.postDataJSON()};return reply(serverData());}
   if(path==='/api/messages'){messageFetches++;return reply(url.searchParams.get('scope_id')==='1'?messages:[]);}
   if(/^\/api\/conversation\/\d+\/messages$/.test(path)){
@@ -59,7 +59,7 @@ async function setup(context){
   if(path==='/api/conversations' && req.method()==='POST') {
    createdGroup=req.postDataJSON();
    const members=[me,...people.filter(p=>createdGroup.usernames.includes(p.username))].map(user=>({user,role:user.id===1?'owner':'member'}));
-   const group={...conversations[0],id:20,name:createdGroup.name,member_count:members.length,members,unread:0};conversations.push(group);return reply({id:20});
+   const group={...conversations[0],id:20,name:createdGroup.name,member_count:members.length,members,group_role:'owner',unread:0};conversations.push(group);return reply({id:20});
   }
   if(path==='/api/conversation/20/members' && req.method()==='POST') {
    addedPeople=req.postDataJSON();const group=conversations.find(c=>c.id===20);
@@ -99,7 +99,7 @@ try {
  assert.equal(await page.locator('.side').evaluate(el=>el.getBoundingClientRect().width),navigationWidth+16);
  await navigation.press('Home');
  await page.locator('.workspace-menu summary').click();
- assert(await page.getByRole('button',{name:'Join with invite',exact:true}).isVisible());
+ assert(await page.getByRole('button',{name:'Join with Wire',exact:true}).isVisible());
  await page.keyboard.press('Escape');assert.equal(await page.locator('.workspace-menu[open]').count(),0);
  await page.getByRole('button',{name:'Quick switcher',exact:true}).click();
  await page.getByRole('searchbox',{name:'Find conversations and servers'}).fill('Jamie');
@@ -308,13 +308,13 @@ try {
  await page.setViewportSize({width:1440,height:960});
  await page.getByRole('button',{name:'Plainwire home',exact:true}).click();await page.waitForSelector('.home-welcome');
  await page.evaluate(()=>location.hash='#server/1');await page.waitForSelector('.server-hero');
- await page.getByRole('button',{name:'Invite people',exact:true}).click();await page.waitForSelector('.invite-link-row');
- await page.getByRole('button',{name:'Revoke',exact:true}).click();await page.getByText('Revoked link',{exact:true}).waitFor();assert.equal(inviteRevoked,true);
- await page.getByRole('combobox',{name:'Invite expiration'}).selectOption('3600');
+ await page.getByRole('button',{name:'Wire',exact:true}).click();await page.waitForSelector('.invite-link-row');
+ await page.getByRole('button',{name:'Revoke',exact:true}).click();await page.getByText('Revoked Wire',{exact:true}).waitFor();assert.equal(inviteRevoked,true);
+ await page.getByRole('combobox',{name:'Wire expiration'}).selectOption('3600');
  await page.getByRole('button',{name:'One use',exact:true}).click();await page.screenshot({path:'test-results/invites-desktop.png'});
- await page.getByRole('button',{name:'Copy invite',exact:true}).click();await page.waitForTimeout(100);
+ await page.getByRole('dialog',{name:'Conversation action'}).getByRole('button',{name:'Create Wire',exact:true}).click();await page.waitForTimeout(100);
  assert.equal(inviteOptions.expires_in,3600);assert.equal(inviteOptions.max_uses,1);
- assert.equal(await page.locator('.invite-code-input').inputValue(),`${origin}/#invite/new-link`);
+ assert.equal(await page.locator('.invite-code-input').inputValue(),`${origin}/#wire/new-link`);
  await page.keyboard.press('Escape');
  await page.waitForFunction(()=>!document.querySelector('.modal'));
  await page.emulateMedia({colorScheme:'dark'});await page.evaluate(()=>location.hash='#dm/1');await page.waitForSelector('.msg');await page.screenshot({path:'test-results/chat-dark.png'});
@@ -364,5 +364,5 @@ try {
  await page.screenshot({path:'test-results/group-chat-mobile.png',animations:'disabled'});
  authenticated=false;const auth=await browser.newContext({viewport:{width:1440,height:960},colorScheme:'light'});await setup(auth);const login=await auth.newPage();login.on('pageerror',e=>errors.push(e.message));await login.goto(origin);await login.waitForSelector('.auth-submit');await login.screenshot({path:'test-results/login-desktop.png'});await login.setViewportSize({width:390,height:844});await login.screenshot({path:'test-results/login-mobile.png'});
  const blocked=await browser.newContext();await setup(blocked);await blocked.addInitScript(()=>Object.defineProperty(window,'localStorage',{get(){throw new DOMException('Storage blocked','SecurityError')}}));const blockedPage=await blocked.newPage();blockedPage.on('pageerror',e=>errors.push(e.message));await blockedPage.goto(origin);await blockedPage.waitForSelector('.auth-submit');
- assert.deepEqual(errors,[],'no browser exceptions');console.log('PASS: missed-call cards; recent-DM Markdown; mentions and autocomplete; initial latest-message positioning; bounded mobile composer; click-select group creation and adding members; live membership refresh; long server names; functional home mark; mobile customization footer; quick switcher keyboard navigation/dismissal; sidebar resizing; workspace menu dismissal; latest-message navigation and preserved reading position; scoped media updates; settings tab scroll reset; Markdown and syntax highlighting; unsafe markup rejection; settings search; welcome preview; invite expiry/revocation; desktop/light/dark/mobile layouts; drafts across routes; concurrent sends out of order; new draft preserved; late send isolated; failed send/retry; sign-in; no runtime exceptions.');
+ assert.deepEqual(errors,[],'no browser exceptions');console.log('PASS: missed-call cards; recent-DM Markdown; mentions and autocomplete; initial latest-message positioning; bounded mobile composer; click-select group creation and adding members; live membership refresh; long server names; functional home mark; mobile customization footer; quick switcher keyboard navigation/dismissal; sidebar resizing; workspace menu dismissal; latest-message navigation and preserved reading position; scoped media updates; settings tab scroll reset; Markdown and syntax highlighting; unsafe markup rejection; settings search; welcome preview; Wire expiry/revocation; desktop/light/dark/mobile layouts; drafts across routes; concurrent sends out of order; new draft preserved; late send isolated; failed send/retry; sign-in; no runtime exceptions.');
 } finally {await browser.close();server.close();}

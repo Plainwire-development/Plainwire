@@ -166,6 +166,14 @@ authed(<<"POST">>, [<<"threads">>], Req0, Session, _) -> with_json(Req0, fun(M, 
 authed(<<"GET">>, [<<"thread">>, Id], Req, Session, _) -> result(Req, pw_db:thread(uid(Session), Id));
 authed(<<"POST">>, [<<"thread">>, Id, <<"replies">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:reply_thread(uid(Session), Id, maps:get(<<"body">>,M,<<>>))) end);
 authed(<<"POST">>, [<<"thread">>, Id, <<"vote">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:vote_thread(uid(Session), Id, maps:get(<<"value">>,M,0))) end);
+authed(<<"POST">>, [<<"thread">>, Id, <<"edit">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:edit_thread(uid(Session), Id, maps:get(<<"title">>,M,<<>>), maps:get(<<"body">>,M,<<>>))) end);
+authed(<<"POST">>, [<<"thread">>, Id, <<"moderate">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:moderate_thread(uid(Session), Id, maps:get(<<"action">>,M,<<>>), maps:get(<<"value">>,M,false))) end);
+authed(<<"POST">>, [<<"thread">>, ThreadId, <<"reply">>, ReplyId, <<"edit">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:edit_reply(uid(Session), ThreadId, ReplyId, maps:get(<<"body">>,M,<<>>))) end);
+authed(<<"POST">>, [<<"thread">>, ThreadId, <<"reply">>, ReplyId, <<"delete">>], Req, Session, _) ->
+    result(Req, pw_db:delete_reply(uid(Session), ThreadId, ReplyId));
 authed(<<"POST">>, [<<"thread">>, Id, <<"delete">>], Req, Session, _) -> result(Req, pw_db:delete_thread(uid(Session), Id));
 authed(<<"GET">>, [<<"users">>], Req, _, _) -> result(Req, pw_db:users(qs(Req, <<"q">>)));
 authed(<<"GET">>, [<<"profile">>, Id], Req, Session, _) -> result(Req, pw_db:profile(uid(Session), Id));
@@ -180,6 +188,22 @@ authed(<<"POST">>, [<<"servers">>], Req0, Session, _) -> with_json(Req0, fun(M, 
 authed(<<"GET">>, [<<"server">>, Id], Req, Session, _) -> result(Req, pw_db:server(uid(Session), Id));
 authed(<<"POST">>, [<<"server">>, Id], Req0, Session, _) ->
     with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_server(uid(Session), Id, M)) end);
+authed(<<"GET">>, [<<"server">>, Id, <<"permissions">>], Req, Session, _) -> result(Req, pw_db:server_permissions(uid(Session), Id));
+authed(<<"POST">>, [<<"server">>, Id, <<"default-permissions">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_server_default_permissions(uid(Session), Id, maps:get(<<"permissions">>, M, 0))) end);
+authed(<<"GET">>, [<<"server">>, Id, <<"roles">>], Req, Session, _) -> result(Req, pw_db:server_roles(uid(Session), Id));
+authed(<<"POST">>, [<<"server">>, Id, <<"roles">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_server_role(uid(Session), Id, maps:get(<<"name">>,M,<<>>), M)) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"role">>, RoleId], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_server_role(uid(Session), Id, RoleId, M)) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"role">>, RoleId, <<"delete">>], Req, Session, _) ->
+    result(Req, pw_db:delete_server_role(uid(Session), Id, RoleId));
+authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"roles">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:set_server_member_roles(uid(Session), Id, UserId, maps:get(<<"role_ids">>,M,[]))) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"kick">>], Req, Session, _) ->
+    result(Req, pw_db:kick_server_member(uid(Session), Id, UserId));
+authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"profile">>], Req0, Session, _) ->
+    with_json_large(Req0, fun(M, Req) -> result(Req, pw_db:update_server_member_profile(uid(Session), Id, UserId, M)) end);
 authed(<<"POST">>, [<<"server">>, Id, <<"channels">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_channel(uid(Session), Id, maps:get(<<"name">>,M,<<>>), maps:get(<<"kind">>,M,<<"text">>), maps:get(<<"category_id">>,M,undefined))) end);
 authed(<<"GET">>, [<<"server">>, Id, <<"categories">>], Req, Session, _) -> result(Req, pw_db:categories(uid(Session), Id));
 authed(<<"POST">>, [<<"server">>, Id, <<"categories">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_category(uid(Session), Id, maps:get(<<"name">>,M,<<>>))) end);
@@ -187,11 +211,32 @@ authed(<<"POST">>, [<<"server">>, Id, <<"category">>, CatId], Req0, Session, _) 
 authed(<<"POST">>, [<<"server">>, Id, <<"categories">>, <<"reorder">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:reorder_categories(uid(Session), Id, maps:get(<<"order">>,M,[]))) end);
 authed(<<"POST">>, [<<"server">>, Id, <<"category">>, CatId, <<"delete">>], Req, Session, _) -> result(Req, pw_db:delete_category(uid(Session), Id, CatId));
 authed(<<"POST">>, [<<"channel">>, ChannelId, <<"move">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:move_channel(uid(Session), ChannelId, maps:get(<<"category_id">>,M,undefined), maps:get(<<"position">>,M,undefined))) end);
+authed(<<"GET">>, [<<"server">>, Id, <<"wires">>], Req, Session, _) -> result(Req, pw_db:list_invites(uid(Session), Id));
+authed(<<"DELETE">>, [<<"server">>, Id, <<"wires">>, Code], Req, Session, _) -> result(Req, pw_db:revoke_invite(uid(Session), Id, Code));
+authed(<<"POST">>, [<<"server">>, Id, <<"wires">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_invite(uid(Session), Id, maps:get(<<"channel_id">>,M,undefined), maps:get(<<"max_uses">>,M,0), maps:get(<<"expires_in">>,M,86400))) end);
+authed(<<"POST">>, [<<"wires">>, Code, <<"join">>], Req, Session, _) -> result(Req, pw_db:join_invite(uid(Session), Code));
+authed(<<"GET">>, [<<"wires">>, Code], Req, _, _) -> result(Req, pw_db:invite_preview(Code));
 authed(<<"GET">>, [<<"server">>, Id, <<"invites">>], Req, Session, _) -> result(Req, pw_db:list_invites(uid(Session), Id));
 authed(<<"DELETE">>, [<<"server">>, Id, <<"invites">>, Code], Req, Session, _) -> result(Req, pw_db:revoke_invite(uid(Session), Id, Code));
 authed(<<"POST">>, [<<"server">>, Id, <<"invites">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_invite(uid(Session), Id, maps:get(<<"channel_id">>,M,undefined), maps:get(<<"max_uses">>,M,0), maps:get(<<"expires_in">>,M,86400))) end);
 authed(<<"POST">>, [<<"invites">>, Code, <<"join">>], Req, Session, _) -> result(Req, pw_db:join_invite(uid(Session), Code));
 authed(<<"GET">>, [<<"invites">>, Code], Req, _, _) -> result(Req, pw_db:invite_preview(Code));
+authed(<<"GET">>, [<<"onboarding">>], Req, Session, _) ->
+    result(Req, pw_db:onboarding(uid(Session)));
+authed(<<"POST">>, [<<"onboarding">>, <<"start">>], Req, Session, _) ->
+    result(Req, pw_db:start_onboarding(uid(Session)));
+authed(<<"POST">>, [<<"onboarding">>, <<"progress">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_onboarding(uid(Session), maps:get(<<"step">>, M, -1))) end);
+authed(<<"POST">>, [<<"onboarding">>, <<"complete">>], Req, Session, _) ->
+    result(Req, pw_db:complete_onboarding(uid(Session)));
+authed(<<"POST">>, [<<"onboarding">>, <<"dismiss">>], Req, Session, _) ->
+    result(Req, pw_db:dismiss_onboarding(uid(Session)));
+authed(<<"POST">>, [<<"onboarding">>, <<"replay">>], Req, Session, _) ->
+    result(Req, pw_db:replay_onboarding(uid(Session)));
+authed(<<"GET">>, [<<"gifs">>, <<"search">>], Req, Session, _) ->
+    result(Req, pw_klipy:search(uid(Session), qs(Req, <<"q">>), qs(Req, <<"pos">>)));
+authed(<<"POST">>, [<<"gifs">>, <<"share">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_klipy:register_share(uid(Session), maps:get(<<"id">>,M,<<>>), maps:get(<<"q">>,M,<<>>))) end);
 authed(<<"GET">>, [<<"embed">>], Req, Session, _) ->
     case qs(Req, <<"url">>) of
         undefined -> pw_util:err_json(Req, 400, <<"missing_url">>);
@@ -238,6 +283,10 @@ authed(<<"POST">>, [<<"conversation">>, Id, <<"messages">>], Req0, Session, _) -
     with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:post_direct_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
 authed(<<"POST">>, [<<"conversation">>, Id, <<"leave">>], Req, Session, _) -> result(Req, pw_db:leave_conversation(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"close">>], Req, Session, _) -> result(Req, pw_db:close_conversation(uid(Session), Id));
+authed(<<"POST">>, [<<"conversation">>, Id, <<"member">>, UserId, <<"role">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:set_conversation_member_role(uid(Session), Id, UserId, maps:get(<<"role">>,M,<<"member">>))) end);
+authed(<<"POST">>, [<<"conversation">>, Id, <<"member">>, UserId, <<"kick">>], Req, Session, _) ->
+    result(Req, pw_db:kick_conversation_member(uid(Session), Id, UserId));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"request">>, <<"accept">>], Req, Session, _) -> result(Req, pw_db:accept_message_request(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"request">>, <<"deny">>], Req, Session, _) -> result(Req, pw_db:deny_message_request(uid(Session), Id));
 authed(<<"GET">>, [<<"notifications">>], Req, Session, _) -> result(Req, pw_db:notifications(uid(Session)));

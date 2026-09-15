@@ -12,6 +12,16 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED = {'.git', 'node_modules', '_build', 'elm-stuff', 'test-results', 'dist',
             'data', 'uploads', 'tooling', '__pycache__', '.venv', '.build'}
+# Source archives ship the authoritative inputs, not potentially stale bundles.
+# `make build` (or scripts/start.sh when assets are absent) recreates these from
+# package-lock.json and VERSION on the target machine.
+SOURCE_GENERATED = {
+    'priv/static/app.js',
+    'priv/static/app.css',
+    'priv/static/index.html',
+    'priv/static/markdown.js',
+    'priv/static/highlight-all.js',
+}
 
 
 def source_files():
@@ -30,6 +40,9 @@ def source_files():
             dirs[:] = sorted(d for d in dirs if d not in EXCLUDED)
             for name in sorted(names):
                 p = Path(base) / name
+                rel = p.relative_to(ROOT).as_posix()
+                if rel in SOURCE_GENERATED:
+                    continue
                 if name.startswith('.env') or name == 'erl_crash.dump' or name.startswith('.pw-media-quality.'):
                     continue
                 if p.suffix.lower() in {'.pem', '.key', '.p12', '.pfx', '.beam', '.pyc', '.log', '.dump', '.bak', '.gz', '.zip'}:

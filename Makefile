@@ -38,7 +38,7 @@ FRONTEND_OUTPUTS := priv/static/index.html priv/static/app.css priv/static/app.j
 NATIVE_TARGET := $(if $(filter 1,$(NATIVE)),native)
 NATIVE_TEST := $(if $(filter 1,$(NATIVE)),test-native)
 
-.PHONY: help doctor deps frontend backend native build verify test-health test-rtc-contract test-ui-contract test-browser test-native test-backend test check release source package run clean browsers
+.PHONY: help doctor deps frontend backend native build verify test-health test-rtc-contract test-ui-contract test-release-contract test-browser test-native test-backend test check release source package run clean browsers
 # Rebar invocations and test servers are sequenced even with make -j.
 .NOTPARALLEL: check test test-browser test-backend
 
@@ -53,7 +53,7 @@ help:
 	  '  make check NATIVE=1    Syntax, browser, RTP, numerical and EUnit checks' \
 	  '  make release NATIVE=1  Check and assemble an Erlang runtime release' \
 	  '  make package NATIVE=1  Check, release, and archive with SHA-256' \
-	  '  make source           Build frontend and archive portable source only' \
+	  '  make source           Compile frontend/backend and archive portable source only' \
 	  '  make run              Start the development server (requires PostgreSQL)' \
 	  '  make clean            Remove build/test output; preserve data and secrets' \
 	  'Options: PROFILE=default|cluster NATIVE=0|1 CC=cc FC=gfortran' \
@@ -99,7 +99,10 @@ test-rtc-contract:
 test-ui-contract:
 	$(NPM) run test:ui-contract
 
-test-browser: frontend test-rtc-contract test-ui-contract
+test-release-contract:
+	$(NPM) run test:release-contract
+
+test-browser: frontend test-rtc-contract test-ui-contract test-release-contract
 	$(NPM) run test:browser
 	$(NPM) run test:rtc
 
@@ -122,8 +125,9 @@ else
 endif
 	@printf 'Checked release: %s\n' "$(RELEASE_ROOT)"
 
-# A source archive is not proof that the full release build passed.
-source: verify frontend
+# A source archive contains authoritative inputs only; generated UI bundles are rebuilt by `make build`.
+# It is not proof that the host-specific release build passed.
+source: verify frontend backend
 	$(PYTHON) scripts/archive.py source
 
 package: release source

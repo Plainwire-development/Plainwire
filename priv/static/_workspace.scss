@@ -165,8 +165,8 @@ button:disabled { cursor: not-allowed; }
 .setting-copy small { font-size: 12px; line-height: 1.55; }
 .settings-action-card, .choice-card, .voice-mode-button { border-radius: 7px; box-shadow: none; }
 .settings-action-card:hover, .settings-tab:hover { transform: none; }
-.forum-card, .reddit-thread { box-shadow: none; }
-.forum-card:hover, .reddit-thread:hover { transform: none; box-shadow: none; }
+.forum-card, .forum-thread { box-shadow: none; }
+.forum-card:hover, .forum-thread:hover { transform: none; box-shadow: none; }
 
 /* The sign-in page uses typography, a wordmark, and plain surfaces. */
 .auth-shell { background: var(--bg2); }

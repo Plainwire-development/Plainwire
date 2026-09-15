@@ -374,17 +374,17 @@ resolve_redirect(OriginalUrl, Location0) ->
     end.
 
 content_type(Headers) ->
-    case header_value("content-type", Headers) of
+    case header_value(<<"content-type">>, Headers) of
         undefined -> <<"application/octet-stream">>;
-        CT when is_list(CT) ->
-            pw_util:bin(string:trim(hd(string:split(CT, ";"))));
-        CT when is_binary(CT) ->
-            pw_util:bin(string:trim(hd(binary:split(CT, <<";">>))))
+        CT0 ->
+            CT = pw_util:bin(CT0),
+            [MediaType | _] = binary:split(CT, <<";">>, [global]),
+            string:lowercase(string:trim(MediaType))
     end.
 
-header_value(Name, Headers) ->
-    Lower = string:lowercase(Name),
-    case [V || {K, V} <- Headers, string:lowercase(K) =:= Lower] of
+header_value(Name0, Headers) ->
+    Lower = string:lowercase(pw_util:bin(Name0)),
+    case [V || {K, V} <- Headers, string:lowercase(pw_util:bin(K)) =:= Lower] of
         [V | _] -> V;
         [] -> undefined
     end.

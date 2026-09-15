@@ -71,7 +71,18 @@ load_env() {
 }
 
 build_assets() {
-  npm run build
+  # Use the project target instead of invoking the bundler directly. This keeps
+  # dependency installation, generated-file grouping, and VERSION fingerprints
+  # identical to normal development/release builds.
+  "${MAKE:-make}" frontend
+}
+
+frontend_needs_build() {
+  # `make -q` performs timestamp/dependency evaluation without running recipes.
+  # Exit 1 means source/dependencies are newer than the generated assets; exit 2
+  # means Make itself could not evaluate the target, which should be surfaced by
+  # the real build rather than silently serving stale JavaScript.
+  "${MAKE:-make}" -q frontend >/dev/null 2>&1
 }
 
 main() {
@@ -113,6 +124,9 @@ main() {
     build_assets
   elif [ ! -f priv/static/app.js ] || [ ! -f priv/static/app.css ] || [ ! -f priv/static/index.html ]; then
     printf 'Frontend assets missing; building...\n'
+    build_assets
+  elif ! frontend_needs_build; then
+    printf 'Frontend source changed since the generated assets; rebuilding...\n'
     build_assets
   fi
 

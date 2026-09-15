@@ -12,6 +12,8 @@
     app_name: 'Plainwire',
     default_theme: 'system',
     registration_enabled: true,
+    gif_search_enabled: false,
+    gif_provider: '',
     instance_description: 'A fast, self-hosted place to talk.',
     upload_max_bytes: 250 * 1024 * 1024,
     profile_image_max_bytes: 16 * 1024 * 1024,

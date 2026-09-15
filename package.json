@@ -15,12 +15,13 @@
     "test:rtc-contract": "node test/browser/rtc-contract.mjs",
     "test:ui-contract": "node test/browser/ui-contract.mjs",
     "build:rich-text": "node scripts/build-rich-text.mjs",
-    "test:health": "node test/browser/call-health.mjs"
+    "test:health": "node test/browser/call-health.mjs",
+    "test:release-contract": "node test/browser/release-contract.mjs"
   },
   "devDependencies": {
-    "elm": "^0.19.1-6",
+    "elm": "0.19.1-6",
     "esbuild": "0.28.2",
-    "less": "^4.2.2",
+    "less": "^4.9.1",
     "playwright": "^1.62.1",
     "sass": "^1.101.0"
   },
@@ -28,5 +29,13 @@
     "haml": "^0.4.3",
     "highlight.js": "11.12.0",
     "markdown-it": "15.0.2"
+  },
+  "allowScripts": {
+    "@parcel/watcher@2.5.6": true,
+    "elm@0.19.1-6": true,
+    "esbuild@0.28.2": true
+  },
+  "engines": {
+    "node": ">=20.19"
   }
 }

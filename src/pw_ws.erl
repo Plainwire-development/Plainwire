@@ -32,7 +32,7 @@ init_owner(Req0) ->
                             WsOpts = #{idle_timeout => 300000, max_frame_size => 65536, compress => true},
                             {cowboy_websocket, Req0, #{session=>CleanSession, token=>Token,
                                 last_auth_check=>erlang:monotonic_time(millisecond),
-                                uid=>maps:get(id,User), subs=>[], voice=>undefined, call=>undefined, status=>Status}, WsOpts};
+                                uid=>maps:get(id,User), subs=>[], voice=>undefined, voice_profile=>undefined, call=>undefined, status=>Status}, WsOpts};
                         _ -> {ok, cowboy_req:reply(401, #{}, <<"not authenticated">>, Req0), #{}}
                     end
             end
@@ -74,7 +74,7 @@ websocket_handle({text, Data}, State0=#{uid:=Uid}) ->
 websocket_handle(_Frame, State) -> {ok, State}.
 
 %% speaking and quality samples are limited in their handlers and just dropped.
-message_allowed(_Uid, #{<<"type">> := Type}) when Type =:= <<"voice_activity">>; Type =:= <<"call_quality">> ->
+message_allowed(_Uid, #{<<"type">> := Type}) when Type =:= <<"voice_activity">>; Type =:= <<"call_quality">>; Type =:= <<"typing">> ->
     true;
 message_allowed(Uid, #{<<"type">> := Type}) when Type =:= <<"voice_signal">>; Type =:= <<"call_signal">> ->
     %% every ICE restart trickles a fresh batch of candidates.
@@ -116,20 +116,61 @@ handle_msg(#{<<"type">> := <<"presence_watch">>, <<"user_ids">> := Uids0}, State
     Uids = lists:sublist(lists:usort([U || U0 <- Uids0, U <- [pw_util:int(U0)], is_integer(U), U > 0]), 2000),
     pw_hub:watch_presence(self(), Uids),
     {ok, State};
-handle_msg(#{<<"type">> := <<"voice_join">>, <<"channel_id">> := Cid0}, State=#{uid:=Uid, session:=Session}) ->
-    Cid = pw_util:int(Cid0),
-    case pw_db:member_of_channel(Uid, Cid) of
+handle_msg(#{<<"type">> := <<"typing">>, <<"scope">> := Scope0, <<"scope_id">> := ScopeId0} = Msg,
+           State=#{uid:=Uid, session:=Session}) ->
+    ScopeId = pw_util:int(ScopeId0),
+    Scope = case Scope0 of
+        <<"direct">> -> direct;
+        <<"channel">> -> channel;
+        <<"thread">> -> thread;
+        _ -> undefined
+    end,
+    Active = maps:get(<<"active">>, Msg, true) =:= true,
+    Key = case {Scope, ScopeId} of
+        {direct, Id} when is_integer(Id), Id > 0 -> {direct, Id};
+        {channel, Id} when is_integer(Id), Id > 0 -> {channel, Id};
+        {thread, Id} when is_integer(Id), Id > 0 -> {thread, Id};
+        _ -> undefined
+    end,
+    case Key =/= undefined andalso pw_rate:allow({ws_typing, Uid}, 180, 60000) of
         true ->
+            case typing_profile(Uid, Key, Session) of
+                {ok, User} ->
+                    Event = #{
+                        type => typing,
+                        scope => atom_to_binary(Scope, utf8),
+                        scope_id => ScopeId,
+                        user_id => Uid,
+                        username => maps:get(username, User, <<>>),
+                        display_name => maps:get(display_name, User, maps:get(username, User, <<>>)),
+                        avatar_url => maps:get(avatar_url, User, <<>>),
+                        active => Active,
+                        ts => pw_util:now_ms()
+                    },
+                    pw_hub:broadcast(Key, Event),
+                    {ok, State};
+                error -> {ok, State}
+            end;
+        false ->
+            %% Typing is deliberately best-effort. Invalid or over-rate events are
+            %% dropped instead of turning a harmless UI hint into a chat error.
+            {ok, State}
+    end;
+handle_msg(#{<<"type">> := <<"voice_join">>, <<"channel_id">> := Cid0}, State=#{uid:=Uid}) ->
+    Cid = pw_util:int(Cid0),
+    case {pw_db:voice_access(Uid, Cid), pw_db:channel_identity(Uid, Cid)} of
+        {true, {ok, VoiceProfile}} ->
             S1 = maybe_leave_rtc(State),
-            case pw_hub:voice_join(Cid, Uid, self(), maps:get(user,Session)) of
-                ok -> {ok, S1#{voice=>Cid, call=>undefined}};
+            case pw_hub:voice_join(Cid, Uid, self(), VoiceProfile) of
+                ok -> {ok, S1#{voice=>Cid, voice_profile=>VoiceProfile, call=>undefined}};
                 {error, Reason} -> reply_rtc_error(S1, Reason, voice, Cid)
             end;
-        false -> reply_rtc_error(State, forbidden, voice, Cid)
+        _ -> reply_rtc_error(State, forbidden, voice, Cid)
     end;
-handle_msg(#{<<"type">> := <<"voice_leave">>}, State) -> S1 = maybe_leave_voice(State), {ok, S1#{voice=>undefined}};
-handle_msg(#{<<"type">> := <<"voice_state">>, <<"patch">> := Patch}, State=#{uid:=Uid, session:=Session, voice:=Cid}) when is_integer(Cid), is_map(Patch) ->
-    pw_hub:voice_state(Cid, Uid, self(), clean_room_patch(Patch), maps:get(user,Session)), {ok, State};
+handle_msg(#{<<"type">> := <<"voice_leave">>}, State) -> S1 = maybe_leave_voice(State), {ok, S1#{voice=>undefined, voice_profile=>undefined}};
+handle_msg(#{<<"type">> := <<"voice_state">>, <<"patch">> := Patch}, State=#{uid:=Uid, voice:=Cid}) when is_integer(Cid), is_map(Patch) ->
+    VoiceProfile = maps:get(voice_profile, State, #{}),
+    pw_hub:voice_state(Cid, Uid, self(), clean_room_patch(Patch), VoiceProfile), {ok, State};
 handle_msg(#{<<"type">> := <<"voice_signal">>, <<"to_user_id">> := To0, <<"signal">> := Sig}, State=#{uid:=Uid, voice:=Cid}) when is_integer(Cid) ->
     case {pw_util:int(To0), signal_ok(Sig)} of
         {To, true} when is_integer(To), To > 0 -> pw_hub:voice_signal(Cid, Uid, self(), To, Sig), {ok, State};
@@ -222,7 +263,7 @@ websocket_info(revalidate_auth, State0) ->
         {error, expired} -> {stop, State0}
     end;
 websocket_info({hub_json, Event=#{type := voice_superseded}}, State=#{uid:=Uid}) ->
-    deliver_hub_payload(pw_util:json(Event), voice_superseded, Uid, State#{voice => undefined});
+    deliver_hub_payload(pw_util:json(Event), voice_superseded, Uid, State#{voice => undefined, voice_profile => undefined});
 websocket_info({hub_json, Event=#{type := call_superseded}}, State=#{uid:=Uid}) ->
     deliver_hub_payload(pw_util:json(Event), call_superseded, Uid, State#{call => undefined});
 websocket_info({hub_json, Event}, State=#{uid:=Uid}) ->
@@ -278,6 +319,21 @@ can_subscribe(Uid, {direct, Id}) -> pw_db:member_of_conversation(Uid, Id);
 can_subscribe(Uid, {server, Id}) -> pw_db:member_of_server(Uid, Id);
 can_subscribe(_, {thread, Id}) -> pw_db:subscribable(thread, Id);
 can_subscribe(_, {forum, Id}) -> pw_db:subscribable(forum, Id).
+
+typing_profile(Uid, {channel, Id}, _Session) ->
+    case pw_db:channel_message_identity(Uid, Id) of
+        {ok, User} -> {ok, User};
+        _ -> error
+    end;
+typing_profile(Uid, Key, Session) ->
+    case can_type_in(Uid, Key) of
+        true -> {ok, maps:get(user, Session)};
+        false -> error
+    end.
+
+can_type_in(Uid, {direct, Id}) -> pw_db:member_of_conversation(Uid, Id);
+can_type_in(Uid, {thread, Id}) -> pw_db:member_of_thread_forum(Uid, Id);
+can_type_in(_, _) -> false.
 
 %% size isn't validation; check the signal shape too.
 signal_ok(#{<<"kind">> := <<"offer">>, <<"sdp">> := Sdp}) -> sdp_ok(Sdp);
@@ -355,12 +411,12 @@ revalidate_subscriptions(State=#{uid:=Uid, subs:=Subs}) ->
 revalidate_rooms(State=#{uid:=Uid}) ->
     S1 = case maps:get(voice, State, undefined) of
         Cid when is_integer(Cid) ->
-            case pw_db:member_of_channel(Uid, Cid) of
+            case pw_db:voice_access(Uid, Cid) of
                 true -> State;
                 _ ->
                     pw_hub:voice_leave(Cid, Uid, self()),
                     self() ! {hub_json, #{type => voice_ejected, channel_id => Cid, reason => access_revoked}},
-                    State#{voice => undefined}
+                    State#{voice => undefined, voice_profile => undefined}
             end;
         _ -> State
     end,
@@ -425,7 +481,7 @@ maybe_leave_call(State) -> State.
 maybe_leave_rtc(State) ->
     S1 = maybe_leave_voice(State),
     S2 = maybe_leave_call(S1),
-    S2#{voice => undefined, call => undefined}.
+    S2#{voice => undefined, voice_profile => undefined, call => undefined}.
 
 event_type(Map) -> maps:get(<<"type">>, Map, maps:get(type, Map, unknown)).
 
