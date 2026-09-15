@@ -16,6 +16,10 @@
 -define(TTL_MS, 3600000).
 -define(MAX_CACHE_ENTRIES, 500).
 -define(MAX_CACHE_MEM, 104857600).
+-define(MAX_FETCH_RESULTS, 4096).
+-define(FETCH_SLOT_WAIT_MS, 10000).
+-define(FETCH_RESULT_TTL_MS, 5000).
+-define(FETCH_BUDGET_GRACE_MS, 3000).
 
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
@@ -38,7 +42,7 @@ cache_data_url(<<"data:", Rest/binary>> = DataUrl) ->
                     prune_cache(Now),
                     proxy_url(SynthUrl);
                 error ->
-                    DataUrl
+                    <<>>
             end
     end;
 cache_data_url(Url) -> Url.
@@ -106,8 +110,12 @@ resolve_fetch(_Uid, Token) ->
     Key = cache_key(Url),
     Now = pw_util:now_ms(),
     case cache_lookup(Key) of
+        %% Keep compatibility with error markers written by 1.7.5-1 prerelease
+        %% builds while preserving the specific reason for all new entries.
         [{Key, <<"error">>, <<"error">>, Expires}] when Expires > Now ->
             {error, upstream_error};
+        [{Key, <<"error">>, Reason, Expires}] when Expires > Now, is_atom(Reason) ->
+            {error, Reason};
         [{Key, Body, Type, Expires}] when Expires > Now, byte_size(Body) =< ?MAX_SERVE_BYTES ->
             {ok, Body, Type};
         [{Key, _, _, Expires}] when Expires > Now ->
@@ -132,52 +140,84 @@ resolve_fetch_url(Url, Key, Now) ->
                             prune_cache(Now),
                             {ok, Body, Type};
                         false ->
+                            cache_negative(Key, too_large, Now, 3600000),
                             {error, too_large}
                     end;
                 {error, blocked_url} = Err ->
                     Err;
                 {error, unsupported_type} = Err ->
-                    ets:insert(?CACHE, {Key, <<"error">>, <<"error">>, Now + 3600000}),
+                    cache_negative(Key, unsupported_type, Now, 3600000),
                     Err;
-                Err ->
-                    %% cache upstream misery briefly; no need to pile on.
-                    ets:insert(?CACHE, {Key, <<"error">>, <<"error">>, Now + 5000}),
+                {error, Reason} = Err ->
+                    %% Cache upstream misery long enough that avatar-heavy pages
+                    %% do not stampede a dead host on every refresh. Preserve the
+                    %% reason so a cached timeout/overload keeps the same HTTP
+                    %% semantics as the first request.
+                    cache_negative(Key, Reason, Now, 30000),
                     Err
             end;
         Err ->
             Err
     end.
 
+cache_negative(Key, Reason0, Now, TtlMs) ->
+    %% httpc can return nested tuples such as {http, 500}. Never place arbitrary
+    %% terms in the content-type slot: cache reads intentionally accept only this
+    %% small atom vocabulary and collapse everything else to upstream_error.
+    Reason = cacheable_error_reason(Reason0),
+    ets:insert(?CACHE, {Key, <<"error">>, Reason, Now + TtlMs}),
+    %% Negative entries count toward the exact same memory/cardinality budget as
+    %% successful media. Without this call, unique dead URLs bypassed MAX_CACHE_ENTRIES.
+    prune_cache(Now).
+
+cacheable_error_reason(timeout) -> timeout;
+cacheable_error_reason(overloaded) -> overloaded;
+cacheable_error_reason(too_large) -> too_large;
+cacheable_error_reason(unsupported_type) -> unsupported_type;
+cacheable_error_reason(_) -> upstream_error.
+
 %% one download per URL, with a global cap. GIF stampedes are real somehow.
 coalesced_http_get(Url, Key) ->
     Now = erlang:monotonic_time(millisecond),
-    case ets:lookup(?RESULTS, Key) of
-        [{Key, Result, Expires}] when Expires > Now -> Result;
-        _ ->
+    Budget = fetch_operation_budget_ms(),
+    case fetch_result(Key, Now) of
+        {hit, Result} -> Result;
+        miss ->
             Lock = {Key, self(), Now},
             case ets:insert_new(?INFLIGHT, Lock) of
                 true ->
                     try
                         Result = bounded_http_get(Url),
-                        ets:insert(?RESULTS, {Key, Result, erlang:monotonic_time(millisecond) + 5000}),
+                        ets:insert(?RESULTS, {Key, Result, erlang:monotonic_time(millisecond) + ?FETCH_RESULT_TTL_MS}),
+                        trim_fetch_results(),
                         Result
                     after ets:delete_object(?INFLIGHT, Lock)
                     end;
                 false ->
-                    await_fetch(Key, Url, Now + 17000)
+                    await_fetch(Key, Url, Now + Budget, Budget)
             end
     end.
 
-await_fetch(Key, Url, Deadline) ->
+%% Waiters must use the same worst-case budget as the owner: the owner may spend
+%% time queued behind the global concurrency cap before its own HTTP deadline even
+%% starts. Keeping one shared budget prevents a slow-but-valid request from being
+%% declared stale while it is still inside Plainwire's configured limits.
+fetch_operation_budget_ms() ->
+    ?FETCH_SLOT_WAIT_MS + media_http_timeout_ms() + ?FETCH_BUDGET_GRACE_MS.
+
+media_http_timeout_ms() ->
+    min(30000, max(2000, pw_util:env_int("PLAINWIRE_HTTP_FETCH_TIMEOUT_MS", 8000))).
+
+await_fetch(Key, Url, Deadline, StaleAfterMs) ->
     Now = erlang:monotonic_time(millisecond),
-    case ets:lookup(?RESULTS, Key) of
-        [{Key, Result, Expires}] when Expires > Now -> Result;
-        _ when Now >= Deadline -> {error, timeout};
-        _ ->
+    case fetch_result(Key, Now) of
+        {hit, Result} -> Result;
+        miss when Now >= Deadline -> {error, timeout};
+        miss ->
             case ets:lookup(?INFLIGHT, Key) of
                 [{Key, Owner, Started}] when is_pid(Owner) ->
-                    case is_process_alive(Owner) andalso Now - Started < 20000 of
-                        true -> receive after 25 -> await_fetch(Key, Url, Deadline) end;
+                    case is_process_alive(Owner) andalso Now - Started < StaleAfterMs of
+                        true -> receive after 25 -> await_fetch(Key, Url, Deadline, StaleAfterMs) end;
                         false ->
                             ets:delete_object(?INFLIGHT, {Key, Owner, Started}),
                             coalesced_http_get(Url, Key)
@@ -186,11 +226,49 @@ await_fetch(Key, Url, Deadline) ->
             end
     end.
 
+fetch_result(Key, Now) ->
+    case ets:lookup(?RESULTS, Key) of
+        [{Key, Result, Expires}] when Expires > Now ->
+            {hit, Result};
+        [{Key, _Result, _Expires}] ->
+            %% One-off URLs should not retain dead dedupe entries indefinitely.
+            ets:delete(?RESULTS, Key),
+            miss;
+        _ ->
+            miss
+    end.
+
+%% ?RESULTS is only a short coalescing handoff cache, not durable media cache.
+%% Bound it independently so a busy long-lived node cannot accumulate one ETS
+%% row forever for every unique avatar URL it has ever seen. Under an extreme
+%% >4096-results-in-5s burst, evicting any handoff result is safe: at worst one
+%% waiter performs a duplicate bounded fetch instead of leaking memory forever.
+trim_fetch_results() ->
+    case ets:info(?RESULTS, size) of
+        Size when is_integer(Size), Size > ?MAX_FETCH_RESULTS ->
+            case ets:first(?RESULTS) of
+                '$end_of_table' -> ok;
+                EvictKey ->
+                    ets:delete(?RESULTS, EvictKey),
+                    trim_fetch_results()
+            end;
+        _ ->
+            ok
+    end.
+
 bounded_http_get(Url) ->
     Max = max(1, pw_util:env_int("PLAINWIRE_MEDIA_FETCH_CONCURRENCY", 24)),
-    acquire_fetch_slot(Max, erlang:monotonic_time(millisecond) + 10000),
-    try http_get(Url)
-    after ets:update_counter(?LIMITS, active_fetches, {2, -1}, {active_fetches, 1})
+    Deadline = erlang:monotonic_time(millisecond) + ?FETCH_SLOT_WAIT_MS,
+    case acquire_fetch_slot(Max, Deadline) of
+        ok ->
+            try http_get(Url)
+            after ets:update_counter(?LIMITS, active_fetches, {2, -1}, {active_fetches, 1})
+            end;
+        {error, overloaded} = Err ->
+            %% Return a normal bounded failure so the coalescer can publish it to
+            %% all waiters and the caller can negative-cache it. Raising here used
+            %% to strand waiters behind an owner that had already crashed out.
+            Err
     end.
 
 acquire_fetch_slot(Max, Deadline) ->
@@ -200,7 +278,7 @@ acquire_fetch_slot(Max, Deadline) ->
         false ->
             _ = ets:update_counter(?LIMITS, active_fetches, {2, -1}),
             case erlang:monotonic_time(millisecond) >= Deadline of
-                true -> erlang:error(media_overloaded);
+                true -> {error, overloaded};
                 false -> receive after 20 -> acquire_fetch_slot(Max, Deadline) end
             end
     end.
@@ -234,9 +312,16 @@ validate_url(Url) ->
     case uri_string:parse(binary_to_list(Url)) of
         #{scheme := Scheme, host := Host} when Scheme =:= "http"; Scheme =:= "https" ->
             LowerHost = string:lowercase(Host),
-            case blocked_host_or_addr(LowerHost) orelse not host_allowed(LowerHost) of
-                true -> {error, blocked_url};
-                false -> ok
+            %% Reject a disallowed hostname before DNS. Aside from being faster in
+            %% production allow-list mode, this avoids pointless resolver work for
+            %% every blocked avatar on a large friends list.
+            case host_allowed(LowerHost) of
+                false -> {error, blocked_url};
+                true ->
+                    case blocked_host_or_addr(LowerHost) of
+                        true -> {error, blocked_url};
+                        false -> ok
+                    end
             end;
         _ ->
             {error, invalid_url}

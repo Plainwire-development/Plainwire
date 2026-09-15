@@ -927,7 +927,21 @@
   let wsPingTimer = null;
   let syncInFlight = null;
   let syncQueued = false;
-  let lastSyncWarningKey = '';
+  const syncRecovery = new Map();
+  const syncRecoveryPaths = {
+    friends: '/friends',
+    servers: '/servers',
+    conversations: '/conversations',
+    notifications: '/notifications',
+  };
+  const syncRecoveryComponentsByPath = Object.fromEntries(
+    Object.entries(syncRecoveryPaths).map(([component, path]) => [path, component])
+  );
+  // Recovery is component-scoped, but the status message is intentionally
+  // session-scoped. Friends + servers failing together should not produce two
+  // identical toasts while the UI is already preserving both last-good lists.
+  let syncRecoveryNoticeShown = false;
+  let authReloadScheduled = false;
   const screenSharers = new Set();
   const watchedScreens = new Set();
   // very noisy. off unless somebody actually asks for it.
@@ -1950,7 +1964,80 @@
     return body;
   };
 
-  const performApi = async ({ method = 'GET', path, body, request_id = null }) => {
+  const clearSyncRecovery = (component) => {
+    const state = syncRecovery.get(component);
+    if (state?.timer) clearTimeout(state.timer);
+    syncRecovery.delete(component);
+  };
+
+  const clearAllSyncRecovery = () => {
+    for (const component of Array.from(syncRecovery.keys())) clearSyncRecovery(component);
+    syncRecoveryNoticeShown = false;
+  };
+
+  const scheduleAuthReload = () => {
+    if (authReloadScheduled) return;
+    authReloadScheduled = true;
+    clearAllSyncRecovery();
+    debug('AUTH', 'session_expired_reload');
+    // Yield once so any current fetch/finally handlers can unwind before Elm is
+    // reinitialized into the signed-out state. This is intentionally one-shot.
+    setTimeout(() => location.reload(), 0);
+  };
+
+  const kickSyncRecovery = (component) => {
+    const current = syncRecovery.get(component);
+    if (!current || authReloadScheduled) return;
+    if (current.timer) clearTimeout(current.timer);
+    current.timer = null;
+    syncRecovery.set(component, current);
+    if (!current.inFlight) scheduleSyncRecovery(component, 0);
+  };
+
+  const scheduleSyncRecovery = (component, delay = 500) => {
+    const path = syncRecoveryPaths[component];
+    if (!path || authReloadScheduled) return;
+    const current = syncRecovery.get(component) || { attempts: 0, timer: null, inFlight: false };
+    if (current.timer || current.inFlight) return;
+    current.timer = setTimeout(async () => {
+      current.timer = null;
+      if (authReloadScheduled) return;
+      if (!navigator.onLine) {
+        syncRecovery.set(component, current);
+        scheduleSyncRecovery(component, 1500);
+        return;
+      }
+      current.inFlight = true;
+      syncRecovery.set(component, current);
+      const data = await performApi({ method: 'GET', path, silent: true });
+      // A newer full sync/direct refresh may have cleared or replaced this
+      // recovery while the request was in flight. Never resurrect stale state.
+      if (syncRecovery.get(component) !== current) return;
+      current.inFlight = false;
+      if (authReloadScheduled) return;
+      if (data !== null) {
+        debug('API', 'sync_component_recovered', { component, attempts: current.attempts });
+        clearSyncRecovery(component);
+        return;
+      }
+      current.attempts += 1;
+      if (current.attempts >= 3 && !syncRecoveryNoticeShown) {
+        syncRecoveryNoticeShown = true;
+        send(app.ports.bridgeReceive, {
+          tag: 'toast',
+          data: 'Some account data is reconnecting. Plainwire kept your existing view and will retry automatically.'
+        });
+      }
+      syncRecovery.set(component, current);
+      const nextDelay = current.attempts <= 5
+        ? Math.min(8000, 500 * (2 ** current.attempts))
+        : 30000;
+      scheduleSyncRecovery(component, nextDelay);
+    }, Math.max(0, delay));
+    syncRecovery.set(component, current);
+  };
+
+  const performApi = async ({ method = 'GET', path, body, request_id = null, silent = false }) => {
     const requestRoute = location.hash;
     const requestStarted = performance.now();
     debug('API', 'request', { method, path, body: debugApiBody(path, body) });
@@ -1969,39 +2056,68 @@
       }
       const res = await fetch('/api' + path, options);
       const json = await res.json().catch(() => ({ ok: false, error: 'bad_json' }));
-      debug('API', 'response', { method, path, status: res.status, ok: !!json.ok, duration_ms: Math.round(performance.now() - requestStarted), error: json.error });
-      if (method === 'GET' && /^\/(messages\?|thread\/|threads\?|profile\/|server\/|users\?)/.test(path) && requestRoute !== location.hash) return null;
-      if (json.ok && json.data && json.data.csrf) csrf = json.data.csrf;
-      if (json.ok && json.data && json.data.user && json.data.user.id) meId = json.data.user.id;
-      if (json.ok && json.data) updatePresenceWatch(json.data);
-      if (json.ok && path.startsWith('/sync?') && json.data?.sync_degraded) {
-        const warnings = Array.isArray(json.data.sync_warnings) ? json.data.sync_warnings.map(String).sort() : [];
-        const warningKey = warnings.join(',') || 'unknown';
-        debug('API', 'sync_degraded', { components: warnings }, 'error');
-        if (warningKey !== lastSyncWarningKey) {
-          lastSyncWarningKey = warningKey;
-          const names = warnings.length ? warnings.join(', ') : 'some account data';
-          send(app.ports.bridgeReceive, { tag: 'toast', data: `Plainwire recovered from a sync problem (${names}). Check the server log for sync_component_failed.` });
-        }
-      } else if (json.ok && path.startsWith('/sync?')) {
-        lastSyncWarningKey = '';
+      // HTTP and application envelopes must agree. Keeping one success bit avoids
+      // clearing recovery state on a non-2xx response while telling Elm the same
+      // request failed.
+      const succeeded = res.ok && json.ok === true;
+      debug('API', 'response', { method, path, status: res.status, ok: succeeded, duration_ms: Math.round(performance.now() - requestStarted), error: json.error });
+      if (res.status === 401 && json.error === 'not_authenticated' && !['/me', '/login', '/register'].includes(path)) {
+        // A retry loop cannot repair an expired authenticated session. Reload
+        // once so /me can render the signed-out shell instead of hammering
+        // every recovery path. The unauthenticated boot /me request is excluded
+        // to avoid a reload loop on the login screen.
+        scheduleAuthReload();
       }
-      if (json.ok && method === 'POST' && path === '/logout') resetTypingState({ skipNetwork: true });
-      if (json.ok && method === 'POST' && /^\/server\/\d+\/wires$/.test(path) && typeof json.data?.url === 'string' && (json.data.url.startsWith('#wire/') || json.data.url.startsWith('#invite/'))) {
+      if (method === 'GET' && /^\/(messages\?|thread\/|threads\?|profile\/|server\/|users\?)/.test(path) && requestRoute !== location.hash) return null;
+      if (succeeded && json.data && json.data.csrf) csrf = json.data.csrf;
+      if (succeeded && json.data && json.data.user && json.data.user.id) meId = json.data.user.id;
+      if (succeeded && json.data) updatePresenceWatch(json.data);
+      if (succeeded && path.startsWith('/sync?')) {
+        const warnings = Array.isArray(json.data?.sync_warnings) ? json.data.sync_warnings.map(String) : [];
+        const failed = new Set(warnings);
+        if (warnings.length) debug('API', 'sync_degraded', { components: warnings }, 'warn');
+        Object.keys(syncRecoveryPaths).forEach((component) => {
+          if (failed.has(component)) scheduleSyncRecovery(component, 250);
+          else clearSyncRecovery(component);
+        });
+        if (failed.size === 0 && syncRecovery.size === 0) syncRecoveryNoticeShown = false;
+      } else if (method === 'GET') {
+        const recoveredComponent = syncRecoveryComponentsByPath[path];
+        if (succeeded && recoveredComponent) {
+          clearSyncRecovery(recoveredComponent);
+          if (syncRecovery.size === 0) syncRecoveryNoticeShown = false;
+        } else if (!succeeded && recoveredComponent && !silent && !authReloadScheduled) {
+          // Direct list refreshes (for example opening Friends) deserve the
+          // same resilient recovery as a degraded bootstrap sync. Keep Elm's
+          // last-known-good state and retry the one failed component only.
+          scheduleSyncRecovery(recoveredComponent, 500);
+        }
+      }
+      if (succeeded && method === 'POST' && path === '/logout') {
+        clearAllSyncRecovery();
+        resetTypingState({ skipNetwork: true });
+      }
+      if (succeeded && method === 'POST' && /^\/server\/\d+\/wires$/.test(path) && typeof json.data?.url === 'string' && (json.data.url.startsWith('#wire/') || json.data.url.startsWith('#invite/'))) {
         json.data.url = new URL(json.data.url.replace('#invite/', '#wire/'), location.origin + '/').href;
       }
-      send(app.ports.apiReceive, {
-        path,
-        method,
-        request_id,
-        ok: res.ok && !!json.ok,
-        data: json.data || null,
-        error: json.error || (json.ok ? null : 'request_failed')
-      });
-      return json.ok ? json.data : null;
+      if (succeeded || !silent) {
+        send(app.ports.apiReceive, {
+          path,
+          method,
+          request_id,
+          ok: succeeded,
+          data: json.data ?? null,
+          error: json.error || (succeeded ? null : 'request_failed')
+        });
+      }
+      return succeeded ? json.data : null;
     } catch (error) {
-      debug('API', 'request_failed', { method, path, duration_ms: Math.round(performance.now() - requestStarted), error: error.message }, 'error');
-      send(app.ports.apiReceive, { path, method, request_id, ok: false, data: null, error: error.name === 'AbortError' ? 'request_timeout' : 'request_failed' });
+      debug('API', 'request_failed', { method, path, duration_ms: Math.round(performance.now() - requestStarted), error: error.message }, silent ? 'warn' : 'error');
+      const recoveryComponent = method === 'GET' ? syncRecoveryComponentsByPath[path] : undefined;
+      if (!silent && recoveryComponent && !authReloadScheduled) scheduleSyncRecovery(recoveryComponent, 500);
+      if (!silent) {
+        send(app.ports.apiReceive, { path, method, request_id, ok: false, data: null, error: error.name === 'AbortError' ? 'request_timeout' : 'request_failed' });
+      }
       return null;
     } finally {
       clearTimeout(timeout);
@@ -6960,7 +7076,10 @@
     syncMobileViewport();
     send(app.ports.onHashChange, location.hash);
   });
-  window.addEventListener('online', () => debug('NETWORK', 'browser_online'));
+  window.addEventListener('online', () => {
+    debug('NETWORK', 'browser_online');
+    Array.from(syncRecovery.keys()).forEach(kickSyncRecovery);
+  });
   window.addEventListener('offline', () => debug('NETWORK', 'browser_offline', {}, 'warn'));
   window.addEventListener('unhandledrejection', (event) => debug('ERROR', 'unhandled_promise_rejection', { error: event.reason?.message || String(event.reason) }, 'error'));
   window.addEventListener('error', (event) => {
@@ -6971,37 +7090,25 @@
     const target = event.target;
     if (!(target instanceof HTMLImageElement)) return;
 
-    const fallback = target.dataset.avatarFallback;
-    if (fallback) {
-      const retries = parseInt(target.dataset.avatarTries || '0', 10);
-      if (retries < 3) {
-        target.dataset.avatarTries = String(retries + 1);
-        setTimeout(() => {
-          const originalSrc = target.dataset.avatarSrc || target.src;
-          if (originalSrc) {
-            target.src = originalSrc;
-            target.classList.remove('image-failed');
-            target.classList.add('avatar-retrying');
-            setTimeout(() => target.classList.remove('avatar-retrying'), 1000);
-          }
-        }, Math.pow(2, retries) * 1000);
-        return;
-      }
+    const fallback = String(target.dataset.avatarFallback || '').trim();
+    if (fallback && target.dataset.fallbackApplied !== '1') {
+      const initial = fallback.slice(0, 1).toUpperCase();
       const palette = ['#5865f2', '#3b82f6', '#16877a', '#37854f', '#9a6716', '#b64d6b', '#7c5bb5', '#a75432'];
-      const replacement = document.createElement('div');
-      replacement.className = target.className + ' image-failed';
-      replacement.textContent = String(fallback).slice(0, 1).toUpperCase();
-      replacement.style.backgroundColor = palette[(String(fallback).codePointAt(0) || 0) % palette.length];
-      replacement.style.color = '#fff';
-      replacement.setAttribute('role', 'img');
-      replacement.setAttribute('aria-label', 'Avatar unavailable');
-      target.replaceWith(replacement);
-    } else {
-      target.removeAttribute('src');
+      const color = palette[(initial.codePointAt(0) || 0) % palette.length];
+      const safeInitial = initial.replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[ch]);
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96"><rect width="96" height="96" rx="22" fill="${color}"/><text x="48" y="55" text-anchor="middle" dominant-baseline="middle" font-family="system-ui,sans-serif" font-size="38" font-weight="700" fill="white">${safeInitial}</text></svg>`;
+      target.dataset.fallbackApplied = '1';
       target.removeAttribute('srcset');
-      target.alt = '';
+      target.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
       target.classList.add('image-failed');
+      target.alt = `${fallback} avatar`;
+      return;
     }
+
+    target.removeAttribute('src');
+    target.removeAttribute('srcset');
+    target.alt = '';
+    target.classList.add('image-failed');
   }, true);
 
   navigator.mediaDevices?.addEventListener?.('devicechange', publishAudioDevices);

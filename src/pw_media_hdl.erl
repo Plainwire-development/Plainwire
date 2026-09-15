@@ -22,14 +22,17 @@ authenticate_and_serve(Req0, HeadOnly) ->
         {ok, Uid} ->
             Path = cowboy_req:path(Req0),
             Token = extract_token(Path),
-            case pw_rate:allow({media, pw_util:ip(Req0), Uid}, 300, 60000) of
+            MediaLimit = min(5000, max(120, pw_util:env_int("PLAINWIRE_MEDIA_REQUESTS_PER_MINUTE", 1200))),
+            case pw_rate:allow({media, pw_util:ip(Req0), Uid}, MediaLimit, 60000) of
                 false ->
                     pw_util:err_json(Req0, 429, <<"rate_limited">>);
                 true ->
                     serve(Req0, Uid, Token, HeadOnly)
             end;
+        {error, no_session} ->
+            pw_util:err_json(Req0, 401, <<"not_authenticated">>);
         {error, _} ->
-            pw_util:err_json(Req0, 401, <<"not_authenticated">>)
+            pw_util:err_json(Req0, 503, <<"database_unavailable">>)
     end.
 
 serve(Req0, Uid, Token, HeadOnly) ->
@@ -61,6 +64,8 @@ serve(Req0, Uid, Token, HeadOnly) ->
             pw_util:err_json(Req0, 415, <<"unsupported_media_type">>);
         {error, timeout} ->
             pw_util:err_json(Req0, 504, <<"media_timeout">>);
+        {error, overloaded} ->
+            pw_util:err_json(Req0, 503, <<"media_overloaded">>);
         {error, _} ->
             pw_util:err_json(Req0, 502, <<"fetch_failed">>)
     end.

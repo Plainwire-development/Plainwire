@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
-const [bridge, elm, api, db, ws, cluster, clusterWire, clusterLocal, klipy, config, mediaHdl, uploadGc, uploadHdl, makefile] = await Promise.all([
+const [bridge, elm, api, db, ws, cluster, clusterWire, clusterLocal, klipy, config, media, mediaHdl, util, uploadGc, uploadHdl, makefile] = await Promise.all([
   readFile('priv/static/elm-bridge.js', 'utf8'),
   readFile('priv/static/elm/src/Main.elm', 'utf8'),
   readFile('src/pw_api.erl', 'utf8'),
@@ -12,7 +12,9 @@ const [bridge, elm, api, db, ws, cluster, clusterWire, clusterLocal, klipy, conf
   readFile('src/pw_cluster_local.erl', 'utf8'),
   readFile('src/pw_klipy.erl', 'utf8'),
   readFile('src/pw_client_config.erl', 'utf8'),
+  readFile('src/pw_media.erl', 'utf8'),
   readFile('src/pw_media_hdl.erl', 'utf8'),
+  readFile('src/pw_util.erl', 'utf8'),
   readFile('src/pw_upload_gc.erl', 'utf8'),
   readFile('src/pw_upload_hdl.erl', 'utf8'),
   readFile('Makefile', 'utf8')
@@ -35,7 +37,7 @@ assert.match(ws, /<<"typing">>[\s\S]*can_type_in/, 'server validates typing scop
 assert.match(bridge, /BroadcastChannel\('plainwire-typing-v1'\)/, 'same-account tabs coordinate typing claims');
 assert.match(bridge, /if \(value\.type === 'ping' \|\| value\.type === 'typing'\) return;/, 'typing packets are never replayed from the websocket queue');
 assert.match(bridge, /resetTypingState\(\{ skipNetwork: true \}\);[\s\S]*wsReconnectAttempt/, 'websocket epoch changes clear stale typing state before reconnect');
-assert.match(bridge, /path === '\/logout'\) resetTypingState/, 'logout clears typing state immediately');
+assert.match(bridge, /path === '\/logout'[\s\S]*clearAllSyncRecovery\(\);[\s\S]*resetTypingState/, 'logout clears sync recovery and typing state immediately');
 assert.match(bridge, /access_revoked[\s\S]*clearRemoteTyping/, 'access revocation clears typing indicators for the revoked scope');
 assert.match(db, /channel_message_identity\(Uid, ChannelId\)/, 'send-capable channel realtime identity has a dedicated backend read');
 assert.match(db, /COALESCE\(NULLIF\(sm\.nickname,''\),u\.display_name\)/, 'channel messages prefer the server nickname without changing direct-message identity');
@@ -112,6 +114,17 @@ assert.match(mediaHdl, /<<"HEAD">> -> authenticate_and_serve/, 'media proxy expl
 assert.match(mediaHdl, /cowboy_req:reply\(405/, 'media proxy rejects unsupported HTTP methods');
 assert.match(mediaHdl, /sha256_hex\(Body\)/, 'media ETags track representation bytes rather than stable URL tokens');
 assert.match(mediaHdl, /private, max-age=3600/, 'authenticated media is not marked public/immutable');
+assert.match(media, /fetch_operation_budget_ms\(\)[\s\S]*FETCH_SLOT_WAIT_MS[\s\S]*media_http_timeout_ms\(\)[\s\S]*FETCH_BUDGET_GRACE_MS/, 'media coalescing waiters share the configured owner fetch budget');
+assert.doesNotMatch(media, /await_fetch\(Key, Url, Now \+ 17000\)|Now - Started < 20000/, 'media coalescing no longer uses stale hard-coded deadlines shorter than supported fetch timeouts');
+assert.match(media, /true -> \{error, overloaded\}/, 'media saturation returns a bounded result instead of crashing the coalescing owner');
+assert.match(media, /MAX_FETCH_RESULTS, 4096[\s\S]*trim_fetch_results\(\)[\s\S]*ets:info\(\?RESULTS, size\)/, 'short-lived media coalescing results have a hard memory-cardinality bound');
+assert.match(media, /fetch_result\(Key, Now\)[\s\S]*ets:delete\(\?RESULTS, Key\)/, 'expired per-URL coalescing results are removed on lookup');
+assert.match(media, /cache_negative\(Key, Reason0, Now, TtlMs\)[\s\S]*cacheable_error_reason\(Reason0\)[\s\S]*prune_cache\(Now\)/, 'negative media cache entries are normalized and share the successful-cache size and memory bounds');
+assert.match(media, /<<"error">>, Reason, Expires[\s\S]*is_atom\(Reason\)[\s\S]*\{error, Reason\}/, 'cached media failures preserve their original failure reason');
+assert.match(media, /cacheable_error_reason\(timeout\) -> timeout;[\s\S]*cacheable_error_reason\(_\) -> upstream_error/, 'arbitrary httpc failure terms cannot be mistaken for cached media content types');
+assert.match(mediaHdl, /\{error, overloaded\}[\s\S]*503[\s\S]*media_overloaded/, 'media saturation is surfaced as temporary unavailability rather than a generic upstream error');
+assert.match(media, /case safe_data_url_parse\(Rest\)[\s\S]*error ->[\s\S]*<<>>/, 'malformed data-image avatars fail closed');
+assert.match(util, /<<"data:", _\/binary>> -> pw_media:cache_data_url\(Url\)/, 'profile image mapping routes data URLs through validated media caching');
 assert.match(makefile, /^source: verify frontend backend$/m, 'source archives are compile-gated on both frontend and backend');
 
 
@@ -135,6 +148,36 @@ assert.match(db, /sync_component\(Name, Default, Fun\)[\s\S]*db_error\(Reason\)[
 assert.match(api, /\{error, internal_error\} -> pw_util:err_json\(Req0, 500, <<"internal_error">>\)/, 'auth backend failures are not mislabeled as 401');
 assert.match(ws, /\{error, no_session\}[\s\S]*reply\(401[\s\S]*\{error, Reason\}[\s\S]*reply\(503/, 'websocket distinguishes invalid sessions from backend lookup failures');
 assert.match(db, /route\(\{session, Token\}[\s\S]*\{ok, undefined\} ->[\s\S]*\{error, no_session\};[\s\S]*\{error, Reason\} ->[\s\S]*erlang:error\(\{sql_error, Reason\}\)/, 'session lookup preserves SQL failures instead of disguising them as expired authentication');
-assert.match(bridge, /sync_degraded[\s\S]*sync_component_failed/, 'degraded bootstrap is visible in client diagnostics without blocking rendering');
+assert.match(bridge, /const syncRecoveryPaths = \{[\s\S]*friends: '\/friends'[\s\S]*servers: '\/servers'/, 'degraded bootstrap has component-scoped recovery endpoints');
+assert.match(bridge, /const succeeded = res\.ok && json\.ok === true;[\s\S]*return succeeded \? json\.data : null;/, 'HTTP status and API envelope share one success definition for recovery and Elm delivery');
+assert.ok(!bridge.includes("if (json.ok && method === 'POST'"), 'post-processing uses the unified HTTP/API success definition');
+assert.match(bridge, /scheduleSyncRecovery[\s\S]*performApi\(\{ method: 'GET', path, silent: true \}\)/, 'component recovery retries quietly without replacing good UI state with error responses');
+assert.match(bridge, /inFlight: false/, 'component recovery tracks in-flight work so repeated sync warnings cannot duplicate requests');
+assert.match(bridge, /let syncRecoveryNoticeShown = false/, 'degraded component recovery coalesces its user-facing reconnect status');
+assert.match(bridge, /current\.attempts >= 3 && !syncRecoveryNoticeShown[\s\S]*syncRecoveryNoticeShown = true/, 'friends and servers cannot each emit the same recovery toast');
+assert.match(bridge, /syncRecovery\.get\(component\) !== current/, 'stale in-flight component requests cannot resurrect recovery after newer healthy state');
+assert.match(bridge, /syncRecoveryComponentsByPath/, 'successful direct component refreshes clear stale recovery state');
+assert.match(bridge, /!succeeded && recoveredComponent && !silent && !authReloadScheduled[\s\S]*scheduleSyncRecovery\(recoveredComponent, 500\)/, 'failed direct component refreshes start isolated recovery');
+assert.match(bridge, /catch \(error\)[\s\S]*recoveryComponent = method === 'GET'[\s\S]*scheduleSyncRecovery\(recoveryComponent, 500\)/, 'network failures on direct component refreshes start isolated recovery');
+assert.match(bridge, /scheduleAuthReload[\s\S]*clearAllSyncRecovery/, 'expired sessions stop component retry loops and reload once');
+assert.match(elm, /method == "GET" && List\.member tag \[ "\/friends", "\/servers", "\/notifications", "\/conversations" \]/, 'component refresh failures preserve the current view without duplicate error toasts');
+assert.match(elm, /err == "not_authenticated"[\s\S]*booting = False, authBusy = False/, 'session expiry is quiet while the bridge performs its one-shot reload');
+assert.match(bridge, /failed = new Set\(warnings\)[\s\S]*sync_degraded[\s\S]*scheduleSyncRecovery/, 'full sync schedules retries only for degraded components');
+assert.doesNotMatch(bridge, /Check the server log for sync_component_failed/, 'internal sync diagnostics are not leaked into user-facing recovery copy');
+assert.match(elm, /failed "friends"[\s\S]*model\.friends[\s\S]*data\.friends/, 'degraded friend sync preserves last-known-good friend state');
+assert.match(elm, /failed "servers"[\s\S]*model\.servers[\s\S]*data\.servers/, 'degraded server sync preserves last-known-good server state');
+assert.match(elm, /Friends ->[\s\S]*ApiGet "\/friends"/, 'opening Friends independently refreshes the friend list');
+assert.match(elm, /Just "online"[\s\S]*Just "away"[\s\S]*Just "busy"/, 'Friends Online filter recognizes only active presence states');
+assert.match(elm, /BridgeEvent "unblock_user"/, 'Friends uses the ownership-checked unblock action');
+assert.match(db, /fr\.status <> 'blocked' OR fr\.requester_id = \$1/, 'blocked list exposes only blocks created by the current user');
+assert.match(db, /map_rows_resilient\(friends[\s\S]*map_rows_resilient\(servers/, 'one malformed friend/server row cannot collapse an entire sync component');
+assert.match(db, /\{27, \[[\s\S]*ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at[\s\S]*CREATE TABLE IF NOT EXISTS channel_categories/, 'compatibility migration repairs legacy user and server schema used by bootstrap');
+assert.match(db, /ALTER TABLE friendships ADD COLUMN IF NOT EXISTS updated_at bigint NOT NULL DEFAULT 0/, 'compatibility migration repairs friend timestamps required by list ordering');
+assert.match(db, /ALTER TABLE server_member_roles ADD COLUMN IF NOT EXISTS assigned_by/, 'compatibility migration repairs role assignment ownership metadata');
+assert.match(db, /ALTER TABLE server_member_roles ADD COLUMN IF NOT EXISTS assigned_at bigint NOT NULL DEFAULT 0/, 'compatibility migration repairs role assignment timestamps');
+assert.match(elm, /attribute "data-avatar-fallback" name[\s\S]*attribute "data-avatar-fallback" s\.name/, 'avatar elements preserve the full accessible identity while deriving local fallback initials');
+assert.match(bridge, /avatarFallback[\s\S]*fallbackApplied/, 'avatar failures resolve to a local fallback instead of retry storms');
+assert.doesNotMatch(bridge, /avatarTries|avatar-retrying|replaceWith\(/, 'obsolete avatar retry/DOM replacement machinery is gone');
+assert.match(elm, /attribute "loading" "lazy"[\s\S]*attribute "fetchpriority" "low"/, 'list icons use browser-managed lazy loading instead of eager request stampedes');
 
-console.log('PASS: 1.7.5 onboarding, scoped identity, typing, moderation, forum, cluster-revocation, KLIPY, and route contracts.');
+console.log('PASS: 1.7.5-1 stabilization, onboarding, scoped identity, typing, moderation, forum, cluster-revocation, KLIPY, and route contracts.');

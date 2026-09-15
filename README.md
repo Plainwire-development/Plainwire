@@ -221,10 +221,11 @@ Deployment and update instructions are kept in [deploy/README.md](deploy/README.
 
 ## Version
 
-Current release: **1.7.5**
+Current release: **1.7.5-1**
 
 Release-specific changes are kept in the release notes rather than this README:
 
+* [1.7.5-1 release notes](RELEASE_NOTES_1.7.5-1.md)
 * [1.7.5 release notes](RELEASE_NOTES_1.7.5.md)
 * [1.7.4 release notes](RELEASE_NOTES_1.7.4.md)
 * [1.7.3 release notes](RELEASE_NOTES_1.7.3.md)

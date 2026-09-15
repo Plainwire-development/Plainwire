@@ -248,13 +248,28 @@ security_headers() ->
 
 proxied_image(Url0) ->
     Url = bin(Url0),
-    case Url of
-        <<>> -> <<>>;
-        <<"data:", _/binary>> -> pw_media:cache_data_url(Url);
-        <<"/api/media/", _/binary>> -> Url;
-        <<"http://", _/binary>> -> pw_media:proxy_url(Url);
-        <<"https://", _/binary>> -> pw_media:proxy_url(Url);
-        _ -> Url
+    %% Image presentation must never be able to take down a friends/server sync.
+    %% Legacy rows can contain malformed/oversized URLs, and the media cache may
+    %% be restarting independently of the database worker. Local file URLs are
+    %% deterministic; remote/data images fail closed to the normal UI fallback.
+    case byte_size(Url) =< 17825792 of
+        false -> <<>>;
+        true ->
+            try
+                case Url of
+                    <<>> -> <<>>;
+                    <<"data:", _/binary>> -> pw_media:cache_data_url(Url);
+                    <<"/api/media/", _/binary>> -> Url;
+                    <<"/api/files/", _/binary>> -> Url;
+                    <<"http://", _/binary>> when byte_size(Url) =< 8192 -> pw_media:proxy_url(Url);
+                    <<"https://", _/binary>> when byte_size(Url) =< 8192 -> pw_media:proxy_url(Url);
+                    <<"http://", _/binary>> -> <<>>;
+                    <<"https://", _/binary>> -> <<>>;
+                    _ -> Url
+                end
+            catch
+                _:_ -> <<>>
+            end
     end.
 
 safe_image_data_url(Url) when is_binary(Url), byte_size(Url) =< 17825792 ->

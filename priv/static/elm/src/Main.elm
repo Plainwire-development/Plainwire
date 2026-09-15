@@ -574,6 +574,22 @@ update msg model =
                 ( "/sync?since=0", _ ) ->
                     handleSync val model
 
+                ( "/friends", "GET" ) ->
+                    handleList (D.list (D.maybe decodeFriend) |> D.map (List.filterMap identity)) (\items m -> { m | friends = items }) val model
+
+                ( "/servers", "GET" ) ->
+                    handleList (D.list (D.maybe decodeServer) |> D.map (List.filterMap identity)) (\items m -> { m | servers = items }) val model
+
+                ( "/notifications", "GET" ) ->
+                    handleList (D.list (D.maybe decodeNotification) |> D.map (List.filterMap identity)) (\items m -> { m | notifs = items }) val model
+
+                ( "/conversations", "GET" ) ->
+                    handleList
+                        (D.list (D.maybe decodeConversation) |> D.map (List.filterMap identity))
+                        (\items m -> { m | convs = sortConvs (mergeConversationDetails m.convs items) })
+                        val
+                        model
+
                 ( "/forums", "GET" ) ->
                     handleList (D.list decodeForum) (\items m -> { m | forums = items }) val model
 
@@ -732,8 +748,18 @@ update msg model =
             else if String.startsWith "/users?q=" tag then
                 ( { model | friendSearchAttempted = False, toast = Just "Search is temporarily unavailable. Please try again." }, Cmd.none )
 
-            else if err == "not_authenticated" && model.me == Nothing then
-                ( { model | booting = False }, Cmd.none )
+            else if method == "GET" && List.member tag [ "/friends", "/servers", "/notifications", "/conversations" ] then
+                -- These list endpoints are refreshed independently by the bridge when
+                -- bootstrap sync degrades. Keep the last known-good model and avoid a
+                -- duplicate error toast; prolonged recovery is surfaced once by the
+                -- bridge with a calm connection-status message.
+                ( model, Cmd.none )
+
+            else if err == "not_authenticated" then
+                -- The bridge performs a one-shot reload for an expired authenticated
+                -- session. Do not flash a generic request error while that transition
+                -- is already in progress; /me will render the signed-out shell.
+                ( { model | booting = False, authBusy = False }, Cmd.none )
 
             else
                 let
@@ -2026,20 +2052,46 @@ handleSync val model =
     case D.decodeValue decodeSyncData val of
         Ok data ->
             let
+                failed name =
+                    List.member name data.syncWarnings
+
+                nextConvs =
+                    if failed "conversations" then
+                        model.convs
+
+                    else
+                        sortConvs (mergeConversationDetails model.convs data.conversations)
+
                 nextModel =
                     { model
-                        | notifs = data.notifications
-                        , convs = sortConvs (mergeConversationDetails model.convs data.conversations)
-                        , servers = data.servers
-                        , friends = data.friends
+                        | notifs =
+                            if failed "notifications" then
+                                model.notifs
+
+                            else
+                                data.notifications
+                        , convs = nextConvs
+                        , servers =
+                            if failed "servers" then
+                                model.servers
+
+                            else
+                                data.servers
+                        , friends =
+                            if failed "friends" then
+                                model.friends
+
+                            else
+                                data.friends
                         , serverTime = data.now
                     }
 
                 redirectIfGone =
                     case model.active of
                         DmView id ->
-                            if List.any (\c -> c.id == id) data.conversations then
-                                -- conversation found, clear any pending flag
+                            if failed "conversations" || List.any (\c -> c.id == id) nextConvs then
+                                -- A degraded conversation sync must never throw the user
+                                -- out of a chat that was valid one request ago.
                                 ( { nextModel | pendingConversationId = Nothing }, Cmd.none )
 
                             else if model.pendingConversationId == Just id then
@@ -2717,6 +2769,9 @@ handleInviteJoin val model =
 routeCmd : ActiveRoute -> Cmd Msg
 routeCmd active =
     case active of
+        Friends ->
+            apiSend (encodeApiRequest (ApiGet "/friends"))
+
         Forums ->
             apiSend (encodeApiRequest (ApiGet "/forums"))
 
@@ -6165,7 +6220,12 @@ avatarColor name =
 
 
 avatarImg : String -> String -> String -> Html Msg
-avatarImg url name cls =
+avatarImg =
+    avatarImgWithLoading "lazy"
+
+
+avatarImgWithLoading : String -> String -> String -> String -> Html Msg
+avatarImgWithLoading loadingMode url name cls =
     if String.isEmpty url then
         div [ class ("avatar " ++ cls), style "background-color" (avatarColor name), style "color" "#ffffff" ]
             [ text (String.left 1 (String.toUpper name)) ]
@@ -6175,9 +6235,17 @@ avatarImg url name cls =
             [ class ("avatar " ++ cls)
             , src url
             , alt (name ++ " avatar")
+            , style "background-color" (avatarColor name)
             , attribute "decoding" "async"
-            , attribute "loading" "lazy"
-            , attribute "data-avatar-fallback" (String.left 1 (String.toUpper name))
+            , attribute "loading" loadingMode
+            , attribute "fetchpriority"
+                (if loadingMode == "eager" then
+                    "high"
+
+                 else
+                    "low"
+                )
+            , attribute "data-avatar-fallback" name
             , attribute "data-avatar-src" url
             ]
             []
@@ -6204,7 +6272,7 @@ presenceAvatar statuses userId url name cls =
                     "Offline"
     in
     div [ class "presence-avatar", title label, attribute "aria-label" (name ++ "  -  " ++ label) ]
-        [ avatarImg url name cls
+        [ avatarImgWithLoading "lazy" url name cls
         , span [ class ("avatar-presence-dot " ++ presence), attribute "aria-hidden" "true" ] []
         ]
 
@@ -6215,7 +6283,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.7.5", attribute "data-ui-revision" "interface-4" ]
+    div [ class "layout", attribute "data-ui-version" "1.7.5-1", attribute "data-ui-revision" "interface-4" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -6464,7 +6532,18 @@ serverIcon s =
         div [ class "server-icon" ] [ text (String.left 1 (String.toUpper s.name)) ]
 
     else
-        div [ class "server-icon" ] [ img [ src s.iconUrl, alt s.name ] [] ]
+        div [ class "server-icon", style "background-color" (avatarColor s.name) ]
+            [ img
+                [ src s.iconUrl
+                , alt s.name
+                , attribute "decoding" "async"
+                , attribute "loading" "lazy"
+                , attribute "fetchpriority" "low"
+                , attribute "data-avatar-fallback" s.name
+                , attribute "data-avatar-src" s.iconUrl
+                ]
+                []
+            ]
 
 
 renderSide : Model -> Html Msg
@@ -6650,6 +6729,9 @@ channelGroup model heading channels =
 statusClass : Dict String String -> Int -> String
 statusClass userStatuses uid =
     case Dict.get (String.fromInt uid) userStatuses of
+        Just "online" ->
+            "online"
+
         Just "busy" ->
             "busy"
 
@@ -6659,10 +6741,7 @@ statusClass userStatuses uid =
         Just "invisible" ->
             "invisible"
 
-        Just _ ->
-            "online"
-
-        Nothing ->
+        _ ->
             "offline"
 
 
@@ -7009,7 +7088,7 @@ convName c =
 convAvatar : Model -> Conversation -> Html Msg
 convAvatar model c =
     if not (String.isEmpty c.avatarUrl) then
-        img [ class "avatar", src c.avatarUrl, alt "" ] []
+        avatarImgWithLoading "lazy" c.avatarUrl (convName c) ""
 
     else if c.memberCount == 2 then
         presenceAvatar model.userStatuses c.peerId c.peerAvatarUrl (convName c) ""
@@ -7035,7 +7114,7 @@ userPanel model =
             in
             div [ class "user-panel" ]
                 [ div [ class "presence-avatar", title (statusDisplayName liveStatus), attribute "aria-label" (u.displayName ++ "  -  " ++ statusDisplayName liveStatus) ]
-                    [ avatarImg u.avatarUrl u.displayName ""
+                    [ avatarImgWithLoading "eager" u.avatarUrl u.displayName ""
                     , span [ class ("avatar-presence-dot " ++ liveStatus), attribute "aria-hidden" "true" ] []
                     ]
                 , div [ class "grow" ]
@@ -7866,7 +7945,22 @@ renderFriendsPage model =
             List.filter (\f -> f.status == "blocked") model.friends
 
         online =
-            List.filter (\f -> Dict.get (String.fromInt f.user.id) model.userStatuses /= Nothing) accepted
+            List.filter
+                (\f ->
+                    case Dict.get (String.fromInt f.user.id) model.userStatuses of
+                        Just "online" ->
+                            True
+
+                        Just "away" ->
+                            True
+
+                        Just "busy" ->
+                            True
+
+                        _ ->
+                            False
+                )
+                accepted
 
         pendingCount =
             List.length incoming + List.length outgoing
@@ -7887,12 +7981,22 @@ renderFriendsPage model =
     in
     div [ class "friends-page" ]
         [ div [ class "friends-toolbar" ]
-            [ h2 [] [ text "Friends" ]
+            [ div [ class "friends-title" ]
+                [ h2 [] [ text "Friends" ]
+                , small [ class "muted" ]
+                    [ text
+                        (String.fromInt (List.length accepted)
+                            ++ " friends · "
+                            ++ String.fromInt (List.length online)
+                            ++ " online"
+                        )
+                    ]
+                ]
             , nav [ class "friends-tabs", attribute "aria-label" "Friends sections" ]
-                [ friendTab model.friendsTab "online" "Online" 0
-                , friendTab model.friendsTab "all" "All" 0
+                [ friendTab model.friendsTab "online" "Online" (List.length online)
+                , friendTab model.friendsTab "all" "All" (List.length accepted)
                 , friendTab model.friendsTab "pending" "Pending" pendingCount
-                , friendTab model.friendsTab "blocked" "Blocked" 0
+                , friendTab model.friendsTab "blocked" "Blocked" (List.length blocked)
                 , friendTab model.friendsTab "add" "Add Friend" 0
                 ]
             ]
@@ -8128,7 +8232,7 @@ friendRow userStatuses f =
               else
                 text ""
             , if f.status == "blocked" then
-                button [ class "btn secondary", onClick (BridgeEvent "remove_friend" (E.int f.user.id)) ] [ text "Unblock" ]
+                button [ class "btn secondary", onClick (BridgeEvent "unblock_user" (E.int f.user.id)) ] [ text "Unblock" ]
 
               else
                 text ""
@@ -8139,16 +8243,16 @@ friendRow userStatuses f =
 statusLabel : Dict String String -> Int -> String
 statusLabel statuses userId =
     case Dict.get (String.fromInt userId) statuses of
+        Just "online" ->
+            "Online"
+
         Just "busy" ->
             "Do Not Disturb"
 
         Just "away" ->
             "Idle"
 
-        Just _ ->
-            "Online"
-
-        Nothing ->
+        _ ->
             "Offline"
 
 

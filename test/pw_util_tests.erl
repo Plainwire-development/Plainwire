@@ -26,6 +26,10 @@ safe_profile_image_data_urls_test() ->
     ?assertNot(pw_util:safe_image_data_url(<<"data:image/svg+xml;base64,PHN2Zz4=">>)),
     ?assertNot(pw_util:safe_image_data_url(<<"data:text/html;base64,PGgxPg==">>)).
 
+malformed_profile_data_avatar_maps_to_fallback_test() ->
+    ?assertEqual(<<>>, pw_util:proxied_image(<<"data:image/svg+xml;base64,PHN2Zz4=">>)),
+    ?assertEqual(<<>>, pw_util:proxied_image(<<"data:image/png;base64,definitely-broken">>)).
+
 
 env_bool_uses_default_for_invalid_values_test() ->
     with_env("PLAINWIRE_TEST_BOOL", "definitely-not-a-bool", fun() ->

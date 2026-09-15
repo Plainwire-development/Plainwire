@@ -25,6 +25,9 @@ assert f'attribute "data-ui-version" "{version}"' in Path('priv/static/elm/src/M
 assert f'_ -> <<"{version}">>' in Path('src/pw_client_config.erl').read_text()
 assert f'?assertEqual(<<"{version}">>, maps:get(version, Config))' in Path('test/pw_client_config_tests.erl').read_text()
 assert Path(f'RELEASE_NOTES_{version}.md').is_file()
+readme = Path('README.md').read_text()
+assert f'Current release: **{version}**' in readme
+assert f'[{version} release notes](RELEASE_NOTES_{version}.md)' in readme
 index_haml = Path('priv/static/index.haml').read_text()
 assert index_haml.count('__PLAINWIRE_VERSION__') == 2
 build_haml = Path('scripts/build-haml.sh').read_text()
@@ -46,6 +49,22 @@ for path in Path('src').glob('*.erl'):
     # compiler remains the authority; this protects source-only verification too.
     duplicate_result = re.search(r'(?m)^\s*(\{(?:error|ok),\s*[^\n]+\})\s*\n\s*\1\s*$', body)
     assert not duplicate_result, f'duplicated Erlang result expression in {path}: {duplicate_result.group(1)}'
+    # A merge artifact that repeats a top-level function head on adjacent lines
+    # is always invalid Erlang and is easy to miss in source-only environments.
+    lines = body.splitlines()
+    for idx, (left, right) in enumerate(zip(lines, lines[1:]), 1):
+        if left == right and re.fullmatch(r'[a-z][A-Za-z0-9_@]*\(.*\)(?: when .*)? ->', left):
+            raise AssertionError(f'duplicated Erlang function head in {path}:{idx}: {left}')
+authored_sources = [
+    *Path('src').glob('*.erl'),
+    *Path('priv/static/elm/src').rglob('*.elm'),
+    Path('priv/static/elm-bridge.js'), Path('priv/static/bootstrap.js'), Path('priv/static/call-health.js'),
+    *Path('native').rglob('*.c'), *Path('native').rglob('*.f90'), *Path('web').glob('*.js'),
+]
+unfinished = re.compile(r'(?i)\b(?:TODO|FIXME|XXX|unimplemented|stubbed|placeholder implementation|not implemented)\b')
+for source in authored_sources:
+    hit = unfinished.search(source.read_text())
+    assert not hit, f'unfinished marker in authored source {source}: {hit.group(0)}'
 db_source = Path('src/pw_db.erl').read_text()
 migration_ids = [int(v) for v in re.findall(r'(?m)^\s*\{(\d+), \[', db_source)]
 assert migration_ids == list(range(1, max(migration_ids) + 1)), f'non-contiguous or duplicate DB migrations: {migration_ids}'

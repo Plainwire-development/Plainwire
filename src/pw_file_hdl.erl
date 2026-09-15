@@ -7,15 +7,22 @@
 
 init(Req0, _) ->
     Id = path_id(cowboy_req:path(Req0)),
-    case {cowboy_req:method(Req0), authenticated_uid(Req0)} of
-        {<<"GET">>, {ok, Uid}} -> serve(Req0, Uid, Id, false);
-        {<<"HEAD">>, {ok, Uid}} -> serve(Req0, Uid, Id, true);
-        {_, {error, _}} -> pw_util:err_json(Req0, 401, <<"not_authenticated">>);
+    case cowboy_req:method(Req0) of
+        <<"GET">> -> authenticate_and_serve(Req0, Id, false);
+        <<"HEAD">> -> authenticate_and_serve(Req0, Id, true);
         _ -> pw_util:err_json(Req0, 405, <<"method_not_allowed">>)
     end.
 
+authenticate_and_serve(Req0, Id, Head) ->
+    case authenticated_uid(Req0) of
+        {ok, Uid} -> serve(Req0, Uid, Id, Head);
+        {error, no_session} -> pw_util:err_json(Req0, 401, <<"not_authenticated">>);
+        {error, _} -> pw_util:err_json(Req0, 503, <<"database_unavailable">>)
+    end.
+
 serve(Req0, Uid, Id, Head) ->
-    Allowed = pw_rate:allow({file_download, Uid, pw_util:ip(Req0)}, 600, 60000),
+    FileLimit = min(5000, max(120, pw_util:env_int("PLAINWIRE_FILE_REQUESTS_PER_MINUTE", 1200))),
+    Allowed = pw_rate:allow({file_download, Uid, pw_util:ip(Req0)}, FileLimit, 60000),
     Result = case Allowed andalso valid_id(Id) of
         true -> pw_upload_gc:lookup(Uid, Id);
         false -> denied

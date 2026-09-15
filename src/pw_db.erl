@@ -754,7 +754,7 @@ route({users, Q0}, Conn) ->
                 "SELECT id, username, display_name, bio, avatar_url, banner_url, status, theme, created_at, last_seen "
                 "FROM users WHERE username ILIKE $1 OR display_name ILIKE $2 "
                 "ORDER BY last_seen DESC LIMIT 40", [Like, Like]),
-            {ok, [user_map(R) || R <- Rows]}
+            {ok, map_rows_resilient(users, Rows, fun user_map/1)}
     end;
 route({profile, Viewer, UserId0}, Conn) ->
     UserId = pw_util:int(UserId0),
@@ -831,10 +831,18 @@ route({friend_remove, Uid, Target0}, Conn) ->
     Target = pw_util:int(Target0),
     case Target of
         undefined -> {error, invalid_user};
+        Uid -> {error, invalid_user};
         _ ->
             {A, B} = pair(Uid, Target),
-            _ = exec(Conn, "DELETE FROM friendships WHERE user_low = $1 AND user_high = $2", [A, B]),
-            {ok, #{removed => true}}
+            %% Generic remove/decline/cancel must never undo a block. Unblocking
+            %% is ownership checked separately so another user cannot erase it.
+            case one(Conn, "SELECT status FROM friendships WHERE user_low = $1 AND user_high = $2", [A, B]) of
+                {ok, [<<"blocked">>]} -> {error, forbidden};
+                {ok, [_]} ->
+                    ok = exec(Conn, "DELETE FROM friendships WHERE user_low = $1 AND user_high = $2 AND status <> 'blocked'", [A, B]),
+                    {ok, #{removed => true}};
+                _ -> {ok, #{removed => false}}
+            end
     end;
 route({friend_block, Uid, Target0}, Conn) ->
     Target = pw_util:int(Target0),
@@ -879,9 +887,10 @@ route({friends, Uid}, Conn) ->
     Sql = "SELECT fr.status, fr.requester_id, fr.addressee_id, u.id, u.username, u.display_name, "
           "u.bio, u.avatar_url, u.banner_url, u.status, u.theme, u.created_at, u.last_seen "
           "FROM friendships fr JOIN users u ON u.id = CASE WHEN fr.user_low = $1 THEN fr.user_high ELSE fr.user_low END "
-          "WHERE fr.user_low = $1 OR fr.user_high = $1 ORDER BY fr.updated_at DESC",
+          "WHERE (fr.user_low = $1 OR fr.user_high = $1) "
+          "AND (fr.status <> 'blocked' OR fr.requester_id = $1) ORDER BY fr.updated_at DESC",
     {ok, Rows} = rows(Conn, Sql, [Uid]),
-    {ok, [friend_map(R, Uid) || R <- Rows]};
+    {ok, map_rows_resilient(friends, Rows, fun(R) -> friend_map(R, Uid) end)};
 route({forums, Uid}, Conn) ->
     Sql = "SELECT f.id, f.slug, f.name, f.description, f.position, f.owner_id, "
            "(SELECT count(*) FROM threads t WHERE t.forum_id = f.id), "
@@ -1263,7 +1272,7 @@ route({servers, Uid}, Conn) ->
           "FROM servers s JOIN server_members sm ON sm.server_id = s.id AND sm.user_id = $1 "
           "ORDER BY sm.joined_at ASC",
     {ok, Rows} = rows(Conn, Sql, [Uid, pw_permissions:all()]),
-    {ok, [server_row_map(R) || R <- Rows]};
+    {ok, map_rows_resilient(servers, Rows, fun server_row_map/1)};
 route({create_server, Uid, Name0, Desc0}, Conn) ->
     Name = pw_util:clean_text(Name0, 80),
     Desc = pw_util:clean_text(Desc0, 280),
@@ -2090,7 +2099,7 @@ route({conversations, Uid}, Conn) ->
           "WHERE dm.hidden = false "
           "ORDER BY dt.updated_at DESC",
     {ok, Rows} = rows(Conn, Sql, [Uid]),
-    {ok, [conversation_row_map(R) || R <- Rows]};
+    {ok, map_rows_resilient(conversations, Rows, fun conversation_row_map/1)};
 route({create_conversation, Uid, Name0, UserIds0}, Conn) ->
     UserIds1 = [pw_util:int(X) || X <- ensure_list(UserIds0)],
     UserIds = lists:usort([X || X <- UserIds1, is_integer(X), X =/= Uid]),
@@ -2595,6 +2604,20 @@ route({conversation_peer_ids, Uid, Cid0}, Conn) ->
             {error, forbidden}
     end.
 
+map_rows_resilient(Name, Rows, Fun) ->
+    {Items, _} = lists:foldl(fun(Row, {Acc, Index}) ->
+        try Fun(Row) of
+            Item -> {[Item | Acc], Index + 1}
+        catch
+            Class:Reason ->
+                %% Do not log the row itself: profile/message data can be private.
+                logger:warning("[plainwire:db] row_present_failed component=~p index=~p class=~p reason=~p",
+                    [Name, Index, Class, Reason]),
+                {Acc, Index + 1}
+        end
+    end, {[], 0}, Rows),
+    lists:reverse(Items).
+
 sync_component(Name, Default, Fun) ->
     try Fun() of
         {ok, Data} -> {Data, []};
@@ -2976,6 +2999,47 @@ migrations() -> [
         "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
         "SELECT up.id, 'direct', dt.id, 0 FROM direct_threads dt JOIN uploads up ON "
         "dt.avatar_url = '/api/files/' || up.id ON CONFLICT DO NOTHING"
+    ]},
+    {27, [
+        %% Compatibility repair for installations that were upgraded by older
+        %% non-transactional migration code. Every statement is idempotent; the
+        %% normal ordered migrations remain authoritative for healthy installs.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS bio text NOT NULL DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url text NOT NULL DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS banner_url text NOT NULL DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS theme text NOT NULL DEFAULT 'system'",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at bigint NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at bigint NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen bigint NOT NULL DEFAULT 0",
+        "ALTER TABLE friendships ADD COLUMN IF NOT EXISTS created_at bigint NOT NULL DEFAULT 0",
+        "ALTER TABLE friendships ADD COLUMN IF NOT EXISTS updated_at bigint NOT NULL DEFAULT 0",
+        "CREATE INDEX IF NOT EXISTS idx_friendships_low_updated ON friendships(user_low, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_friendships_high_updated ON friendships(user_high, updated_at DESC)",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS banner_url text NOT NULL DEFAULT ''",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS accent_color text NOT NULL DEFAULT '#5865f2'",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS welcome_message text NOT NULL DEFAULT ''",
+        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS default_permissions bigint NOT NULL DEFAULT 771",
+        "ALTER TABLE server_members ADD COLUMN IF NOT EXISTS nickname text NOT NULL DEFAULT ''",
+        "ALTER TABLE server_members ADD COLUMN IF NOT EXISTS avatar_url text NOT NULL DEFAULT ''",
+        "ALTER TABLE server_members ADD COLUMN IF NOT EXISTS bio text NOT NULL DEFAULT ''",
+        "CREATE TABLE IF NOT EXISTS channel_categories(id serial PRIMARY KEY, server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, name text NOT NULL, position integer NOT NULL, created_at bigint NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_channel_categories_server ON channel_categories(server_id, position ASC, id ASC)",
+        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS category_id integer REFERENCES channel_categories(id) ON DELETE SET NULL",
+        "CREATE TABLE IF NOT EXISTS server_roles(id bigserial PRIMARY KEY, server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, name text NOT NULL, color text NOT NULL DEFAULT '#99aab5', permissions bigint NOT NULL DEFAULT 0, position integer NOT NULL DEFAULT 1, hoist boolean NOT NULL DEFAULT false, mentionable boolean NOT NULL DEFAULT false, created_at bigint NOT NULL, updated_at bigint NOT NULL)",
+        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS color text NOT NULL DEFAULT '#99aab5'",
+        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS permissions bigint NOT NULL DEFAULT 0",
+        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS position integer NOT NULL DEFAULT 1",
+        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS hoist boolean NOT NULL DEFAULT false",
+        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS mentionable boolean NOT NULL DEFAULT false",
+        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS created_at bigint NOT NULL DEFAULT 0",
+        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS updated_at bigint NOT NULL DEFAULT 0",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_server_roles_name_unique ON server_roles(server_id, lower(name))",
+        "CREATE INDEX IF NOT EXISTS idx_server_roles_order ON server_roles(server_id, position DESC, id ASC)",
+        "CREATE TABLE IF NOT EXISTS server_member_roles(server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, role_id bigint NOT NULL REFERENCES server_roles(id) ON DELETE CASCADE, assigned_by integer REFERENCES users(id) ON DELETE SET NULL, assigned_at bigint NOT NULL DEFAULT 0, PRIMARY KEY(server_id,user_id,role_id))",
+        "ALTER TABLE server_member_roles ADD COLUMN IF NOT EXISTS assigned_by integer REFERENCES users(id) ON DELETE SET NULL",
+        "ALTER TABLE server_member_roles ADD COLUMN IF NOT EXISTS assigned_at bigint NOT NULL DEFAULT 0",
+        "CREATE INDEX IF NOT EXISTS idx_server_member_roles_user ON server_member_roles(server_id,user_id,role_id)"
     ]}
 ].
 

@@ -13,6 +13,10 @@ rejects_invalid_url_schemes_test() ->
     ?assertEqual({error, invalid_url}, pw_media:validate_url(<<"data:image/png;base64,abc">>)),
     ?assertEqual({error, invalid_url}, pw_media:validate_url(<<"/local/path.png">>)).
 
+malformed_data_avatar_fails_closed_test() ->
+    ?assertEqual(<<>>, pw_media:cache_data_url(<<"data:image/svg+xml;base64,PHN2Zz4=">>)),
+    ?assertEqual(<<>>, pw_media:cache_data_url(<<"data:image/png;base64,not actually base64!">>)).
+
 legacy_proxy_token_is_decoded_then_validated_test() ->
     Token = pw_util:base64url(<<"http://127.0.0.1/image.png">>),
     ?assertEqual({error, blocked_url}, pw_media:fetch(1, Token)).

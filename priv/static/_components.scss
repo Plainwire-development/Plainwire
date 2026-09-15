@@ -2268,10 +2268,6 @@ img { max-width: 100%; }
   line-height: normal;
   text-align: center;
 }
-.avatar.avatar-retrying {
-  opacity: 0.6;
-  transition: opacity 0.3s;
-}
 
 .content {
   padding: var(--page-pad);
@@ -9095,4 +9091,41 @@ html[data-reduce-motion="true"] {
   .pw-tour-spotlight,
   .pw-tour-guide,
   .pw-onboarding-chat-layer { transition-duration: .01ms !important; }
+}
+
+/* 1.7.5 stability polish: friend state stays legible while a degraded sync
+   recovers, and image boxes paint immediately instead of flashing empty. */
+.friends-title {
+  min-width: 132px;
+  display: grid;
+  gap: 2px;
+}
+.friends-title h2 { margin: 0; }
+.friends-title small { font-size: 11px; white-space: nowrap; }
+.friends-tabs .tab-count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text2), transparent 88%);
+  color: var(--text2);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.friends-tab.active .tab-count {
+  background: color-mix(in srgb, var(--accent), transparent 80%);
+  color: var(--text1);
+}
+img.avatar, .server-icon img {
+  background: var(--bg4);
+  transition: opacity 120ms ease;
+}
+img.avatar.image-failed, .server-icon img.image-failed {
+  opacity: 1;
+}
+@media (max-width: 720px) {
+  .friends-title { min-width: 0; }
+  .friends-title small { white-space: normal; }
 }

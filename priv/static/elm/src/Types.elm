@@ -939,21 +939,25 @@ decodeNotification =
         (D.field "created_at" D.int)
 
 
-decodeSyncData : D.Decoder { notifications : List Notification, conversations : List Conversation, servers : List Server, friends : List Friend, now : Int }
+decodeSyncData : D.Decoder { notifications : List Notification, conversations : List Conversation, servers : List Server, friends : List Friend, now : Int, syncWarnings : List String }
 decodeSyncData =
-    D.map5
-        (\notifications conversations servers friends now ->
-            { notifications = notifications, conversations = conversations, servers = servers, friends = friends, now = now }
+    D.map2
+        (\core syncWarnings -> { notifications = core.notifications, conversations = core.conversations, servers = core.servers, friends = core.friends, now = core.now, syncWarnings = syncWarnings })
+        (D.map5
+            (\notifications conversations servers friends now ->
+                { notifications = notifications, conversations = conversations, servers = servers, friends = friends, now = now }
+            )
+            (D.field "notifications" (resilientList decodeNotification) |> defaultValue [])
+            (D.field "conversations" (resilientList decodeConversation) |> defaultValue [])
+            (D.field "servers" (resilientList decodeServer) |> defaultValue [])
+            (D.field "friends" (resilientList decodeFriend) |> defaultValue [])
+            (D.field "now" D.int)
         )
-        (D.field "notifications" (resilientList decodeNotification) |> defaultValue [])
-        (D.field "conversations" (resilientList decodeConversation) |> defaultValue [])
-        (D.field "servers" (resilientList decodeServer) |> defaultValue [])
-        (D.field "friends" (resilientList decodeFriend) |> defaultValue [])
-        (D.field "now" D.int)
+        (D.field "sync_warnings" (D.list D.string) |> defaultValue [])
 
 
 type alias SyncData r =
-    { r | notifications : List Notification, conversations : List Conversation, servers : List Server, friends : List Friend, now : Int }
+    { r | notifications : List Notification, conversations : List Conversation, servers : List Server, friends : List Friend, now : Int, syncWarnings : List String }
 
 
 defaultMsg : Message
