@@ -200,3 +200,7 @@ Release-specific changes are kept in the release notes rather than this README:
 ## License
 
 See the repository license file.
+
+## Notice
+
+**This partially uses AI.** but it is ***not*** vibecoded.
