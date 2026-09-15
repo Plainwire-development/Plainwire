@@ -4,19 +4,21 @@
 %% Server permissions are additive. Legacy owner/admin/member membership remains
 %% valid, while custom roles OR these bits on top. This keeps upgrades safe for
 %% existing servers and avoids surprising deny-order semantics.
--define(VIEW_CHANNELS,      1 bsl 0).
--define(SEND_MESSAGES,      1 bsl 1).
--define(MANAGE_MESSAGES,    1 bsl 2).
--define(MANAGE_CHANNELS,    1 bsl 3).
--define(MANAGE_SERVER,      1 bsl 4).
--define(MANAGE_ROLES,       1 bsl 5).
--define(KICK_MEMBERS,       1 bsl 6).
--define(MANAGE_PROFILES,    1 bsl 7).
--define(CREATE_WIRES,       1 bsl 8).
--define(VOICE_CONNECT,      1 bsl 9).
--define(MANAGE_WIRES,       1 bsl 11).
--define(MENTION_EVERYONE,   1 bsl 12).
--define(ADMINISTRATOR,      1 bsl 30).
+%% Parentheses are load-bearing: these expand into bor/band expressions, where
+%% bsl shares precedence with bor and binds looser than band.
+-define(VIEW_CHANNELS,      (1 bsl 0)).
+-define(SEND_MESSAGES,      (1 bsl 1)).
+-define(MANAGE_MESSAGES,    (1 bsl 2)).
+-define(MANAGE_CHANNELS,    (1 bsl 3)).
+-define(MANAGE_SERVER,      (1 bsl 4)).
+-define(MANAGE_ROLES,       (1 bsl 5)).
+-define(KICK_MEMBERS,       (1 bsl 6)).
+-define(MANAGE_PROFILES,    (1 bsl 7)).
+-define(CREATE_WIRES,       (1 bsl 8)).
+-define(VOICE_CONNECT,      (1 bsl 9)).
+-define(MANAGE_WIRES,       (1 bsl 11)).
+-define(MENTION_EVERYONE,   (1 bsl 12)).
+-define(ADMINISTRATOR,      (1 bsl 30)).
 
 all() ->
     ?VIEW_CHANNELS bor ?SEND_MESSAGES bor ?MANAGE_MESSAGES bor ?MANAGE_CHANNELS bor
