@@ -570,8 +570,10 @@ route({session, Token}, Conn) ->
                            csrf => Csrf, server_time => Now},
                     ets:insert(?SESSION_CACHE, {H, Session, session_cache_expiry(Now, ExpiresAt)}),
                     {ok, Session};
-                _ ->
-                    {error, no_session}
+                {ok, undefined} ->
+                    {error, no_session};
+                {error, Reason} ->
+                    erlang:error({sql_error, Reason})
             end
     end;
 route({logout, Token}, Conn) ->
@@ -718,20 +720,29 @@ route({update_theme, Uid, Theme0}, Conn) ->
     {ok, #{theme => Theme}};
 route({sync, Uid, Since0}, Conn) ->
     Since = case pw_util:int(Since0) of undefined -> 0; I -> I end,
-    Notifs = case Since > 0 of
-        true ->
-            {ok, Rows} = rows(Conn, "SELECT id, kind, body, url, seen, created_at FROM notifications WHERE user_id = $1 AND created_at > $2 ORDER BY id DESC LIMIT 120", [Uid, Since]),
-            {ok, [notification_map(R) || R <- Rows]};
-        false ->
-            route({notifications, Uid}, Conn)
-    end,
-    {ok, Convs} = route({conversations, Uid}, Conn),
-    {ok, Servers} = route({servers, Uid}, Conn),
-    {ok, Friends} = route({friends, Uid}, Conn),
+    %% Bootstrap must not be all-or-nothing. A malformed legacy row or a
+    %% permanent query/schema bug in one panel used to turn /api/sync into a
+    %% blank-app 500 and then make the reconnecting WebSocket look logged out.
+    %% Keep transient database failures fatal so the outer reconnect/retry path
+    %% still does the right thing; isolate only permanent component failures.
+    {Notifs, W1} = sync_component(notifications, [], fun() ->
+        case Since > 0 of
+            true ->
+                case rows(Conn, "SELECT id, kind, body, url, seen, created_at FROM notifications WHERE user_id = $1 AND created_at > $2 ORDER BY id DESC LIMIT 120", [Uid, Since]) of
+                    {ok, Rows} -> {ok, [notification_map(R) || R <- Rows]};
+                    {error, Reason} -> erlang:error({sql_error, Reason})
+                end;
+            false -> route({notifications, Uid}, Conn)
+        end
+    end),
+    {Convs, W2} = sync_component(conversations, [], fun() -> route({conversations, Uid}, Conn) end),
+    {Servers, W3} = sync_component(servers, [], fun() -> route({servers, Uid}, Conn) end),
+    {Friends, W4} = sync_component(friends, [], fun() -> route({friends, Uid}, Conn) end),
+    Warnings = W1 ++ W2 ++ W3 ++ W4,
     {ok, #{now => pw_util:now_ms(), since => Since,
-          notifications => case Notifs of {ok, N} -> N; _ -> [] end,
-          conversations => Convs,
-          servers => Servers, friends => Friends}};
+          notifications => Notifs, conversations => Convs,
+          servers => Servers, friends => Friends,
+          sync_degraded => (Warnings =/= []), sync_warnings => Warnings}};
 route({users, Q0}, Conn) ->
     Q = pw_util:clean_text(Q0, 80),
     case byte_size(Q) >= 2 of
@@ -2325,7 +2336,6 @@ route({deny_message_request, Uid, Cid0}, Conn) ->
     Result = with_tx(Conn, fun() ->
         case one(Conn, "SELECT request_state FROM direct_members WHERE thread_id = $1 AND user_id = $2 FOR UPDATE", [Cid, Uid]) of
             {ok, [<<"pending">>]} ->
-                Now = pw_util:now_ms(),
                 {ok, MemberRows} = rows(Conn, "SELECT user_id, muted FROM direct_members WHERE thread_id = $1", [Cid]),
                 MemberIds = [MemberId || [MemberId, _Muted] <- MemberRows],
                 NotifyIds = [MemberId || [MemberId, false] <- MemberRows, MemberId =/= Uid],
@@ -2583,6 +2593,25 @@ route({conversation_peer_ids, Uid, Cid0}, Conn) ->
             {ok, [only_id(R) || R <- Rows]};
         false ->
             {error, forbidden}
+    end.
+
+sync_component(Name, Default, Fun) ->
+    try Fun() of
+        {ok, Data} -> {Data, []};
+        {error, Reason} ->
+            logger:error("[plainwire:db] sync_component_failed component=~p reason=~p", [Name, Reason]),
+            {Default, [atom_to_binary(Name, utf8)]};
+        Other ->
+            logger:error("[plainwire:db] sync_component_failed component=~p unexpected=~p", [Name, Other]),
+            {Default, [atom_to_binary(Name, utf8)]}
+    catch
+        Class:Reason:Stack ->
+            case db_error(Reason) of
+                true -> erlang:raise(Class, Reason, Stack);
+                false ->
+                    logger:error("[plainwire:db] sync_component_failed component=~p class=~p reason=~p stack=~p", [Name, Class, Reason, Stack]),
+                    {Default, [atom_to_binary(Name, utf8)]}
+            end
     end.
 
 invalidate_upload_authz_users(Uids) ->
@@ -3909,7 +3938,7 @@ server_member_is_owner(Conn, Sid, Uid) ->
         _ -> false
     end.
 
-can_moderate_server_member(Conn, Actor, Sid, Target) when Actor =:= Target -> false;
+can_moderate_server_member(_Conn, Actor, _Sid, Target) when Actor =:= Target -> false;
 can_moderate_server_member(Conn, Actor, Sid, Target) ->
     not server_member_is_owner(Conn, Sid, Target) andalso
     (server_member_is_owner(Conn, Sid, Actor) orelse server_member_rank0(Conn, Sid, Actor) > server_member_rank0(Conn, Sid, Target)).
@@ -4087,9 +4116,6 @@ notify_mention(Conn, Uid, Body, Url, Event, Now) ->
     create_notification(Conn, Uid, <<"mention">>, pw_util:clean_text(Body, 180), Url, Now),
     pw_hub:notify_user(Uid, Event).
 
-notify_channel_members(Conn, Sid, Sender, Cid, Msg, Now) ->
-    notify_channel_members(Conn, Sid, Sender, Cid, Msg, Now, false).
-
 notify_channel_members(Conn, Sid, Sender, Cid, Msg, Now, SuppressMentions) ->
     Body = maps:get(body, Msg),
     {ok, MemberRows} = rows(Conn, "SELECT user_id FROM server_members WHERE server_id = $1 AND user_id <> $2", [Sid, Sender]),
@@ -4188,9 +4214,6 @@ best_effort_missed_call_notifications(Conn, Cid, Caller, Msg, Now) ->
         error_logger:error_msg("missed-call notification failure ~p:~p ~p cid=~p caller=~p~n", [C,R,S,Cid,Caller]),
         ok
     end.
-
-notify_direct_members(Conn, Cid, Sender, Event, Now) ->
-    notify_direct_members(Conn, Cid, Sender, Event, Now, false).
 
 notify_direct_members(Conn, Cid, Sender, Event, Now, SuppressMentions) ->
     Msg = maps:get(message, Event, #{}),

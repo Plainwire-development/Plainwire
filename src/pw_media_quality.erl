@@ -174,5 +174,6 @@ failed(S) ->
     S#{port => undefined, active => undefined, queue => queue:new(), retry_ms => min(30000, Delay * 2)}.
 reply(Job, Result) ->
     maps:get(pid, Job) ! {quality_result, maps:get(request, Job), maps:get(peer, Job), Result}.
-close_port(Port) when is_port(Port) -> catch erlang:port_close(Port), ok;
+close_port(Port) when is_port(Port) ->
+    try erlang:port_close(Port) of _ -> ok catch error:badarg -> ok end;
 close_port(_) -> ok.

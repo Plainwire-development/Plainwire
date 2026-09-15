@@ -126,4 +126,15 @@ assert.match(db, /route\(\{create_channel[\s\S]*with_tx\(Conn[\s\S]*SELECT id FR
 assert.match(db, /route\(\{create_category[\s\S]*with_tx\(Conn[\s\S]*SELECT id FROM servers WHERE id = \$1 FOR UPDATE[\s\S]*category_created/, 'category position allocation is serialized across API nodes');
 assert.match(db, /best_effort_user_notification\(Conn[\s\S]*catch C:R:S/, 'single-recipient notification failures cannot masquerade as failed committed mutations');
 
+
+// Bootstrap/runtime failures are isolated instead of blanking the whole app or
+// being misreported as an authentication failure.
+assert.match(db, /sync_component\(notifications[\s\S]*sync_component\(conversations[\s\S]*sync_component\(servers[\s\S]*sync_component\(friends/, 'full sync isolates independent data components');
+assert.match(db, /sync_degraded => \(Warnings =\/= \[\]\), sync_warnings => Warnings/, 'sync reports degraded components without changing the success envelope');
+assert.match(db, /sync_component\(Name, Default, Fun\)[\s\S]*db_error\(Reason\)[\s\S]*erlang:raise/, 'transient DB failures still escape to the reconnect/retry path');
+assert.match(api, /\{error, internal_error\} -> pw_util:err_json\(Req0, 500, <<"internal_error">>\)/, 'auth backend failures are not mislabeled as 401');
+assert.match(ws, /\{error, no_session\}[\s\S]*reply\(401[\s\S]*\{error, Reason\}[\s\S]*reply\(503/, 'websocket distinguishes invalid sessions from backend lookup failures');
+assert.match(db, /route\(\{session, Token\}[\s\S]*\{ok, undefined\} ->[\s\S]*\{error, no_session\};[\s\S]*\{error, Reason\} ->[\s\S]*erlang:error\(\{sql_error, Reason\}\)/, 'session lookup preserves SQL failures instead of disguising them as expired authentication');
+assert.match(bridge, /sync_degraded[\s\S]*sync_component_failed/, 'degraded bootstrap is visible in client diagnostics without blocking rendering');
+
 console.log('PASS: 1.7.5 onboarding, scoped identity, typing, moderation, forum, cluster-revocation, KLIPY, and route contracts.');

@@ -31,9 +31,11 @@ admin_default() -> all().
 
 sanitize(Value) when is_integer(Value), Value >= 0 -> Value band all();
 sanitize(Value) ->
-    case catch binary_to_integer(pw_util:bin(Value)) of
-        I when is_integer(I), I >= 0 -> I band all();
+    try binary_to_integer(pw_util:bin(Value)) of
+        I when I >= 0 -> I band all();
         _ -> 0
+    catch
+        error:badarg -> 0
     end.
 
 has(Permissions, Bit) when is_integer(Permissions), is_integer(Bit) ->

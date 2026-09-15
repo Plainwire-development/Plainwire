@@ -927,6 +927,7 @@
   let wsPingTimer = null;
   let syncInFlight = null;
   let syncQueued = false;
+  let lastSyncWarningKey = '';
   const screenSharers = new Set();
   const watchedScreens = new Set();
   // very noisy. off unless somebody actually asks for it.
@@ -1973,6 +1974,18 @@
       if (json.ok && json.data && json.data.csrf) csrf = json.data.csrf;
       if (json.ok && json.data && json.data.user && json.data.user.id) meId = json.data.user.id;
       if (json.ok && json.data) updatePresenceWatch(json.data);
+      if (json.ok && path.startsWith('/sync?') && json.data?.sync_degraded) {
+        const warnings = Array.isArray(json.data.sync_warnings) ? json.data.sync_warnings.map(String).sort() : [];
+        const warningKey = warnings.join(',') || 'unknown';
+        debug('API', 'sync_degraded', { components: warnings }, 'error');
+        if (warningKey !== lastSyncWarningKey) {
+          lastSyncWarningKey = warningKey;
+          const names = warnings.length ? warnings.join(', ') : 'some account data';
+          send(app.ports.bridgeReceive, { tag: 'toast', data: `Plainwire recovered from a sync problem (${names}). Check the server log for sync_component_failed.` });
+        }
+      } else if (json.ok && path.startsWith('/sync?')) {
+        lastSyncWarningKey = '';
+      }
       if (json.ok && method === 'POST' && path === '/logout') resetTypingState({ skipNetwork: true });
       if (json.ok && method === 'POST' && /^\/server\/\d+\/wires$/.test(path) && typeof json.data?.url === 'string' && (json.data.url.startsWith('#wire/') || json.data.url.startsWith('#invite/'))) {
         json.data.url = new URL(json.data.url.replace('#invite/', '#wire/'), location.origin + '/').href;

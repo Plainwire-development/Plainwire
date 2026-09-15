@@ -24,7 +24,7 @@ init_owner(Req0) ->
                     logger:warning("[plainwire:ws] connection_rejected reason=unauthenticated"),
                     {ok, cowboy_req:reply(401, #{}, <<"not authenticated">>, Req0), #{}};
                 Token ->
-                        case cached_session(Token) of
+                    case cached_session(Token) of
                         {ok, Session} ->
                             User = maps:get(user, Session),
                             Status = maps:get(status, User, <<"online">>),
@@ -33,7 +33,11 @@ init_owner(Req0) ->
                             {cowboy_websocket, Req0, #{session=>CleanSession, token=>Token,
                                 last_auth_check=>erlang:monotonic_time(millisecond),
                                 uid=>maps:get(id,User), subs=>[], voice=>undefined, voice_profile=>undefined, call=>undefined, status=>Status}, WsOpts};
-                        _ -> {ok, cowboy_req:reply(401, #{}, <<"not authenticated">>, Req0), #{}}
+                        {error, no_session} ->
+                            {ok, cowboy_req:reply(401, #{}, <<"not authenticated">>, Req0), #{}};
+                        {error, Reason} ->
+                            logger:error("[plainwire:ws] session_lookup_failed reason=~p", [Reason]),
+                            {ok, cowboy_req:reply(503, #{<<"retry-after">> => <<"2">>}, <<"session service unavailable">>, Req0), #{}}
                     end
             end
     end.

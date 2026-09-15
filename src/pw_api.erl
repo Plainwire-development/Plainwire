@@ -113,6 +113,7 @@ handle(Method, Path, Req0, State) ->
         {error, database_unavailable} -> pw_util:err_json(Req0, 503, <<"database_unavailable">>);
         {error, database_busy} -> pw_util:err_json(Req0, 503, <<"database_busy">>);
         {error, timeout} -> pw_util:err_json(Req0, 503, <<"database_timeout">>);
+        {error, internal_error} -> pw_util:err_json(Req0, 500, <<"internal_error">>);
         {error,_} -> pw_util:err_json(Req0, 401, <<"not_authenticated">>)
     end.
 
@@ -323,6 +324,7 @@ result(Req, ok) -> pw_util:ok_json(Req, #{ok=>true});
 result(Req, {error, database_unavailable}) -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
 result(Req, {error, database_busy}) -> pw_util:err_json(Req, 503, <<"database_busy">>);
 result(Req, {error, timeout}) -> pw_util:err_json(Req, 503, <<"database_timeout">>);
+result(Req, {error, internal_error}) -> pw_util:err_json(Req, 500, <<"internal_error">>);
 result(Req, {error, forbidden}) -> pw_util:err_json(Req, 403, <<"forbidden">>);
 result(Req, {error, not_found}) -> pw_util:err_json(Req, 404, <<"not_found">>);
 result(Req, {error, E}) when is_atom(E) -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8));
