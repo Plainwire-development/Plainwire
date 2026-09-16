@@ -2259,7 +2259,9 @@ handleThread : E.Value -> Model -> ( Model, Cmd Msg )
 handleThread val model =
     case D.decodeValue threadDetailDecoder val of
         Ok detail ->
-            ( { model | currentThread = Just detail.thread, replies = detail.replies }, Cmd.none )
+            ( { model | currentThread = Just detail.thread, replies = detail.replies }
+            , wsSend (E.object [ ( "type", E.string "subscribe" ), ( "key", E.string ("forum:" ++ String.fromInt detail.thread.forumId) ) ])
+            )
 
         Err _ ->
             ( model, Cmd.none )
@@ -3440,6 +3442,15 @@ handleWsEvent val model =
         Ok ( "friend_accept", _ ) ->
             ( model, bridgeSend (E.object [ ( "tag", E.string "silent_sync" ), ( "data", E.null ) ]) )
 
+        Ok ( "user_identity_updated", _ ) ->
+            ( model
+            , Cmd.batch
+                [ apiSend (encodeApiRequest (ApiGet "/me"))
+                , bridgeSend (E.object [ ( "tag", E.string "silent_sync" ), ( "data", E.null ) ])
+                , routeCmd model.active
+                ]
+            )
+
         Ok ( "conversation_created", _ ) ->
             ( model, bridgeSend (E.object [ ( "tag", E.string "silent_sync" ), ( "data", E.null ) ]) )
 
@@ -4313,7 +4324,7 @@ handleNotificationEvent ev model =
         Ok event ->
             if event.kind == "message_reaction" then
                 let
-                    notificationTitle =
+                    reactionTitle =
                         if String.isEmpty event.emoji then
                             "New reaction"
 
@@ -4348,7 +4359,7 @@ handleNotificationEvent ev model =
                         else
                             notify
                                 (E.object
-                                    [ ( "title", E.string notificationTitle )
+                                    [ ( "title", E.string reactionTitle )
                                     , ( "body", E.string event.body )
                                     , ( "url", E.string event.url )
                                     , ( "tag", E.string tagText )
@@ -6870,7 +6881,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.8.0", attribute "data-ui-revision" "interface-4" ]
+    div [ class "layout", attribute "data-ui-version" "1.8.1", attribute "data-ui-revision" "interface-4" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -7019,7 +7030,7 @@ renderRail model =
                 []
     in
     nav [ class "rail", attribute "aria-label" "Main navigation" ]
-        ([ button [ class "mark", type_ "button", title (model.appName ++ " home"), attribute "aria-label" (model.appName ++ " home"), onClick (Go "#") ] [ text "P" ]
+        ([ button [ class "mark", type_ "button", title (model.appName ++ " home"), attribute "aria-label" (model.appName ++ " home"), onClick (Go "#") ] []
          , railBtn "home" "Home" (model.active == Home) (Go "#")
          , railBtn "messages" "Direct messages" (isDmActive model) (Go "#dms")
          , railBtn "forums" "Forums" (model.active == Forums) (Go "#forums")
@@ -9678,7 +9689,7 @@ renderSettingsSearch query =
             , ( "voice", "Voice & audio", "Microphone, speaker, noise suppression and test" )
             , ( "sound", "Notifications", "Sounds, chimes, volume and desktop alerts" )
             , ( "privacy", "Privacy", "Drafts, local storage and preferences" )
-            , ( "account", "Account", "Password, sessions, security and connection diagnostics" )
+            , ( "account", "Account", "Username, handle, password, sessions, security and connection diagnostics" )
             ]
 
         matches =
@@ -9844,7 +9855,9 @@ renderAccountSettings user model =
             , span [ class "pill" ] [ text "Signed in" ]
             ]
         , div [ class "account-action-grid" ]
-            [ button [ class "settings-action-card", onClick (BridgeEvent "account_change_password" E.null) ]
+            [ button [ class "settings-action-card", onClick (BridgeEvent "account_change_username" (E.string user.username)) ]
+                [ b [] [ text "Change username" ], small [ class "muted" ] [ text "Change your global @handle without changing your account identity, servers, roles, or DMs." ] ]
+            , button [ class "settings-action-card", onClick (BridgeEvent "account_change_password" E.null) ]
                 [ b [] [ text "Change password" ], small [ class "muted" ] [ text "Update your password and sign out other sessions." ] ]
             , button [ class "settings-action-card", onClick (BridgeEvent "account_sessions" E.null) ]
                 [ b [] [ text "Active sessions" ], small [ class "muted" ] [ text "Review where your account is currently signed in." ] ]

@@ -3868,10 +3868,10 @@ img { max-width: 100%; }
 .auth-brand-mark {
   width: 30px;
   height: 30px;
-  border: 1px solid color-mix(in srgb, var(--accent), white 12%);
+  border: 1px solid var(--line);
   border-radius: 9px;
-  background: var(--accent);
-  box-shadow: inset 0 0 0 5px color-mix(in srgb, var(--bg2), transparent 74%);
+  background-color: #fff;
+  box-shadow: var(--shadow-sm);
 }
 
 .auth-brand-copy {
@@ -6195,7 +6195,7 @@ input[type="file"]::file-selector-button:hover { background: var(--hover); }
 }
 
 /* Native file controls are intentionally hidden. They look different on every
-   browser and were one of the last obviously unfinished parts of settings. */
+   browser and were one of the last inconsistent parts of settings. */
 .file-picker-row {
   display: flex;
   align-items: center;
@@ -9141,4 +9141,55 @@ img.avatar.image-failed, .server-icon img.image-failed {
 @media (max-width: 720px) {
   .friends-title { min-width: 0; }
   .friends-title small { white-space: normal; }
+}
+
+/* Hosted-instance announcements. Kept outside Elm so service operators can
+   publish/retire banners in realtime without coupling them to a page route. */
+:root { --pw-global-banner-offset: 0px; }
+#app {
+  height: calc(100vh - var(--pw-global-banner-offset));
+  height: calc(100dvh - var(--pw-global-banner-offset));
+  margin-top: var(--pw-global-banner-offset);
+}
+.pw-global-banner-stack {
+  position: fixed;
+  z-index: 12000;
+  inset: 0 0 auto 0;
+  display: grid;
+  gap: 1px;
+  padding-top: env(safe-area-inset-top, 0px);
+  background: var(--line, rgba(120, 128, 138, .22));
+  box-shadow: 0 1px 0 rgba(0,0,0,.12);
+}
+.pw-global-banner {
+  --banner-tone: var(--accent, #7b83ff);
+  min-height: 42px;
+  display: grid;
+  grid-template-columns: 3px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  padding: 8px max(14px, env(safe-area-inset-right, 0px)) 8px max(14px, env(safe-area-inset-left, 0px));
+  background: color-mix(in srgb, var(--bg2, #171a1f) 96%, var(--banner-tone) 4%);
+  color: var(--text, #eef0f3);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.pw-global-banner.success { --banner-tone: #67b68b; }
+.pw-global-banner.warning { --banner-tone: #d6a54a; }
+.pw-global-banner.critical { --banner-tone: #d7636e; }
+.pw-global-banner-marker { width: 3px; height: 24px; border-radius: 99px; background: var(--banner-tone); }
+.pw-global-banner-copy { min-width: 0; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.pw-global-banner-copy strong { color: var(--text, #eef0f3); font-size: 12px; font-weight: 720; }
+.pw-global-banner-copy > span { min-width: 0; color: var(--muted, #a2a8b0); overflow-wrap: anywhere; }
+.pw-global-banner-link { color: var(--text, #eef0f3); font-weight: 680; text-decoration: underline; text-underline-offset: 2px; }
+.pw-global-banner-close {
+  width: 28px; height: 28px; display: grid; place-items: center;
+  border: 0; border-radius: 7px; background: transparent; color: var(--muted, #a2a8b0);
+  font-size: 18px; line-height: 1; cursor: pointer;
+}
+.pw-global-banner-close:hover, .pw-global-banner-close:focus-visible { background: var(--bg3, rgba(255,255,255,.06)); color: var(--text, #eef0f3); }
+@media (max-width: 640px) {
+  .pw-global-banner { align-items: start; padding-block: 9px; }
+  .pw-global-banner-copy { display: grid; gap: 2px; }
+  .pw-global-banner-marker { margin-top: 1px; }
 }

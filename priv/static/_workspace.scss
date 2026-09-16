@@ -253,14 +253,14 @@ button:disabled { cursor: not-allowed; }
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
 
-.mark { position: relative; }
-.mark::after, .auth-brand-mark::after {
-  content: 'p'; display: grid; place-items: center; position: absolute; inset: 0;
-  color: var(--bg2); font: 700 28px/1 system-ui, sans-serif; background: none;
-  border: 0; transform: none; width: auto; height: auto;
+.mark, .auth-brand-mark {
+  position: relative;
+  background-image: url('/assets/plainwire-mark.svg');
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 78%;
 }
-.auth-brand-mark { position: relative; }
-.auth-brand-mark::after { font-size: 22px; }
+.mark::after, .auth-brand-mark::after { content: none; display: none; }
 .composer textarea { resize: none; }
 .auth-error { color: var(--danger); background: color-mix(in srgb, var(--danger), transparent 94%); border-color: color-mix(in srgb, var(--danger), transparent 65%); }
 .toast { top: 76px; right: 18px; bottom: auto; }

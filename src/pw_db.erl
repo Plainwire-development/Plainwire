@@ -3,7 +3,7 @@
 -export([
     start_link/0,
     health/0,
-    register/3, login/2, session/1, session_fast/1, logout/1, sessions/2, logout_other_sessions/2, change_password/4, me/1, update_profile/3, update_theme/2,
+    register/3, login/2, session/1, session_fast/1, logout/1, sessions/2, logout_other_sessions/2, change_password/4, change_username/4, me/1, update_profile/3, update_theme/2,
     onboarding/1, start_onboarding/1, update_onboarding/2, complete_onboarding/1, dismiss_onboarding/1, replay_onboarding/1,
     sync/2, users/1, profile/2, profile_by_username/2,
     friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friend_unblock/2, friends/1,
@@ -27,11 +27,14 @@
     admin_create_enrollment/6, admin_redeem_enrollment/9, admin_rotate_key/5,
     admin_operators/1, admin_set_operator_role/3, admin_remove_operator/2,
     admin_overview/0, admin_users/3, admin_user/1, admin_servers/3, admin_server/1,
-    admin_audit/2, admin_record_audit/6
+    admin_audit/2, admin_record_audit/6,
+    global_banners/0, invalidate_global_banners_cache/0, admin_banners/0, admin_create_banner/2, admin_update_banner/3, admin_delete_banner/3,
+    instance_registration_mode/0, admin_set_registration_mode/2
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -ifdef(TEST).
--export([profile_file_signature/2, extract_file_ids/1]).
+-export([profile_file_signature/2, extract_file_ids/1,
+         normalize_banner_patch/2, safe_banner_link/1, normalize_registration_mode/1]).
 -endif.
 
 -record(st, {}).
@@ -45,6 +48,8 @@
 -define(SESSION_GC_MS, 3600000).
 
 -define(SESSION_CACHE, pw_session_cache).
+-define(BANNER_CACHE, pw_global_banner_cache).
+-define(BANNER_CACHE_TTL_MS, 1000).
 
 start_link() -> gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
@@ -93,7 +98,7 @@ call(Msg) ->
 call_with_pool(Msg, #pool{conns = Conns, size = Size, counter = Counter}) ->
     case pick_connection(Conns, Size, Counter) of
         overloaded ->
-            logger:warning("[plainwire:db] pool_overloaded operation=~p", [element(1, Msg)]),
+            logger:warning("[plainwire:db] pool_overloaded operation=~p", [operation_name(Msg)]),
             {error, database_busy};
         {Idx, Conn, QueueLen} ->
             Started = erlang:monotonic_time(millisecond),
@@ -101,6 +106,9 @@ call_with_pool(Msg, #pool{conns = Conns, size = Size, counter = Counter}) ->
             try run_connection_locked(Idx, Msg, Conn, Started, QueueLen)
             after ets:update_counter(?POOL_LOAD, Idx, {2, -1}, {Idx, 1}) end
     end.
+
+operation_name(Msg) when is_tuple(Msg), tuple_size(Msg) > 0 -> element(1, Msg);
+operation_name(Msg) -> Msg.
 
 run_connection_locked(Idx, Msg, Conn, Started, QueueLen) ->
     %% epgsql locks queries, not whole transactions. lock the whole route.
@@ -150,7 +158,7 @@ log_db_latency(Msg, Started, QueueLen) ->
     Elapsed = erlang:monotonic_time(millisecond) - Started,
     SlowMs = pw_util:env_int("PLAINWIRE_DB_SLOW_MS", 250),
     case Elapsed >= SlowMs of
-        true -> logger:warning("[plainwire:db] slow operation=~p duration_ms=~p initial_queue=~p", [element(1, Msg), Elapsed, QueueLen]);
+        true -> logger:warning("[plainwire:db] slow operation=~p duration_ms=~p initial_queue=~p", [operation_name(Msg), Elapsed, QueueLen]);
         false -> ok
     end.
 
@@ -171,6 +179,7 @@ logout(T) -> call({logout, T}).
 sessions(Uid, Token) -> call({sessions, Uid, Token}).
 logout_other_sessions(Uid, Token) -> call({logout_other_sessions, Uid, Token}).
 change_password(Uid, Token, Current, New) -> call({change_password, Uid, Token, Current, New}).
+change_username(Uid, CurrentPassword, NewUsername, ExpectedUsername) -> call({change_username, Uid, CurrentPassword, NewUsername, ExpectedUsername}).
 me(Uid) -> call({me, Uid}).
 update_profile(Uid, Display, Patch) -> call({update_profile, Uid, Display, Patch}).
 update_theme(Uid, Theme) -> call({update_theme, Uid, Theme}).
@@ -300,10 +309,56 @@ admin_server(Sid) -> call({admin_server, Sid}).
 admin_audit(Limit, BeforeId) -> call({admin_audit, Limit, BeforeId}).
 admin_record_audit(ActorUid, Action, TargetType, TargetId, Detail, IpHash) ->
     call({admin_record_audit, ActorUid, Action, TargetType, TargetId, Detail, IpHash}).
+global_banners() -> global_banners_cached().
+invalidate_global_banners_cache() ->
+    try ets:delete(?BANNER_CACHE, active), ok
+    catch error:badarg -> ok end.
+
+global_banners_cached() ->
+    case cached_global_banners() of
+        {ok, Banners} -> {ok, Banners};
+        miss ->
+            %% A banner mutation wakes many clients at once. Serialize only the
+            %% short cache refill on this node so that realtime invalidation does
+            %% not turn into one identical PostgreSQL query per connected tab.
+            LockId = {{?MODULE, global_banners_cache}, self()},
+            try global:trans(LockId, fun() ->
+                case cached_global_banners() of
+                    {ok, Banners1} -> {ok, Banners1};
+                    miss -> cache_global_banners(call(global_banners))
+                end
+            end, [node()], infinity) of
+                aborted -> call(global_banners);
+                Reply -> Reply
+            catch
+                _:_ -> call(global_banners)
+            end
+    end.
+
+cached_global_banners() ->
+    Now = erlang:monotonic_time(millisecond),
+    try ets:lookup(?BANNER_CACHE, active) of
+        [{active, ExpiresAt, Banners}] when ExpiresAt > Now -> {ok, Banners};
+        _ -> miss
+    catch error:badarg -> miss end.
+
+cache_global_banners({ok, Banners} = Result) ->
+    ExpiresAt = erlang:monotonic_time(millisecond) + ?BANNER_CACHE_TTL_MS,
+    try ets:insert(?BANNER_CACHE, {active, ExpiresAt, Banners})
+    catch error:badarg -> ok end,
+    Result;
+cache_global_banners(Error) -> Error.
+admin_banners() -> call(admin_banners).
+admin_create_banner(ActorUid, Patch) -> call({admin_create_banner, ActorUid, Patch}).
+admin_update_banner(ActorUid, BannerId, Patch) -> call({admin_update_banner, ActorUid, BannerId, Patch}).
+admin_delete_banner(ActorUid, BannerId, ExpectedUpdatedAt) -> call({admin_delete_banner, ActorUid, BannerId, ExpectedUpdatedAt}).
+instance_registration_mode() -> call(instance_registration_mode).
+admin_set_registration_mode(ActorUid, Mode) -> call({admin_set_registration_mode, ActorUid, Mode}).
 
 init([]) ->
     application:ensure_all_started(inets),
     _ = ets:new(?SESSION_CACHE, [named_table, public, set, {read_concurrency, true}]),
+    _ = ets:new(?BANNER_CACHE, [named_table, public, set, {read_concurrency, true}, {write_concurrency, true}]),
     _ = ets:new(?POOL_CONNS, [named_table, public, set, {read_concurrency, true}, {write_concurrency, true}]),
     _ = ets:new(?POOL_LOAD, [named_table, public, set, {read_concurrency, true}, {write_concurrency, true}]),
     {ok, MigConn} = connect_with_retry(10, 500),
@@ -398,17 +453,6 @@ transient_db_reason(_) -> false.
 
 read_msg({register, _, _, _}) -> false;
 read_msg({login, _, _}) -> false;
-read_msg({admin_bootstrap_owner, _, _, _}) -> false;
-read_msg({admin_recover_owner, _, _, _}) -> false;
-read_msg({admin_login, _, _, _, _, _, _, _, _}) -> false;
-read_msg({admin_session, _}) -> false;
-read_msg({admin_logout, _}) -> false;
-read_msg({admin_create_enrollment, _, _, _, _, _, _}) -> false;
-read_msg({admin_redeem_enrollment, _, _, _, _, _, _, _, _, _}) -> false;
-read_msg({admin_rotate_key, _, _, _, _, _}) -> false;
-read_msg({admin_set_operator_role, _, _, _}) -> false;
-read_msg({admin_remove_operator, _, _}) -> false;
-read_msg({admin_record_audit, _, _, _, _, _, _}) -> false;
 read_msg({logout, _}) -> false;
 read_msg({logout_other_sessions, _, _}) -> false;
 read_msg({change_password, _, _, _, _}) -> false;
@@ -484,6 +528,22 @@ read_msg({abort_upload, _, _}) -> false;
 read_msg({delete_upload, _}) -> false;
 read_msg({upload_ref_backfill, _}) -> false;
 read_msg({prune_sessions, _}) -> false;
+read_msg({change_username, _, _, _, _}) -> false;
+read_msg({admin_bootstrap_owner, _, _, _}) -> false;
+read_msg({admin_recover_owner, _, _, _}) -> false;
+read_msg({admin_login, _, _, _, _, _, _, _, _}) -> false;
+read_msg({admin_session, _}) -> false; %% updates last_seen opportunistically
+read_msg({admin_logout, _}) -> false;
+read_msg({admin_create_enrollment, _, _, _, _, _, _}) -> false;
+read_msg({admin_redeem_enrollment, _, _, _, _, _, _, _, _, _}) -> false;
+read_msg({admin_rotate_key, _, _, _, _, _}) -> false;
+read_msg({admin_set_operator_role, _, _, _}) -> false;
+read_msg({admin_remove_operator, _, _}) -> false;
+read_msg({admin_record_audit, _, _, _, _, _, _}) -> false;
+read_msg({admin_create_banner, _, _}) -> false;
+read_msg({admin_update_banner, _, _, _}) -> false;
+read_msg({admin_delete_banner, _, _, _}) -> false;
+read_msg({admin_set_registration_mode, _, _}) -> false;
 read_msg(_) -> true.
 
 safe_log_msg({register, _, _, _}) -> {register, redacted};
@@ -496,9 +556,13 @@ safe_log_msg({admin_logout, _}) -> {admin_logout, redacted};
 safe_log_msg({admin_create_enrollment, Actor, Target, Role, _, Expires, _}) -> {admin_create_enrollment, Actor, Target, Role, redacted, Expires};
 safe_log_msg({admin_redeem_enrollment, _, _, _, _, _, _, _, _, _}) -> {admin_redeem_enrollment, redacted};
 safe_log_msg({admin_rotate_key, Uid, _, _, _, _}) -> {admin_rotate_key, Uid, redacted};
+safe_log_msg({admin_create_banner, ActorUid, _}) -> {admin_create_banner, ActorUid, redacted};
+safe_log_msg({admin_update_banner, ActorUid, BannerId, _}) -> {admin_update_banner, ActorUid, BannerId, redacted};
+safe_log_msg({admin_delete_banner, ActorUid, BannerId, _}) -> {admin_delete_banner, ActorUid, BannerId, redacted_revision};
 safe_log_msg({session, _}) -> {session, redacted};
 safe_log_msg({logout, _}) -> {logout, redacted};
 safe_log_msg({logout_other_sessions, Uid, _}) -> {logout_other_sessions, Uid, redacted};
+safe_log_msg({change_username, Uid, _, NewUsername, _}) -> {change_username, Uid, redacted, pw_util:normalize_username(NewUsername), redacted_expected};
 safe_log_msg({change_password, Uid, _, _, _}) -> {change_password, Uid, redacted};
 safe_log_msg({update_profile, Uid, _, _}) -> {update_profile, Uid, redacted};
 safe_log_msg({update_server, Uid, ServerId, _}) -> {update_server, Uid, ServerId, redacted};
@@ -675,7 +739,7 @@ route({admin_create_enrollment, ActorUid, TargetUsername0, RequestedRole0, Token
                 case one(Conn, "SELECT id,username,display_name FROM users WHERE username=$1 FOR UPDATE", [TargetUsername]) of
                     {ok, [TargetUid, Username, DisplayName]} ->
                         ExistingRole = case one(Conn, "SELECT role FROM admin_operators WHERE user_id=$1", [TargetUid]) of
-                            {ok, [Role]} -> Role;
+                            {ok, [ExistingRoleValue]} -> ExistingRoleValue;
                             _ -> undefined
                         end,
                         EffectiveRole = case ExistingRole of undefined -> RequestedRole; _ -> ExistingRole end,
@@ -919,6 +983,137 @@ route({admin_record_audit, ActorUid, Action0, TargetType0, TargetId0, Detail0, I
     IpHash = pw_util:clean_text(IpHash0, 128),
     admin_audit_insert(Conn, ActorUid, Action, TargetType, TargetId, Detail, IpHash, pw_util:now_ms()),
     {ok, #{recorded => true}};
+route(global_banners, Conn) ->
+    Now = pw_util:now_ms(),
+    {ok, Rows} = rows(Conn,
+        "SELECT id,title,body,severity,starts_at,ends_at,dismissible,link_label,link_url,updated_at "
+        "FROM global_banners WHERE enabled=true AND starts_at<=$1 AND (ends_at=0 OR ends_at>$1) "
+        "ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 WHEN 'success' THEN 2 ELSE 3 END, "
+        "starts_at DESC,id DESC LIMIT 32", [Now]),
+    {ok, [banner_map(Row) || Row <- Rows]};
+route(admin_banners, Conn) ->
+    {ok, Rows} = rows(Conn,
+        "SELECT b.id,b.title,b.body,b.severity,b.starts_at,b.ends_at,b.dismissible,b.link_label,b.link_url,b.enabled,"
+        "b.created_by,u.username,b.created_at,b.updated_at FROM global_banners b "
+        "LEFT JOIN users u ON u.id=b.created_by ORDER BY b.updated_at DESC,b.id DESC LIMIT 200", []),
+    {ok, [admin_banner_map(Row) || Row <- Rows]};
+route({admin_create_banner, ActorUid, Patch0}, Conn) ->
+    with_tx(Conn, fun() ->
+        case admin_can_operate(Conn, ActorUid) of
+            false -> {error, forbidden};
+            true ->
+                case normalize_banner_patch(Patch0, pw_util:now_ms()) of
+                    {error, Reason} -> {error, Reason};
+                    {ok, Banner} ->
+                        Now = pw_util:now_ms(),
+                        {ok, [BannerId]} = one(Conn,
+                            "INSERT INTO global_banners(title,body,severity,starts_at,ends_at,dismissible,link_label,link_url,enabled,created_by,created_at,updated_at) "
+                            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) RETURNING id",
+                            [maps:get(title, Banner), maps:get(body, Banner), maps:get(severity, Banner),
+                             maps:get(starts_at, Banner), maps:get(ends_at, Banner), maps:get(dismissible, Banner),
+                             maps:get(link_label, Banner), maps:get(link_url, Banner), maps:get(enabled, Banner), ActorUid, Now]),
+                        admin_audit_insert(Conn, ActorUid, <<"banner.created">>, <<"global_banner">>, integer_to_binary(BannerId),
+                                           banner_audit_detail(Banner), <<>>, Now),
+                        {ok, Banner#{id => BannerId, created_by => ActorUid, created_at => Now, updated_at => Now}}
+                end
+        end
+    end);
+route({admin_update_banner, ActorUid, BannerId0, Patch0}, Conn) ->
+    case pw_util:int(BannerId0) of
+        BannerId when is_integer(BannerId), BannerId > 0 ->
+            with_tx(Conn, fun() ->
+                case admin_can_operate(Conn, ActorUid) of
+                    false -> {error, forbidden};
+                    true ->
+                        case one(Conn,
+                            "SELECT title,body,severity,starts_at,ends_at,dismissible,link_label,link_url,enabled,updated_at "
+                            "FROM global_banners WHERE id=$1 FOR UPDATE",
+                            [BannerId]) of
+                            {ok, ExistingRow} when is_list(ExistingRow), length(ExistingRow) =:= 10 ->
+                                ExistingUpdatedAt = lists:nth(10, ExistingRow),
+                                Patch = normalize_patch_keys(Patch0),
+                                ExpectedUpdatedAt = pw_util:int(maps:get(<<"expected_updated_at">>, Patch, undefined)),
+                                case ExpectedUpdatedAt =:= ExistingUpdatedAt of
+                                    false -> {error, banner_conflict};
+                                    true ->
+                                        Existing = banner_patch_from_row(lists:sublist(ExistingRow, 9)),
+                                        case normalize_banner_patch(maps:merge(Existing, Patch), pw_util:now_ms()) of
+                                            {error, Reason} -> {error, Reason};
+                                            {ok, Banner} ->
+                                                %% updated_at doubles as the public banner revision used for
+                                                %% dismissal invalidation. Keep it strictly monotonic even if
+                                                %% two updates land inside the same millisecond.
+                                                Now = max(pw_util:now_ms(), ExistingUpdatedAt + 1),
+                                                ok = exec(Conn,
+                                                    "UPDATE global_banners SET title=$2,body=$3,severity=$4,starts_at=$5,ends_at=$6,dismissible=$7,"
+                                                    "link_label=$8,link_url=$9,enabled=$10,updated_at=$11 WHERE id=$1",
+                                                    [BannerId, maps:get(title, Banner), maps:get(body, Banner), maps:get(severity, Banner),
+                                                     maps:get(starts_at, Banner), maps:get(ends_at, Banner), maps:get(dismissible, Banner),
+                                                     maps:get(link_label, Banner), maps:get(link_url, Banner), maps:get(enabled, Banner), Now]),
+                                                admin_audit_insert(Conn, ActorUid, <<"banner.updated">>, <<"global_banner">>, integer_to_binary(BannerId),
+                                                                   banner_audit_detail(Banner), <<>>, Now),
+                                                {ok, Banner#{id => BannerId, updated_at => Now}}
+                                        end
+                                end;
+                            _ -> {error, not_found}
+                        end
+                end
+            end);
+        _ -> {error, not_found}
+    end;
+route({admin_delete_banner, ActorUid, BannerId0, ExpectedUpdatedAt0}, Conn) ->
+    BannerId = pw_util:int(BannerId0),
+    ExpectedUpdatedAt = pw_util:int(ExpectedUpdatedAt0),
+    case {BannerId, ExpectedUpdatedAt} of
+        {Id, Revision} when is_integer(Id), Id > 0, is_integer(Revision), Revision > 0 ->
+            with_tx(Conn, fun() ->
+                case admin_can_operate(Conn, ActorUid) of
+                    false -> {error, forbidden};
+                    true ->
+                        case one(Conn, "SELECT title,updated_at FROM global_banners WHERE id=$1 FOR UPDATE", [Id]) of
+                            {ok, [_Title, CurrentUpdatedAt]} when CurrentUpdatedAt =/= Revision ->
+                                {error, banner_conflict};
+                            {ok, [Title, Revision]} ->
+                                case one(Conn, "DELETE FROM global_banners WHERE id=$1 AND updated_at=$2 RETURNING id", [Id, Revision]) of
+                                    {ok, [Id]} ->
+                                        Now = pw_util:now_ms(),
+                                        admin_audit_insert(Conn, ActorUid, <<"banner.deleted">>, <<"global_banner">>, integer_to_binary(Id),
+                                                           pw_util:clean_text(Title, 80), <<>>, Now),
+                                        {ok, #{deleted => true, id => Id}};
+                                    _ -> {error, banner_conflict}
+                                end;
+                            _ -> {error, not_found}
+                        end
+                end
+            end);
+        _ -> {error, banner_conflict}
+    end;
+route(instance_registration_mode, Conn) ->
+    case one(Conn, "SELECT value FROM instance_settings WHERE key='registration_mode'", []) of
+        {ok, [RawMode]} ->
+            case normalize_registration_mode(RawMode) of
+                invalid -> {ok, <<"inherit">>};
+                Mode -> {ok, Mode}
+            end;
+        _ -> {ok, <<"inherit">>}
+    end;
+route({admin_set_registration_mode, ActorUid, Mode0}, Conn) ->
+    case normalize_registration_mode(Mode0) of
+        invalid -> {error, invalid_registration_mode};
+        Mode -> with_tx(Conn, fun() ->
+            case admin_can_operate(Conn, ActorUid) of
+                false -> {error, forbidden};
+                true ->
+                    Now = pw_util:now_ms(),
+                    ok = exec(Conn,
+                        "INSERT INTO instance_settings(key,value,updated_by,updated_at) VALUES('registration_mode',$1,$2,$3) "
+                        "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_by=EXCLUDED.updated_by,updated_at=EXCLUDED.updated_at",
+                        [Mode, ActorUid, Now]),
+                    admin_audit_insert(Conn, ActorUid, <<"service.registration_mode">>, <<"instance_setting">>, <<"registration_mode">>, Mode, <<>>, Now),
+                    {ok, #{registration_mode => Mode}}
+            end
+        end)
+    end;
 route({register, U0, D0, P0}, Conn) ->
     U = pw_util:normalize_username(U0),
     D0b = pw_util:clean_text(D0, 48),
@@ -1041,6 +1236,59 @@ route({change_password, Uid, Token, Current0, New0}, Conn) ->
                     [ets:delete(?SESSION_CACHE, SessionHash) || [SessionHash] <- Existing],
                     {ok, #{changed => true, revoked_sessions => length(Existing)}};
                 Error -> Error
+            end
+    end;
+route({change_username, Uid, Current0, NewUsername0, ExpectedUsername0}, Conn) ->
+    Current = pw_util:clean_text(Current0, 256),
+    NewUsername = pw_util:normalize_username(NewUsername0),
+    ExpectedUsername = pw_util:normalize_username(ExpectedUsername0),
+    case byte_size(NewUsername) >= 3 andalso byte_size(NewUsername) =< 24 andalso
+         byte_size(ExpectedUsername) >= 3 andalso byte_size(ExpectedUsername) =< 24 of
+        false -> {error, invalid_username};
+        true ->
+            Result = with_tx(Conn, fun() ->
+                case one(Conn,
+                    "SELECT username,password_hash,password_salt FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+                    {ok, [CurrentUsername, PasswordHash, Salt]} ->
+                        case pw_util:verify_password(Current, Salt, PasswordHash) of
+                            false -> {error, bad_password};
+                            true when CurrentUsername =/= ExpectedUsername ->
+                                %% A second tab or device renamed this account after this
+                                %% dialog opened. Do not silently overwrite the newer identity.
+                                {error, username_changed_elsewhere};
+                            true when CurrentUsername =:= NewUsername ->
+                                {ok, #{changed => false, username => CurrentUsername}};
+                            true ->
+                                %% Serialize competing claims for the same normalized username.
+                                %% The unique users(username) index remains the final DB invariant.
+                                ok = exec(Conn, "SELECT pg_advisory_xact_lock(hashtextextended($1, 1347175753))", [NewUsername]),
+                                case one(Conn, "SELECT id FROM users WHERE username=$1 AND id<>$2 LIMIT 1", [NewUsername, Uid]) of
+                                    {ok, [_]} -> {error, username_taken};
+                                    _ ->
+                                        Now = pw_util:now_ms(),
+                                        case rows(Conn,
+                                            "UPDATE users SET username=$1,updated_at=$2 WHERE id=$3 AND username=$4 RETURNING username",
+                                            [NewUsername, Now, Uid, ExpectedUsername]) of
+                                            {ok, [[SavedUsername]]} ->
+                                                {ok, #{changed => true, username => SavedUsername, previous_username => CurrentUsername}};
+                                            {ok, []} -> {error, username_changed_elsewhere};
+                                            {error, Reason} ->
+                                                case is_unique_violation(Reason) of
+                                                    true -> {error, username_taken};
+                                                    false -> erlang:error({sql_error, Reason})
+                                                end
+                                        end
+                                end
+                        end;
+                    _ -> {error, not_found}
+                end
+            end),
+            case Result of
+                {ok, #{changed := true, username := SavedUsername} = Data} ->
+                    invalidate_session_cache(Uid),
+                    best_effort_identity_changed(Conn, Uid, SavedUsername),
+                    {ok, Data};
+                Other -> Other
             end
     end;
 route({onboarding, Uid}, Conn) ->
@@ -3652,8 +3900,65 @@ migrations() -> [
         "CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at)",
         "CREATE INDEX IF NOT EXISTS idx_sessions_user_expiry ON sessions(user_id,expires_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_uploads_user_status ON uploads(user_id,status)"
+    ]},
+    {30, [
+        "CREATE TABLE IF NOT EXISTS global_banners(id bigserial PRIMARY KEY, title text NOT NULL DEFAULT '', body text NOT NULL, "
+        "severity text NOT NULL CHECK(severity IN ('info','success','warning','critical')), starts_at bigint NOT NULL CHECK(starts_at>=0), "
+        "ends_at bigint NOT NULL DEFAULT 0 CHECK(ends_at=0 OR ends_at>starts_at), "
+        "dismissible boolean NOT NULL DEFAULT true, link_label text NOT NULL DEFAULT '', link_url text NOT NULL DEFAULT '', enabled boolean NOT NULL DEFAULT true, "
+        "created_by integer REFERENCES users(id) ON DELETE SET NULL, created_at bigint NOT NULL, updated_at bigint NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_global_banners_window ON global_banners(enabled,starts_at,ends_at,id)",
+        "CREATE INDEX IF NOT EXISTS idx_global_banners_updated ON global_banners(updated_at DESC,id DESC)",
+        "CREATE TABLE IF NOT EXISTS instance_settings(key text PRIMARY KEY, value text NOT NULL, updated_by integer REFERENCES users(id) ON DELETE SET NULL, updated_at bigint NOT NULL)",
+        "INSERT INTO instance_settings(key,value,updated_by,updated_at) VALUES('registration_mode','inherit',NULL,0) ON CONFLICT(key) DO NOTHING"
     ]}
 ].
+
+is_unique_violation(Reason) ->
+    Text = string:lowercase(binary_to_list(pw_util:bin(io_lib:format("~p", [Reason])))),
+    string:find(Text, "23505") =/= nomatch orelse string:find(Text, "unique") =/= nomatch.
+
+best_effort_identity_changed(Conn, Uid, Username) ->
+    Event = #{type => user_identity_updated, user_id => Uid, username => Username},
+    %% The renaming user's own socket should update immediately. Discover the
+    %% remaining targets while this DB worker is available, then release it
+    %% before potentially large cross-node fanout work.
+    pw_hub:notify_user(Uid, Event),
+    ServerIds = case rows(Conn, "SELECT server_id FROM server_members WHERE user_id=$1", [Uid]) of
+        {ok, ServerRows} -> lists:usort([Sid || [Sid] <- ServerRows]);
+        _ -> []
+    end,
+    DirectIds = case rows(Conn, "SELECT thread_id FROM direct_members WHERE user_id=$1", [Uid]) of
+        {ok, DirectRows} -> lists:usort([Cid || [Cid] <- DirectRows]);
+        _ -> []
+    end,
+    ForumIds = case rows(Conn,
+        "SELECT forum_id FROM forum_members WHERE user_id=$1 "
+        "UNION SELECT forum_id FROM threads WHERE user_id=$1 "
+        "UNION SELECT t.forum_id FROM replies r JOIN threads t ON t.id=r.thread_id WHERE r.user_id=$1",
+        [Uid]) of
+        {ok, ForumRows} -> lists:usort([ForumId || [ForumId] <- ForumRows]);
+        _ -> []
+    end,
+    FriendIds = case rows(Conn,
+        "SELECT CASE WHEN user_low=$1 THEN user_high ELSE user_low END FROM friendships "
+        "WHERE (user_low=$1 OR user_high=$1) AND status IN ('accepted','pending')", [Uid]) of
+        {ok, FriendRows} -> lists:usort([PeerUid || [PeerUid] <- FriendRows, PeerUid =/= Uid]);
+        _ -> []
+    end,
+    _ = spawn(fun() ->
+        try
+            [pw_hub:broadcast({server, Sid}, Event) || Sid <- ServerIds],
+            [pw_hub:broadcast({direct, Cid}, Event) || Cid <- DirectIds],
+            [pw_hub:broadcast({forum, ForumId}, Event) || ForumId <- ForumIds],
+            [pw_hub:notify_user(PeerUid, Event) || PeerUid <- FriendIds],
+            ok
+        catch C:R ->
+            logger:warning("[plainwire:identity] realtime fanout failed uid=~p class=~p reason=~p", [Uid, C, R]),
+            ok
+        end
+    end),
+    ok.
 
 safe_exec(Conn, Sql) ->
     case try_exec(Conn, Sql) of
@@ -5136,6 +5441,123 @@ admin_server_detail([Sid, Name, CreatedAt, UpdatedAt, OwnerId, OwnerUsername, Ow
       owner => #{id => OwnerId, username => OwnerUsername, display_name => OwnerDisplayName},
       member_count => Members, channel_count => Channels, role_count => Roles,
       active_invite_count => Invites, message_count => Messages, last_message_at => LastMessageAt}.
+
+admin_can_operate(Conn, ActorUid) ->
+    case admin_actor_role(Conn, ActorUid) of
+        <<"owner">> -> true;
+        <<"operator">> -> true;
+        _ -> false
+    end.
+
+banner_map([Id, Title, Body, Severity, StartsAt, EndsAt, Dismissible, LinkLabel, LinkUrl, UpdatedAt]) ->
+    #{id => Id, title => Title, body => Body, severity => Severity, starts_at => StartsAt, ends_at => EndsAt,
+      dismissible => Dismissible, link_label => LinkLabel, link_url => LinkUrl, updated_at => UpdatedAt}.
+
+admin_banner_map([Id, Title, Body, Severity, StartsAt, EndsAt, Dismissible, LinkLabel, LinkUrl, Enabled,
+                  CreatedBy, CreatedByUsername, CreatedAt, UpdatedAt]) ->
+    Base = banner_map([Id, Title, Body, Severity, StartsAt, EndsAt, Dismissible, LinkLabel, LinkUrl, UpdatedAt]),
+    Base#{enabled => Enabled, created_by => CreatedBy, created_by_username => CreatedByUsername, created_at => CreatedAt}.
+
+banner_patch_from_row([Title, Body, Severity, StartsAt, EndsAt, Dismissible, LinkLabel, LinkUrl, Enabled]) ->
+    #{<<"title">> => Title, <<"body">> => Body, <<"severity">> => Severity, <<"starts_at">> => StartsAt,
+      <<"ends_at">> => EndsAt, <<"dismissible">> => Dismissible, <<"link_label">> => LinkLabel,
+      <<"link_url">> => LinkUrl, <<"enabled">> => Enabled}.
+
+normalize_patch_keys(Map) when is_map(Map) ->
+    maps:from_list([{pw_util:bin(K), V} || {K, V} <- maps:to_list(Map)]);
+normalize_patch_keys(_) -> #{}.
+
+normalize_banner_patch(Patch0, Now) when is_map(Patch0), is_integer(Now), Now >= 0 ->
+    Patch = normalize_patch_keys(Patch0),
+    TitleResult = banner_text(Patch, <<"title">>, <<>>, 80),
+    BodyResult = banner_text(Patch, <<"body">>, <<>>, 500),
+    Severity = normalize_banner_severity(maps:get(<<"severity">>, Patch, <<"info">>)),
+    StartResult = banner_time(Patch, <<"starts_at">>, Now),
+    EndResult = banner_time(Patch, <<"ends_at">>, 0),
+    DismissibleResult = banner_bool(Patch, <<"dismissible">>, true),
+    EnabledResult = banner_bool(Patch, <<"enabled">>, true),
+    LinkLabelResult = banner_text(Patch, <<"link_label">>, <<>>, 40),
+    LinkUrlResult = banner_text(Patch, <<"link_url">>, <<>>, 512),
+    case {TitleResult, BodyResult, Severity, StartResult, EndResult,
+          DismissibleResult, EnabledResult, LinkLabelResult, LinkUrlResult} of
+        {{ok, Title}, {ok, Body}, ValidSeverity, {ok, StartsAt}, {ok, EndsAt},
+         {ok, Dismissible}, {ok, Enabled}, {ok, LinkLabel0}, {ok, LinkUrl0}}
+          when ValidSeverity =/= invalid, byte_size(Body) > 0,
+               (EndsAt =:= 0 orelse EndsAt > StartsAt) ->
+            LinkUrl = safe_banner_link(LinkUrl0),
+            case LinkUrl0 =:= <<>> orelse LinkUrl =/= <<>> of
+                true ->
+                    LinkLabel = case LinkUrl of <<>> -> <<>>; _ -> LinkLabel0 end,
+                    {ok, #{title => Title, body => Body, severity => ValidSeverity,
+                           starts_at => StartsAt, ends_at => EndsAt,
+                           dismissible => Dismissible, link_label => LinkLabel,
+                           link_url => LinkUrl, enabled => Enabled}};
+                false -> {error, invalid_banner_link}
+            end;
+        {{error, text_type}, _, _, _, _, _, _, _, _} -> {error, invalid_banner};
+        {_, {error, text_type}, _, _, _, _, _, _, _} -> {error, invalid_banner};
+        {_, {ok, <<>>}, _, _, _, _, _, _, _} -> {error, invalid_banner};
+        {_, _, invalid, _, _, _, _, _, _} -> {error, invalid_banner};
+        {_, _, _, error, _, _, _, _, _} -> {error, invalid_banner_window};
+        {_, _, _, _, error, _, _, _, _} -> {error, invalid_banner_window};
+        {_, _, _, _, _, {error, bool_type}, _, _, _} -> {error, invalid_banner};
+        {_, _, _, _, _, _, {error, bool_type}, _, _} -> {error, invalid_banner};
+        {_, _, _, _, _, _, _, {error, text_type}, _} -> {error, invalid_banner_link};
+        {_, _, _, _, _, _, _, _, {error, text_type}} -> {error, invalid_banner_link};
+        _ -> {error, invalid_banner_window}
+    end;
+normalize_banner_patch(_, _) -> {error, invalid_banner}.
+
+banner_text(Patch, Key, Default, Max) ->
+    case maps:find(Key, Patch) of
+        error -> {ok, pw_util:clean_text(Default, Max)};
+        {ok, Value} when is_binary(Value) -> {ok, pw_util:clean_text(Value, Max)};
+        {ok, _} -> {error, text_type}
+    end.
+
+banner_bool(Patch, Key, Default) ->
+    case maps:find(Key, Patch) of
+        error -> {ok, Default};
+        {ok, true} -> {ok, true};
+        {ok, false} -> {ok, false};
+        {ok, _} -> {error, bool_type}
+    end.
+
+banner_time(Patch, Key, Default) ->
+    case maps:find(Key, Patch) of
+        error -> parse_banner_time(Default);
+        {ok, Value} when is_integer(Value) -> parse_banner_time(Value);
+        {ok, _} -> error
+    end.
+
+normalize_banner_severity(<<"info">>) -> <<"info">>;
+normalize_banner_severity(<<"success">>) -> <<"success">>;
+normalize_banner_severity(<<"warning">>) -> <<"warning">>;
+normalize_banner_severity(<<"critical">>) -> <<"critical">>;
+normalize_banner_severity(_) -> invalid.
+
+parse_banner_time(Value) ->
+    case pw_util:int(Value) of N when is_integer(N), N >= 0 -> {ok, N}; _ -> error end.
+
+safe_banner_link(<<>>) -> <<>>;
+safe_banner_link(<<"https://", Rest/binary>> = Url) when byte_size(Rest) > 0 -> Url;
+safe_banner_link(<<"/", "/", _/binary>>) -> <<>>;
+safe_banner_link(<<"/", _/binary>> = Url) -> Url;
+safe_banner_link(_) -> <<>>.
+
+banner_audit_detail(Banner) ->
+    Severity = maps:get(severity, Banner, <<"info">>),
+    EndsAt = maps:get(ends_at, Banner, 0),
+    Enabled = maps:get(enabled, Banner, true),
+    pw_util:clean_text(iolist_to_binary(io_lib:format("severity=~ts ends_at=~p enabled=~p", [Severity, EndsAt, Enabled])), 240).
+
+normalize_registration_mode(<<"inherit">>) -> <<"inherit">>;
+normalize_registration_mode(<<"enabled">>) -> <<"enabled">>;
+normalize_registration_mode(<<"disabled">>) -> <<"disabled">>;
+normalize_registration_mode(inherit) -> <<"inherit">>;
+normalize_registration_mode(enabled) -> <<"enabled">>;
+normalize_registration_mode(disabled) -> <<"disabled">>;
+normalize_registration_mode(_) -> invalid.
 
 maybe_upgrade_password_hash(Conn, Uid, Password, StoredHash) ->
     case pw_util:password_needs_rehash(StoredHash) of

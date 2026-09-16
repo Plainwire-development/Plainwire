@@ -23,6 +23,10 @@ wire_validation_test() ->
     ?assertMatch({error, _}, pw_cluster_wire:decode(Bad, [api], Now)),
     ?assertEqual(false, pw_cluster_wire:allowed({user, 1}, #{type => call_signal})),
     ?assertEqual(true, pw_cluster_wire:allowed({user, 1}, #{type => mention, scope => direct})),
+    ?assertEqual(true, pw_cluster_wire:allowed({topic, {system, global}}, #{type => system_banners_changed})),
+    ?assertEqual(true, pw_cluster_wire:allowed({topic, {system, global}}, #{type => service_settings_changed})),
+    ?assertEqual(true, pw_cluster_wire:allowed({topic, {system, global}}, #{type => realtime_resync})),
+    ?assertEqual(false, pw_cluster_wire:allowed({topic, {system, global}}, #{type => arbitrary_admin_event})),
     Huge = pw_cluster_wire:encode(api, Boot, 3, Now, {user, 1}, #{type => direct_message, data => binary:copy(<<0>>, 140000)}),
     ?assertMatch({error, _}, pw_cluster_wire:decode(Huge, [api], Now)).
 

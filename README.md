@@ -6,12 +6,6 @@ It has servers, channels, DMs, group chats, forums, voice calls, screen sharing,
 
 Plainwire is built with Erlang/OTP, Cowboy, PostgreSQL, Elm, WebSocket, and WebRTC.
 
-Plainwire can also be used as a self hosted service on your own servers, it isnt tied to ours; but it is recommended to use our provided servers. Much like how Stoat handles it.
-
-Our central, and official [Plainwire Server](https://plainwire.kokonico.me) 
-
-----------------------------
-
 ## Using Plainwire
 
 The easiest way to use Plainwire is through a hosted instance.
@@ -226,7 +220,7 @@ Caddy, nginx, and similar reverse proxies work well in front of Plainwire.
 
 ### Service control plane
 
-Plainwire 1.8.0 includes an optional host-level operator console. It administers the configured Plainwire service instance itself; it is not a per-server moderation panel. The control plane is disabled by default and runs on a separate Cowboy listener when enabled.
+Plainwire 1.8.1 includes an optional host-level operator console. It administers the configured Plainwire service instance itself; it is not a per-server moderation panel. The control plane is disabled by default and runs on a separate Cowboy listener when enabled.
 
 The console is intentionally private-content blind. It can inspect service health, runtime/build information, database and realtime health, aggregate message/upload/call statistics, registered accounts, hosted server metadata, resource usage, operators, and operator audit history. It has no message-body, DM-text, attachment-content, message-search, or verification-secret endpoint.
 
@@ -253,16 +247,17 @@ For remote operator access, the recommended deployment is a **separate admin hos
 
 Back up the admin instance-secret file together with PostgreSQL. Treat it like other host credentials: source access alone is harmless, but host-secret access is privileged.
 
+Plainwire 1.8.1 also adds **Service controls** to the host console. Operators can publish scheduled or permanent global announcements, pause/resume or retire them in realtime, override whether new account registration is open without restarting the service, and request a lightweight client-state reconciliation without disconnecting active calls. Global announcements use the normal Plainwire visual language, are capped on-screen to prevent banner flooding, support safe same-origin or HTTPS links, and may be dismissible or persistent.
+
 Deployment and update instructions are kept in [deploy/README.md](deploy/README.md).
 
 ## Version
 
-Current release: **1.8.0**
+Current release: **1.8.1**
 
-Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history and release tags.
+Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history.
 
-* [1.8.0 release notes](RELEASE_NOTES_1.8.0.md)
-* [1.7.5-2 release notes](RELEASE_NOTES_1.7.5-2.md)
+* [1.8.1 release notes](RELEASE_NOTES_1.8.1.md)
 
 ## License
 

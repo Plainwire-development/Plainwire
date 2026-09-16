@@ -5,12 +5,13 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="dark light">
   <title>Plainwire Control</title>
+  <link rel="icon" type="image/svg+xml" href="/plainwire-mark.svg">
   <link rel="stylesheet" href="/admin.css">
 </head>
 <body>
   <div id="auth" class="auth-shell" hidden>
     <section class="auth-card">
-      <div class="brand-lockup"><div class="brand-mark">P</div><div><strong>Plainwire Control</strong><span id="instance-label">Service operator access</span></div></div>
+      <div class="brand-lockup"><div class="brand-mark" aria-hidden="true"></div><div><strong>Plainwire Control</strong><span id="instance-label">Service operator access</span></div></div>
       <div class="privacy-note"><strong>Private-content blind by design.</strong><span>This console exposes service metadata and health, never message bodies or attachment contents.</span></div>
       <div class="auth-tabs" role="tablist">
         <button class="tab active" data-auth-tab="login" type="button">Sign in</button>
@@ -51,14 +52,15 @@
 
   <div id="app" class="app-shell" hidden>
     <aside class="sidebar">
-      <div class="brand-lockup compact"><div class="brand-mark">P</div><div><strong>Control</strong><span id="sidebar-instance">Plainwire host</span></div></div>
+      <div class="brand-lockup compact"><div class="brand-mark" aria-hidden="true"></div><div><strong>Control</strong><span id="sidebar-instance">Plainwire host</span></div></div>
       <nav id="nav">
         <button class="nav-item active" data-view="overview"><span>Overview</span><small>01</small></button>
         <button class="nav-item" data-view="users"><span>Users</span><small>02</small></button>
         <button class="nav-item" data-view="servers"><span>Servers</span><small>03</small></button>
-        <button class="nav-item" data-view="host"><span>Host</span><small>04</small></button>
-        <button class="nav-item" data-view="operators"><span>Operators</span><small>05</small></button>
-        <button class="nav-item" data-view="audit"><span>Audit</span><small>06</small></button>
+        <button class="nav-item" data-view="control"><span>Service controls</span><small>04</small></button>
+        <button class="nav-item" data-view="host"><span>Host</span><small>05</small></button>
+        <button class="nav-item" data-view="operators"><span>Operators</span><small>06</small></button>
+        <button class="nav-item" data-view="audit"><span>Audit</span><small>07</small></button>
       </nav>
       <div class="sidebar-bottom">
         <div class="operator-chip"><span class="presence-dot"></span><div><strong id="operator-name">Operator</strong><small id="operator-role">viewer</small></div></div>

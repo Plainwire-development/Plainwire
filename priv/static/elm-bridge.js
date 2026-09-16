@@ -319,6 +319,91 @@
       return payload.data;
     } finally { clearTimeout(timeout); }
   };
+  let globalBannerItems = [];
+  let globalBannerTimer = null;
+  let globalBannerRequest = null;
+  const bannerDismissKey = (banner) => `plainwire_banner_dismissed_${Number(banner?.id || 0)}_${Number(banner?.updated_at || 0)}`;
+  const safeBannerHref = (value) => {
+    if (typeof value !== 'string' || !value) return '';
+    try {
+      const url = new URL(value, location.origin);
+      if (url.protocol !== 'https:' && url.origin !== location.origin) return '';
+      return url.href;
+    } catch (_) { return ''; }
+  };
+  const syncGlobalBannerOffset = () => {
+    const stack = document.getElementById('pw-global-banners');
+    const height = stack && stack.childElementCount ? Math.ceil(stack.getBoundingClientRect().height) : 0;
+    document.documentElement.style.setProperty('--pw-global-banner-offset', `${height}px`);
+  };
+  const renderGlobalBanners = (items = globalBannerItems) => {
+    globalBannerItems = Array.isArray(items) ? items.slice(0, 32) : [];
+    if (globalBannerTimer) { clearTimeout(globalBannerTimer); globalBannerTimer = null; }
+    const now = Date.now();
+    const boundaries = [];
+    const visible = globalBannerItems.filter((banner) => {
+      const starts = Number(banner?.starts_at || 0);
+      const ends = Number(banner?.ends_at || 0);
+      if (starts > now) { boundaries.push(starts); return false; }
+      if (ends > 0) {
+        if (ends <= now) return false;
+        boundaries.push(ends);
+      }
+      return storage.getItem(bannerDismissKey(banner)) !== '1';
+    });
+    let stack = document.getElementById('pw-global-banners');
+    if (!visible.length) {
+      stack?.remove();
+      syncGlobalBannerOffset();
+    } else {
+      if (!stack) {
+        stack = document.createElement('div');
+        stack.id = 'pw-global-banners';
+        stack.className = 'pw-global-banner-stack';
+        stack.setAttribute('aria-label', 'Service announcements');
+        document.body.prepend(stack);
+      }
+      stack.replaceChildren();
+      visible.slice(0, 3).forEach((banner) => {
+        const severity = ['info', 'success', 'warning', 'critical'].includes(banner?.severity) ? banner.severity : 'info';
+        const row = document.createElement('section');
+        row.className = `pw-global-banner ${severity}`;
+        row.setAttribute('role', severity === 'critical' ? 'alert' : 'status');
+        const marker = document.createElement('span'); marker.className = 'pw-global-banner-marker'; marker.setAttribute('aria-hidden', 'true');
+        const copy = document.createElement('div'); copy.className = 'pw-global-banner-copy';
+        if (banner?.title) { const title = document.createElement('strong'); title.textContent = String(banner.title).slice(0, 80); copy.append(title); }
+        const body = document.createElement('span'); body.textContent = String(banner?.body || '').slice(0, 500); copy.append(body);
+        const href = safeBannerHref(banner?.link_url || '');
+        if (href && banner?.link_label) {
+          const link = document.createElement('a'); link.className = 'pw-global-banner-link'; link.href = href;
+          link.textContent = String(banner.link_label).slice(0, 40);
+          if (new URL(href).origin !== location.origin) { link.target = '_blank'; link.rel = 'noopener noreferrer'; }
+          copy.append(link);
+        }
+        row.append(marker, copy);
+        if (banner?.dismissible !== false) {
+          const close = document.createElement('button'); close.type = 'button'; close.className = 'pw-global-banner-close'; close.textContent = '×';
+          close.setAttribute('aria-label', 'Dismiss announcement');
+          close.addEventListener('click', () => { storage.setItem(bannerDismissKey(banner), '1'); renderGlobalBanners(); });
+          row.append(close);
+        }
+        stack.append(row);
+      });
+      requestAnimationFrame(syncGlobalBannerOffset);
+    }
+    const next = boundaries.filter((at) => at > now).sort((a, b) => a - b)[0];
+    if (next) globalBannerTimer = setTimeout(() => renderGlobalBanners(), Math.min(2147483000, Math.max(100, next - Date.now() + 50)));
+  };
+  const refreshGlobalBanners = () => {
+    if (globalBannerRequest) return globalBannerRequest;
+    globalBannerRequest = directApi('/system/banners', { timeoutMs: 10000 })
+      .then((items) => { renderGlobalBanners(items); return items; })
+      .catch((error) => { debug('SYNC', 'global_banners_failed', { error: error.message }, 'warn'); return globalBannerItems; })
+      .finally(() => { globalBannerRequest = null; });
+    return globalBannerRequest;
+  };
+  window.addEventListener('resize', () => requestAnimationFrame(syncGlobalBannerOffset), { passive: true });
+
   const permissionBit = (data, key) => Number((data?.catalog || []).find(item => item.key === key)?.bit || 0);
   const hasPermission = (data, key) => {
     const permissions = Number(data?.permissions || 0);
@@ -1082,6 +1167,7 @@
     setEnabled: (enabled) => { storage.setItem('plainwire_debug', enabled ? 'true' : 'false'); location.reload(); }
   };
   debug('BOOT', 'bridge_initialized', { debug: debugEnabled, secure_context: window.isSecureContext, online: navigator.onLine, client_config: clientConfig });
+  queueMicrotask(() => refreshGlobalBanners());
 
   let rtcConfigNextRefresh = 0;
   let rtcConfigValidUntil = 0;
@@ -2171,6 +2257,7 @@
     if (!meId || document.hidden || !navigator.onLine) return;
     debug('SYNC', 'visible_reconcile', { reason, route: location.hash || '#' });
     api({ method: 'GET', path: '/sync?since=0' });
+    refreshGlobalBanners();
 
     const hash = String(location.hash || '#').replace(/^#\/?/, '');
     let match = hash.match(/^dm\/(\d+)$/);
@@ -2194,6 +2281,16 @@
   };
 
   setInterval(() => reconcileVisibleApp('periodic_safety_net'), APP_RECONCILE_MS);
+
+  // The public banner endpoint exposes only announcements whose start time has
+  // arrived, so future operator announcements are not leaked before schedule.
+  // A tiny visibility-aware poll gives scheduled banners minute-level activation
+  // even when no operator mutation occurs at the exact start time. Realtime is
+  // still the fast path for create/edit/pause/delete operations.
+  const PUBLIC_BANNER_RECONCILE_MS = 60000;
+  setInterval(() => {
+    if (!document.hidden && navigator.onLine) refreshGlobalBanners();
+  }, PUBLIC_BANNER_RECONCILE_MS);
 
   const activeComposer = () => {
     const composers = Array.from(document.querySelectorAll('#compose'));
@@ -3240,6 +3337,7 @@
         }
         sendWs({ type: 'ping' });
       }, WS_HEARTBEAT_MS);
+      refreshGlobalBanners();
       if (reconnected) {
         // WsStatus also asks Elm to reconcile the active route. This direct sync
         // closes the small gap before Elm processes that port event and keeps
@@ -3254,10 +3352,11 @@
         debug('WS', 'received', { message: msg });
         if (msg.session && msg.session.user && msg.session.user.id) meId = msg.session.user.id;
         if (msg.type === 'hello') maybeResumeRtcRoom();
+        const systemConsumed = handleSystemEvent(msg) === true;
         handlePresenceEvent(msg);
         const typingConsumed = handleTypingEvent(msg) === true;
         const rtcConsumed = handleRtcEvent(msg) === true;
-        if (!typingConsumed && !rtcConsumed) send(app.ports.wsReceive, msg);
+        if (!systemConsumed && !typingConsumed && !rtcConsumed) send(app.ports.wsReceive, msg);
       } catch (error) { debug('WS', 'invalid_message', { error: error.message, bytes: String(event.data).length }, 'error'); }
     };
     ws.onerror = () => debug('WS', 'transport_error', { ready_state: ws?.readyState }, 'error');
@@ -5887,6 +5986,25 @@
     next.forEach((uid) => screenSharers.add(uid));
   };
 
+  const handleSystemEvent = (msg) => {
+    if (msg.type === 'system_banners_changed') {
+      refreshGlobalBanners();
+      // Active-banner reads are cached very briefly on each API node. A hosted
+      // deployment can have several API nodes, so do one delayed reconciliation
+      // as well; this closes the tiny cross-node cache window without reloads or
+      // continuous polling.
+      setTimeout(() => { if (!document.hidden) refreshGlobalBanners(); }, 1400);
+      return true;
+    }
+    if (msg.type === 'service_settings_changed') {
+      // Registration and similar host controls are authoritative server-side.
+      // Existing signed-in tabs only need a light config refresh; no full reload.
+      fetch('/api/client-config', { headers: { accept: 'application/json' }, cache: 'no-store' }).catch(() => {});
+      return true;
+    }
+    return false;
+  };
+
   const handlePresenceEvent = (msg) => {
     if (msg.type === 'presence_state' && msg.statuses) {
       send(app.ports.bridgeReceive, { tag: 'presence_state', data: msg.statuses });
@@ -6734,6 +6852,97 @@
     return { backdrop, dialog, body };
   };
 
+  const openUsernameDialog = (currentUsername = '') => {
+    const content = document.createElement('div');
+    content.className = 'account-password-fields';
+
+    const usernameField = document.createElement('label');
+    usernameField.className = 'field';
+    const usernameLabel = document.createElement('span');
+    usernameLabel.textContent = 'New username';
+    const username = document.createElement('input');
+    username.type = 'text';
+    username.autocomplete = 'username';
+    username.spellcheck = false;
+    username.maxLength = 24;
+    username.value = String(currentUsername || '').toLowerCase();
+    username.placeholder = 'username';
+    username.setAttribute('aria-describedby', 'username-change-help');
+    const usernameHelp = document.createElement('small');
+    usernameHelp.id = 'username-change-help';
+    usernameHelp.className = 'muted';
+    usernameHelp.textContent = '3–24 characters: lowercase letters, numbers, _ or -. This changes your global @username.';
+    usernameField.append(usernameLabel, username, usernameHelp);
+
+    const passwordField = document.createElement('label');
+    passwordField.className = 'field';
+    const passwordLabel = document.createElement('span');
+    passwordLabel.textContent = 'Current password';
+    const password = document.createElement('input');
+    password.type = 'password';
+    password.autocomplete = 'current-password';
+    password.maxLength = 256;
+    passwordField.append(passwordLabel, password);
+
+    const status = document.createElement('div');
+    status.className = 'account-dialog-status';
+    content.append(usernameField, passwordField, status);
+
+    username.addEventListener('input', () => {
+      const normalized = username.value.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 24);
+      if (username.value !== normalized) username.value = normalized;
+      status.textContent = '';
+    });
+
+    showAccountDialog({
+      title: 'Change username',
+      subtitle: 'Your numeric account identity stays the same, so friends, DMs, servers, roles, and operator access remain attached to you.',
+      content,
+      actions: [
+        { label: 'Cancel', onClick: closeAccountDialog },
+        { label: 'Change username', className: 'btn', onClick: async (button) => {
+          status.textContent = '';
+          const next = username.value.trim().toLowerCase();
+          if (!/^[a-z0-9_-]{3,24}$/.test(next)) {
+            status.textContent = 'Use 3–24 lowercase letters, numbers, underscores, or hyphens.';
+            username.focus();
+            return;
+          }
+          if (!password.value) {
+            status.textContent = 'Enter your current password to confirm this identity change.';
+            password.focus();
+            return;
+          }
+          button.disabled = true;
+          try {
+            const data = await accountApi('POST', '/username', { username: next, expected_username: String(currentUsername || '').toLowerCase(), current_password: password.value });
+            closeAccountDialog();
+            await Promise.allSettled([
+              api({ method: 'GET', path: '/me' }),
+              api({ method: 'GET', path: '/sync?since=0' })
+            ]);
+            reconcileVisibleApp('username_changed');
+            send(app.ports.bridgeReceive, {
+              tag: 'toast',
+              data: data?.changed === false ? `Your username is already @${next}.` : `Username changed to @${data?.username || next}.`
+            });
+          } catch (error) {
+            const message = {
+              username_taken: 'That username is already taken.',
+              invalid_username: 'Use 3–24 lowercase letters, numbers, underscores, or hyphens.',
+              bad_password: 'Current password is incorrect.',
+              rate_limited: 'Too many username changes. Try again later.',
+              username_changed_elsewhere: 'Your username changed in another session. Close this dialog and reopen Account settings before trying again.'
+            }[error.message] || 'Could not change the username.';
+            status.textContent = message;
+          } finally {
+            button.disabled = false;
+          }
+        } }
+      ]
+    });
+  };
+
   const openPasswordDialog = () => {
     const content = document.createElement('div');
     content.className = 'account-password-fields';
@@ -7009,6 +7218,10 @@
         break;
       case 'open_gif_picker':
         openGifPicker();
+        break;
+      case 'account_change_username':
+      case 'change_username':
+        openUsernameDialog(String(data || ''));
         break;
       case 'replay_onboarding':
         mutateOnboarding('replay').then(() => openOnboardingChat()).catch((error) => {

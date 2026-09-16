@@ -47,3 +47,35 @@ invite_options_test() ->
     ?assertEqual({ok, 0, 0}, pw_db:invite_options(0, 0)),
     [ ?assertMatch({error, invalid_invite_options}, pw_db:invite_options(M, E))
       || {M, E} <- [{-1, 86400}, {10001, 86400}, {0, -1}, {0, 1}, {0, 2592001}, {<<"1">>, 3600}, {1, null}] ].
+
+banner_validation_test() ->
+    Now = 1700000000000,
+    Base = #{<<"body">> => <<"Maintenance tonight">>, <<"severity">> => <<"warning">>,
+             <<"starts_at">> => Now, <<"ends_at">> => 0, <<"dismissible">> => false,
+             <<"enabled">> => true, <<"link_label">> => <<"Status">>, <<"link_url">> => <<"/status">>},
+    {ok, Banner} = pw_db:normalize_banner_patch(Base, Now),
+    ?assertEqual(false, maps:get(dismissible, Banner)),
+    ?assertEqual(<<"/status">>, maps:get(link_url, Banner)),
+    ?assertMatch({error, invalid_banner_window}, pw_db:normalize_banner_patch(Base#{<<"ends_at">> => Now}, Now)),
+    ?assertMatch({error, invalid_banner}, pw_db:normalize_banner_patch(Base#{<<"body">> => <<>>}, Now)),
+    ?assertMatch({error, invalid_banner}, pw_db:normalize_banner_patch(Base#{<<"severity">> => <<"urgent">>}, Now)),
+    ?assertMatch({error, invalid_banner}, pw_db:normalize_banner_patch(Base#{<<"dismissible">> => <<"false">>}, Now)),
+    ?assertMatch({error, invalid_banner}, pw_db:normalize_banner_patch(Base#{<<"enabled">> => 1}, Now)),
+    ?assertMatch({error, invalid_banner_window}, pw_db:normalize_banner_patch(Base#{<<"starts_at">> => integer_to_binary(Now)}, Now)),
+    ?assertMatch({error, invalid_banner_link}, pw_db:normalize_banner_patch(Base#{<<"link_url">> => 42}, Now)),
+    ?assertMatch({error, invalid_banner}, pw_db:normalize_banner_patch([], Now)).
+
+banner_link_validation_test() ->
+    ?assertEqual(<<>>, pw_db:safe_banner_link(<<>>)),
+    ?assertEqual(<<"/status">>, pw_db:safe_banner_link(<<"/status">>)),
+    ?assertEqual(<<"https://status.example.test/incidents/1">>,
+                 pw_db:safe_banner_link(<<"https://status.example.test/incidents/1">>)),
+    ?assertEqual(<<>>, pw_db:safe_banner_link(<<"//evil.example">>)),
+    ?assertEqual(<<>>, pw_db:safe_banner_link(<<"http://example.test">>)),
+    ?assertEqual(<<>>, pw_db:safe_banner_link(<<"javascript:alert(1)">>)).
+
+registration_mode_validation_test() ->
+    ?assertEqual(<<"inherit">>, pw_db:normalize_registration_mode(<<"inherit">>)),
+    ?assertEqual(<<"enabled">>, pw_db:normalize_registration_mode(enabled)),
+    ?assertEqual(<<"disabled">>, pw_db:normalize_registration_mode(<<"disabled">>)),
+    ?assertEqual(invalid, pw_db:normalize_registration_mode(<<"open">>)).

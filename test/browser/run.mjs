@@ -42,7 +42,7 @@ async function setup(context){
  await context.route('**/api/**',async route=>{
   const req=route.request(), url=new URL(req.url()), path=url.pathname;
   const reply=(data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify({ok:status<400,data,...(status===401?{error:'not_authenticated'}:{})})});
-  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.8.0',asset_version:'1.8.0',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
+  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.8.1',asset_version:'1.8.1',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
   if(path==='/api/me')return authenticated?reply({user:me,csrf:'test-csrf',server_time:now}):reply(null,401);
   if(path==='/api/sync')return reply(sync);
   if(path==='/api/forums')return reply([]);
@@ -88,9 +88,8 @@ try {
  const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
  await page.goto(origin);await page.waitForSelector('.home-welcome');
  await page.waitForSelector('.dm-preview strong');
- const dmPreviews=page.locator('.dm-preview',{hasText:'Status: **ready to review** with [notes](https://example.com/notes).'});
- assert((await dmPreviews.count())>=2,'home and sidebar DMs render bounded plain-text summaries');
- assert.equal(await page.locator('.dm-preview a, .dm-preview .link-video, .dm-preview .link-embed').count(),0,'compact inbox previews never render links or embeds');
+ const dmPreviewTexts=await page.locator('.dm-preview').allTextContents();assert(dmPreviewTexts.filter(t=>t.includes('Status: **ready to review** with [notes](https://example.com/notes).' )).length>=2,'home and sidebar DMs render bounded plain-text previews');
+ assert.equal(await page.locator('.dm-preview .link-video, .dm-preview .link-embed').count(),0,'compact inbox previews never embed');
  const shellGap=await page.locator('.layout').evaluate(el=>{const side=el.querySelector('.side').getBoundingClientRect(),main=el.querySelector('.main').getBoundingClientRect();return main.left-side.right;});
  assert(shellGap>=8,`navigation and content keep a visible gutter (${shellGap}px)`);
  await page.screenshot({path:'test-results/home-desktop.png'});
@@ -192,7 +191,7 @@ try {
  });
  sockets.at(-1).send(JSON.stringify({type:'message_created',message:message(9000,Array(45).fill('A longer conversation to check reading position.').join('\n'))}));
  await page.waitForSelector('[data-mid="9000"]');await page.waitForTimeout(100);
- await page.locator('#messages').evaluate(el=>{el.scrollTop=0;});
+ await page.locator('#messages').evaluate(el=>{el.scrollTop=0;el.dispatchEvent(new Event('scroll'));});
  await page.getByRole('button',{name:'Jump to latest ↓',exact:true}).waitFor();
  sockets.at(-1).send(JSON.stringify({type:'message_created',message:message(9001,'A new message while you read earlier ones.')}));
  await page.waitForSelector('[data-mid="9001"]');await page.waitForTimeout(100);

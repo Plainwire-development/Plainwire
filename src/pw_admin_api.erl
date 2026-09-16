@@ -131,6 +131,71 @@ authed(<<"GET">>, [<<"operators">>], Req, Session, _Hash, State) ->
     inspect_only(Req, Session, fun() ->
         reply_result(Req, pw_db:admin_operators(maps:get(user_id, Session)), State)
     end, State);
+authed(<<"GET">>, [<<"banners">>], Req, _Session, _Hash, State) ->
+    reply_result(Req, pw_db:admin_banners(), State);
+authed(<<"POST">>, [<<"banners">>], Req0, Session, _Hash, State) ->
+    operator_json(Req0, Session, fun(M, Req) ->
+        case pw_db:admin_create_banner(maps:get(user_id, Session), M) of
+            {ok, Data} ->
+                ok = pw_db:invalidate_global_banners_cache(),
+                _ = pw_hub:broadcast({system, global}, #{type => system_banners_changed}),
+                reply_ok(Req, Data, State);
+            Error -> reply_result(Req, Error, State)
+        end
+    end, State);
+authed(<<"POST">>, [<<"banners">>, IdBin], Req0, Session, _Hash, State) ->
+    case positive_int(IdBin) of
+        undefined -> reply_error(Req0, 400, <<"invalid_banner_id">>, State);
+        BannerId -> operator_json(Req0, Session, fun(M, Req) ->
+            case pw_db:admin_update_banner(maps:get(user_id, Session), BannerId, M) of
+                {ok, Data} ->
+                    ok = pw_db:invalidate_global_banners_cache(),
+                    _ = pw_hub:broadcast({system, global}, #{type => system_banners_changed}),
+                    reply_ok(Req, Data, State);
+                Error -> reply_result(Req, Error, State)
+            end
+        end, State)
+    end;
+authed(<<"DELETE">>, [<<"banners">>, IdBin], Req, Session, _Hash, State) ->
+    case {can_operate(Session), positive_int(IdBin)} of
+        {false, _} -> reply_error(Req, 403, <<"forbidden">>, State);
+        {_, undefined} -> reply_error(Req, 400, <<"invalid_banner_id">>, State);
+        {true, BannerId} ->
+            ExpectedUpdatedAt = qs(Req, <<"expected_updated_at">>, undefined),
+            case pw_db:admin_delete_banner(maps:get(user_id, Session), BannerId, ExpectedUpdatedAt) of
+                {ok, Data} ->
+                    ok = pw_db:invalidate_global_banners_cache(),
+                    _ = pw_hub:broadcast({system, global}, #{type => system_banners_changed}),
+                    reply_ok(Req, Data, State);
+                Error -> reply_result(Req, Error, State)
+            end
+    end;
+authed(<<"GET">>, [<<"controls">>], Req, _Session, _Hash, State) ->
+    case pw_db:instance_registration_mode() of
+        {ok, Mode} -> reply_ok(Req, #{registration_mode => Mode,
+                                      registration_enabled => pw_client_config:registration_enabled()}, State);
+        Error -> reply_result(Req, Error, State)
+    end;
+authed(<<"POST">>, [<<"controls">>, <<"registration">>], Req0, Session, _Hash, State) ->
+    operator_json(Req0, Session, fun(M, Req) ->
+        Mode = maps:get(<<"mode">>, M, <<"inherit">>),
+        case pw_db:admin_set_registration_mode(maps:get(user_id, Session), Mode) of
+            {ok, Data} ->
+                _ = pw_hub:broadcast({system, global}, #{type => service_settings_changed}),
+                reply_ok(Req, Data#{registration_enabled => pw_client_config:registration_enabled()}, State);
+            Error -> reply_result(Req, Error, State)
+        end
+    end, State);
+authed(<<"POST">>, [<<"controls">>, <<"reconcile">>], Req, Session, _Hash, State) ->
+    ActorUid = maps:get(user_id, Session),
+    case {can_operate(Session), pw_rate:allow({admin_reconcile_clients, ActorUid}, 6, 60000)} of
+        {false, _} -> reply_error(Req, 403, <<"forbidden">>, State);
+        {true, false} -> reply_error(Req, 429, <<"rate_limited">>, State);
+        {true, true} ->
+            _ = pw_db:admin_record_audit(ActorUid, <<"service.reconcile_clients">>, <<"instance">>, <<>>, <<"requested realtime client reconciliation">>, request_ip_hash(Req)),
+            _ = pw_hub:broadcast({system, global}, #{type => realtime_resync}),
+            reply_ok(Req, #{broadcast => true}, State)
+    end;
 authed(<<"POST">>, [<<"operators">>, <<"enrollment">>], Req0, Session, _Hash, State) ->
     owner_json(Req0, Session, fun(M, Req) ->
         Username = maps:get(<<"username">>, M, <<>>),
@@ -197,6 +262,16 @@ owner_json(Req0, Session, Fun, State) ->
         true -> with_json(Req0, Fun, State);
         false -> reply_error(Req0, 403, <<"forbidden">>, State)
     end.
+
+operator_json(Req0, Session, Fun, State) ->
+    case can_operate(Session) of
+        true -> with_json(Req0, Fun, State);
+        false -> reply_error(Req0, 403, <<"forbidden">>, State)
+    end.
+
+can_operate(Session) ->
+    Role = maps:get(role, Session, <<>>),
+    Role =:= <<"owner">> orelse Role =:= <<"operator">>.
 
 with_json(Req0, Fun, State) ->
     case pw_util:read_json(Req0, ?MAX_BODY) of
@@ -284,6 +359,11 @@ error_status(recovery_unavailable) -> {409, <<"recovery_unavailable">>};
 error_status(bad_recovery) -> {401, <<"bad_recovery">>};
 error_status(invalid_enrollment) -> {400, <<"invalid_enrollment">>};
 error_status(invalid_role) -> {400, <<"invalid_role">>};
+error_status(invalid_banner) -> {400, <<"invalid_banner">>};
+error_status(invalid_banner_window) -> {400, <<"invalid_banner_window">>};
+error_status(invalid_banner_link) -> {400, <<"invalid_banner_link">>};
+error_status(banner_conflict) -> {409, <<"banner_conflict">>};
+error_status(invalid_registration_mode) -> {400, <<"invalid_registration_mode">>};
 error_status(user_not_found) -> {404, <<"user_not_found">>};
 error_status(not_found) -> {404, <<"not_found">>};
 error_status(database_busy) -> {503, <<"database_busy">>};

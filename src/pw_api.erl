@@ -31,7 +31,7 @@ auth_attempt_allowed(Kind, Req, Username0) ->
         pw_rate:allow({Kind, pair, Ip, Username}, 8, 600000).
 
 handle(<<"POST">>, [<<"register">>], Req0, _) ->
-    case pw_util:env_bool("PLAINWIRE_REGISTRATION_ENABLED", true) of
+    case pw_client_config:registration_enabled() of
         false ->
             pw_util:err_json(Req0, 403, <<"registration_disabled">>);
         true ->
@@ -74,6 +74,13 @@ handle(<<"POST">>, [<<"login">>], Req0, _) ->
                 end
         end
     end);
+handle(<<"GET">>, [<<"system">>, <<"banners">>], Req0, _) ->
+    case pw_db:global_banners() of
+        {ok, Data} -> pw_util:ok_json(Req0, #{ok => true, data => Data});
+        {error, database_busy} -> pw_util:err_json(Req0, 503, <<"database_busy">>);
+        {error, database_unavailable} -> pw_util:err_json(Req0, 503, <<"database_unavailable">>);
+        _ -> pw_util:err_json(Req0, 500, <<"internal_error">>)
+    end;
 handle(<<"GET">>, [<<"version">>], Req0, _) ->
     pw_util:ok_json(Req0, #{ok => true, data => #{
         name => <<"Plainwire">>,
@@ -151,6 +158,15 @@ authed(<<"POST">>, [<<"password">>], Req0, Session, _) ->
             Token = pw_util:cookie_value(Req0, <<"pw_session">>),
             with_json(Req0, fun(M, Req) ->
                 result(Req, pw_db:change_password(Uid, Token, maps:get(<<"current_password">>, M, <<>>), maps:get(<<"new_password">>, M, <<>>)))
+            end)
+    end;
+authed(<<"POST">>, [<<"username">>], Req0, Session, _) ->
+    Uid = uid(Session),
+    case pw_rate:allow({username_change, Uid}, 5, 3600000) of
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+        true ->
+            with_json(Req0, fun(M, Req) ->
+                result(Req, pw_db:change_username(Uid, maps:get(<<"current_password">>, M, <<>>), maps:get(<<"username">>, M, <<>>), maps:get(<<"expected_username">>, M, <<>>)))
             end)
     end;
 authed(<<"GET">>, [<<"sync">>], Req, Session, _) -> result(Req, pw_db:sync(uid(Session), qs(Req, <<"since">>)));
@@ -335,6 +351,7 @@ result(Req, {error, database_busy}) -> pw_util:err_json(Req, 503, <<"database_bu
 result(Req, {error, timeout}) -> pw_util:err_json(Req, 503, <<"database_timeout">>);
 result(Req, {error, internal_error}) -> pw_util:err_json(Req, 500, <<"internal_error">>);
 result(Req, {error, forbidden}) -> pw_util:err_json(Req, 403, <<"forbidden">>);
+result(Req, {error, username_changed_elsewhere}) -> pw_util:err_json(Req, 409, <<"username_changed_elsewhere">>);
 result(Req, {error, not_found}) -> pw_util:err_json(Req, 404, <<"not_found">>);
 result(Req, {error, E}) when is_atom(E) -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8));
 result(Req, {error, E}) -> pw_util:err_json(Req, 400, pw_util:bin(E));

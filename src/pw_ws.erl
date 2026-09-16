@@ -270,6 +270,10 @@ websocket_info({hub_json, Event=#{type := voice_superseded}}, State=#{uid:=Uid})
     deliver_hub_payload(pw_util:json(Event), voice_superseded, Uid, State#{voice => undefined, voice_profile => undefined});
 websocket_info({hub_json, Event=#{type := call_superseded}}, State=#{uid:=Uid}) ->
     deliver_hub_payload(pw_util:json(Event), call_superseded, Uid, State#{call => undefined});
+websocket_info({hub_json, Event=#{type := user_identity_updated, user_id := EventUid, username := Username}},
+               State=#{uid:=Uid}) when EventUid =:= Uid ->
+    State1 = apply_self_identity_update(State, Username),
+    deliver_hub_payload(pw_util:json(Event), user_identity_updated, Uid, State1);
 websocket_info({hub_json, Event}, State=#{uid:=Uid}) ->
     deliver_hub_payload(pw_util:json(Event), event_type(Event), Uid, State);
 websocket_info({hub_text, Payload, Type}, State=#{uid:=Uid}) ->
@@ -536,6 +540,27 @@ clamp_level(N) -> N.
 debug(debug, Event, Data) -> logger:debug("[plainwire:ws] ~s ~p", [Event, Data]);
 debug(info, Event, Data) -> logger:notice("[plainwire:ws] ~s ~p", [Event, Data]);
 debug(warning, Event, Data) -> logger:warning("[plainwire:ws] ~s ~p", [Event, Data]).
+
+apply_self_identity_update(State=#{session := Session, uid := Uid}, Username0) ->
+    Username = pw_util:normalize_username(Username0),
+    User0 = maps:get(user, Session, #{}),
+    User = User0#{username => Username},
+    VoiceProfile0 = maps:get(voice_profile, State, undefined),
+    VoiceProfile = case VoiceProfile0 of
+        Profile when is_map(Profile) -> Profile#{username => Username};
+        _ -> VoiceProfile0
+    end,
+    case maps:get(voice, State, undefined) of
+        VoiceId when is_integer(VoiceId), is_map(VoiceProfile) ->
+            pw_hub:voice_state(VoiceId, Uid, self(), #{}, VoiceProfile);
+        _ -> ok
+    end,
+    case maps:get(call, State, undefined) of
+        ConversationId when is_integer(ConversationId) ->
+            pw_hub:call_state(ConversationId, Uid, self(), #{}, User);
+        _ -> ok
+    end,
+    State#{session => Session#{user => User}, voice_profile => VoiceProfile}.
 
 strip_session_urls(Session = #{user := User}) ->
     Session#{user => maps:remove(avatar_source_url, maps:remove(banner_source_url, User))};

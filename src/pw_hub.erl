@@ -152,6 +152,7 @@ handle_cast({connect, Uid, Pid, Status0}, St) ->
     monitor(process, Pid),
     Users = add_to_set(Uid, Pid, St#st.users),
     Pids = maps:put(Pid, Uid, St#st.pids),
+    Subs = add_to_set({system, global}, Pid, St#st.subs),
     Status = normalize_status(Status0),
     PidStatuses = maps:put(Pid, Status, St#st.pid_statuses),
     Prev = maps:get(Uid, St#st.online, undefined),
@@ -165,7 +166,7 @@ handle_cast({connect, Uid, Pid, Status0}, St) ->
     Pid ! {hub_json, #{type => presence_state, online => Visible, statuses => Statuses}},
     send_active_calls(Pid, Uid, St#st.calls),
     log("client_connected", #{uid => Uid, sessions => length(maps:get(Uid, Users, [])), online_users => map_size(Online)}),
-    {noreply, St#st{users = Users, pids = Pids, pid_statuses = PidStatuses, online = Online}};
+    {noreply, St#st{users = Users, pids = Pids, pid_statuses = PidStatuses, online = Online, subs = Subs}};
 handle_cast({disconnect, Pid}, St) ->
     log("client_disconnected", #{uid => maps:get(Pid, St#st.pids, undefined)}),
     {noreply, remove_pid(Pid, St)};

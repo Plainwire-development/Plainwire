@@ -13,6 +13,11 @@ const staticHandler=read('src/pw_admin_static.erl');
 const js=read('priv/admin/admin.js');
 const html=read('priv/admin/index.html');
 const env=read('.env.example');
+const bridge=read('priv/static/elm-bridge.js');
+const components=read('priv/static/_components.scss');
+const clientConfig=read('src/pw_client_config.erl');
+const publicApi=read('src/pw_api.erl');
+const clusterWire=read('src/pw_cluster_wire.erl');
 
 assert.match(sup,/plainwire_admin_http[\s\S]*PLAINWIRE_ADMIN_BIND[\s\S]*127\.0\.0\.1/,'admin uses a distinct listener and defaults to loopback');
 assert.match(page,/GET[\s\S]*HEAD[\s\S]*405/,'admin page serves only GET/HEAD and rejects other methods');
@@ -31,6 +36,12 @@ assert.match(db,/route\(\{admin_recover_owner[\s\S]*\{ok, Uid, Username, Display
 assert.doesNotMatch(ident,/pwadm1\.[A-Za-z0-9_-]{20,}/,'source does not contain a reusable administrator token');
 
 assert.match(db,/\{29, \[[\s\S]*CREATE TABLE IF NOT EXISTS admin_operators[\s\S]*admin_sessions[\s\S]*admin_enrollments[\s\S]*admin_audit/,'migration 29 creates normalized operator/session/enrollment/audit state');
+assert.match(db,/\{30, \[[\s\S]*CREATE TABLE IF NOT EXISTS global_banners[\s\S]*CREATE TABLE IF NOT EXISTS instance_settings/,'migration 30 creates persisted global announcements and instance controls');
+assert.match(db,/\{ok, \[ExistingRoleValue\]\} -> ExistingRoleValue[\s\S]{0,300}EffectiveRole = case ExistingRole/,'admin enrollment uses distinct bindings rather than the unsafe Role case binding');
+assert.match(db,/\{ok, \[Uid, _EnrollmentRole, Username/,'redeeming an enrollment does not leave an unused Role binding');
+assert.match(db,/LimitI -> LimitI end\)\)[\s\S]{0,180}BeforeI -> max\(1, BeforeI\) end/,'audit pagination cases use independent Erlang bindings');
+assert.doesNotMatch(db,/\{ok, \[Role\]\} -> Role[\s\S]{0,260}Role = case ExistingRole/,'unsafe Role binding regression is absent');
+assert.doesNotMatch(db,/case pw_util:int\(Limit0\)[\s\S]{0,120}; I -> I end[\s\S]{0,180}case pw_util:int\(BeforeId0\)[\s\S]{0,120}; I ->/,'unsafe reused I audit binding regression is absent');
 assert.match(db,/LOCK TABLE admin_operators IN SHARE ROW EXCLUSIVE MODE[\s\S]*can_change_owner[\s\S]*last_owner/,'operator changes serialize and enforce the last-owner invariant');
 assert.match(db,/route\(\{admin_login[\s\S]{0,2600}FOR UPDATE OF u,a/,'admin login locks user/operator credential rows so an old key cannot race key rotation');
 assert.match(db,/route\(\{admin_rotate_key[\s\S]{0,1800}FOR UPDATE OF u,a/,'admin key rotation uses the same user/operator row-lock order as login');
@@ -44,7 +55,8 @@ assert.match(db,/idx_messages_created_global ON messages\(created_at DESC\)/,'ad
 assert.match(db,/idx_messages_user ON messages\(user_id,id DESC\)/,'per-user admin message counts use a dedicated user index');
 
 const adminDb=db.slice(db.indexOf('route(admin_operator_count'),db.indexOf('route({register'));
-assert.doesNotMatch(adminDb,/SELECT[^"\n]*(?:\.body|\bbody\b)/i,'admin DB surface never selects message/thread/reply bodies');
+assert.doesNotMatch(adminDb,/SELECT[^"\n]*\bbody\b[^"\n]*FROM\s+(?:messages|threads|replies)\b/i,'admin DB surface never selects communication bodies');
+assert.doesNotMatch(adminDb,/SELECT[^"\n]*FROM\s+(?:messages|threads|replies)\b[^"\n]*\bbody\b/i,'admin DB surface never reads communication bodies through reordered SQL');
 assert.doesNotMatch(adminDb,/avatar_url|banner_url|\bbio\b/,'admin DB surface avoids private/profile-content fields');
 assert.match(api,/content_access => false[\s\S]*message_bodies[\s\S]*attachment_contents[\s\S]*message_search/,'API publishes an explicit private-content blind contract');
 assert.doesNotMatch(api,/messages.*search|search.*messages/i,'admin API has no message-search route');
@@ -62,5 +74,37 @@ assert.match(js,/modalLocked[\s\S]*closeModal\(true\)/,'one-time secret modal ca
 assert.match(html,/Host recovery[\s\S]*local recovery token/i,'host-local recovery is visible only through its explicit emergency UI');
 assert.match(html,/Private-content blind by design/,'login surface states the privacy boundary before operator authentication');
 assert.match(env,/PLAINWIRE_ADMIN_ENABLED/,'deployment example documents explicit admin enablement');
+assert.match(db,/route\(global_banners[\s\S]*starts_at<=\$1[\s\S]*ends_at=0 OR ends_at>\$1[\s\S]*LIMIT 32/,'public banner reads are bounded and expose only active announcements');
 
-console.log('PASS: isolated host-admin listener, instance-bound operator verification, loopback-only emergency recovery, atomic enrollment/recovery, last-owner safety, privacy-blind queries, CSRF/rate limits, safe host telemetry, and DOM-safe admin UI contracts.');
+assert.match(db,/BANNER_CACHE_TTL_MS, 1000[\s\S]*global_banners_cached[\s\S]*global:trans[\s\S]*cache_global_banners/,'public banner reads use a short single-flight node cache instead of querying PostgreSQL once per visible client');
+assert.equal((api.match(/invalidate_global_banners_cache\(\)/g)||[]).length,3,'every banner mutation invalidates the active-banner cache before realtime fanout');
+assert.match(bridge,/system_banners_changed[\s\S]{0,700}setTimeout\(\(\) => \{ if \(!document\.hidden\) refreshGlobalBanners\(\); \}, 1400\)/,'clients reconcile once after the short cross-node banner cache window');
+assert.match(db,/slow operation=~p[\s\S]{0,180}operation_name\(Msg\)/,'slow-query logging safely handles atom-form DB operations');
+assert.doesNotMatch(db,/slow operation=~p[^\n]*element\(1, Msg\)/,'slow-query logging cannot crash on atom-form DB messages');
+assert.match(db,/CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1[\s\S]*starts_at DESC,id DESC LIMIT 32/,'active banner delivery prioritizes urgent and newer announcements before the client three-banner cap');
+assert.match(db,/normalize_banner_patch[\s\S]*byte_size\(Body\) > 0[\s\S]*invalid_banner_window[\s\S]*safe_banner_link/,'banner writes validate text, scheduling windows, and links server-side');
+assert.match(db,/banner_bool[\s\S]*\{ok, true\}[\s\S]*\{ok, false\}[\s\S]*bool_type/,'banner booleans are type-checked rather than truthy-coerced');
+assert.match(db,/banner_time[\s\S]*when is_integer\(Value\)[\s\S]*parse_banner_time/,'banner timestamps must arrive as numeric JSON values');
+assert.match(db,/route\(instance_registration_mode[\s\S]*invalid -> \{ok, <<"inherit">>\}/,'corrupt persisted registration mode fails safely to inherit');
+assert.match(db,/route\(\{admin_update_banner[\s\S]*FOR UPDATE/,'banner edits serialize on the target row');
+assert.match(db,/expected_updated_at[\s\S]*ExistingUpdatedAt[\s\S]*banner_conflict/,'banner edits reject stale operator revisions instead of silently overwriting concurrent changes');
+assert.match(db,/max\(pw_util:now_ms\(\), ExistingUpdatedAt \+ 1\)/,'banner revisions are strictly monotonic even for same-millisecond edits');
+assert.match(db,/admin_delete_banner[\s\S]*SELECT title,updated_at FROM global_banners WHERE id=\$1 FOR UPDATE[\s\S]*banner_conflict/,'banner deletion also refuses to act on a stale operator revision');
+assert.match(api,/banner_conflict[\s\S]*409/,'stale banner edits are exposed as HTTP 409 conflicts');
+assert.match(js,/expected_updated_at:b.updated_at[\s\S]*expected_updated_at:existing.updated_at/,'admin pause and edit requests carry the banner revision');
+assert.match(api,/\[<<"banners">>\][\s\S]{0,1200}system_banners_changed/,'banner mutations publish realtime invalidation events');
+assert.match(api,/\[<<"controls">>, <<"registration">>\][\s\S]*service_settings_changed[\s\S]*\[<<"controls">>, <<"reconcile">>\][\s\S]*realtime_resync/,'service controls expose registration override and realtime client reconciliation');
+assert.match(api,/admin_reconcile_clients[\s\S]*6, 60000[\s\S]*realtime_resync/,'instance-wide client reconciliation has its own operator rate limit');
+assert.match(publicApi,/\[<<"system">>, <<"banners">>\][\s\S]{0,400}global_banners/,'global announcements are available through a dedicated public read-only endpoint');
+assert.match(clientConfig,/registration_enabled\(\)[\s\S]*PLAINWIRE_REGISTRATION_ENABLED[\s\S]*instance_registration_mode/,'registration control dynamically overrides or inherits the deployment default');
+assert.match(clusterWire,/system, global[\s\S]*system_banners_changed[\s\S]*service_settings_changed[\s\S]*realtime_resync/,'host control events are explicitly allowlisted across the cluster');
+assert.match(bridge,/globalBannerItems[\s\S]*visible\.slice\(0, 3\)[\s\S]*textContent[\s\S]*Dismiss announcement/,'client banners are bounded, DOM-safe, and dismissible');
+assert.match(bridge,/safeBannerHref[\s\S]*https:[\s\S]*location\.origin/,'banner links are constrained to HTTPS external links or same-origin navigation');
+assert.match(bridge,/PUBLIC_BANNER_RECONCILE_MS = 60000[\s\S]*document\.hidden[\s\S]*navigator\.onLine[\s\S]*refreshGlobalBanners/,'scheduled banners use a narrow visibility-aware refresh without full-app polling');
+assert.match(components,/pw-global-banner-stack[\s\S]*pw-global-banner/,'global banner UI is integrated with the Plainwire shell');
+assert.match(components,/pw-global-banner-stack[\s\S]{0,400}safe-area-inset-top/,'global banner stack respects mobile safe areas');
+assert.match(js,/renderControl[\s\S]*registration[\s\S]*Reconcile clients[\s\S]*Global banners/,'admin control view exposes service registration, reconciliation, and banner management');
+assert.match(js,/showBannerEditor[\s\S]*dismissible/,'admin banner editor supports permanent scheduling and dismissal controls');
+assert.match(js,/parseLocalDateTime\(value\)\{if\(!value\)return null[\s\S]*endRaw&&endValue===null[\s\S]*endValue>0&&endValue<=startValue/,'admin banner editor rejects malformed or non-forward schedule windows instead of translating them into permanent banners');
+
+console.log('PASS: host-admin isolation/auth, global-banner and service-control persistence/realtime delivery, Erlang binding regressions, privacy boundaries, CSRF/rate limits, safe host telemetry, and DOM-safe admin UI contracts.');

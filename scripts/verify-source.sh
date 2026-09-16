@@ -31,7 +31,14 @@ readme = Path('README.md').read_text()
 assert f'Current release: **{version}**' in readme
 assert f'[{version} release notes](RELEASE_NOTES_{version}.md)' in readme
 index_haml = Path('priv/static/index.haml').read_text()
-assert index_haml.count('__PLAINWIRE_VERSION__') == 2
+expected_versioned_assets = [
+    '/assets/plainwire-mark.svg?v=__PLAINWIRE_VERSION__',
+    '/assets/app.css?v=__PLAINWIRE_VERSION__',
+    '/assets/bootstrap.js?v=__PLAINWIRE_VERSION__',
+]
+for asset in expected_versioned_assets:
+    assert index_haml.count(asset) == 1, f'missing or duplicated versioned asset: {asset}'
+assert index_haml.count('__PLAINWIRE_VERSION__') == len(expected_versioned_assets), 'unexpected version token outside the approved asset URLs'
 build_haml = Path('scripts/build-haml.sh').read_text()
 assert "readFileSync('VERSION'" in build_haml and "replaceAll('__PLAINWIRE_VERSION__', version)" in build_haml
 build_css = Path('scripts/build-css.mjs').read_text()
@@ -95,12 +102,22 @@ for path in Path('src').glob('*.erl'):
     # compiler remains the authority; this protects source-only verification too.
     duplicate_result = re.search(r'(?m)^\s*(\{(?:error|ok),\s*[^\n]+\})\s*\n\s*\1\s*$', body)
     assert not duplicate_result, f'duplicated Erlang result expression in {path}: {duplicate_result.group(1)}'
-    # A merge artifact that repeats a top-level function head on adjacent lines
-    # is always invalid Erlang and is easy to miss in source-only environments.
+    # Exact duplicate top-level clauses are unreachable warning noise at best
+    # and usually a copy/paste regression. Catch them even when they are not
+    # adjacent (the real Erlang compiler remains authoritative).
     lines = body.splitlines()
-    for idx, (left, right) in enumerate(zip(lines, lines[1:]), 1):
-        if left == right and re.fullmatch(r'[a-z][A-Za-z0-9_@]*\(.*\)(?: when .*)? ->', left):
-            raise AssertionError(f'duplicated Erlang function head in {path}:{idx}: {left}')
+    function_heads = {}
+    for idx, line_text in enumerate(lines, 1):
+        # Erlang top-level function clauses begin in column 1 in this codebase.
+        # Do not mistake indented anonymous-fun callbacks such as
+        # `with_json(Req, fun(M, Req1) ->` for function declarations.
+        if line_text != line_text.lstrip():
+            continue
+        stripped = line_text.rstrip()
+        if re.fullmatch(r'[a-z][A-Za-z0-9_@]*\(.*\)(?: when .*)? ->(?:.*[;.]?)?', stripped):
+            function_heads.setdefault(stripped, []).append(idx)
+    duplicated_heads = {head: at for head, at in function_heads.items() if len(at) > 1}
+    assert not duplicated_heads, f'exact duplicate Erlang function clause(s) in {path}: {duplicated_heads}'
 authored_sources = [
     *Path('src').glob('*.erl'),
     *Path('priv/static/elm/src').rglob('*.elm'),
@@ -113,6 +130,17 @@ for source in authored_sources:
     hit = unfinished.search(source.read_text())
     assert not hit, f'unfinished marker in authored source {source}: {hit.group(0)}'
 db_source = Path('src/pw_db.erl').read_text()
+# Guard known Erlang single-assignment regressions that were caught by erlc in
+# the 1.8.0 admin paths. These checks are intentionally exact enough to avoid
+# pretending to be a compiler while still preventing the same unsafe bindings
+# from re-entering a source-only release.
+assert '{ok, [ExistingRoleValue]} -> ExistingRoleValue' in db_source
+assert 'EffectiveRole = case ExistingRole of undefined -> RequestedRole; _ -> ExistingRole end' in db_source
+assert '{ok, [Uid, _EnrollmentRole, Username' in db_source
+assert 'LimitI -> LimitI end' in db_source
+assert 'BeforeI -> max(1, BeforeI) end' in db_source
+assert not re.search(r'\{ok, \[Role\]\} -> Role[\s\S]{0,260}Role = case ExistingRole', db_source), 'unsafe Erlang Role binding regression in admin enrollment'
+assert not re.search(r'case pw_util:int\(Limit0\)[\s\S]{0,120}; I -> I end[\s\S]{0,180}case pw_util:int\(BeforeId0\)[\s\S]{0,120}; I ->', db_source), 'unsafe reused Erlang I binding regression in admin audit pagination'
 migration_ids = [int(v) for v in re.findall(r'(?m)^\s*\{(\d+), \[', db_source)]
 assert migration_ids == list(range(1, max(migration_ids) + 1)), f'non-contiguous or duplicate DB migrations: {migration_ids}'
 package = json.loads(Path('package.json').read_text())

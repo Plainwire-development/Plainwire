@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
-const [bridge, elm, api, db, ws, cluster, clusterWire, clusterLocal, klipy, config, media, mediaHdl, util, uploadGc, uploadHdl, makefile] = await Promise.all([
+const [bridge, elm, api, db, ws, cluster, clusterWire, clusterLocal, klipy, config, media, mediaHdl, util, uploadGc, uploadHdl, makefile, indexHaml, themeHooks, adminHtml, adminCss, sup, markSvg] = await Promise.all([
   readFile('priv/static/elm-bridge.js', 'utf8'),
   readFile('priv/static/elm/src/Main.elm', 'utf8'),
   readFile('src/pw_api.erl', 'utf8'),
@@ -17,7 +17,19 @@ const [bridge, elm, api, db, ws, cluster, clusterWire, clusterLocal, klipy, conf
   readFile('src/pw_util.erl', 'utf8'),
   readFile('src/pw_upload_gc.erl', 'utf8'),
   readFile('src/pw_upload_hdl.erl', 'utf8'),
-  readFile('Makefile', 'utf8')
+  readFile('Makefile', 'utf8'),
+  readFile('priv/static/index.haml', 'utf8'),
+  readFile('priv/static/_theme-hooks.less', 'utf8'),
+  readFile('priv/admin/index.html', 'utf8'),
+  readFile('priv/admin/admin.css', 'utf8'),
+  readFile('src/pw_sup.erl', 'utf8'),
+  readFile('priv/static/plainwire-mark.svg', 'utf8')
+]);
+
+const [adminMarkSvg, fullLogoSvg, browserRun] = await Promise.all([
+  readFile('priv/admin/plainwire-mark.svg', 'utf8'),
+  readFile('priv/static/plainwire-logo.svg', 'utf8'),
+  readFile('test/browser/run.mjs', 'utf8')
 ]);
 
 const between = (text, start, end) => {
@@ -189,6 +201,33 @@ assert.doesNotMatch(bridge, /avatarTries|avatar-retrying|replaceWith\(/, 'obsole
 assert.match(elm, /attribute "loading" "lazy"[\s\S]*attribute "fetchpriority" "low"/, 'list icons use browser-managed lazy loading instead of eager request stampedes');
 
 
+// Username changes preserve numeric identity and propagate the new handle without rewriting ownership relations.
+assert.match(elm, /BridgeEvent "account_change_username"[\s\S]*Change username/, 'Account settings exposes the recovered username-change flow');
+assert.match(bridge, /openUsernameDialog[\s\S]*Current password[\s\S]*POST', '\/username'/, 'username change requires current-password confirmation');
+assert.match(bridge, /numeric account identity stays the same/i, 'username dialog explains that the stable account identity is preserved');
+assert.match(api, /\[<<"username">>\][\s\S]*username_change[\s\S]*pw_db:change_username/, 'username mutation is authenticated and independently rate-limited');
+assert.match(db, /route\(\{change_username[\s\S]*SELECT username,password_hash,password_salt FROM users WHERE id=\$1 FOR UPDATE[\s\S]*verify_password/, 'username mutation locks the stable user row and verifies the current password');
+assert.match(db, /CurrentUsername =\/= ExpectedUsername[\s\S]*username_changed_elsewhere[\s\S]*WHERE id=\$3 AND username=\$4 RETURNING username/, 'stale rename dialogs cannot overwrite a newer username change from another session');
+assert.match(api, /username_changed_elsewhere[\s\S]*409/, 'concurrent username rename conflicts are surfaced explicitly');
+assert.match(bridge, /expected_username: String\(currentUsername[\s\S]*username_changed_elsewhere/, 'username dialog submits its observed handle and explains cross-session conflicts');
+assert.match(db, /pg_advisory_xact_lock\(hashtextextended\(\$1, 1347175753\)\)[\s\S]*UPDATE users SET username=\$1,updated_at=\$2 WHERE id=\$3/, 'competing normalized username claims serialize before changing only the users identity row');
+assert.match(db, /best_effort_identity_changed[\s\S]*server_members WHERE user_id=\$1[\s\S]*direct_members WHERE user_id=\$1[\s\S]*friendships/, 'username changes discover the relevant server, DM, and friend views without changing their ID-based membership rows');
+assert.match(db, /best_effort_identity_changed[\s\S]*pw_hub:notify_user\(Uid, Event\)[\s\S]*spawn\(fun\(\)[\s\S]*pw_hub:broadcast\(\{server, Sid\}/, 'username fanout releases the DB worker before potentially large cross-node propagation');
+assert.match(ws, /apply_self_identity_update[\s\S]*voice_state[\s\S]*call_state[\s\S]*Session#\{user => User\}/, 'the renaming user\'s live websocket, voice, and call identity updates without reconnecting');
+assert.match(db, /user_ids_for_usernames[\s\S]*SELECT id,username FROM users WHERE username IN/, 'username-based DM member lookup resolves the current users table handle');
+assert.match(db, /SELECT u\.id, u\.username FROM users u JOIN server_members[\s\S]*pw_mention:resolve/, 'server mentions resolve against current usernames attached to stable member IDs');
+
+// The approved Plainwire vector mark is the favicon and replaces legacy text-P brand marks.
+assert.match(indexHaml, /rel: "icon"[\s\S]*plainwire-mark\.svg/, 'main web app uses the vector Plainwire mark as its favicon');
+assert.match(adminHtml, /rel="icon"[^>]*plainwire-mark\.svg/, 'control plane uses the same vector mark favicon');
+assert.match(sup, /"\/plainwire-mark\.svg"[\s\S]*image\/svg\+xml/, 'separate admin listener serves the SVG mark with the correct media type');
+assert.match(themeHooks, /\.rail \.mark,[\s\S]*\.auth-brand-mark[\s\S]*background-image: url\('\/assets\/plainwire-mark\.svg'\)/, 'late theme override keeps legacy background shorthands from restoring the old P mark');
+assert.match(adminCss, /\.brand-mark[^{]*\{[^}]*plainwire-mark\.svg/, 'control-plane brand mark uses the approved SVG rather than a literal P');
+assert.doesNotMatch(markSvg, /<image\b|data:image\//i, 'Plainwire mark remains true SVG path geometry rather than an embedded raster');
+assert.equal(adminMarkSvg, markSvg, 'main app and control plane ship the exact same Plainwire mark source');
+assert.doesNotMatch(fullLogoSvg, /<image\b|data:image\//i, 'full Plainwire logo remains true vector source rather than an embedded raster');
+assert.match(browserRun,/scrollTop=0;el\.dispatchEvent\(new Event\('scroll'\)\)/,'jump-to-latest browser regression deterministically emits the scroll event it expects');
+
 // Server deletion and reactions are backend-authoritative, transaction-safe, and bounded.
 assert.match(db, /route\(\{delete_server[\s\S]*SELECT owner_id,name FROM servers WHERE id = \$1 FOR UPDATE/, 'server deletion locks the owner row and remains owner-authoritative');
 assert.match(db, /ConfirmName =:= ServerName[\s\S]*confirmation_mismatch/, 'server deletion independently enforces exact-name confirmation server-side');
@@ -205,4 +244,4 @@ assert.match(db, /batch_message_reactions[\s\S]*bool_or\(mr\.user_id=\$5\)/, 'me
 assert.match(db, /server_member_profile[\s\S]*server_permissions0\(Conn, Uid, Sid\)[\s\S]*mr\.user_id=\$2/, 'targeted server profiles require server membership and fetch one member');
 assert.match(db, /\(r\.permissions & 1073741824\) DESC[\s\S]*\(r\.permissions & 16\) DESC[\s\S]*r\.position DESC/, 'presentation role color prioritizes actual privilege strength before display position');
 
-console.log('PASS: 1.7.5-2 stabilization, onboarding, scoped identity, typing, moderation, forum, cluster-revocation, KLIPY, and route contracts.');
+console.log('PASS: 1.8.1 release contracts: stabilization, identity rename, vector branding, onboarding, realtime, moderation, reactions, deletion, and route integrity.');

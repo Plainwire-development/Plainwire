@@ -19,3 +19,22 @@
   --pw-emoji-hover: color-mix(in srgb, var(--bg3), var(--accent) 12%);
   --pw-context-shadow: 0 14px 34px color-mix(in srgb, #000, transparent 82%);
 }
+
+/* Plainwire brand mark is intentionally a real image, not a text fallback.
+   Keep this override last because legacy component layers still use background
+   shorthands for these surfaces. */
+.rail .mark,
+.auth-brand-mark {
+  background-color: #fff;
+  background-image: url('/assets/plainwire-mark.svg');
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 78%;
+  color: transparent;
+}
+
+.mark::after,
+.auth-brand-mark::after {
+  content: none;
+  display: none;
+}

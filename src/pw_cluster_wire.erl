@@ -25,9 +25,11 @@ allowed({user, Uid}, #{type := Type}) when is_integer(Uid), Uid > 0 ->
                        category_created, category_updated, category_deleted, categories_reordered,
                        channel_created, channel_updated, channel_moved,
                        server_roles_updated, server_member_roles_updated, server_member_removed,
-                       server_member_profile_updated,
+                       server_member_profile_updated, user_identity_updated,
                        call_incoming, call_ended, call_declined, call_accepted, call_cancelled,
                        call_missed, call_presence]);
+allowed({topic, {system, global}}, #{type := Type}) ->
+    lists:member(Type, [system_banners_changed, service_settings_changed, realtime_resync]);
 allowed({topic, {Kind, Id}}, #{type := Type}) when is_integer(Id), Id > 0 ->
     lists:member(Kind, [channel, direct, thread, forum, server]) andalso
         lists:member(Type, [message_created, message_updated, message_deleted, thread_created,
@@ -35,7 +37,7 @@ allowed({topic, {Kind, Id}}, #{type := Type}) when is_integer(Id), Id > 0 ->
                           channel_updated, conversation_updated, category_created, category_updated,
                           category_deleted, categories_reordered, channel_created, channel_moved, member_joined,
                           conversation_closed, conversation_members_added, conversation_members_changed,
-                          thread_updated, thread_reply_updated, thread_reply_deleted]);
+                          user_identity_updated, thread_updated, thread_reply_updated, thread_reply_deleted]);
 allowed({control, revoke_server_access}, #{uid := Uid, server_id := ServerId, channel_ids := ChannelIds}) ->
     is_integer(Uid) andalso Uid > 0 andalso is_integer(ServerId) andalso ServerId > 0 andalso
         is_list(ChannelIds) andalso length(ChannelIds) =< 512 andalso

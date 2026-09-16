@@ -40,6 +40,7 @@ admin_listener_spec() ->
             {"/api/[...]", pw_admin_api, []},
             {"/admin.js", pw_admin_static, #{file => "admin.js", type => <<"text/javascript; charset=utf-8">>}},
             {"/admin.css", pw_admin_static, #{file => "admin.css", type => <<"text/css; charset=utf-8">>}},
+            {"/plainwire-mark.svg", pw_admin_static, #{file => "plainwire-mark.svg", type => <<"image/svg+xml; charset=utf-8">>}},
             {"/[...]", pw_admin_page, []}
         ]}
     ]),
