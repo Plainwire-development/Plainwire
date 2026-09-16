@@ -10,6 +10,7 @@ init([]) ->
         #{id => pw_cluster, start => {pw_cluster, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_cluster]},
         #{id => pw_media_quality, start => {pw_media_quality, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_media_quality]},
         #{id => pw_rate, start => {pw_rate, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_rate]},
+        #{id => pw_github_cache, start => {pw_github_cache, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_github_cache]},
         #{id => pw_hub, start => {pw_hub, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_hub]},
         #{id => pw_media, start => {pw_media, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_media]},
         #{id => pw_db, start => {pw_db, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_db]},

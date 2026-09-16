@@ -1,6 +1,18 @@
-# Plainwire 1.8.1
+# Plainwire 1.9.0
 
-Plainwire 1.8.1 is a control-plane and reliability patch release. It expands the hosted-instance operator console without changing Plainwire's private-content boundary, and fixes Erlang source issues found when compiling the 1.8.0 admin paths with a real Erlang compiler.
+Plainwire 1.9.0 is a control-plane and reliability release. It expands the hosted-instance operator console without changing Plainwire's private-content boundary, and fixes Erlang source issues found when compiling the 1.8.0 admin paths with a real Erlang compiler.
+
+## Plainwire Source
+
+- The Plainwire mark now opens a first-class **Plainwire Source** route instead of duplicating the Home action.
+- Added a live, read-only development tracker for the public `Plainwire-development` organization: organization activity, every public repository, commit history and bounded file-by-file diffs, releases, tags, branches, README, code browsing, GitHub language statistics, contributors, and raw public metadata.
+- Contributor and release/commit author names open in-app mirrors of their public GitHub profiles, including follower/following counts, public repositories, organizations, and recent public activity. A recent-activity panel also surfaces currently active contributors without pretending it is an all-time ranking.
+- Added a guided source-architecture tour using Plainwire's existing onboarding/tour visual language. Architecture cards connect the Elm app, browser bridge, Cowboy API, realtime hub, PostgreSQL layer, media boundary, native call-quality worker, and desktop client to their real repositories/files.
+- Source data is proxied only through a fixed `api.github.com` backend boundary, cached with ETags and stale-if-error behavior, response-size bounded, per-session rate limited, and optionally authenticated with a server-only `PLAINWIRE_GITHUB_TOKEN`. Repository/path/ref/SHA/profile inputs are validated before upstream requests.
+- The GitHub metadata cache is supervised and hard-bounded to prevent request-process lifetime bugs or user-controlled commit/path/profile cardinality from growing server memory indefinitely. Text-file previews require valid UTF-8 and reject NUL/binary payloads before JSON encoding.
+- A configured GitHub token is strictly a quota helper: repository detail is denied unless GitHub confirms the repository is public, public repository/profile/organization responses are projected before shared caching, and auth-only permission/security/custom-property metadata is discarded.
+- GitHub README/release/commit Markdown reuses Plainwire's safe Markdown renderer while explicitly disabling chat link-unfurl requests and Plainwire `@mention` resolution. Public profile avatars permit only GitHub's canonical avatar CDN in CSP and are host-validated client-side.
+- The page automatically refreshes while visible, supports manual refresh, handles GitHub quota/outage states without blanking cached data, and has dedicated narrow/mobile layouts. Route/dialog request generations prevent slow GitHub responses from overwriting newer navigation or reopening a viewer the user already dismissed.
 
 ## Hosted-instance announcements
 
@@ -29,7 +41,7 @@ Plainwire 1.8.1 is a control-plane and reliability patch release. It expands the
 
 ## Erlang compiler fixes
 
-The 1.8.0 admin work exposed Erlang single-assignment mistakes under `erlc`. 1.8.1 fixes them directly:
+The 1.8.0 admin work exposed Erlang single-assignment mistakes under `erlc`. 1.9.0 fixes them directly:
 
 - enrollment creation uses `ExistingRoleValue` and `EffectiveRole` instead of reusing unsafe `Role` bindings;
 - enrollment redemption marks the unused enrollment-role column as `_EnrollmentRole`;

@@ -425,7 +425,7 @@ document.addEventListener('click', (event) => {
 });
 
 class PlainwireMarkdown extends HTMLElement {
-  static observedAttributes = ['source', 'compact', 'data-me'];
+  static observedAttributes = ['source', 'compact', 'data-me', 'no-embeds', 'no-mentions'];
   connectedCallback() { this.render(); }
   attributeChangedCallback() { if (this.isConnected) this.render(); }
   disconnectedCallback() { for (const code of this.querySelectorAll('code[data-language]')) observer?.unobserve(code); }
@@ -433,13 +433,13 @@ class PlainwireMarkdown extends HTMLElement {
     for (const embed of this.querySelectorAll('.link-embed-wrap, .link-video, .remote-image-embed')) embed.remove();
     for (const source of this.querySelectorAll('.embedded-image-source')) source.classList.remove('embedded-image-source');
     delete this.dataset.embeds;
-    if (!this.hasAttribute('compact') && document.documentElement.dataset.linkPreviews !== 'false') enhanceLinks(this);
+    if (!this.hasAttribute('compact') && !this.hasAttribute('no-embeds') && document.documentElement.dataset.linkPreviews !== 'false') enhanceLinks(this);
   }
   render() {
     const source = this.getAttribute('source') || '';
     const compact = this.hasAttribute('compact');
     const currentUser = this.getAttribute('data-me') || this.closest('[data-me]')?.getAttribute('data-me') || '';
-    const renderKey = `${compact ? 'compact' : 'full'}:${currentUser}:${source}`;
+    const renderKey = `${compact ? 'compact' : 'full'}:${this.hasAttribute('no-embeds') ? 'no-embeds' : 'embeds'}:${this.hasAttribute('no-mentions') ? 'no-mentions' : 'mentions'}:${currentUser}:${source}`;
     if (this.lastSource === renderKey) return;
     this.lastSource = renderKey;
     for (const code of this.querySelectorAll('code[data-language]')) observer?.unobserve(code);
@@ -468,8 +468,8 @@ class PlainwireMarkdown extends HTMLElement {
       if (observer) observer.observe(code);
       highlight(code);
     }
-    if (!compact && document.documentElement.dataset.linkPreviews !== 'false') enhanceLinks(this);
-    if (!compact) enhanceMentions(this);
+    if (!compact && !this.hasAttribute('no-embeds') && document.documentElement.dataset.linkPreviews !== 'false') enhanceLinks(this);
+    if (!compact && !this.hasAttribute('no-mentions')) enhanceMentions(this);
   }
 }
 customElements.define('pw-markdown', PlainwireMarkdown);

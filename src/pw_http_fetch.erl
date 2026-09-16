@@ -7,19 +7,44 @@ get(Url, MaxBytes) -> get(Url, MaxBytes, #{}).
 %% failing. Page metadata lives near the top; media must arrive whole.
 get(Url, MaxBytes, Opts) when is_binary(Url), is_integer(MaxBytes), MaxBytes > 0, is_map(Opts) ->
     Truncate = maps:get(truncate, Opts, false) =:= true,
-    Headers = [{"user-agent", maps:get(user_agent, Opts, "PlainwireRelay/1.4")}, {"accept-encoding", "identity"}
-               | [{"accept", Accept} || Accept <- [maps:get(accept, Opts, undefined)], Accept =/= undefined]],
+    ExtraHeaders = normalize_extra_headers(maps:get(headers, Opts, [])),
+    Headers = [{"user-agent", maps:get(user_agent, Opts, "PlainwireRelay/1.4")}, {"accept-encoding", "identity"}]
+        ++ [{"accept", Accept} || Accept <- [maps:get(accept, Opts, undefined)], Accept =/= undefined]
+        ++ ExtraHeaders,
     %% no redirects here; they sidestep the SSRF check. rude. Keep media/page
     %% fetches bounded so one dead avatar host cannot make a refresh feel frozen.
     Timeout = clamp_timeout(pw_util:env_int("PLAINWIRE_HTTP_FETCH_TIMEOUT_MS", 8000), 2000, 30000),
     ConnectTimeout = min(Timeout - 250, clamp_timeout(pw_util:env_int("PLAINWIRE_HTTP_CONNECT_TIMEOUT_MS", 2500), 500, 10000)),
-    HttpOptions = [{timeout, Timeout}, {connect_timeout, ConnectTimeout}, {autoredirect, false}],
+    HttpOptions = [{timeout, Timeout}, {connect_timeout, ConnectTimeout}, {autoredirect, false}] ++ tls_options(Url),
     Options = [{sync, false}, {stream, {self, once}}],
     Deadline = erlang:monotonic_time(millisecond) + Timeout + 1000,
     case httpc:request(get, {binary_to_list(Url), Headers}, HttpOptions, Options) of
         {ok, RequestId} -> await_start(RequestId, MaxBytes, Truncate, Deadline);
         {error, Reason} -> {error, Reason}
     end.
+
+
+tls_options(<<"https://", _/binary>>) ->
+    %% OTP 25 still defaulted httpc TLS verification to verify_none. Plainwire
+    %% supports OTP 25+, so make certificate + HTTPS hostname verification
+    %% explicit instead of relying on the runtime's changing defaults.
+    try
+        [{ssl, [
+            {verify, verify_peer},
+            {cacerts, public_key:cacerts_get()},
+            {customize_hostname_check, [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]}
+        ]}]
+    catch
+        _:_ ->
+            %% Fail closed if the host trust store cannot be loaded. An empty CA
+            %% set makes TLS verification fail rather than silently downgrading.
+            [{ssl, [
+                {verify, verify_peer},
+                {cacerts, []},
+                {customize_hostname_check, [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]}
+            ]}]
+    end;
+tls_options(_) -> [].
 
 await_start(RequestId, MaxBytes, Truncate, Deadline) ->
     receive
@@ -94,3 +119,30 @@ header_value(Name0, Headers) ->
 cancel(RequestId) ->
     try httpc:cancel_request(RequestId) catch _:_ -> ok end,
     ok.
+
+normalize_extra_headers(Headers) when is_list(Headers) ->
+    [
+        {binary_to_list(NameBin), binary_to_list(ValueBin)}
+     || {Name, Value} <- Headers,
+        NameBin <- [pw_util:bin(Name)],
+        ValueBin <- [pw_util:bin(Value)],
+        byte_size(NameBin) > 0,
+        byte_size(NameBin) =< 128,
+        byte_size(ValueBin) =< 4096,
+        valid_header_name(NameBin),
+        binary:match(ValueBin, <<"\r">>) =:= nomatch,
+        binary:match(ValueBin, <<"\n">>) =:= nomatch
+    ];
+normalize_extra_headers(_) -> [].
+
+valid_header_name(<<>>) -> true;
+valid_header_name(<<C, Rest/binary>>) when (C >= $a andalso C =< $z) orelse
+                                            (C >= $A andalso C =< $Z) orelse
+                                            (C >= $0 andalso C =< $9) orelse
+                                            C =:= $! orelse C =:= $# orelse C =:= $$ orelse
+                                            C =:= $% orelse C =:= $& orelse C =:= $' orelse
+                                            C =:= $* orelse C =:= $+ orelse C =:= $- orelse
+                                            C =:= $. orelse C =:= $^ orelse C =:= $_ orelse
+                                            C =:= $` orelse C =:= $| orelse C =:= $~ ->
+    valid_header_name(Rest);
+valid_header_name(_) -> false.

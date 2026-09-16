@@ -6881,7 +6881,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.8.1", attribute "data-ui-revision" "interface-4" ]
+    div [ class "layout", attribute "data-ui-version" "1.9.0", attribute "data-ui-revision" "interface-4" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -6921,6 +6921,9 @@ mainClass active =
 
         Settings ->
             "main route-settings"
+
+        SourceHub ->
+            "main route-source"
 
         _ ->
             "main"
@@ -7030,7 +7033,7 @@ renderRail model =
                 []
     in
     nav [ class "rail", attribute "aria-label" "Main navigation" ]
-        ([ button [ class "mark", type_ "button", title (model.appName ++ " home"), attribute "aria-label" (model.appName ++ " home"), onClick (Go "#") ] []
+        ([ button [ class ("mark" ++ (if model.active == SourceHub then " active" else "")), type_ "button", title (model.appName ++ " source architecture"), attribute "aria-label" (model.appName ++ " source architecture"), attribute "aria-current" (if model.active == SourceHub then "page" else "false"), onClick (Go "#source") ] []
          , railBtn "home" "Home" (model.active == Home) (Go "#")
          , railBtn "messages" "Direct messages" (isDmActive model) (Go "#dms")
          , railBtn "forums" "Forums" (model.active == Forums) (Go "#forums")
@@ -7432,7 +7435,7 @@ renderQuickNavigation conversations servers currentServer =
                     (List.map (\c -> item (convName c) "Conversation" ("#dm/" ++ String.fromInt c.id)) conversations
                         ++ List.map (\server -> item server.name "Server" ("#server/" ++ String.fromInt server.id)) servers
                         ++ rooms
-                        ++ [ item "Home" "Overview" "#home", item "Friends" "People" "#friends", item "Settings" "Personal preferences" "#settings", item "Notifications" "Activity" "#notifications" ]
+                        ++ [ item "Home" "Overview" "#home", item "Friends" "People" "#friends", item "Plainwire Source" "Architecture and development" "#source", item "Settings" "Personal preferences" "#settings", item "Notifications" "Activity" "#notifications" ]
                     )
                 )
             )
@@ -7955,6 +7958,9 @@ topbarSubtitle model =
         Notifications ->
             "Mentions and activity"
 
+        SourceHub ->
+            "Live source architecture and development"
+
         SearchView _ ->
             "Search results"
 
@@ -8006,6 +8012,9 @@ topbarTitle model =
 
         Notifications ->
             "Notifications"
+
+        SourceHub ->
+            "Plainwire Source"
 
         SearchView _ ->
             "Search"
@@ -8067,6 +8076,16 @@ renderPage model =
 
         Notifications ->
             Notifications.view relativeTime model
+
+        SourceHub ->
+            div [ class "source-hub-page" ]
+                [ Html.node "pw-source-hub" []
+                    [ div [ class "source-hub-fallback card pad" ]
+                        [ h3 [] [ text "Loading Plainwire source architecture…" ]
+                        , p [ class "muted" ] [ text "Live development data is loaded securely through this Plainwire instance." ]
+                        ]
+                    ]
+                ]
 
         SearchView q ->
             renderSearchPage q model
@@ -11591,6 +11610,9 @@ parseRoute raw =
 
     else if s == "notifications" then
         Notifications
+
+    else if s == "source" || String.startsWith "source/" s then
+        SourceHub
 
     else if String.startsWith "f/" s then
         ForumView (parseInt (String.dropLeft 2 s))

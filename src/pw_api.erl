@@ -254,6 +254,16 @@ authed(<<"POST">>, [<<"onboarding">>, <<"dismiss">>], Req, Session, _) ->
     result(Req, pw_db:dismiss_onboarding(uid(Session)));
 authed(<<"POST">>, [<<"onboarding">>, <<"replay">>], Req, Session, _) ->
     result(Req, pw_db:replay_onboarding(uid(Session)));
+authed(<<"GET">>, [<<"development">>, <<"overview">>], Req, Session, _) ->
+    github_request(Req, Session, fun pw_github:overview/0);
+authed(<<"GET">>, [<<"development">>, <<"repository">>], Req, Session, _) ->
+    github_request(Req, Session, fun() -> pw_github:repository(qs(Req, <<"repo">>)) end);
+authed(<<"GET">>, [<<"development">>, <<"commit">>], Req, Session, _) ->
+    github_request(Req, Session, fun() -> pw_github:commit(qs(Req, <<"repo">>), qs(Req, <<"sha">>)) end);
+authed(<<"GET">>, [<<"development">>, <<"profile">>], Req, Session, _) ->
+    github_request(Req, Session, fun() -> pw_github:profile(qs(Req, <<"login">>)) end);
+authed(<<"GET">>, [<<"development">>, <<"content">>], Req, Session, _) ->
+    github_request(Req, Session, fun() -> pw_github:content(qs(Req, <<"repo">>), qs(Req, <<"path">>), qs(Req, <<"ref">>)) end);
 authed(<<"GET">>, [<<"gifs">>, <<"search">>], Req, Session, _) ->
     result(Req, pw_klipy:search(uid(Session), qs(Req, <<"q">>), qs(Req, <<"pos">>)));
 authed(<<"POST">>, [<<"gifs">>, <<"share">>], Req0, Session, _) ->
@@ -342,6 +352,24 @@ with_json_large(Req0, Fun) ->
         {ok, M, Req} -> Fun(M, Req);
         {error, too_large, Req} -> pw_util:err_json(Req, 413, <<"profile_images_too_large">>);
         {error, _, Req} -> pw_util:err_json(Req, 400, <<"invalid_json">>)
+    end.
+
+
+github_request(Req, Session, Fun) ->
+    case pw_rate:allow({github_source, uid(Session)}, 90, 60000) of
+        false -> pw_util:err_json(Req, 429, <<"source_rate_limited">>);
+        true ->
+            case Fun() of
+                {ok, Data} -> pw_util:ok_json(Req, #{ok => true, data => Data});
+                {error, not_found} -> pw_util:err_json(Req, 404, <<"source_not_found">>);
+                {error, rate_limited} -> pw_util:err_json(Req, 503, <<"github_rate_limited">>);
+                {error, invalid_repository} -> pw_util:err_json(Req, 400, <<"invalid_repository">>);
+                {error, invalid_commit} -> pw_util:err_json(Req, 400, <<"invalid_commit">>);
+                {error, invalid_profile} -> pw_util:err_json(Req, 400, <<"invalid_profile">>);
+                {error, invalid_path} -> pw_util:err_json(Req, 400, <<"invalid_path">>);
+                {error, invalid_ref} -> pw_util:err_json(Req, 400, <<"invalid_ref">>);
+                {error, _} -> pw_util:err_json(Req, 502, <<"github_unavailable">>)
+            end
     end.
 
 result(Req, {ok, Data}) -> pw_util:ok_json(Req, #{ok=>true,data=>Data});

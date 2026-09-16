@@ -8,6 +8,7 @@ node --check priv/static/call-health.js
 node --check priv/admin/admin.js
 node --check web/markdown.js
 node --check web/interface.js
+node --check web/source-hub.js
 node --check scripts/build-rich-text.mjs
 npm run test:rtc-contract
 npm run test:ui-contract

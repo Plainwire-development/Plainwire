@@ -422,6 +422,7 @@ type ActiveRoute
     | InviteView String
     | Notifications
     | SearchView String
+    | SourceHub
 
 
 type Route

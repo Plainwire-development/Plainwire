@@ -228,7 +228,7 @@ security_headers() ->
     end,
     %% YouTube/Vimeo link cards load a poster and, after a click, the player frame.
     Csp = <<"default-src 'self'; ", ScriptPolicy/binary,
-        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://i.ytimg.com; media-src 'self' blob:; ",
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://i.ytimg.com https://avatars.githubusercontent.com; media-src 'self' blob:; ",
         "frame-src https://www.youtube-nocookie.com https://player.vimeo.com; ",
         "connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'">>,
     #{

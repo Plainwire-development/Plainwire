@@ -90,7 +90,9 @@ outbound_and_failure_test() ->
         ?assertEqual(256, ets:lookup_element(pw_cluster_outbox, count, 2)),
         sys:resume(Cluster)
     after
-        catch sys:resume(Cluster), gen_server:stop(Cluster), gen_server:stop(Hub),
+        try sys:resume(Cluster) catch _:_ -> ok end,
+        try gen_server:stop(Cluster) catch _:_ -> ok end,
+        try gen_server:stop(Hub) catch _:_ -> ok end,
         [application:unset_env(plainwire_relay, K) || K <- [cluster, test_transport_sink, test_transport_result]]
     end.
 

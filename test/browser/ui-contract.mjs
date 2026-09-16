@@ -1,14 +1,20 @@
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
-const [elm, types, bridge, markdown, api, db, less, scss, contentLess, callsScss, notificationView, componentsScss] = await Promise.all([
+const [elm, types, bridge, markdown, sourceHub, githubBackend, githubCache, supervisor, api, db, util, less, sourceLess, scss, contentLess, callsScss, notificationView, componentsScss] = await Promise.all([
   readFile('priv/static/elm/src/Main.elm', 'utf8'),
   readFile('priv/static/elm/src/Types.elm', 'utf8'),
   readFile('priv/static/elm-bridge.js', 'utf8'),
   readFile('web/markdown.js', 'utf8'),
+  readFile('web/source-hub.js', 'utf8'),
+  readFile('src/pw_github.erl', 'utf8'),
+  readFile('src/pw_github_cache.erl', 'utf8'),
+  readFile('src/pw_sup.erl', 'utf8'),
   readFile('src/pw_api.erl', 'utf8'),
   readFile('src/pw_db.erl', 'utf8'),
+  readFile('src/pw_util.erl', 'utf8'),
   readFile('priv/static/_theme-hooks.less', 'utf8'),
+  readFile('priv/static/_source-hub.less', 'utf8'),
   readFile('priv/static/_message-extras.scss', 'utf8'),
   readFile('priv/static/_content.less', 'utf8'),
   readFile('priv/static/_calls.scss', 'utf8'),
@@ -23,6 +29,49 @@ assert.match(elm, /emojiPickerItems/, 'emoji picker uses a maintained item list'
 assert.match(bridge, /insert_composer_text/, 'emoji selection inserts at the active composer cursor');
 assert.match(markdown, /mention\.dataset\.mentionUsername/, 'mentions retain an exact username target');
 assert.match(markdown, /profile-by-username\?username=/, 'clicking a mention resolves the exact profile');
+
+
+// Plainwire Source: the logo opens a real first-class route backed by a bounded,
+// same-origin GitHub metadata proxy. The browser never receives upstream tokens.
+assert.match(types, /\| SourceHub/, 'Source Hub is a typed Elm route');
+assert.match(elm, /onClick \(Go "#source"\)/, 'Plainwire mark opens the Source Hub');
+assert.match(elm, /Html\.node "pw-source-hub"/, 'Source Hub mounts as a first-class page');
+assert.match(api, /\[<<"development">>, <<"overview">>\]/, 'Source Hub overview endpoint is authenticated through the main API');
+assert.match(api, /pw_rate:allow\(\{github_source, uid\(Session\)\}/, 'Source Hub upstream requests have a per-session rate limit');
+assert.match(sourceHub, /\/api\/development\//, 'Source Hub browser traffic stays on the Plainwire origin');
+assert.doesNotMatch(sourceHub, /fetch\(['"`]https:\/\/api\.github\.com/, 'Source Hub never calls the GitHub REST API directly from the browser');
+assert.match(sourceHub, /no-embeds/, 'repository and release Markdown disables chat-style remote link previews');
+assert.match(sourceHub, /no-mentions/, 'GitHub Markdown does not resolve @mentions as Plainwire users');
+assert.match(markdown, /no-embeds/, 'safe Markdown supports an explicit no-embed mode');
+assert.match(markdown, /no-mentions/, 'safe Markdown supports an explicit no-mention mode');
+assert.match(sourceHub, /source-active-contributors/, 'recent GitHub actors are surfaced as active contributors');
+assert.match(sourceHub, /source-event-commit-button/, 'push-event commits can open a bounded commit diff');
+assert.match(sourceHub, /renderLanguages/, 'repository language metadata has a dedicated detector view');
+assert.match(sourceHub, /decoded_content/, 'bounded source-file contents are rendered without raw HTML insertion');
+assert.match(sourceHub, /textContent/, 'Source Hub builds GitHub metadata with textContent');
+assert.doesNotMatch(sourceHub, /\.innerHTML\s*=/, 'Source Hub never injects GitHub metadata through innerHTML');
+assert.match(sourceHub, /PLAINWIRE|Plainwire Source|Source tour/, 'Source Hub includes the guided architecture experience');
+assert.match(sourceLess, /\.source-tour-guide\.is-visible/, 'Source tour uses the established Plainwire tour transition');
+assert.match(sourceLess, /@media \(max-width: 760px\)/, 'Source Hub has an explicit mobile layout');
+assert.match(util, /https:\/\/avatars\.githubusercontent\.com/, 'CSP permits only GitHub’s canonical avatar CDN for mirrored profiles');
+assert.match(sourceHub, /githubOnly[\s\S]*hostname\.toLowerCase\(\) !== 'github\.com'/, 'GitHub action links are restricted to canonical github.com HTTPS URLs');
+assert.match(sourceHub, /Cached · refresh incomplete/, 'Source Hub labels partial upstream failures as cached/degraded instead of falsely live');
+assert.match(sourceHub, /validGitHubLogin/, 'Source Hub validates profile route names before issuing requests');
+assert.match(githubBackend, /-define\(CACHE_MAX_ENTRIES, 128\)/, 'GitHub metadata cache has an explicit hard entry bound');
+assert.match(githubBackend, /-define\(CACHE_TARGET_ENTRIES, 96\)/, 'GitHub metadata cache prunes below the hard bound');
+assert.match(githubBackend, /Value =\/= <<"\.">>[\s\S]*Value =\/= <<"\.\.">>/, 'repository validation rejects dot path-normalization edge cases');
+assert.match(githubCache, /ets:new\(\?TABLE, \[named_table, public, set/, 'GitHub metadata cache has a dedicated long-lived ETS owner');
+assert.match(supervisor, /id => pw_github_cache[\s\S]*start => \{pw_github_cache, start_link, \[\]\}/, 'GitHub cache owner is supervised before HTTP traffic');
+assert.match(githubBackend, /cached_json\(Key, Path, MaxBytes, Transform\)/, 'GitHub content can be sanitized before entering the shared cache');
+assert.match(githubBackend, /fun decoded_content\/1/, 'README and source-file payloads drop upstream base64 before caching');
+assert.match(githubBackend, /case github_token\(\) of[\s\S]*cached_json\(Key, Base[\s\S]*fetch_json\(Base, \?MAX_JSON, undefined, fun public_repository_metadata\/1\)/, 'token-authenticated repository visibility is rechecked live while unauthenticated reads may share safe public cache');
+assert.match(githubBackend, /maps:without\(\[[\s\S]*permissions[\s\S]*security_and_analysis[\s\S]*custom_properties/, 'authenticated GitHub repo responses drop permission and organization-private metadata');
+assert.match(githubBackend, /fun public_profile\/1/, 'profile metadata is projected to the public GitHub user shape before caching');
+assert.match(githubBackend, /public_repository_meta\(Repo\)[\s\S]*With a server token, never make that decision from stale cache[\s\S]*public_repository_result/, 'repository detail uses a non-stale visibility gate whenever authenticated GitHub reads could cross into private data');
+assert.match(sourceHub, /validRepoName/, 'Source Hub mirrors backend repository-name validation before requests');
+assert.match(sourceHub, /routeSerial !== this\.routeSerial/, 'late repository/profile responses cannot overwrite a newer Source route');
+assert.match(sourceHub, /dialogSerial !== this\.dialogSerial/, 'late commit/file responses cannot reopen or replace a newer Source dialog');
+assert.match(sourceHub, /addEventListener\('cancel',[\s\S]*dismissDialog/, 'Source dialogs invalidate pending viewers when dismissed with Escape');
 
 assert.match(api, /\[<<"edit_message">>, MsgId\]/, 'edit endpoint is exposed');
 assert.match(api, /\[<<"forward_message">>, MsgId\]/, 'forward endpoint is exposed');

@@ -1,3 +1,4 @@
+import './source-hub.js';
 // UI-only controls. Each component owns and releases its listeners and observers.
 const element = (tag, cls, text) => {
   const el = document.createElement(tag);
@@ -25,7 +26,7 @@ class QuickSwitcher extends HTMLElement {
     this.dialog = dialog;
     let items = [], index = 0, matches = [];
     const navigate = item => {
-      if (!item || !/^#(?:dm|server|channel)\/\d+$|^#(?:home|friends|settings|notifications|messages)$/.test(item.href)) return;
+      if (!item || !/^#(?:dm|server|channel)\/\d+$|^#(?:home|friends|settings|notifications|messages|source)$/.test(item.href)) return;
       dialog.close(); location.hash = item.href;
     };
     const select = next => {
@@ -135,7 +136,7 @@ class MentionPicker extends HTMLElement {
     close.addEventListener('click', () => this.close());
     this.panel.addEventListener('mousedown', (event) => { event.preventDefault(); });
   }
-  disconnectedCallback() { this.abort?.abort(); }
+  disconnectedCallback() { queueMicrotask(() => { if (!this.isConnected) { this.abort?.abort(); this.built = false; } }); }
   composerTextarea() {
     return this.closest('.composer')?.querySelector('#compose') || null;
   }

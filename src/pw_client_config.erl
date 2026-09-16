@@ -38,7 +38,7 @@ source_repository() ->
 version() ->
     case application:get_key(plainwire_relay, vsn) of
         {ok, Vsn} -> pw_util:bin(Vsn);
-        _ -> <<"1.8.1">>
+        _ -> <<"1.9.0">>
     end.
 
 asset_version() ->
@@ -84,7 +84,10 @@ read_asset_parts(Static, [Name | Rest], Acc) ->
 
 registration_enabled() ->
     EnvDefault = pw_util:env_bool("PLAINWIRE_REGISTRATION_ENABLED", true),
-    case catch pw_db:instance_registration_mode() of
+    Mode = try pw_db:instance_registration_mode()
+           catch _:_ -> unavailable
+           end,
+    case Mode of
         {ok, <<"enabled">>} -> true;
         {ok, <<"disabled">>} -> false;
         _ -> EnvDefault

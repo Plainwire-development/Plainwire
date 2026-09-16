@@ -6,6 +6,12 @@ It has servers, channels, DMs, group chats, forums, voice calls, screen sharing,
 
 Plainwire is built with Erlang/OTP, Cowboy, PostgreSQL, Elm, WebSocket, and WebRTC.
 
+Plainwire can also be used as a self hosted service on your own servers, it isnt tied to ours; but it is recommended to use our provided servers. Much like how Stoat handles it.
+
+Our central, and official [Plainwire Server](https://plainwire.kokonico.me) 
+
+----------------------------
+
 ## Using Plainwire
 
 The easiest way to use Plainwire is through a hosted instance.
@@ -119,6 +125,17 @@ PLAINWIRE_SOURCE_REPOSITORY=https://github.com/Plainwire-development/Plainwire
 
 Only an HTTPS repository URL is exposed to the browser; private server credentials are not part of client config.
 
+The Plainwire mark in the main navigation opens **Plainwire Source**, a read-only development view for the public `Plainwire-development` organization. It shows recent public activity, repositories (including the desktop client and forum), commits and file diffs, releases/tags/branches, README/files, GitHub language statistics, contributors, mirrored public GitHub profiles, raw metadata, and a guided source-architecture tour. Data is fetched by the Plainwire server and cached; the browser never talks to the GitHub REST API directly.
+
+Busy public instances may optionally authenticate those server-side GitHub reads:
+
+```sh
+PLAINWIRE_GITHUB_TOKEN=replace-with-a-server-side-github-token
+PLAINWIRE_GITHUB_CACHE_TTL_MS=120000
+```
+
+The token is optional for public repositories and is never included in client config or API responses. Treat it as a quota helper and give it no repository permissions when possible. Plainwire independently requires repositories to be public and projects authenticated GitHub responses down to public-safe metadata before caching or returning them. Without a token, Plainwire automatically uses a longer cache interval to conserve GitHub's unauthenticated quota.
+
 ### GIF search
 
 KLIPY integration is optional. Configure the provider key only on the server:
@@ -220,7 +237,7 @@ Caddy, nginx, and similar reverse proxies work well in front of Plainwire.
 
 ### Service control plane
 
-Plainwire 1.8.1 includes an optional host-level operator console. It administers the configured Plainwire service instance itself; it is not a per-server moderation panel. The control plane is disabled by default and runs on a separate Cowboy listener when enabled.
+Plainwire 1.9.0 includes an optional host-level operator console. It administers the configured Plainwire service instance itself; it is not a per-server moderation panel. The control plane is disabled by default and runs on a separate Cowboy listener when enabled.
 
 The console is intentionally private-content blind. It can inspect service health, runtime/build information, database and realtime health, aggregate message/upload/call statistics, registered accounts, hosted server metadata, resource usage, operators, and operator audit history. It has no message-body, DM-text, attachment-content, message-search, or verification-secret endpoint.
 
@@ -247,24 +264,21 @@ For remote operator access, the recommended deployment is a **separate admin hos
 
 Back up the admin instance-secret file together with PostgreSQL. Treat it like other host credentials: source access alone is harmless, but host-secret access is privileged.
 
-Plainwire 1.8.1 also adds **Service controls** to the host console. Operators can publish scheduled or permanent global announcements, pause/resume or retire them in realtime, override whether new account registration is open without restarting the service, and request a lightweight client-state reconciliation without disconnecting active calls. Global announcements use the normal Plainwire visual language, are capped on-screen to prevent banner flooding, support safe same-origin or HTTPS links, and may be dismissible or persistent.
+Plainwire 1.9.0 also adds **Service controls** to the host console. Operators can publish scheduled or permanent global announcements, pause/resume or retire them in realtime, override whether new account registration is open without restarting the service, and request a lightweight client-state reconciliation without disconnecting active calls. Global announcements use the normal Plainwire visual language, are capped on-screen to prevent banner flooding, support safe same-origin or HTTPS links, and may be dismissible or persistent.
 
 Deployment and update instructions are kept in [deploy/README.md](deploy/README.md).
 
 ## Version
 
-Current release: **1.8.1**
+Current release: **1.9.0**
 
 Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history.
 
-* [1.8.1 release notes](RELEASE_NOTES_1.8.1.md)
+* [1.9.0 release notes](RELEASE_NOTES_1.9.0.md)
 
 ## License
 
-Licensed under AGPL-3, and PlainSimple License 1.
-Choose what license you want to abide by.
-
-See the repository license file.
+Dual Licensing. AGPL-3 and our PlainSimple 1.0; choose a license to abide by.
 
 ## Notice
 

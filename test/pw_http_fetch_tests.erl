@@ -40,3 +40,39 @@ read_request(Socket, Acc) ->
         _ ->
             Acc
     end.
+
+extra_headers_are_forwarded_test() ->
+    {ok, _} = application:ensure_all_started(inets),
+    Parent = self(),
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}, {ip, {127, 0, 0, 1}}]),
+    {ok, Port} = inet:port(Listen),
+    Server = spawn(fun() -> serve_once(Listen, Parent) end),
+    Url = <<"http://127.0.0.1:", (integer_to_binary(Port))/binary, "/headers">>,
+    try
+        {ok, 200, _, <<"{}">>} = pw_http_fetch:get(Url, 4096, #{
+            headers => [{<<"x-github-api-version">>, <<"2026-03-10">>},
+                        {<<"if-none-match">>, <<"etag-test">>},
+                        {<<"bad\r\nheader">>, <<"skip-me">>},
+                        {<<"x-bad-value">>, <<"safe\r\ninjected: nope">>}]
+        }),
+        receive
+            {captured_request, Request} ->
+                Lower = string:lowercase(Request),
+                ?assertNotEqual(nomatch, binary:match(Lower, <<"x-github-api-version: 2026-03-10">>)),
+                ?assertNotEqual(nomatch, binary:match(Lower, <<"if-none-match: etag-test">>)),
+                ?assertEqual(nomatch, binary:match(Lower, <<"skip-me">>)),
+                ?assertEqual(nomatch, binary:match(Lower, <<"injected: nope">>))
+        after 1000 ->
+            ?assert(false)
+        end
+    after
+        exit(Server, kill),
+        gen_tcp:close(Listen)
+    end.
+
+serve_once(Listen, Parent) ->
+    {ok, Socket} = gen_tcp:accept(Listen),
+    Request = read_request(Socket, <<>>),
+    Parent ! {captured_request, Request},
+    _ = gen_tcp:send(Socket, <<"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}">>),
+    gen_tcp:close(Socket).

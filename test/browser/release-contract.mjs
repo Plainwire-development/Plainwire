@@ -244,4 +244,4 @@ assert.match(db, /batch_message_reactions[\s\S]*bool_or\(mr\.user_id=\$5\)/, 'me
 assert.match(db, /server_member_profile[\s\S]*server_permissions0\(Conn, Uid, Sid\)[\s\S]*mr\.user_id=\$2/, 'targeted server profiles require server membership and fetch one member');
 assert.match(db, /\(r\.permissions & 1073741824\) DESC[\s\S]*\(r\.permissions & 16\) DESC[\s\S]*r\.position DESC/, 'presentation role color prioritizes actual privilege strength before display position');
 
-console.log('PASS: 1.8.1 release contracts: stabilization, identity rename, vector branding, onboarding, realtime, moderation, reactions, deletion, and route integrity.');
+console.log('PASS: 1.9.0 release contracts: stabilization, identity rename, vector branding, onboarding, realtime, moderation, reactions, deletion, and route integrity.');
