@@ -301,7 +301,11 @@ deliver_hub_payload(Payload, Type, Uid, State) ->
 terminate(Reason, _, State=#{uid:=Uid}) ->
     debug(info, "disconnected", #{uid => Uid, reason => Reason, room => room_summary(State)}),
     %% refresh isn't hangup. let the replacement socket reclaim the room.
-    pw_hub:disconnect(self()), ok.
+    pw_hub:disconnect(self()), ok;
+%% Rejected handshakes (bad origin, no session, database down) never reach
+%% websocket_init, so cowboy terminates them with the state init/2 returned
+%% and there is no hub registration to drop.
+terminate(_, _, _) -> ok.
 
 parse_key(Bin) when is_binary(Bin) ->
     case binary:split(Bin, <<":">>, [global]) of

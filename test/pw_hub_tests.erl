@@ -376,7 +376,9 @@ socket_loop(Parent, Tag) ->
         {hub_json, Event} -> Parent ! {socket_event, Tag, Event}, socket_loop(Parent, Tag);
         {hub_text, Payload, call_presence} ->
             Json = jsx:decode(Payload, [return_maps]),
-            Users = [#{user_id => maps:get(<<"user_id">>, U)} || U <- maps:get(<<"users">>, Json, [])],
+            Users = [#{user_id => maps:get(<<"user_id">>, U),
+                       reconnecting => maps:get(<<"reconnecting">>, U, false)}
+                     || U <- maps:get(<<"users">>, Json, [])],
             Parent ! {socket_event, Tag, #{type => call_presence,
                 conversation_id => maps:get(<<"conversation_id">>, Json),
                 active => maps:get(<<"active">>, Json), users => Users}},

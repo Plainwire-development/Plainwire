@@ -5607,7 +5607,7 @@
       // The server forgets seat state across a fresh join or reconnect and drops
       // changes made while ringing. Tell it what this client is actually doing.
       room.stateSynced = true;
-      sendWs({ type: kind === 'voice' ? 'voice_state' : 'call_state', patch: { muted: micMuted, deafened, screen: !!screenStream } });
+      sendWs({ type: kind === 'voice' ? 'voice_state' : 'call_state', patch: { muted: micMuted, deafened, screen: !!screenStream, screen_audio: !!screenStream && screenAudioSource !== 'none' } });
     }
     const userId = (u) => Number(u.user_id || u.userId || u.profile?.id || 0);
     const roster = new Set(users.map(userId).filter((uid) => uid && uid !== meId));
