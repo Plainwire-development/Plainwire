@@ -20,6 +20,14 @@ const [bridge, elm, api, db, ws, cluster, clusterWire, clusterLocal, klipy, conf
   readFile('Makefile', 'utf8')
 ]);
 
+const between = (text, start, end) => {
+  const a = text.indexOf(start);
+  assert(a >= 0, `missing ${start}`);
+  const b = text.indexOf(end, a + start.length);
+  assert(b > a, `missing ${end} after ${start}`);
+  return text.slice(a, b);
+};
+
 // Fresh-account onboarding is durable, but guide content stays live and ephemeral.
 assert.match(db, /INSERT INTO users[\s\S]*<<"pending">>, 0, Now/, 'new registrations begin with pending onboarding');
 assert.match(db, /ADD COLUMN IF NOT EXISTS onboarding_state text NOT NULL DEFAULT 'complete'/, 'existing migrated users do not get forced into onboarding');
@@ -180,4 +188,21 @@ assert.match(bridge, /avatarFallback[\s\S]*fallbackApplied/, 'avatar failures re
 assert.doesNotMatch(bridge, /avatarTries|avatar-retrying|replaceWith\(/, 'obsolete avatar retry/DOM replacement machinery is gone');
 assert.match(elm, /attribute "loading" "lazy"[\s\S]*attribute "fetchpriority" "low"/, 'list icons use browser-managed lazy loading instead of eager request stampedes');
 
-console.log('PASS: 1.7.5-1 stabilization, onboarding, scoped identity, typing, moderation, forum, cluster-revocation, KLIPY, and route contracts.');
+
+// Server deletion and reactions are backend-authoritative, transaction-safe, and bounded.
+assert.match(db, /route\(\{delete_server[\s\S]*SELECT owner_id,name FROM servers WHERE id = \$1 FOR UPDATE/, 'server deletion locks the owner row and remains owner-authoritative');
+assert.match(db, /ConfirmName =:= ServerName[\s\S]*confirmation_mismatch/, 'server deletion independently enforces exact-name confirmation server-side');
+assert.match(db, /SELECT id FROM channels WHERE server_id = \$1 ORDER BY id ASC FOR UPDATE[\s\S]*DELETE FROM notifications[\s\S]*DELETE FROM upload_refs[\s\S]*DELETE FROM messages[\s\S]*DELETE FROM servers/, 'server deletion purges polymorphic traces before FK cascades remove owned rows');
+assert.match(db, /pw_cluster:revoke_server_access\(MemberId, Sid, ChannelIds\)/, 'server deletion revokes live access for every former member after commit');
+assert.match(db, /route\(\{post_channel_message[\s\S]*SELECT id FROM servers WHERE id=\$1 FOR KEY SHARE/, 'channel posting holds a parent server lock that conflicts with concurrent deletion');
+assert.match(db, /route\(\{forward_message[\s\S]*SELECT id FROM servers WHERE id=\$1 FOR KEY SHARE/, 'channel forwarding also serializes against concurrent server deletion');
+const moveChannel = between(db, 'route({move_channel, Uid, ChannelId0, CatId0, Position0}, Conn) ->', 'route({create_invite,');
+assert.ok(moveChannel.indexOf('SELECT id FROM servers WHERE id = $1 FOR UPDATE') < moveChannel.indexOf('SELECT id FROM channels WHERE id=$1 AND server_id=$2 FOR UPDATE'), 'channel moves use server-before-channel lock order');
+assert.match(db, /\{28, \[[\s\S]*CREATE TABLE IF NOT EXISTS message_reactions[\s\S]*PRIMARY KEY\(message_id,user_id,emoji\)[\s\S]*idx_message_reactions_user/, 'reactions use a normalized, cascade-safe table with message and user lookup indexes');
+assert.match(db, /route\(\{toggle_message_reaction[\s\S]*channel_message_access\(Conn, Uid, ScopeId\)[\s\S]*conversation_can_send/, 'reaction writes require current send-capable scope access');
+assert.match(db, /route\(\{delete_message[\s\S]*DELETE FROM message_reactions WHERE message_id=\$1/, 'soft-deleting a message removes otherwise invisible reaction records');
+assert.match(db, /batch_message_reactions[\s\S]*bool_or\(mr\.user_id=\$5\)/, 'message pages batch reaction aggregation and viewer state instead of N+1 fetching');
+assert.match(db, /server_member_profile[\s\S]*server_permissions0\(Conn, Uid, Sid\)[\s\S]*mr\.user_id=\$2/, 'targeted server profiles require server membership and fetch one member');
+assert.match(db, /\(r\.permissions & 1073741824\) DESC[\s\S]*\(r\.permissions & 16\) DESC[\s\S]*r\.position DESC/, 'presentation role color prioritizes actual privilege strength before display position');
+
+console.log('PASS: 1.7.5-2 stabilization, onboarding, scoped identity, typing, moderation, forum, cluster-revocation, KLIPY, and route contracts.');

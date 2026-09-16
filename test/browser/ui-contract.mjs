@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
-const [elm, types, bridge, markdown, api, db, less, scss] = await Promise.all([
+const [elm, types, bridge, markdown, api, db, less, scss, contentLess, callsScss] = await Promise.all([
   readFile('priv/static/elm/src/Main.elm', 'utf8'),
   readFile('priv/static/elm/src/Types.elm', 'utf8'),
   readFile('priv/static/elm-bridge.js', 'utf8'),
@@ -9,7 +9,9 @@ const [elm, types, bridge, markdown, api, db, less, scss] = await Promise.all([
   readFile('src/pw_api.erl', 'utf8'),
   readFile('src/pw_db.erl', 'utf8'),
   readFile('priv/static/_theme-hooks.less', 'utf8'),
-  readFile('priv/static/_message-extras.scss', 'utf8')
+  readFile('priv/static/_message-extras.scss', 'utf8'),
+  readFile('priv/static/_content.less', 'utf8'),
+  readFile('priv/static/_calls.scss', 'utf8')
 ]);
 
 assert.match(markdown, /eyes:\s*'👀'/u, ':eyes: renders as the eyes emoji');
@@ -34,6 +36,10 @@ assert.match(db, /insert_upload_refs\(Conn, load_message\(StoredBody\), TargetSc
 assert.match(db, /safe_log_msg\(\{edit_message, Uid, Mid, _\}\).*redacted/s, 'edited message bodies are redacted from DB error logs');
 assert.match(types, /lastSenderName\s*:\s*String/, 'conversation summaries carry the latest sender');
 assert.match(elm, /dm-preview-sender/, 'DM sidebar renders the latest sender');
+assert.match(elm, /conversationPreviewSummary[\s\S]*attachmentCount[\s\S]*String\.left 117 plain \+\+ "…"/, 'DM previews collapse whitespace, bound text, and summarize attachment floods');
+assert.match(elm, /text \(conversationPreviewSummary lastText\)/, 'DM navigation renders a plain-text bounded preview instead of rich Markdown embeds');
+assert.doesNotMatch(elm, /class "muted dm-preview"[\s\S]{0,240}Markdown\.preview lastText/, 'DM navigation never renders message media or rich Markdown');
+assert.match(db, /conversation_preview_body\(StoredBody\)[\s\S]*clean_text\(load_message\(StoredBody\), 512\)/, 'conversation sync bounds last-message preview payloads server-side');
 assert.match(elm, /StartEditMessage/, 'message editing is wired into Elm');
 assert.match(elm, /OpenForwardModal/, 'message forwarding is wired into Elm');
 assert.match(elm, /Find a destination/, 'forwarding UI provides destination search');
@@ -71,5 +77,33 @@ assert.match(db, /re:run\(Body, <<"\\\\S">>/, 'whitespace-only payloads are reje
 assert.match(less, /--pw-mention-bg/, 'theme-facing message tokens live in Less');
 assert.match(scss, /\.message-editor/, 'complex message interaction layout lives in SCSS');
 assert.match(scss, /\.forward-modal/, 'forwarding UI has dedicated SCSS');
+
+
+// Server-scoped identity, reactions, responsive composer controls, and destructive server UI.
+assert.match(types, /type alias Reaction\s*=\s*\{ emoji : String[\s\S]*count : Int[\s\S]*me : Bool/, 'message reactions have an explicit typed client model');
+assert.match(types, /type alias ServerProfile\s*=\s*\{ serverId : Int[\s\S]*member : ServerMember[\s\S]*roles : List ServerProfileRole/, 'server profiles carry scoped member identity and roles');
+assert.match(api, /\[<<"server">>, Id, <<"member">>, UserId, <<"profile">>\]/, 'targeted server-profile endpoint is exposed');
+assert.match(elm, /ShowServerProfile serverId userId[\s\S]*\/member\/" \+\+ String\.fromInt userId \+\+ "\/profile"/, 'server profile UI uses one targeted member request');
+assert.match(elm, /serverMemberContext[\s\S]*View server profile[\s\S]*View full profile/, 'member context menu preserves both server and global profile choices');
+assert.match(elm, /onContextMenu \(OpenServerMemberCtx serverId m\)/, 'server member rows expose the scoped profile through the context gesture');
+assert.match(elm, /attribute "data-long-context" "true"/, 'rich member/message context actions opt into touch long-press');
+assert.match(bridge, /pointerType !== 'touch'[\s\S]*data-long-context="true"[\s\S]*MouseEvent\('contextmenu'/, 'touch long-press maps onto the existing context-menu interaction');
+assert.match(bridge, /suppressLongPressTarget === target[\s\S]*suppressLongPressTarget = null/, 'long-press click suppression releases retained DOM targets');
+assert.match(elm, /memberRow[\s\S]*if String\.isEmpty m\.roleColor[\s\S]*style "color" m\.roleColor/, 'server member usernames use backend-selected role color');
+assert.match(elm, /case \( m\.scope, model\.currentServer \) of[\s\S]*ShowServerProfile[\s\S]*style "color" m\.roleColor/, 'channel message usernames use server profiles and backend-selected role color without affecting DMs');
+assert.match(elm, /handleServerData[\s\S]*roleColors =\s*Dict\.fromList[\s\S]*message\.scope == "channel"[\s\S]*roleColor = color/, 'role updates reconcile visible channel-message colors without recoloring DMs or refetching message pages');
+
+assert.match(api, /\[<<"message">>, MsgId, <<"reactions">>\][\s\S]*\{reaction, uid\(Session\)\}/, 'reaction writes have an independent API rate limit');
+assert.match(elm, /message_reaction_changed/, 'reaction changes are applied from realtime events');
+assert.match(elm, /OpenReactionPicker[\s\S]*emojiPickerItems/, 'message reactions reuse the maintained emoji picker');
+assert.match(elm, /aria-pressed[\s\S]*reaction\.me/, 'reaction chips expose the current user toggle state accessibly');
+assert.match(contentLess, /\.message-reactions/, 'reaction chips have dedicated layout styling');
+assert.match(contentLess, /\.composer \.gif-action \.composer-action-label\s*\{\s*display:\s*none;/, 'GIF action does not render duplicate text that collides at compact widths');
+
+assert.match(elm, /modalHead "Delete server"[\s\S]*Delete server permanently/, 'server deletion uses a deliberate destructive confirmation surface');
+assert.match(elm, /String\.trim model\.modalBody == model\.modalTitle/, 'server deletion requires exact typed-name confirmation in the UI');
+assert.match(elm, /server-danger-zone/, 'owner server settings expose deletion without replacing existing customization controls');
+assert.match(contentLess, /\.server-danger-zone/, 'server danger controls follow the existing settings visual language');
+assert.match(callsScss, /\.call-popup-copy[\s\S]*\.call-popup-kicker[\s\S]*\.call-popup-sub/, 'call popup hierarchy is enhanced without replacing its existing actions');
 
 console.log('PASS: emoji, mentions, DM sender summaries, edit/forward, context menus, shortcuts, attachment ACLs, and SCSS/Less layering contracts.');

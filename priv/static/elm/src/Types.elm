@@ -17,6 +17,7 @@ module Types exposing
     , InvitePreview
     , MemberUser
     , Message
+    , Reaction
     , Model
     , Msg(..)
     , Notification
@@ -27,6 +28,8 @@ module Types exposing
     , Server
     , ServerData
     , ServerMember
+    , ServerProfile
+    , ServerProfileRole
     , Status(..)
     , User
     , VoiceState
@@ -39,6 +42,7 @@ module Types exposing
     , decodeFriend
     , decodeMemberUser
     , decodeMessage
+    , decodeReaction
     , decodeNotification
     , decodeReply
     , decodeServer
@@ -160,6 +164,15 @@ type alias Message =
     , editedAt : Maybe Int
     , deletedAt : Maybe Int
     , forwardedFrom : Maybe ForwardPreview
+    , roleColor : String
+    , reactions : List Reaction
+    }
+
+
+type alias Reaction =
+    { emoji : String
+    , count : Int
+    , me : Bool
     }
 
 
@@ -275,6 +288,23 @@ type alias ServerMember =
     , serverBio : String
     , roleColor : String
     , roleNames : String
+    }
+
+
+type alias ServerProfileRole =
+    { id : Int
+    , name : String
+    , color : String
+    , permissions : Int
+    , position : Int
+    }
+
+
+type alias ServerProfile =
+    { serverId : Int
+    , serverName : String
+    , member : ServerMember
+    , roles : List ServerProfileRole
     }
 
 
@@ -442,6 +472,7 @@ type alias Model =
     , searchThreads : List ForumThread
     , currentServer : Maybe ServerData
     , currentProfile : Maybe User
+    , currentServerProfile : Maybe ServerProfile
     , invitePreview : Maybe InvitePreview
     , msg : List Message
     , nextBefore : Maybe Int
@@ -585,6 +616,7 @@ type Msg
     | ToggleServersSheet
     | CloseServersSheet
     | ShowUserPopup Int
+    | ShowServerProfile Int Int
     | CloseModal
     | Toast String
     | DismissToast
@@ -604,6 +636,8 @@ type Msg
     | OpenForwardModal Message
     | ForwardMessage Int String Int
     | DeleteMessage Int
+    | ToggleReaction Int String
+    | OpenReactionPicker Int
     | LeaveConversation Int
     | CloseConversation Int
     | RetryMessage Int
@@ -613,6 +647,7 @@ type Msg
     | OpenConvCtx Conversation Int Int
     | OpenUserCtx User Int Int
     | OpenServerCtx Server Int Int
+    | OpenServerMemberCtx Int ServerMember Int Int
     | OpenChannelCtx Channel Int Int
     | CopyText String
     | JoinInvite
@@ -622,6 +657,8 @@ type Msg
     | ChannelModal Int
     | ChannelModalInCategory Int Int
     | EditServerModal Server
+    | OpenDeleteServer Server
+    | ConfirmDeleteServer Int
     | EditCategoryModal Int Category
     | EditConversationModal Conversation
     | NewThreadModal (Maybe Int)
@@ -781,6 +818,16 @@ decodeMessage =
         |> andMap (D.field "edited_at" (D.nullable D.int))
         |> andMap (D.field "deleted_at" (D.nullable D.int))
         |> andMap (D.field "forwarded_from" (D.nullable decodeForwardPreview) |> defaultValue Nothing)
+        |> andMap (D.field "role_color" D.string |> defaultValue "")
+        |> andMap (D.field "reactions" (D.list decodeReaction) |> defaultValue [])
+
+
+decodeReaction : D.Decoder Reaction
+decodeReaction =
+    D.map3 Reaction
+        (D.field "emoji" D.string)
+        (D.field "count" D.int)
+        (D.field "me" D.bool |> defaultValue False)
 
 
 decodeForwardPreview : D.Decoder ForwardPreview
@@ -962,7 +1009,7 @@ type alias SyncData r =
 
 defaultMsg : Message
 defaultMsg =
-    Message 0 "" 0 0 "" "" "" "" "text" Nothing Nothing 0 Nothing Nothing Nothing
+    Message 0 "" 0 0 "" "" "" "" "text" Nothing Nothing 0 Nothing Nothing Nothing "" []
 
 
 

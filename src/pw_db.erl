@@ -8,11 +8,11 @@
     sync/2, users/1, profile/2, profile_by_username/2,
     friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friend_unblock/2, friends/1,
     forums/1, create_forum/4, delete_forum/2, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, edit_thread/4, moderate_thread/4, delete_thread/2, reply_thread/3, edit_reply/4, delete_reply/3, vote_thread/3,
-    servers/1, create_server/3, update_server/3, server/2, create_channel/4, create_channel/5,
+    servers/1, create_server/3, update_server/3, delete_server/3, server/2, server_member_profile/3, create_channel/4, create_channel/5,
     server_roles/2, create_server_role/4, update_server_role/4, delete_server_role/3, set_server_member_roles/4,
     kick_server_member/3, update_server_member_profile/4, server_permissions/2, update_server_default_permissions/3,
     create_invite/4, create_invite/5, list_invites/2, revoke_invite/3, invite_options/2, invite_preview/1, join_invite/2,
-    messages/5, post_channel_message/4, delete_message/2, edit_message/3, forward_message/4, record_missed_call/2,
+    messages/5, post_channel_message/4, delete_message/2, edit_message/3, forward_message/4, toggle_message_reaction/3, record_missed_call/2,
     conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4,
     set_conversation_member_role/4, kick_conversation_member/3,
     add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4,
@@ -203,7 +203,9 @@ delete_reply(Uid, ThreadId, ReplyId) -> call({delete_reply, Uid, ThreadId, Reply
 servers(Uid) -> call({servers, Uid}).
 create_server(Uid, Name, Desc) -> call({create_server, Uid, Name, Desc}).
 update_server(Uid, Sid, Patch) -> call({update_server, Uid, Sid, Patch}).
+delete_server(Uid, Sid, ConfirmName) -> call({delete_server, Uid, Sid, ConfirmName}).
 server(Uid, ServerId) -> call({server, Uid, ServerId}).
+server_member_profile(Uid, ServerId, TargetUid) -> call({server_member_profile, Uid, ServerId, TargetUid}).
 create_channel(Uid, ServerId, Name, Kind) -> create_channel(Uid, ServerId, Name, Kind, undefined).
 create_channel(Uid, ServerId, Name, Kind, CategoryId) -> call({create_channel, Uid, ServerId, Name, Kind, CategoryId}).
 server_roles(Uid, ServerId) -> call({server_roles, Uid, ServerId}).
@@ -232,6 +234,7 @@ post_channel_message(Uid, ChannelId, Body, ReplyTo) -> call({post_channel_messag
 delete_message(Uid, Mid) -> call({delete_message, Uid, Mid}).
 edit_message(Uid, Mid, Body) -> call({edit_message, Uid, Mid, Body}).
 forward_message(Uid, Mid, TargetScope, TargetId) -> call({forward_message, Uid, Mid, TargetScope, TargetId}).
+toggle_message_reaction(Uid, Mid, Emoji) -> call({toggle_message_reaction, Uid, Mid, Emoji}).
 conversations(Uid) -> call({conversations, Uid}).
 create_conversation(Uid, Name, UserIds) -> call({create_conversation, Uid, Name, UserIds}).
 create_conversation_usernames(Uid, Name, Usernames) -> call({create_conversation_usernames, Uid, Name, Usernames}).
@@ -395,6 +398,7 @@ read_msg({reply_thread, _, _, _}) -> false;
 read_msg({vote_thread, _, _, _}) -> false;
 read_msg({create_server, _, _, _}) -> false;
 read_msg({update_server, _, _, _}) -> false;
+read_msg({delete_server, _, _, _}) -> false;
 read_msg({create_channel, _, _, _, _, _}) -> false;
 read_msg({create_server_role, _, _, _, _}) -> false;
 read_msg({update_server_role, _, _, _, _}) -> false;
@@ -415,6 +419,7 @@ read_msg({post_channel_message, _, _, _, _}) -> false;
 read_msg({delete_message, _, _}) -> false;
 read_msg({edit_message, _, _, _}) -> false;
 read_msg({forward_message, _, _, _, _}) -> false;
+read_msg({toggle_message_reaction, _, _, _}) -> false;
 read_msg({record_missed_call, _, _}) -> false;
 read_msg({create_conversation, _, _, _}) -> false;
 read_msg({create_conversation_usernames, _, _, _}) -> false;
@@ -1355,6 +1360,82 @@ route({update_server, Uid, Sid0, Patch}, Conn) ->
             route({server, Uid, Sid}, Conn);
         _ -> Result
     end;
+route({delete_server, Uid, Sid0, ConfirmName0}, Conn) ->
+    Sid = pw_util:int(Sid0),
+    ConfirmName = pw_util:clean_text(ConfirmName0, 80),
+    Result = with_tx(Conn, fun() ->
+        case one(Conn, "SELECT owner_id,name FROM servers WHERE id = $1 FOR UPDATE", [Sid]) of
+            {ok, [Uid, ServerName]} when ConfirmName =:= ServerName ->
+                {ok, MemberRows} = rows(Conn, "SELECT user_id FROM server_members WHERE server_id = $1", [Sid]),
+                {ok, ChannelRows} = rows(Conn, "SELECT id FROM channels WHERE server_id = $1 ORDER BY id ASC FOR UPDATE", [Sid]),
+                MemberIds = [only_id(R) || R <- MemberRows],
+                ChannelIds = [only_id(R) || R <- ChannelRows],
+                %% Messages are polymorphic and intentionally have no channel FK.
+                %% Purge their dependent rows before the server/channel cascade so
+                %% a deleted server cannot leave invisible message/upload zombies.
+                ok = exec(Conn,
+                    "DELETE FROM notifications n WHERE EXISTS (SELECT 1 FROM channels c WHERE c.server_id=$1 AND n.url = '#/channel/' || c.id::text)",
+                    [Sid]),
+                ok = exec(Conn,
+                    "DELETE FROM upload_refs ur WHERE (ur.scope='server' AND ur.scope_id=$1) "
+                    "OR (ur.scope='server_member' AND ur.scope_id=$1) "
+                    "OR (ur.scope='channel' AND EXISTS (SELECT 1 FROM channels c WHERE c.server_id=$1 AND c.id=ur.scope_id))",
+                    [Sid]),
+                ok = exec(Conn,
+                    "DELETE FROM messages m WHERE m.scope='channel' AND EXISTS (SELECT 1 FROM channels c WHERE c.server_id=$1 AND c.id=m.scope_id)",
+                    [Sid]),
+                ok = exec(Conn, "DELETE FROM servers WHERE id = $1", [Sid]),
+                {ok, #{deleted => true, id => Sid, member_ids => MemberIds, channel_ids => ChannelIds}};
+            {ok, [Uid, _]} -> {error, confirmation_mismatch};
+            {ok, [_Other, _]} -> {error, forbidden};
+            _ -> {error, not_found}
+        end
+    end),
+    case Result of
+        {ok, #{member_ids := MemberIds, channel_ids := ChannelIds} = Data} ->
+            invalidate_upload_authz_users(MemberIds),
+            [pw_cluster:revoke_server_access(MemberId, Sid, ChannelIds) || MemberId <- MemberIds],
+            {ok, maps:without([member_ids, channel_ids], Data)};
+        Other -> Other
+    end;
+route({server_member_profile, Uid, Sid0, Target0}, Conn) ->
+    Sid = pw_util:int(Sid0),
+    Target = pw_util:int(Target0),
+    case server_permissions0(Conn, Uid, Sid) of
+        {ok, _} ->
+            case one(Conn,
+                "SELECT u.id,u.username,u.display_name,u.bio,u.avatar_url,u.banner_url,u.status,u.theme,u.created_at,u.last_seen,"
+                "sm.role,sm.muted,sm.joined_at,sm.nickname,sm.avatar_url,sm.bio,"
+                "COALESCE((SELECT r.color FROM server_member_roles mr JOIN server_roles r ON r.id=mr.role_id "
+                "WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id ORDER BY "
+                "(r.permissions & 1073741824) DESC,(r.permissions & 16) DESC,(r.permissions & 32) DESC,"
+                "(r.permissions & 8) DESC,(r.permissions & 4) DESC,(r.permissions & 64) DESC,"
+                "(r.permissions & 128) DESC,(r.permissions & 2048) DESC,(r.permissions & 4096) DESC,"
+                "(r.permissions & 256) DESC,(r.permissions & 512) DESC,(r.permissions & 2) DESC,"
+                "(r.permissions & 1) DESC,r.position DESC,r.id ASC LIMIT 1),''),"
+                "COALESCE((SELECT string_agg(r.name, ', ' ORDER BY r.position DESC,r.id ASC) FROM server_member_roles mr "
+                "JOIN server_roles r ON r.id=mr.role_id WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id),'') "
+                "FROM server_members sm JOIN users u ON u.id=sm.user_id WHERE sm.server_id=$1 AND sm.user_id=$2",
+                [Sid, Target]) of
+                {ok, MemberRow} when is_list(MemberRow) ->
+                    case one(Conn, "SELECT name FROM servers WHERE id=$1", [Sid]) of
+                        {ok, [ServerName]} ->
+                            case rows(Conn,
+                                "SELECT r.id,r.name,r.color,r.permissions,r.position,r.hoist,r.mentionable,r.created_at,r.updated_at "
+                                "FROM server_member_roles mr JOIN server_roles r ON r.id=mr.role_id "
+                                "WHERE mr.server_id=$1 AND mr.user_id=$2 ORDER BY r.position DESC,r.id ASC", [Sid, Target]) of
+                                {ok, RoleRows} ->
+                                    {ok, #{server_id => Sid, server_name => ServerName, member => member_map(MemberRow),
+                                           roles => [server_role_map(R) || R <- RoleRows]}};
+                                Error -> Error
+                            end;
+                        _ ->
+                            {error, not_found}
+                    end;
+                _ -> {error, not_found}
+            end;
+        Error -> Error
+    end;
 route({server, Uid, ServerId0}, Conn) ->
     Sid = pw_util:int(ServerId0),
     case one(Conn, "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2", [Sid, Uid]) of
@@ -1374,7 +1455,7 @@ route({server, Uid, ServerId0}, Conn) ->
                 "SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.banner_url, u.status, u.theme, "
                 "u.created_at, u.last_seen, sm.role, sm.muted, sm.joined_at, sm.nickname, sm.avatar_url, sm.bio, "
                 "COALESCE((SELECT r.color FROM server_member_roles mr JOIN server_roles r ON r.id=mr.role_id "
-                "WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id ORDER BY r.position DESC,r.id ASC LIMIT 1),''), "
+                "WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id ORDER BY (r.permissions & 1073741824) DESC,(r.permissions & 16) DESC,(r.permissions & 32) DESC,(r.permissions & 8) DESC,(r.permissions & 4) DESC,(r.permissions & 64) DESC,(r.permissions & 128) DESC,(r.permissions & 2048) DESC,(r.permissions & 4096) DESC,(r.permissions & 256) DESC,(r.permissions & 512) DESC,(r.permissions & 2) DESC,(r.permissions & 1) DESC,r.position DESC,r.id ASC LIMIT 1),''), "
                 "COALESCE((SELECT string_agg(r.name, ', ' ORDER BY r.position DESC,r.id ASC) FROM server_member_roles mr "
                 "JOIN server_roles r ON r.id=mr.role_id WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id),'') "
                 "FROM server_members sm JOIN users u ON u.id = sm.user_id WHERE sm.server_id = $1 "
@@ -1819,18 +1900,27 @@ route({move_channel, Uid, ChannelId0, CatId0, Position0}, Conn) ->
     CatId = optional_id(CatId0),
     Position = pw_util:int(Position0),
     Result = with_tx(Conn, fun() ->
-        case one(Conn, "SELECT server_id FROM channels WHERE id = $1 FOR UPDATE", [ChannelId]) of
+        %% Lock parent before child everywhere. Server deletion follows the same
+        %% order, avoiding channel-move/server-delete lock inversion.
+        case one(Conn, "SELECT server_id FROM channels WHERE id = $1", [ChannelId]) of
             {ok, [Sid]} ->
-                _ = one(Conn, "SELECT id FROM servers WHERE id = $1 FOR UPDATE", [Sid]),
-                case {has_server_permission(Conn, Uid, Sid, <<"manage_channels">>),
-                      valid_channel_category(Conn, Sid, CatId)} of
-                    {false, _} -> {error, forbidden};
-                    {_, false} -> {error, invalid_category};
-                    {true, true} ->
-                        CatIdSafe = sql_optional_id(CatId),
-                        PosSafe = case Position of undefined -> 0; P when is_integer(P) -> min(10000, max(0, P)) end,
-                        ok = exec(Conn, "UPDATE channels SET category_id = $1, position = $2 WHERE id = $3", [CatIdSafe, PosSafe, ChannelId]),
-                        {ok, #{updated => true, server_id => Sid}}
+                case one(Conn, "SELECT id FROM servers WHERE id = $1 FOR UPDATE", [Sid]) of
+                    {ok, [_]} ->
+                        case one(Conn, "SELECT id FROM channels WHERE id=$1 AND server_id=$2 FOR UPDATE", [ChannelId, Sid]) of
+                            {ok, [_]} ->
+                                case {has_server_permission(Conn, Uid, Sid, <<"manage_channels">>),
+                                      valid_channel_category(Conn, Sid, CatId)} of
+                                    {false, _} -> {error, forbidden};
+                                    {_, false} -> {error, invalid_category};
+                                    {true, true} ->
+                                        CatIdSafe = sql_optional_id(CatId),
+                                        PosSafe = case Position of undefined -> 0; P when is_integer(P) -> min(10000, max(0, P)) end,
+                                        ok = exec(Conn, "UPDATE channels SET category_id = $1, position = $2 WHERE id = $3", [CatIdSafe, PosSafe, ChannelId]),
+                                        {ok, #{updated => true, server_id => Sid}}
+                                end;
+                            _ -> {error, not_found}
+                        end;
+                    _ -> {error, not_found}
                 end;
             _ -> {error, not_found}
         end
@@ -1928,7 +2018,8 @@ route({messages, Uid, Scope0, ScopeId0, Before0, After0}, Conn) ->
             {ok, Rows} = rows(Conn, Sql, Params),
             ReplyIds = [R || [_,_,_,_,_,_,_,_,R|_] <- Rows, R =/= null, is_integer(R)],
             ReplyMap = batch_replied_messages(Conn, ReplyIds, Scope, ScopeId),
-            {ok, [message_map_with_replies(R, ReplyMap) || R <- Rows]};
+            ReactionMap = batch_message_reactions(Conn, Rows, Uid, Scope, ScopeId),
+            {ok, [message_map_with_replies_and_reactions(R, ReplyMap, ReactionMap) || R <- Rows]};
         false ->
             {error, forbidden}
     end;
@@ -1941,6 +2032,7 @@ route({delete_message, Uid, Mid0}, Conn) ->
                     false -> {error, forbidden};
                     true ->
                         Now = pw_util:now_ms(),
+                        ok = exec(Conn, "DELETE FROM message_reactions WHERE message_id=$1", [Mid]),
                         ok = exec(Conn, "UPDATE messages SET deleted_at=$1,body='' WHERE id=$2", [Now, Mid]),
                         case extract_file_ids(load_message(OldStoredBody)) of
                             [] -> ok;
@@ -2016,6 +2108,17 @@ route({forward_message, Uid, Mid0, TargetScope0, TargetId0}, Conn) ->
                         end,
                         case {CanReadSource, TargetAccess} of
                             {true, {ok, Sid}} ->
+                                LockOk = case TargetScope of
+                                    <<"channel">> ->
+                                        case one(Conn, "SELECT id FROM servers WHERE id=$1 FOR KEY SHARE", [Sid]) of
+                                            {ok, [_]} -> true;
+                                            _ -> false
+                                        end;
+                                    _ -> true
+                                end,
+                                case LockOk of
+                                    false -> {error, forbidden};
+                                    true ->
                                 Now = pw_util:now_ms(),
                                 {ok, NewId} = insert_returning(Conn,
                                     "INSERT INTO messages(scope,scope_id,user_id,body,reply_to_id,created_at,forwarded_from_id) VALUES($1,$2,$3,$4,NULL,$5,$6) RETURNING id",
@@ -2029,7 +2132,8 @@ route({forward_message, Uid, Mid0, TargetScope0, TargetId0}, Conn) ->
                                     <<"channel">> -> ok
                                 end,
                                 {ok, Row} = one(Conn, message_select() ++ " WHERE m.id = $1", [NewId]),
-                                {ok, #{message => message_map(Conn, Row), scope => TargetScope, scope_id => TargetId, server_id => Sid, notify_at => Now}};
+                                {ok, #{message => message_map(Conn, Row), scope => TargetScope, scope_id => TargetId, server_id => Sid, notify_at => Now}}
+                                end;
                             _ -> {error, forbidden}
                         end;
                     _ -> {error, not_found}
@@ -2056,8 +2160,11 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
         false -> {error, invalid_message};
         true ->
             Result = with_tx(Conn, fun() ->
-                case {channel_message_access(Conn, Uid, Cid), valid_reply_to(Conn, <<"channel">>, Cid, ReplyTo)} of
-                    {{ok, Sid}, true} ->
+                case channel_message_access(Conn, Uid, Cid) of
+                    {ok, Sid} ->
+                        case {one(Conn, "SELECT id FROM servers WHERE id=$1 FOR KEY SHARE", [Sid]),
+                              valid_reply_to(Conn, <<"channel">>, Cid, ReplyTo)} of
+                            {{ok, [_]}, true} ->
                         Now = pw_util:now_ms(),
                         {ok, Mid} = insert_returning(Conn,
                             "INSERT INTO messages(scope,scope_id,user_id,body,reply_to_id,created_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
@@ -2065,8 +2172,10 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
                         insert_upload_refs(Conn, Plain, <<"channel">>, Cid, Now),
                         {ok, Row} = one(Conn, message_select() ++ " WHERE m.id = $1", [Mid]),
                         {ok, #{message => message_map(Conn, Row), server_id => Sid, notify_at => Now}};
-                    {{error, _}, _} -> {error, forbidden};
-                    _ -> {error, invalid_message}
+                            {{ok, [_]}, false} -> {error, invalid_message};
+                            _ -> {error, forbidden}
+                        end;
+                    _ -> {error, forbidden}
                 end
             end),
             case Result of
@@ -2074,6 +2183,53 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
                     pw_hub:broadcast({channel, Cid}, #{type => message_created, scope => channel, scope_id => Cid, message => Msg}),
                     best_effort_channel_notifications(Conn, Sid, Uid, Cid, Msg, Now, false),
                     {ok, Msg};
+                Other -> Other
+            end
+    end;
+route({toggle_message_reaction, Uid, Mid0, Emoji0}, Conn) ->
+    Mid = pw_util:int(Mid0),
+    Emoji = pw_util:clean_text(Emoji0, 32),
+    case reaction_allowed(Emoji) of
+        false -> {error, invalid_reaction};
+        true ->
+            Result = with_tx(Conn, fun() ->
+                case one(Conn, "SELECT scope,scope_id FROM messages WHERE id=$1 AND kind='text' AND deleted_at IS NULL FOR UPDATE", [Mid]) of
+                    {ok, [Scope, ScopeId]} ->
+                        Allowed = case Scope of
+                            <<"channel">> ->
+                                case channel_message_access(Conn, Uid, ScopeId) of
+                                    {ok, _} -> true;
+                                    _ -> false
+                                end;
+                            <<"direct">> -> conversation_can_send(Conn, Uid, ScopeId);
+                            _ -> false
+                        end,
+                        case Allowed of
+                            false -> {error, forbidden};
+                            true ->
+                                Existing = one(Conn, "SELECT 1 FROM message_reactions WHERE message_id=$1 AND user_id=$2 AND emoji=$3", [Mid, Uid, Emoji]),
+                                Added = case Existing of
+                                    {ok, [_]} ->
+                                        ok = exec(Conn, "DELETE FROM message_reactions WHERE message_id=$1 AND user_id=$2 AND emoji=$3", [Mid, Uid, Emoji]),
+                                        false;
+                                    _ ->
+                                        ok = exec(Conn,
+                                            "INSERT INTO message_reactions(message_id,user_id,emoji,created_at) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+                                            [Mid, Uid, Emoji, pw_util:now_ms()]),
+                                        true
+                                end,
+                                {ok, [Count]} = one(Conn, "SELECT count(*) FROM message_reactions WHERE message_id=$1 AND emoji=$2", [Mid, Emoji]),
+                                {ok, #{message_id => Mid, emoji => Emoji, count => Count, added => Added,
+                                       user_id => Uid, scope => Scope, scope_id => ScopeId}}
+                        end;
+                    _ -> {error, not_found}
+                end
+            end),
+            case Result of
+                {ok, #{scope := Scope, scope_id := ScopeId} = Data} ->
+                    Event = maps:merge(#{type => message_reaction_changed}, Data),
+                    pw_hub:broadcast(message_broadcast_key(Scope, ScopeId), Event),
+                    {ok, maps:without([scope, scope_id], Data)};
                 Other -> Other
             end
     end;
@@ -3040,6 +3196,13 @@ migrations() -> [
         "ALTER TABLE server_member_roles ADD COLUMN IF NOT EXISTS assigned_by integer REFERENCES users(id) ON DELETE SET NULL",
         "ALTER TABLE server_member_roles ADD COLUMN IF NOT EXISTS assigned_at bigint NOT NULL DEFAULT 0",
         "CREATE INDEX IF NOT EXISTS idx_server_member_roles_user ON server_member_roles(server_id,user_id,role_id)"
+    ]},
+    {28, [
+        "CREATE TABLE IF NOT EXISTS message_reactions(message_id integer NOT NULL REFERENCES messages(id) ON DELETE CASCADE, "
+        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, emoji text NOT NULL, created_at bigint NOT NULL, "
+        "PRIMARY KEY(message_id,user_id,emoji), CHECK(char_length(emoji) BETWEEN 1 AND 16))",
+        "CREATE INDEX IF NOT EXISTS idx_message_reactions_message ON message_reactions(message_id,created_at ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_message_reactions_user ON message_reactions(user_id,message_id)"
     ]}
 ].
 
@@ -3134,6 +3297,12 @@ store_message(Body) -> pw_crypto:encrypt(Body).
 load_message(undefined) -> <<>>;
 load_message(null) -> <<>>;
 load_message(Body) -> pw_crypto:decrypt(Body).
+
+%% Navigation summaries are intentionally bounded. The full message remains in
+%% the message table and is fetched only for the open conversation; sync/sidebar
+%% payloads should never carry an entire large markdown/attachment body.
+conversation_preview_body(StoredBody) ->
+    pw_util:clean_text(load_message(StoredBody), 512).
 
 store_image_url(Url0) ->
     Url = pw_util:clean_text(Url0, 17825792),
@@ -3768,10 +3937,11 @@ grantable_role_permissions(Conn, Uid, Sid, Requested0) ->
             end
     end.
 
-message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, _ForwardBody]) ->
+message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, _ForwardBody, RoleColor]) ->
     Base = #{id => Id, scope => Scope, scope_id => ScopeId, user_id => Uid, username => U, display_name => D,
       avatar_url => pw_util:proxied_image(Avatar), body => load_message(Body), reply_to_id => db_null(ReplyTo),
-      created_at => Created, edited_at => db_null(Edited), deleted_at => db_null(Deleted), kind => Kind},
+      created_at => Created, edited_at => db_null(Edited), deleted_at => db_null(Deleted), kind => Kind,
+      role_color => RoleColor, reactions => []},
     case ForwardId of
         null -> Base;
         %% A forward is an immutable snapshot. Never expose the *current* body
@@ -3820,6 +3990,35 @@ message_map_with_replies(Row = [_,_,_,_,_,_,_,_,ReplyTo|_], ReplyMap) ->
         end
     end.
 
+message_map_with_replies_and_reactions(Row = [Id|_], ReplyMap, ReactionMap) ->
+    M = message_map_with_replies(Row, ReplyMap),
+    M#{reactions => maps:get(Id, ReactionMap, [])}.
+
+batch_message_reactions(_Conn, [], _Uid, _Scope, _ScopeId) -> #{};
+batch_message_reactions(Conn, Rows0, Uid, Scope, ScopeId) ->
+    Ids = [Id || [Id|_] <- Rows0, is_integer(Id)],
+    case Ids of
+        [] -> #{};
+        _ ->
+            MinId = lists:min(Ids), MaxId = lists:max(Ids),
+            case rows(Conn,
+                "SELECT mr.message_id,mr.emoji,count(*),bool_or(mr.user_id=$5),min(mr.created_at) "
+                "FROM message_reactions mr JOIN messages m ON m.id=mr.message_id "
+                "WHERE m.scope=$1 AND m.scope_id=$2 AND mr.message_id >= $3 AND mr.message_id <= $4 "
+                "GROUP BY mr.message_id,mr.emoji ORDER BY min(mr.created_at) ASC,mr.emoji ASC",
+                [Scope, ScopeId, MinId, MaxId, Uid]) of
+                {ok, ReactionRows} ->
+                    lists:foldl(fun([MessageId, Emoji, Count, Me, _], Acc) ->
+                        Item = #{emoji => Emoji, count => Count, me => Me},
+                        maps:update_with(MessageId, fun(Items) -> Items ++ [Item] end, [Item], Acc)
+                    end, #{}, ReactionRows);
+                _ -> #{}
+            end
+    end.
+
+reaction_allowed(Emoji) ->
+    lists:member(Emoji, [<<240,159,145,128>>, <<240,159,152,132>>, <<240,159,152,130>>, <<240,159,164,163>>, <<240,159,152,137>>, <<240,159,152,141>>, <<240,159,164,148>>, <<240,159,152,133>>, <<240,159,152,173>>, <<240,159,165,186>>, <<240,159,171,160>>, <<240,159,152,142>>, <<240,159,146,128>>, <<240,159,148,165>>, <<226,156,168>>, <<240,159,142,137>>, <<226,157,164,239,184,143>>, <<240,159,146,153>>, <<240,159,145,141>>, <<240,159,145,142>>, <<240,159,145,143>>, <<240,159,153,143>>, <<240,159,145,139>>, <<240,159,153,140>>, <<226,156,133>>, <<226,157,140>>, <<226,154,160,239,184,143>>, <<240,159,154,128>>, <<240,159,144,155>>, <<240,159,147,140>>]).
+
 replied_message(Conn, ReplyTo, Scope, ScopeId) ->
     Sql = "SELECT m.body,m.user_id,COALESCE(NULLIF(sm.nickname,''),u.display_name) "
           "FROM messages m JOIN users u ON u.id=m.user_id "
@@ -3854,7 +4053,7 @@ batch_replied_messages(Conn, Ids, Scope, ScopeId) ->
 conversation_row_map([Id, Name, Avatar, Owner, Created, Updated, LastRead, Muted, RequestState, GroupRole, Count, LastBody, LastMsg, LastSenderId, LastSenderName, LastSenderUsername, Unread, PeerId, PeerName, PeerAvatar, PeerUsername]) ->
     #{id => Id, name => Name, avatar_url => pw_util:proxied_image(Avatar), owner_id => Owner,
       created_at => Created, updated_at => Updated, last_read_message_id => LastRead, muted => Muted, request_state => RequestState, group_role => GroupRole,
-      member_count => Count, last_body => load_message(LastBody), last_message_id => LastMsg, unread => Unread,
+      member_count => Count, last_body => conversation_preview_body(LastBody), last_message_id => LastMsg, unread => Unread,
       last_sender_id => LastSenderId, last_sender_name => LastSenderName, last_sender_username => LastSenderUsername,
       peer_id => PeerId, peer_name => PeerName, peer_avatar_url => pw_util:proxied_image(PeerAvatar), peer_username => PeerUsername}.
 
@@ -3897,7 +4096,14 @@ message_select() ->
     "m.body, m.reply_to_id, m.created_at, m.edited_at, m.deleted_at, m.kind, "
     %% The final column is intentionally NULL. Older decoders expect the slot,
     %% but fetching fm.body would pull live source text across scope boundaries.
-    "m.forwarded_from_id, fm.user_id, fu.display_name, NULL "
+    "m.forwarded_from_id, fm.user_id, fu.display_name, NULL, "
+    "COALESCE((SELECT r.color FROM server_member_roles mr JOIN server_roles r ON r.id=mr.role_id "
+    "WHERE mr.server_id=mc.server_id AND mr.user_id=m.user_id ORDER BY "
+    "(r.permissions & 1073741824) DESC,(r.permissions & 16) DESC,(r.permissions & 32) DESC,"
+    "(r.permissions & 8) DESC,(r.permissions & 4) DESC,(r.permissions & 64) DESC,"
+    "(r.permissions & 128) DESC,(r.permissions & 2048) DESC,(r.permissions & 4096) DESC,"
+    "(r.permissions & 256) DESC,(r.permissions & 512) DESC,(r.permissions & 2) DESC,"
+    "(r.permissions & 1) DESC,r.position DESC,r.id ASC LIMIT 1),'') "
     "FROM messages m JOIN users u ON u.id = m.user_id "
     "LEFT JOIN channels mc ON m.scope='channel' AND mc.id=m.scope_id "
     "LEFT JOIN server_members sm ON sm.server_id=mc.server_id AND sm.user_id=m.user_id "

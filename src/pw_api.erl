@@ -203,8 +203,12 @@ authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"roles">>], Req0, 
     with_json(Req0, fun(M, Req) -> result(Req, pw_db:set_server_member_roles(uid(Session), Id, UserId, maps:get(<<"role_ids">>,M,[]))) end);
 authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"kick">>], Req, Session, _) ->
     result(Req, pw_db:kick_server_member(uid(Session), Id, UserId));
+authed(<<"GET">>, [<<"server">>, Id, <<"member">>, UserId, <<"profile">>], Req, Session, _) ->
+    result(Req, pw_db:server_member_profile(uid(Session), Id, UserId));
 authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"profile">>], Req0, Session, _) ->
     with_json_large(Req0, fun(M, Req) -> result(Req, pw_db:update_server_member_profile(uid(Session), Id, UserId, M)) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"delete">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:delete_server(uid(Session), Id, maps:get(<<"confirm_name">>, M, <<>>))) end);
 authed(<<"POST">>, [<<"server">>, Id, <<"channels">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_channel(uid(Session), Id, maps:get(<<"name">>,M,<<>>), maps:get(<<"kind">>,M,<<"text">>), maps:get(<<"category_id">>,M,undefined))) end);
 authed(<<"GET">>, [<<"server">>, Id, <<"categories">>], Req, Session, _) -> result(Req, pw_db:categories(uid(Session), Id));
 authed(<<"POST">>, [<<"server">>, Id, <<"categories">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_category(uid(Session), Id, maps:get(<<"name">>,M,<<>>))) end);
@@ -261,6 +265,11 @@ authed(<<"POST">>, [<<"edit_message">>, MsgId], Req0, Session, _) ->
     with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:edit_message(uid(Session), MsgId, maps:get(<<"body">>, M, <<>>))) end);
 authed(<<"POST">>, [<<"forward_message">>, MsgId], Req0, Session, _) ->
     with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:forward_message(uid(Session), MsgId, maps:get(<<"target_scope">>, M, <<>>), maps:get(<<"target_id">>, M, undefined))) end);
+authed(<<"POST">>, [<<"message">>, MsgId, <<"reactions">>], Req0, Session, _) ->
+    case pw_rate:allow({reaction, uid(Session)}, 180, 60000) of
+        true -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:toggle_message_reaction(uid(Session), MsgId, maps:get(<<"emoji">>, M, <<>>))) end);
+        false -> pw_util:err_json(Req0, 429, <<"reaction_rate_limited">>)
+    end;
 authed(<<"GET">>, [<<"conversations">>], Req, Session, _) -> result(Req, pw_db:conversations(uid(Session)));
 authed(<<"POST">>, [<<"conversations">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) ->
     Name = maps:get(<<"name">>, M, <<>>),

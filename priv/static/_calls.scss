@@ -543,3 +543,46 @@
 .call-health .call-health-privacy { margin: 0; padding: 0 12px 12px; }
 .call-overlay.expanded { max-height: calc(100dvh - 36px); overflow-y: auto; }
 @media (max-width: 760px) { .call-overlay.expanded { max-height: calc(100dvh - var(--mobile-nav-h) - env(safe-area-inset-bottom) - 24px); } }
+
+/* 1.7.5-2: make call requests read like part of the existing call utility,
+   with clearer state hierarchy without turning them into a new overlay style. */
+.call-popup-copy {
+  min-width: 0;
+  flex: 1;
+}
+.call-popup-kicker {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+  color: var(--text2);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .055em;
+  text-transform: uppercase;
+}
+.call-popup-kicker .call-icon,
+.call-popup-kicker .ui-icon {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+}
+.call-popup-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.call-popup-sub {
+  max-width: 34ch;
+  margin-top: 3px;
+  line-height: 1.45;
+}
+.call-popup.incoming .call-avatar-wrap::after {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok), transparent 78%);
+}
+@media (max-width: 520px) {
+  .call-popup { padding: 12px; }
+  .call-popup-head { align-items: flex-start; }
+  .call-popup-sub { max-width: none; }
+  .call-popup-actions .btn { min-height: 42px; }
+}

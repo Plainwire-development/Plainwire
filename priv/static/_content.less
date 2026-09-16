@@ -972,3 +972,162 @@ pw-screen-settings { border-radius: 11px; background: var(--bg); }
   .modal-card,
   .action-modal { max-height: 96dvh; }
 });
+
+/* 1.7.5-2: server identity + message reactions stay inside Plainwire's
+   existing compact workspace language instead of introducing card-heavy UI. */
+.message-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+}
+.message-reaction {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 38px;
+  min-height: 28px;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg2);
+  color: var(--text2);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.message-reaction:hover {
+  border-color: var(--line2);
+  background: var(--hover-soft);
+  color: var(--text1);
+}
+.message-reaction.mine {
+  border-color: color-mix(in srgb, var(--accent), var(--line) 55%);
+  background: color-mix(in srgb, var(--accent), transparent 91%);
+  color: var(--text1);
+}
+.message-reaction-emoji { font-size: 15px; line-height: 1; }
+.message-reaction-count { min-width: 1ch; font-variant-numeric: tabular-nums; font-weight: 700; }
+
+.server-profile-loading {
+  min-height: 150px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 10px;
+  text-align: center;
+}
+.server-profile-identity {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+.server-profile-copy { min-width: 0; }
+.server-profile-copy h2 {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 21px;
+  letter-spacing: -.025em;
+}
+.server-profile-copy p {
+  margin: 4px 0 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.server-profile-about,
+.server-profile-roles { margin-top: 18px; }
+.server-profile-about p { margin: 7px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.server-profile-role-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 8px;
+}
+.server-profile-role {
+  --role-color: var(--text2);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  max-width: 100%;
+  padding: 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--role-color), var(--line) 68%);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--role-color), transparent 93%);
+  color: var(--text1);
+  font-size: 12px;
+  font-weight: 650;
+}
+.server-profile-role-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--role-color);
+}
+.server-profile-role.legacy {
+  --role-color: var(--accent);
+}
+.server-profile-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.danger-confirm { display: grid; gap: 13px; }
+.delete-server-name {
+  width: fit-content;
+  max-width: 100%;
+  padding: 7px 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid color-mix(in srgb, var(--danger), var(--line) 62%);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--danger), transparent 94%);
+  color: var(--text1);
+  font-weight: 700;
+}
+
+/* The GIF badge already says GIF. Repeating a second text label beside it was
+   what collided at compact widths. Keep one semantic button label via aria-label
+   and one visible badge, then let the action retain a fixed touch target. */
+.composer .gif-action .composer-action-label { display: none; }
+.composer .gif-action {
+  flex: 0 0 auto;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.composer .gif-action .composer-action-gif { flex: 0 0 auto; }
+
+@media (max-width: 760px) {
+  .composer .gif-action .composer-action-label { display: none; }
+  .server-profile-actions { display: grid; grid-template-columns: 1fr 1fr; }
+  .server-profile-actions .btn:first-child { grid-column: 1 / -1; }
+  .message-reaction { min-height: 30px; }
+}
+.server-danger-zone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid color-mix(in srgb, var(--danger), var(--line) 68%);
+}
+.server-danger-zone .setting-copy { min-width: 0; }
+.server-danger-zone .setting-copy small { display: block; margin-top: 4px; }
+.server-danger-zone .btn { flex: 0 0 auto; }
+@media (max-width: 520px) {
+  .server-danger-zone { align-items: stretch; flex-direction: column; }
+  .server-danger-zone .btn { width: 100%; }
+}

@@ -44,4 +44,24 @@ assert.match(bridge, /SYSTEM_AUDIO_DEVICE_RE/, 'screen audio has a high-confiden
 assert.match(bridge, /screenAudioSource === 'loopback'/, 'screen audio UI reports loopback fallback accurately');
 assert.match(bridge, /this browser did not provide system audio/i, 'missing screen audio is surfaced instead of silently ignored');
 
+
+// Muting/deafening must be local media state, while genuinely unhealthy peers self-heal.
+const muteBlock = between(bridge, '  const setMuted = (muted) => {', '  const setDeafened = (value) => {');
+for (const destructive of ['leaveRtcRoom(', 'replacePeerSession(', 'restartPeerIce(', 'makeOffer(']) {
+  assert.ok(!muteBlock.includes(destructive), `mute must not invoke destructive RTC operation ${destructive}`);
+}
+const deafenBlock = between(bridge, '  const setDeafened = (value) => {', '  const enableDrag = () => {');
+for (const destructive of ['leaveRtcRoom(', 'replacePeerSession(', 'restartPeerIce(', 'makeOffer(']) {
+  assert.ok(!deafenBlock.includes(destructive), `deafen must not invoke destructive RTC operation ${destructive}`);
+}
+assert.match(bridge, /RTC_PEER_REBUILD_WINDOW_MS\s*=\s*90000[\s\S]*RTC_MAX_PEER_REBUILDS\s*=\s*2/, 'full peer repair is explicitly budgeted against reconnect storms');
+assert.match(bridge, /function schedulePeerRebuild[\s\S]*peerStillExpected[\s\S]*consumePeerRepairBudget[\s\S]*replacePeerSession[\s\S]*ensurePeer/, 'terminal media recovery rebuilds only the expected failed peer');
+assert.match(bridge, /remote_audio_ended[\s\S]*schedulePeerRebuild/, 'ended audio receivers trigger full peer repair instead of requiring a refresh');
+assert.match(bridge, /remote_audio_missing[\s\S]*schedulePeerRebuild/, 'connected transports with missing audio trigger full peer repair');
+assert.match(bridge, /restartPeerIce[\s\S]*pc\.restartIce\?\.\(\)[\s\S]*makeOffer\(uid, pc, \{ iceRestart: true \}\)/, 'ordinary transport failures keep ICE restart as the cheaper first-line recovery path');
+assert.match(bridge, /peerRepairPromises\.clear\(\)[\s\S]*peerRepairHistory\.clear\(\)/, 'leaving a room clears automatic peer-repair state');
+assert.match(bridge, /room\.roster = roster/, 'automatic repair is guarded by the latest authoritative room roster');
+assert.match(bridge, /room\.audioConnectedAnnounced[\s\S]*Audio reconnected[\s\S]*Call audio connected/, 'connection/reconnection feedback is room-deduplicated instead of peer-spammed');
+assert.match(elm, /Incoming voice call[\s\S]*Outgoing voice call[\s\S]*Answer to join the call[\s\S]*Ringing… waiting for/, 'call popup preserves actions while adding clearer call-state context');
+
 console.log('PASS: RTC protocol contracts, scoped join errors, stale-room protection, duplicate-tab ownership, resume heartbeat, and screen-audio fallback wiring.');

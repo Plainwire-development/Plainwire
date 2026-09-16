@@ -293,6 +293,9 @@
     forum_owner_cannot_leave: 'The forum owner cannot leave their own forum.',
     thread_locked: 'That thread is locked.',
     rate_limited: 'Too many requests. Wait a moment and try again.',
+    reaction_rate_limited: 'You are reacting too quickly. Wait a moment and try again.',
+    invalid_reaction: 'That reaction is not supported.',
+    confirmation_mismatch: 'The server name did not match. Type it exactly to confirm deletion.',
     database_unavailable: 'The server database is temporarily unavailable.',
     database_busy: 'The server is busy. Try again in a moment.',
     request_failed: 'The request could not be completed.'
@@ -908,6 +911,13 @@
   // Bumped whenever a participant's session is replaced, so queued signals from
   // the old session cannot resurrect a peer connection.
   const peerGenerations = new Map();
+  // ICE restart is the cheap recovery path. If the receiver/session itself gets
+  // wedged, rebuild only that peer connection instead of forcing a page refresh.
+  // Budgeted per room+peer so a broken network cannot create a reconnect storm.
+  const peerRepairPromises = new Map();
+  const peerRepairHistory = new Map();
+  const RTC_PEER_REBUILD_WINDOW_MS = 90000;
+  const RTC_MAX_PEER_REBUILDS = 2;
   const defaultRtcConfig = { iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }] };
   const RTC_CONNECT_CHECK_MS = 7000;
   // Relay (TURN over TCP/TLS) paths can take well over one check interval. An ICE
@@ -4837,7 +4847,9 @@
   });
 
   const markPeerFailed = (uid, pc, reason = 'connection_timeout') => {
-    if (!pc || pc.signalingState === 'closed' || pc._failureReported) return;
+    if (!pc || pc._failureReported) return;
+    if (schedulePeerRebuild(uid, pc, reason)) return;
+    if (pc.signalingState === 'closed') return;
     pc._failureReported = true;
     reportPeerConnection(uid, pc, false);
     reportPeerFailure(uid, pc, true, reason);
@@ -4879,6 +4891,82 @@
     peerGenerations.set(uid, (peerGenerations.get(uid) || 0) + 1);
     closePeer(uid);
   };
+
+  const peerStillExpected = (uid, epoch) => {
+    if (!room || room.epoch !== epoch || !room.joined) return false;
+    // Once a roster exists it is authoritative. Before the first roster, a
+    // signal may legitimately arrive first, so do not reject solely for that.
+    return !(room.roster instanceof Set) || room.roster.has(Number(uid));
+  };
+
+  const consumePeerRepairBudget = (uid, epoch) => {
+    const key = `${epoch}:${Number(uid)}`;
+    const cutoff = Date.now() - RTC_PEER_REBUILD_WINDOW_MS;
+    const recent = (peerRepairHistory.get(key) || []).filter((at) => at >= cutoff);
+    if (recent.length >= RTC_MAX_PEER_REBUILDS) {
+      peerRepairHistory.set(key, recent);
+      return false;
+    }
+    recent.push(Date.now());
+    peerRepairHistory.set(key, recent);
+    return true;
+  };
+
+  function schedulePeerRebuild(uid0, pc, reason = 'media_session_stalled') {
+    const uid = Number(uid0 || 0);
+    const epoch = Number(pc?._roomEpoch || room?.epoch || 0);
+    if (!uid || !epoch || !peerStillExpected(uid, epoch)) return false;
+    const key = `${epoch}:${uid}`;
+    if (peerRepairPromises.has(key)) return true;
+    if (!consumePeerRepairBudget(uid, epoch)) {
+      debug('RTC', 'peer_rebuild_budget_exhausted', { peer_user_id: uid, reason, epoch }, 'warn');
+      return false;
+    }
+
+    if (pc) {
+      pc._repairScheduled = true;
+      pc._failureReported = false;
+    }
+    reportPeerFailure(uid, pc, false);
+    reportPeerConnection(uid, pc, false);
+    debug('RTC', 'peer_rebuild_scheduled', { peer_user_id: uid, reason, epoch });
+
+    const repair = (async () => {
+      // Give a just-fired track/ICE event a moment to settle. This also lets
+      // both peers observe the same room roster before signalling again.
+      await new Promise((resolve) => setTimeout(resolve, 320));
+      if (!peerStillExpected(uid, epoch)) return;
+
+      const current = peers.get(uid);
+      if (current && current !== pc && current._roomEpoch === epoch && current._mediaConnected === true) return;
+      replacePeerSession(uid);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      if (!peerStillExpected(uid, epoch)) return;
+
+      const next = await ensurePeer(uid);
+      if (!next || !peerStillExpected(uid, epoch)) return;
+      next._autoRebuilt = true;
+      next._rebuildReason = reason;
+      next._reconnectAttempts = 0;
+      next._lastRecoveryAt = 0;
+      next._failureReported = false;
+      reportPeerFailure(uid, next, false);
+      if (next._offerer) await makeOffer(uid, next, { iceRestart: true });
+      else sendSignal(uid, { kind: 'renegotiate' });
+      debug('RTC', 'peer_rebuild_started', { peer_user_id: uid, reason, epoch });
+    })().catch((error) => {
+      debug('RTC', 'peer_rebuild_failed', { peer_user_id: uid, reason, error: error.message }, 'warn');
+      const current = peers.get(uid) || pc;
+      if (peerStillExpected(uid, epoch)) {
+        reportPeerConnection(uid, current, false);
+        reportPeerFailure(uid, current, true, 'auto_repair_failed');
+      }
+    }).finally(() => {
+      if (peerRepairPromises.get(key) === repair) peerRepairPromises.delete(key);
+    });
+    peerRepairPromises.set(key, repair);
+    return true;
+  }
 
   const cleanupAllFloatWindows = () => {
     floatWindows.forEach((w, id) => {
@@ -4953,6 +5041,8 @@
     peers.forEach((_, uid) => closePeer(uid));
     peerPromises.clear();
     signalQueues.clear();
+    peerRepairPromises.clear();
+    peerRepairHistory.clear();
     if (screenStream) {
       screenStream.getTracks().forEach((t) => t.stop());
       screenStream = null;
@@ -5236,9 +5326,14 @@
         reportPeerFailure(uid, pc, false);
         audioContext()?.resume?.();
         playAllRemoteAudio();
-        if (!pc._announcedConnected) {
-          pc._announcedConnected = true;
-          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call audio connected' });
+        if (room?.epoch === pc._roomEpoch) {
+          if (pc._autoRebuilt && room.audioConnectedAnnounced && !pc._repairAnnounced) {
+            pc._repairAnnounced = true;
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Audio reconnected' });
+          } else if (!room.audioConnectedAnnounced) {
+            room.audioConnectedAnnounced = true;
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call audio connected' });
+          }
         }
       }
     };
@@ -5320,7 +5415,9 @@
           if (pc._remoteAudioTrack === ev.track) pc._remoteAudioTrack = null;
           pc._mediaConnected = false;
           publishConnectionState(true);
-          restartPeerIce(uid, pc, 'remote_audio_ended', { force: true });
+          if (!schedulePeerRebuild(uid, pc, 'remote_audio_ended')) {
+            restartPeerIce(uid, pc, 'remote_audio_ended', { force: true });
+          }
         });
         audio.srcObject = new MediaStream([ev.track]);
         audio.muted = deafened;
@@ -5365,8 +5462,10 @@
           connection: pc.connectionState,
           ice: pc.iceConnectionState
         }, 'warn');
-        restartPeerIce(uid, pc, 'remote_audio_missing', { force: true });
-        if ((pc._reconnectAttempts || 0) < RTC_MAX_RECOVERY_ATTEMPTS) armMediaWatchdog();
+        if (!schedulePeerRebuild(uid, pc, 'remote_audio_missing')) {
+          restartPeerIce(uid, pc, 'remote_audio_missing', { force: true });
+          if ((pc._reconnectAttempts || 0) < RTC_MAX_RECOVERY_ATTEMPTS) armMediaWatchdog();
+        }
       }, 10000);
     };
     // Media gets a full watchdog period after the transport (re)connects.
@@ -5611,6 +5710,7 @@
     }
     const userId = (u) => Number(u.user_id || u.userId || u.profile?.id || 0);
     const roster = new Set(users.map(userId).filter((uid) => uid && uid !== meId));
+    room.roster = roster;
     // A reconnecting participant has no socket, so offers to them are dropped.
     // Their rejoin announces a fresh session and the connection starts then.
     const ids = users.filter((u) => !u.reconnecting).map(userId).filter((uid) => uid && uid !== meId);
@@ -5737,6 +5837,8 @@
   };
 
   const setMuted = (muted) => {
+    // Muting is a media-track state change only. Never tear down, replace or
+    // renegotiate peers here; doing so turns a UI toggle into a call drop.
     micMuted = !!muted;
     if (localStream) localStream.getAudioTracks().forEach((t) => { t.enabled = !micMuted; });
     if (!deafened) mutedBeforeDeafen = micMuted;
@@ -5746,6 +5848,8 @@
   };
 
   const setDeafened = (value) => {
+    // Deafening is local playback + microphone state only. Existing RTC
+    // transports remain alive so undeafening is immediate.
     const next = !!value;
     if (next === deafened) return publishAudioState();
     deafened = next;
@@ -6092,8 +6196,60 @@
       if (!document.querySelector('.ctx-menu')) openFallbackContextMenu(target, x, y);
     });
   }, true);
+  let longPressContext = null;
+  let suppressLongPressClickUntil = 0;
+  let suppressLongPressTarget = null;
+  const clearLongPressContext = () => {
+    if (longPressContext?.timer) clearTimeout(longPressContext.timer);
+    longPressContext = null;
+  };
   document.addEventListener('pointerdown', event => {
     if (fallbackContextMenu && !fallbackContextMenu.contains(event.target)) closeFallbackContextMenu();
+    clearLongPressContext();
+    if (event.pointerType !== 'touch' || event.button !== 0) return;
+    const target = event.target?.closest?.('[data-long-context="true"]');
+    if (!target || event.target?.closest?.('button, a, input, textarea, select, [contenteditable="true"]')) return;
+    const state = {
+      pointerId: event.pointerId,
+      x: event.clientX, y: event.clientY,
+      target, timer: null
+    };
+    state.timer = setTimeout(() => {
+      if (longPressContext !== state || !target.isConnected) return;
+      suppressLongPressClickUntil = Date.now() + 700;
+      suppressLongPressTarget = target;
+      // Do not retain a detached message/member node indefinitely if the browser
+      // suppresses the synthetic follow-up click after a long press.
+      setTimeout(() => {
+        if (suppressLongPressTarget === target && Date.now() >= suppressLongPressClickUntil) {
+          suppressLongPressTarget = null;
+          suppressLongPressClickUntil = 0;
+        }
+      }, 760);
+      target.dispatchEvent(new MouseEvent('contextmenu', {
+        bubbles: true, cancelable: true, composed: true,
+        clientX: state.x, clientY: state.y, button: 2, buttons: 0
+      }));
+      if (navigator.vibrate) navigator.vibrate(12);
+      clearLongPressContext();
+    }, 520);
+    longPressContext = state;
+  }, true);
+  document.addEventListener('pointermove', event => {
+    const state = longPressContext;
+    if (!state || state.pointerId !== event.pointerId) return;
+    if (Math.hypot(event.clientX - state.x, event.clientY - state.y) > 12) clearLongPressContext();
+  }, true);
+  ['pointerup', 'pointercancel'].forEach((name) => document.addEventListener(name, clearLongPressContext, true));
+  document.addEventListener('scroll', clearLongPressContext, true);
+  document.addEventListener('click', event => {
+    if (Date.now() > suppressLongPressClickUntil || !suppressLongPressTarget) return;
+    if (event.target === suppressLongPressTarget || suppressLongPressTarget.contains(event.target)) {
+      event.preventDefault();
+      event.stopPropagation();
+      suppressLongPressClickUntil = 0;
+      suppressLongPressTarget = null;
+    }
   }, true);
 
   const shortcutEditableTarget = (target) => Boolean(target?.closest?.('input, textarea, select, [contenteditable="true"]'));

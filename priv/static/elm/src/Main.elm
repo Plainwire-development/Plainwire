@@ -277,6 +277,7 @@ init flags url _ =
       , searchThreads = []
       , currentServer = Nothing
       , currentProfile = Nothing
+      , currentServerProfile = Nothing
       , invitePreview = Nothing
       , msg = []
       , nextBefore = Nothing
@@ -650,6 +651,15 @@ update msg model =
                     else if String.startsWith "/thread/" tag && String.endsWith "/replies" tag then
                         handleReplyCreated val model
 
+                    else if String.startsWith "/server/" tag && String.contains "/member/" tag && String.endsWith "/profile" tag && method == "GET" then
+                        handleServerProfile val model
+
+                    else if String.startsWith "/server/" tag && String.endsWith "/delete" tag && method == "POST" then
+                        handleServerDeleted val model
+
+                    else if String.startsWith "/message/" tag && String.endsWith "/reactions" tag && method == "POST" then
+                        handleReactionChange val model
+
                     else if String.startsWith "/server/" tag && method == "POST" && String.contains "/categor" tag then
                         ( { model
                             | toast =
@@ -822,7 +832,7 @@ update msg model =
             ( { model | absoluteTimestamps = not model.absoluteTimestamps }, Cmd.none )
 
         CloseModal ->
-            ( { model | modal = Nothing }, Cmd.none )
+            ( { model | modal = Nothing, currentServerProfile = Nothing }, Cmd.none )
 
         ClearDrafts ->
             ( { model | drafts = Dict.empty, inputText = "" }, Cmd.none )
@@ -943,6 +953,27 @@ update msg model =
         DeleteMessage mid ->
             ( { model | ctxMenu = Nothing }, apiSend (encodeApiRequest (ApiPost ("/delete_message/" ++ String.fromInt mid) (Just (E.object [])))) )
 
+        ToggleReaction mid emoji ->
+            if mid <= 0 then
+                ( model, Cmd.none )
+
+            else
+                ( { model | ctxMenu = Nothing, modal = Nothing }
+                , apiSend
+                    (encodeApiRequest
+                        (ApiPost ("/message/" ++ String.fromInt mid ++ "/reactions")
+                            (Just (E.object [ ( "emoji", E.string emoji ) ]))
+                        )
+                    )
+                )
+
+        OpenReactionPicker mid ->
+            if mid <= 0 then
+                ( model, Cmd.none )
+
+            else
+                ( { model | modal = Just ("reaction_picker:" ++ String.fromInt mid), ctxMenu = Nothing }, Cmd.none )
+
         LeaveConversation cid ->
             ( { model | ctxMenu = Nothing }, Cmd.batch [ apiSend (encodeApiRequest (ApiPost ("/conversation/" ++ String.fromInt cid ++ "/leave") (Just (E.object [])))), setHash "#dms" ] )
 
@@ -985,7 +1016,7 @@ update msg model =
             ( model, apiSend (encodeApiRequest (ApiPost ("/conversation/" ++ String.fromInt cid ++ "/read") (Just (E.object [])))) )
 
         OpenMessageCtx m x y ->
-            ( { model | ctxMenu = Just (messageContext model.me m x y) }, Cmd.none )
+            ( { model | ctxMenu = Just (messageContext model m x y) }, Cmd.none )
 
         OpenConvCtx c x y ->
             ( { model | ctxMenu = Just (conversationContext model c x y) }, Cmd.none )
@@ -995,6 +1026,9 @@ update msg model =
 
         OpenServerCtx server x y ->
             ( { model | ctxMenu = Just (serverContext server x y) }, Cmd.none )
+
+        OpenServerMemberCtx serverId member x y ->
+            ( { model | ctxMenu = Just (serverMemberContext serverId member x y) }, Cmd.none )
 
         OpenChannelCtx channel x y ->
             ( { model | ctxMenu = Just (channelContext channel x y) }, Cmd.none )
@@ -1479,6 +1513,26 @@ update msg model =
             , Cmd.none
             )
 
+        OpenDeleteServer server ->
+            ( { model
+                | modal = Just ("delete_server:" ++ String.fromInt server.id)
+                , modalTitle = server.name
+                , modalBody = ""
+                , ctxMenu = Nothing
+              }
+            , Cmd.none
+            )
+
+        ConfirmDeleteServer serverId ->
+            ( model
+            , apiSend
+                (encodeApiRequest
+                    (ApiPost ("/server/" ++ String.fromInt serverId ++ "/delete")
+                        (Just (E.object [ ( "confirm_name", E.string (String.trim model.modalBody) ) ]))
+                    )
+                )
+            )
+
         EditConversationModal conversation ->
             ( { model | modal = Just ("edit_conversation:" ++ String.fromInt conversation.id), modalTitle = conversation.name, modalBody = "" }, Cmd.none )
 
@@ -1487,6 +1541,11 @@ update msg model =
 
         ShowUserPopup userId ->
             ( model, setHash ("#profile/" ++ String.fromInt userId) )
+
+        ShowServerProfile serverId userId ->
+            ( { model | modal = Just "server_profile", currentServerProfile = Nothing, ctxMenu = Nothing }
+            , apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt serverId ++ "/member/" ++ String.fromInt userId ++ "/profile")))
+            )
 
         BridgeEvent tag data ->
             let
@@ -2660,10 +2719,173 @@ handleServerData : E.Value -> Model -> ( Model, Cmd Msg )
 handleServerData val model =
     case D.decodeValue serverDataDecoder val of
         Ok data ->
-            ( { model | currentServer = Just data, serverCache = Dict.insert data.server.id data model.serverCache }, Cmd.none )
+            let
+                isVisibleServer =
+                    model.currentServer
+                        |> Maybe.map (\current -> current.server.id == data.server.id)
+                        |> Maybe.withDefault False
+
+                roleColors =
+                    Dict.fromList (List.map (\member -> ( member.user.id, member.roleColor )) data.members)
+
+                refreshVisibleRoleColor message =
+                    if isVisibleServer && message.scope == "channel" then
+                        case Dict.get message.userId roleColors of
+                            Just color ->
+                                { message | roleColor = color }
+
+                            Nothing ->
+                                message
+
+                    else
+                        message
+            in
+            ( { model
+                | currentServer = Just data
+                , serverCache = Dict.insert data.server.id data model.serverCache
+                , msg = List.map refreshVisibleRoleColor model.msg
+              }
+            , Cmd.none
+            )
 
         Err _ ->
             ( { model | toast = Just "Server saved" }, routeCmd model.active )
+
+
+serverProfileRoleDecoder : Decoder ServerProfileRole
+serverProfileRoleDecoder =
+    D.map5 ServerProfileRole
+        (D.field "id" D.int)
+        (D.field "name" D.string)
+        (D.field "color" D.string |> defaultValue "")
+        (D.field "permissions" D.int |> defaultValue 0)
+        (D.field "position" D.int |> defaultValue 0)
+
+
+serverProfileDecoder : Decoder ServerProfile
+serverProfileDecoder =
+    D.map4 ServerProfile
+        (D.field "server_id" D.int)
+        (D.field "server_name" D.string)
+        (D.field "member" decodeServerMember)
+        (D.field "roles" (D.list serverProfileRoleDecoder) |> defaultValue [])
+
+
+handleServerProfile : E.Value -> Model -> ( Model, Cmd Msg )
+handleServerProfile val model =
+    case D.decodeValue serverProfileDecoder val of
+        Ok profile ->
+            ( { model | modal = Just "server_profile", currentServerProfile = Just profile }, Cmd.none )
+
+        Err _ ->
+            ( { model | modal = Nothing, currentServerProfile = Nothing, toast = Just "Could not load that server profile." }, Cmd.none )
+
+
+handleServerDeleted : E.Value -> Model -> ( Model, Cmd Msg )
+handleServerDeleted val model =
+    case D.decodeValue (D.field "id" D.int) val of
+        Ok serverId ->
+            let
+                deletedCurrent =
+                    model.currentServer
+                        |> Maybe.map (\data -> data.server.id == serverId)
+                        |> Maybe.withDefault False
+
+                navigation =
+                    if deletedCurrent then
+                        setHash "#"
+
+                    else
+                        Cmd.none
+            in
+            ( { model
+                | servers = List.filter (\server -> server.id /= serverId) model.servers
+                , serverCache = Dict.remove serverId model.serverCache
+                , currentServer =
+                    case model.currentServer of
+                        Just data ->
+                            if data.server.id == serverId then
+                                Nothing
+
+                            else
+                                Just data
+
+                        Nothing ->
+                            Nothing
+                , modal = Nothing
+                , currentServerProfile = Nothing
+                , ctxMenu = Nothing
+                , toast = Just "Server deleted"
+              }
+            , Cmd.batch
+                [ apiSend (encodeApiRequest (ApiGet "/servers"))
+                , navigation
+                ]
+            )
+
+        Err _ ->
+            ( { model | toast = Just "The server was deleted, but the local list could not be updated cleanly. Refreshing…" }
+            , apiSend (encodeApiRequest (ApiGet "/servers"))
+            )
+
+
+reactionChangeDecoder : Decoder { messageId : Int, emoji : String, count : Int, added : Bool, userId : Int }
+reactionChangeDecoder =
+    D.map5
+        (\messageId emoji count added userId -> { messageId = messageId, emoji = emoji, count = count, added = added, userId = userId })
+        (D.field "message_id" D.int)
+        (D.field "emoji" D.string)
+        (D.field "count" D.int)
+        (D.field "added" D.bool)
+        (D.field "user_id" D.int)
+
+
+handleReactionChange : E.Value -> Model -> ( Model, Cmd Msg )
+handleReactionChange val model =
+    case D.decodeValue reactionChangeDecoder val of
+        Ok change ->
+            let
+                myId =
+                    Maybe.map .id model.me
+
+                updateReaction reactions =
+                    let
+                        existing =
+                            List.filter (\reaction -> reaction.emoji == change.emoji) reactions |> List.head
+
+                        wasMine =
+                            existing |> Maybe.map .me |> Maybe.withDefault False
+
+                        nextMine =
+                            if myId == Just change.userId then
+                                change.added
+
+                            else
+                                wasMine
+
+                        next =
+                            { emoji = change.emoji, count = change.count, me = nextMine }
+
+                        without =
+                            List.filter (\reaction -> reaction.emoji /= change.emoji) reactions
+                    in
+                    if change.count <= 0 then
+                        without
+
+                    else
+                        without ++ [ next ]
+
+                updateMessage message =
+                    if message.id == change.messageId then
+                        { message | reactions = updateReaction message.reactions }
+
+                    else
+                        message
+            in
+            ( { model | msg = List.map updateMessage model.msg }, Cmd.none )
+
+        Err _ ->
+            ( model, Cmd.none )
 
 
 handleInviteCreated : E.Value -> Model -> ( Model, Cmd Msg )
@@ -3162,6 +3384,8 @@ appendOptimisticMessage scope scopeId body model =
                         Nothing
                         Nothing
                         Nothing
+                        ""
+                        []
             in
             { model | msg = model.msg ++ [ optimistic ], inputText = "", replyTo = Nothing, drafts = Dict.remove (draftKeyFor model.active) model.drafts, outbox = Dict.insert optimistic.id optimistic model.outbox, nextMessageId = model.nextMessageId - 1 }
 
@@ -3194,6 +3418,9 @@ handleWsEvent val model =
 
         Ok ( "message_deleted", ev ) ->
             handleMessageDeleted ev model
+
+        Ok ( "message_reaction_changed", ev ) ->
+            handleReactionChange ev model
 
         Ok ( "direct_message", _ ) ->
             handleNotifiedMessage val model
@@ -3915,14 +4142,50 @@ handleAccessRevoked ev model =
         nextModel =
             case serverId of
                 Just sid ->
-                    { model | serverCache = Dict.remove sid model.serverCache }
+                    let
+                        currentMatches =
+                            model.currentServer
+                                |> Maybe.map (\data -> data.server.id == sid)
+                                |> Maybe.withDefault False
+
+                        profileMatches =
+                            model.currentServerProfile
+                                |> Maybe.map (\profile -> profile.serverId == sid)
+                                |> Maybe.withDefault False
+                    in
+                    { model
+                        | servers = List.filter (\server -> server.id /= sid) model.servers
+                        , serverCache = Dict.remove sid model.serverCache
+                        , currentServer =
+                            if currentMatches then
+                                Nothing
+
+                            else
+                                model.currentServer
+                        , currentServerProfile =
+                            if profileMatches then
+                                Nothing
+
+                            else
+                                model.currentServerProfile
+                        , modal =
+                            if profileMatches then
+                                Nothing
+
+                            else
+                                model.modal
+                    }
 
                 Nothing ->
                     model
 
         destination =
             if activeRevoked then
-                setHash "#dms"
+                if scope == "server" then
+                    setHash "#"
+
+                else
+                    setHash "#dms"
 
             else
                 Cmd.none
@@ -4255,7 +4518,7 @@ handleMessageUpdated message model =
     let
         updateOne existing =
             if existing.id == message.id then
-                message
+                { message | reactions = existing.reactions }
 
             else
                 existing
@@ -4561,7 +4824,63 @@ renderModal model =
 
 modalContent : String -> Model -> List (Html Msg)
 modalContent kind model =
-    if String.startsWith "new_thread" kind then
+    if kind == "server_profile" then
+        case model.currentServerProfile of
+            Nothing ->
+                [ modalHead "Server profile" "Loading this member’s server identity…"
+                , div [ class "modal-body server-profile-loading" ]
+                    [ div [ class "loading-dot", attribute "aria-hidden" "true" ] []
+                    , p [ class "muted" ] [ text "Loading profile…" ]
+                    ]
+                ]
+
+            Just profile ->
+                serverProfileModal model profile
+
+    else if String.startsWith "reaction_picker:" kind then
+        let
+            messageId =
+                String.toInt (String.dropLeft 16 kind) |> Maybe.withDefault 0
+        in
+        [ modalHead "React to message" "Choose a reaction. Selecting one toggles it for this message."
+        , div [ class "modal-body" ]
+            [ div [ class "emoji-picker-grid reaction-picker-grid", attribute "role" "listbox", attribute "aria-label" "Message reactions" ]
+                (List.map (emojiReactionPickerButton messageId) emojiPickerItems)
+            ]
+        ]
+
+    else if String.startsWith "delete_server:" kind then
+        let
+            serverId =
+                String.toInt (String.dropLeft 14 kind) |> Maybe.withDefault 0
+
+            confirmed =
+                not (String.isEmpty model.modalTitle) && String.trim model.modalBody == model.modalTitle
+        in
+        [ modalHead "Delete server" "This permanently removes the server, its channels, messages, roles, Wires, and membership data."
+        , div [ class "modal-body danger-confirm" ]
+            [ p [] [ text "This cannot be undone. To confirm, type the server name exactly:" ]
+            , div [ class "delete-server-name" ] [ text model.modalTitle ]
+            , div [ class "field" ]
+                [ label [ for "delete-server-confirm" ] [ text "Server name" ]
+                , input
+                    [ id "delete-server-confirm"
+                    , value model.modalBody
+                    , placeholder model.modalTitle
+                    , onInput ModalBody
+                    , attribute "autocomplete" "off"
+                    , attribute "spellcheck" "false"
+                    ]
+                    []
+                ]
+            ]
+        , div [ class "modal-actions" ]
+            [ button [ class "btn secondary", onClick CloseModal ] [ text "Cancel" ]
+            , button [ class "btn danger", disabled (not confirmed), onClick (ConfirmDeleteServer serverId) ] [ text "Delete server permanently" ]
+            ]
+        ]
+
+    else if String.startsWith "new_thread" kind then
         [ modalHead "Create thread" "Start a longer conversation."
         , div [ class "modal-body" ]
             [ div [ class "field" ] [ label [] [ text "Category ID" ], input [ value model.modalUserIds, placeholder "Forum/category ID", onInput ModalUserIds ] [] ]
@@ -4901,6 +5220,13 @@ modalContent kind model =
         ]
 
     else if String.startsWith "edit_server:" kind then
+        let
+            serverId =
+                String.toInt (String.dropLeft 12 kind) |> Maybe.withDefault 0
+
+            canDeleteServer =
+                List.any (\server -> server.id == serverId && server.role == "owner") model.servers
+        in
         [ modalHead "Customize server" "Give this server its own identity across desktop and mobile."
         , div [ class "modal-body server-customization" ]
             [ renderServerIdentityPreview model
@@ -4972,6 +5298,29 @@ modalContent kind model =
                         [ "#5865f2", "#3b82f6", "#14b8a6", "#22c55e", "#eab308", "#f97316", "#ec4899", "#8b5cf6" ]
                     )
                 ]
+            , if canDeleteServer then
+                div [ class "server-danger-zone" ]
+                    [ div [ class "setting-copy" ]
+                        [ b [] [ text "Delete server" ]
+                        , small [ class "muted" ] [ text "Permanently remove this server and all server-owned data." ]
+                        ]
+                    , button
+                        [ class "btn danger"
+                        , type_ "button"
+                        , onClick
+                            (case List.filter (\server -> server.id == serverId) model.servers |> List.head of
+                                Just server ->
+                                    OpenDeleteServer server
+
+                                Nothing ->
+                                    NoOp
+                            )
+                        ]
+                        [ text "Delete server…" ]
+                    ]
+
+              else
+                text ""
             ]
         , modalActions "Save server"
         ]
@@ -5074,6 +5423,100 @@ modalContent kind model =
         []
 
 
+serverProfileModal : Model -> ServerProfile -> List (Html Msg)
+serverProfileModal model profile =
+    let
+        member =
+            profile.member
+
+        user =
+            member.user
+
+        displayName =
+            if String.isEmpty (String.trim member.nickname) then
+                user.displayName
+
+            else
+                member.nickname
+
+        avatarUrl =
+            if String.isEmpty (String.trim member.serverAvatarUrl) then
+                user.avatarUrl
+
+            else
+                member.serverAvatarUrl
+
+        about =
+            if String.isEmpty (String.trim member.serverBio) then
+                "No server bio set."
+
+            else
+                member.serverBio
+
+        viewingSelf =
+            Maybe.map .id model.me == Just user.id
+
+        roleChip role =
+            span
+                [ class "server-profile-role"
+                , style "--role-color" (if String.isEmpty role.color then "var(--muted)" else role.color)
+                ]
+                [ span [ class "server-profile-role-dot", attribute "aria-hidden" "true" ] []
+                , text role.name
+                ]
+
+        legacyRole =
+            if member.role == "owner" then
+                [ span [ class "server-profile-role legacy" ] [ text "Server owner" ] ]
+
+            else if member.role == "admin" then
+                [ span [ class "server-profile-role legacy" ] [ text "Administrator" ] ]
+
+            else
+                []
+    in
+    [ modalHead "Server profile" profile.serverName
+    , div [ class "modal-body server-profile-modal" ]
+        [ div [ class "server-profile-identity" ]
+            [ presenceAvatar model.userStatuses user.id avatarUrl displayName "big"
+            , div [ class "server-profile-copy" ]
+                [ h2 [ style "color" (if String.isEmpty member.roleColor then "var(--text1)" else member.roleColor) ] [ text displayName ]
+                , p [ class "muted" ] [ text ("@" ++ user.username ++ " · " ++ profile.serverName) ]
+                ]
+            ]
+        , div [ class "profile-bio server-profile-about" ]
+            [ span [ class "profile-section-label" ] [ text "About on this server" ]
+            , p [] [ text about ]
+            ]
+        , div [ class "server-profile-roles" ]
+            [ span [ class "profile-section-label" ] [ text "Roles" ]
+            , div [ class "server-profile-role-list" ]
+                (legacyRole
+                    ++ (if List.isEmpty profile.roles && List.isEmpty legacyRole then
+                            [ span [ class "muted" ] [ text "No custom roles" ] ]
+
+                        else
+                            List.map roleChip profile.roles
+                       )
+                )
+            ]
+        , div [ class "profile-actions server-profile-actions" ]
+            [ button [ class "btn secondary", onClick (Go ("#profile/" ++ String.fromInt user.id)) ] [ text "View full profile" ]
+            , if viewingSelf then
+                text ""
+
+              else
+                button [ class "btn", onClick (BridgeEvent "dm_user" (E.int user.id)) ] [ text "Message" ]
+            , if viewingSelf then
+                text ""
+
+              else
+                button [ class "btn secondary", onClick (BridgeEvent "call_user" (E.int user.id)) ] [ text "Call" ]
+            ]
+        ]
+    ]
+
+
 shortcutRow : String -> String -> Html Msg
 shortcutRow labelText keys =
     div [ class "shortcut-row" ]
@@ -5125,6 +5568,20 @@ emojiPickerButton ( glyph, shortcode, labelText ) =
         , title (labelText ++ " · " ++ shortcode)
         , attribute "aria-label" (labelText ++ " " ++ shortcode)
         , onClick (InsertComposerText glyph)
+        ]
+        [ span [ class "emoji-picker-glyph", attribute "aria-hidden" "true" ] [ text glyph ]
+        , span [ class "emoji-picker-code" ] [ text shortcode ]
+        ]
+
+
+emojiReactionPickerButton : Int -> ( String, String, String ) -> Html Msg
+emojiReactionPickerButton messageId ( glyph, shortcode, labelText ) =
+    button
+        [ class "emoji-picker-item"
+        , type_ "button"
+        , title (labelText ++ " · " ++ shortcode)
+        , attribute "aria-label" ("React with " ++ labelText)
+        , onClick (ToggleReaction messageId glyph)
         ]
         [ span [ class "emoji-picker-glyph", attribute "aria-hidden" "true" ] [ text glyph ]
         , span [ class "emoji-picker-code" ] [ text shortcode ]
@@ -5403,16 +5860,11 @@ ctxItemView idx item =
         ]
 
 
-messageContext : Maybe User -> Message -> Int -> Int -> ContextMenu
-messageContext me message x y =
+messageContext : Model -> Message -> Int -> Int -> ContextMenu
+messageContext model message x y =
     let
         mine =
-            case me of
-                Just user ->
-                    user.id == message.userId
-
-                Nothing ->
-                    False
+            Maybe.map .id model.me == Just message.userId
 
         base =
             [ { label = "Reply", icon = Just "↩", danger = False, sep = False, msg = SetReplyTo message }
@@ -5420,14 +5872,34 @@ messageContext me message x y =
             , { label = "Copy text", icon = Just "⧉", danger = False, sep = False, msg = CopyText message.body }
             ]
 
+        reactionItems =
+            if message.id <= 0 then
+                []
+
+            else
+                [ { label = "React 👍", icon = Just "👍", danger = False, sep = True, msg = ToggleReaction message.id "👍" }
+                , { label = "React ❤️", icon = Just "❤️", danger = False, sep = False, msg = ToggleReaction message.id "❤️" }
+                , { label = "React 😂", icon = Just "😂", danger = False, sep = False, msg = ToggleReaction message.id "😂" }
+                , { label = "React 🔥", icon = Just "🔥", danger = False, sep = False, msg = ToggleReaction message.id "🔥" }
+                , { label = "More reactions…", icon = Just "+", danger = False, sep = False, msg = OpenReactionPicker message.id }
+                ]
+
         authorItems =
             if mine then
                 []
 
             else
-                [ { label = "View author profile", icon = Just "○", danger = False, sep = True, msg = Go ("#profile/" ++ String.fromInt message.userId) }
-                , { label = "Copy author username", icon = Just "@", danger = False, sep = False, msg = CopyText ("@" ++ message.username) }
-                ]
+                case ( message.scope, model.currentServer ) of
+                    ( "channel", Just data ) ->
+                        [ { label = "View server profile", icon = Just "◉", danger = False, sep = True, msg = ShowServerProfile data.server.id message.userId }
+                        , { label = "View full profile", icon = Just "○", danger = False, sep = False, msg = Go ("#profile/" ++ String.fromInt message.userId) }
+                        , { label = "Copy author username", icon = Just "@", danger = False, sep = False, msg = CopyText ("@" ++ message.username) }
+                        ]
+
+                    _ ->
+                        [ { label = "View author profile", icon = Just "○", danger = False, sep = True, msg = Go ("#profile/" ++ String.fromInt message.userId) }
+                        , { label = "Copy author username", icon = Just "@", danger = False, sep = False, msg = CopyText ("@" ++ message.username) }
+                        ]
 
         mineItems =
             if mine then
@@ -5443,7 +5915,7 @@ messageContext me message x y =
             else
                 []
     in
-    { items = base ++ authorItems ++ mineItems, x = x, y = y }
+    { items = base ++ reactionItems ++ authorItems ++ mineItems, x = x, y = y }
 
 
 conversationContext : Model -> Conversation -> Int -> Int -> ContextMenu
@@ -5519,6 +5991,13 @@ serverContext server x y =
 
             else
                 []
+
+        deletion =
+            if server.role == "owner" then
+                [ { label = "Delete server", icon = Just "×", danger = True, sep = True, msg = OpenDeleteServer server } ]
+
+            else
+                []
     in
     { items =
         [ { label = "Open server", icon = Just "→", danger = False, sep = False, msg = Go ("#server/" ++ String.fromInt server.id) }
@@ -5526,7 +6005,21 @@ serverContext server x y =
         ]
             ++ wireItems
             ++ management
+            ++ deletion
             ++ [ { label = "Copy server ID", icon = Just "#", danger = False, sep = True, msg = CopyText (String.fromInt server.id) } ]
+    , x = x
+    , y = y
+    }
+
+
+serverMemberContext : Int -> ServerMember -> Int -> Int -> ContextMenu
+serverMemberContext serverId member x y =
+    { items =
+        [ { label = "View server profile", icon = Just "◉", danger = False, sep = False, msg = ShowServerProfile serverId member.user.id }
+        , { label = "View full profile", icon = Just "○", danger = False, sep = False, msg = Go ("#profile/" ++ String.fromInt member.user.id) }
+        , { label = "Copy username", icon = Just "@", danger = False, sep = True, msg = CopyText ("@" ++ member.user.username) }
+        , { label = "Copy user ID", icon = Just "#", danger = False, sep = False, msg = CopyText (String.fromInt member.user.id) }
+        ]
     , x = x
     , y = y
     }
@@ -5658,6 +6151,23 @@ renderCallPopup kind popup model =
         avatarHtml =
             avatarImg popup.avatarUrl popup.displayName "big"
 
+        incoming =
+            kind == "incoming"
+
+        kicker =
+            if incoming then
+                "Incoming voice call"
+
+            else
+                "Outgoing voice call"
+
+        detail =
+            if incoming then
+                "Answer to join the call. Your microphone stays off until you accept."
+
+            else
+                "Ringing… waiting for " ++ popup.displayName ++ " to answer."
+
         actions =
             case kind of
                 "incoming" ->
@@ -5674,21 +6184,21 @@ renderCallPopup kind popup model =
                 _ ->
                     text ""
     in
-    div [ class ("call-popup " ++ kind) ]
+    div
+        [ class ("call-popup " ++ kind)
+        , attribute "role" "dialog"
+        , attribute "aria-label" (kicker ++ " with " ++ popup.displayName)
+        ]
         [ div [ class "call-popup-head", attribute "data-call-drag-handle" "true" ]
             [ div [ class "call-avatar-wrap" ]
                 [ avatarHtml ]
-            , div []
-                [ p [ class "call-popup-title" ] [ text popup.displayName ]
-                , p [ class "call-popup-sub" ]
-                    [ text
-                        (if kind == "incoming" then
-                            "Incoming call"
-
-                         else
-                            "Calling..."
-                        )
+            , div [ class "call-popup-copy" ]
+                [ div [ class "call-popup-kicker" ]
+                    [ callIcon "audio"
+                    , span [] [ text kicker ]
                     ]
+                , p [ class "call-popup-title" ] [ text popup.displayName ]
+                , p [ class "call-popup-sub" ] [ text detail ]
                 ]
             ]
         , actions
@@ -6283,7 +6793,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.7.5-1", attribute "data-ui-revision" "interface-4" ]
+    div [ class "layout", attribute "data-ui-version" "1.7.5-2", attribute "data-ui-revision" "interface-4" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -6765,23 +7275,23 @@ renderRightPanel : Model -> Html Msg
 renderRightPanel model =
     case ( model.active, model.currentServer ) of
         ( ServerView _, Just data ) ->
-            renderMembersPanel model.userStatuses data.members
+            renderMembersPanel model data
 
         ( ChannelView _, Just data ) ->
-            renderMembersPanel model.userStatuses data.members
+            renderMembersPanel model data
 
         ( VoiceChannelView _, Just data ) ->
-            renderMembersPanel model.userStatuses data.members
+            renderMembersPanel model data
 
         _ ->
             text ""
 
 
-renderMembersPanel : Dict String String -> List ServerMember -> Html Msg
-renderMembersPanel userStatuses members =
+renderMembersPanel : Model -> ServerData -> Html Msg
+renderMembersPanel model data =
     aside [ class "right members-panel" ]
         [ h3 [] [ text "Members" ]
-        , div [ class "list" ] (List.map (\m -> memberRow userStatuses m) members)
+        , div [ class "list" ] (List.map (\member -> memberRow model.userStatuses data.server.id member) data.members)
         ]
 
 
@@ -6957,6 +7467,57 @@ dmHeader model =
         ]
 
 
+conversationPreviewSummary : String -> String
+conversationPreviewSummary source =
+    let
+        lines =
+            String.lines source
+
+        isAttachmentLine rawLine =
+            let
+                line =
+                    String.trim rawLine
+            in
+            (String.startsWith "![" line || String.startsWith "[" line)
+                && (String.contains "](/api/files/" line || String.contains "](/api/media/" line)
+
+        attachmentCount =
+            lines |> List.filter isAttachmentLine |> List.length
+
+        plain =
+            lines
+                |> List.filter (not << isAttachmentLine)
+                |> String.join " "
+                |> String.words
+                |> String.join " "
+
+        clipped =
+            if String.length plain > 120 then
+                String.left 117 plain ++ "…"
+
+            else
+                plain
+
+        attachmentLabel =
+            if attachmentCount == 1 then
+                "1 attachment"
+
+            else if attachmentCount > 1 then
+                String.fromInt attachmentCount ++ " attachments"
+
+            else
+                ""
+    in
+    if String.isEmpty clipped then
+        attachmentLabel
+
+    else if String.isEmpty attachmentLabel then
+        clipped
+
+    else
+        clipped ++ " · " ++ attachmentLabel
+
+
 conversationSenderLabel : Model -> Conversation -> String
 conversationSenderLabel model conversation =
     if conversation.lastMessageId == Nothing || conversation.lastSenderId == 0 then
@@ -7039,7 +7600,7 @@ convRow c model =
 
                   else
                     strong [ class "dm-preview-sender" ] [ text senderLabel ]
-                , Markdown.preview lastText
+                , text (conversationPreviewSummary lastText)
                 ]
             ]
         , span [ class "dm-row-actions" ]
@@ -7919,7 +8480,7 @@ messageRequestRow model conversation =
 
                   else
                     strong [ class "dm-preview-sender" ] [ text (conversationSenderLabel model conversation) ]
-                , text (Maybe.withDefault "Wants to message you" conversation.lastBody)
+                , text (conversation.lastBody |> Maybe.map conversationPreviewSummary |> Maybe.withDefault "Wants to message you")
                 ]
             ]
         , div [ class "request-actions" ]
@@ -8373,7 +8934,7 @@ renderServerPage model =
                                 , p [ class "muted" ] [ text (String.fromInt (List.length data.members) ++ " people in this server") ]
                                 ]
                             ]
-                        , div [ class "server-member-list" ] (List.map (\m -> memberRow model.userStatuses m) data.members)
+                        , div [ class "server-member-list" ] (List.map (\m -> memberRow model.userStatuses data.server.id m) data.members)
                         ]
                     ]
                 ]
@@ -8494,8 +9055,8 @@ managedChannelRow canManage categories channel =
         ]
 
 
-memberRow : Dict String String -> ServerMember -> Html Msg
-memberRow userStatuses m =
+memberRow : Dict String String -> Int -> ServerMember -> Html Msg
+memberRow userStatuses serverId m =
     let
         displayName =
             if String.isEmpty (String.trim m.nickname) then
@@ -8521,10 +9082,23 @@ memberRow userStatuses m =
             else
                 [ class "server-member-role", style "color" m.roleColor ]
     in
-    div [ class "row member-row clickable-user", onClick (ShowUserPopup m.user.id), onContextMenu (OpenUserCtx m.user), title (if String.isEmpty m.serverBio then displayName else m.serverBio) ]
+    div
+        [ class "row member-row clickable-user"
+        , onClick (ShowServerProfile serverId m.user.id)
+        , onContextMenu (OpenServerMemberCtx serverId m)
+        , attribute "data-long-context" "true"
+        , title (if String.isEmpty m.serverBio then displayName else m.serverBio)
+        ]
         [ presenceAvatar userStatuses m.user.id avatarUrl displayName ""
         , div [ class "grow" ]
-            [ b [] [ text displayName ]
+            [ b
+                (if String.isEmpty m.roleColor then
+                    []
+
+                 else
+                    [ style "color" m.roleColor ]
+                )
+                [ text displayName ]
             , small [ class "muted" ] [ text ("@" ++ m.user.username ++ " · "), span roleAttrs [ text roleText ] ]
             ]
         ]
@@ -10558,6 +11132,7 @@ textMessageView model grouped m =
                    )
             )
         , attribute "data-mid" (String.fromInt m.id)
+        , attribute "data-long-context" "true"
         , onContextMenu (OpenMessageCtx m)
         ]
         [ if grouped then
@@ -10571,7 +11146,25 @@ textMessageView model grouped m =
 
               else
                 div [ class "msg-head" ]
-                    [ b [ class "msg-name", onClick (ShowUserPopup m.userId) ] [ text m.displayName ]
+                    [ b
+                        ([ class "msg-name"
+                         , onClick
+                            (case ( m.scope, model.currentServer ) of
+                                ( "channel", Just data ) ->
+                                    ShowServerProfile data.server.id m.userId
+
+                                _ ->
+                                    ShowUserPopup m.userId
+                            )
+                         ]
+                            ++ (if String.isEmpty m.roleColor then
+                                    []
+
+                                else
+                                    [ style "color" m.roleColor ]
+                               )
+                        )
+                        [ text m.displayName ]
                     , timestampButton model "msg-time" m
                     , if mine then
                         span [ class "pill self-pill" ] [ text "you" ]
@@ -10625,6 +11218,7 @@ textMessageView model grouped m =
 
               else
                 text ""
+            , renderMessageReactions m
             , if failed then
                 div [ class "msg-failed-bar" ]
                     [ span [ class "msg-failed-text" ] [ text "Failed to send" ]
@@ -10639,7 +11233,8 @@ textMessageView model grouped m =
 
               else
                 div [ class "msg-actions" ]
-                    [ button [ class "msg-action", disabled (m.id < 0), onClick (SetReplyTo m) ] [ text "Reply" ]
+                    [ button [ class "msg-action", disabled (m.id < 0), onClick (OpenReactionPicker m.id), title "Add reaction" ] [ text "React" ]
+                    , button [ class "msg-action", disabled (m.id < 0), onClick (SetReplyTo m) ] [ text "Reply" ]
                     , button [ class "msg-action", disabled (m.id < 0), onClick (OpenForwardModal m) ] [ text "Forward" ]
                     , button [ class "msg-action", onClick (CopyText m.body) ] [ text "Copy" ]
                     , if mine && m.id > 0 && m.forwardedFrom == Nothing then
@@ -10655,6 +11250,31 @@ textMessageView model grouped m =
                     ]
             ]
         ]
+
+
+renderMessageReactions : Message -> Html Msg
+renderMessageReactions message =
+    if List.isEmpty message.reactions then
+        text ""
+
+    else
+        div [ class "message-reactions", attribute "aria-label" "Message reactions" ]
+            (List.map
+                (\reaction ->
+                    button
+                        [ class ("message-reaction" ++ (if reaction.me then " mine" else ""))
+                        , type_ "button"
+                        , onClick (ToggleReaction message.id reaction.emoji)
+                        , attribute "aria-pressed" (if reaction.me then "true" else "false")
+                        , attribute "aria-label" (reaction.emoji ++ " reaction, " ++ String.fromInt reaction.count)
+                        , title (if reaction.me then "Remove reaction" else "Add reaction")
+                        ]
+                        [ span [ class "message-reaction-emoji", attribute "aria-hidden" "true" ] [ text reaction.emoji ]
+                        , span [ class "message-reaction-count" ] [ text (String.fromInt reaction.count) ]
+                        ]
+                )
+                message.reactions
+            )
 
 
 missedCallView : Model -> Message -> Html Msg
@@ -11001,6 +11621,15 @@ fmtErr err =
 
         "rate_limited" ->
             "Too many attempts. Wait a moment and try again."
+
+        "reaction_rate_limited" ->
+            "You’re reacting too quickly. Wait a moment and try again."
+
+        "invalid_reaction" ->
+            "That reaction is not supported. Choose one from Plainwire’s reaction picker."
+
+        "confirmation_mismatch" ->
+            "The server name did not match. Type it exactly to confirm deletion."
 
         "user_not_found" ->
             "One or more usernames could not be found. Check the spelling and try again."
