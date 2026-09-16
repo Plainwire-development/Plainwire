@@ -10,7 +10,8 @@ Plainwire can also be used as a self hosted service on your own servers, it isnt
 
 Our central, and official [Plainwire Server](https://plainwire.kokonico.me) 
 
-Our official, always updated every commit testing branch [Frayedwire](https://frayedwire.kokonico.me)
+Our official, always updated; every commit testing app [Frayedwire](https://frayedwire.kokonico.me)
+Its essentially unstable **Plainwire.**
 
 ----------------------------
 
