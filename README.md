@@ -14,6 +14,9 @@ Our official, always updated; every commit testing app [Frayedwire](https://fray
 
 Its essentially unstable/bleeding edge **Plainwire.**
 
+> **Note:** the source explorer IN the Plainwire is a *little* buggy.
+> It will ***surely*** be improved *soon.*
+
 ----------------------------
 
 ## Using Plainwire
