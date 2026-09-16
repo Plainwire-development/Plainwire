@@ -6,6 +6,12 @@ It has servers, channels, DMs, group chats, forums, voice calls, screen sharing,
 
 Plainwire is built with Erlang/OTP, Cowboy, PostgreSQL, Elm, WebSocket, and WebRTC.
 
+Plainwire can also be used as a self hosted service on your own servers, it isnt tied to ours; but it is recommended to use our provided servers. Much like how stoat handles it.
+
+Our [Plainwire Server](https://plainwire.kokonico.me)
+
+----------------------------
+
 ## Using Plainwire
 
 The easiest way to use Plainwire is through a hosted instance.
