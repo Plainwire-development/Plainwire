@@ -110,7 +110,7 @@ async function setup(uid) {
   await context.route('**/api/**', async route => {
     const path = new URL(route.request().url()).pathname;
     const reply = data => route.fulfill({ json: { ok: true, data } });
-    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.7.5-2', asset_version: '1.7.5-2', registration_enabled: true } });
+    if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.8.0', asset_version: '1.8.0', registration_enabled: true } });
     if (path === '/api/me') return reply({ user: people[uid - 1], csrf: 'test', server_time: now });
     if (path === '/api/sync') return reply({ ...sync, conversations: [{ ...conversations[0], peer_id: uid === 1 ? 2 : 1, peer_name: people[uid === 1 ? 1 : 0].display_name }] });
     if (path === '/api/messages') return reply([]);

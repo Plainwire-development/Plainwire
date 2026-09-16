@@ -64,4 +64,15 @@ assert.match(bridge, /room\.roster = roster/, 'automatic repair is guarded by th
 assert.match(bridge, /room\.audioConnectedAnnounced[\s\S]*Audio reconnected[\s\S]*Call audio connected/, 'connection/reconnection feedback is room-deduplicated instead of peer-spammed');
 assert.match(elm, /Incoming voice call[\s\S]*Outgoing voice call[\s\S]*Answer to join the call[\s\S]*Ringing… waiting for/, 'call popup preserves actions while adding clearer call-state context');
 
+
+
+// Half-open websocket and media paths self-heal instead of requiring a page refresh.
+assert.match(bridge, /WS_HEARTBEAT_MS\s*=\s*25000[\s\S]*WS_STALE_AFTER_MS\s*=\s*55000/, 'realtime transport has an explicit heartbeat/staleness budget');
+assert.match(bridge, /heartbeat_stale_socket[\s\S]*ws\.close\(4000, 'heartbeat timeout'\)/, 'half-open websocket paths are forced through normal reconnect recovery');
+assert.match(bridge, /const reconnected = wsEverConnected[\s\S]*api\(\{ method: 'GET', path: '\/sync\?since=0' \}\)/, 'websocket reconnection reconciles missed account state without a page refresh');
+assert.match(bridge, /const auditRtcPeers[\s\S]*currentTrack !== audioTrack[\s\S]*playRemoteAudio\(audio\)/, 'RTC audit repairs suspended/replaced browser audio playback before rebuilding transports');
+assert.match(bridge, /sustained_audio_stall[\s\S]*schedulePeerRebuild/, 'sustained muted receiver/RTP stalls trigger bounded peer-only reconstruction');
+assert.match(bridge, /startRtcRefresh[\s\S]*auditRtcPeers\('periodic'\)/, 'active rooms receive periodic media health auditing');
+assert.match(bridge, /visibilitychange[\s\S]*auditRtcPeers\('foreground'\)/, 'returning to a suspended tab rechecks call playback immediately');
+
 console.log('PASS: RTC protocol contracts, scoped join errors, stale-room protection, duplicate-tab ownership, resume heartbeat, and screen-audio fallback wiring.');

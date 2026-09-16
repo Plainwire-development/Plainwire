@@ -935,6 +935,10 @@
   let vad = null;
   let micTest = null;
   let wsPingTimer = null;
+  let wsLastMessageAt = 0;
+  let wsEverConnected = false;
+  const WS_HEARTBEAT_MS = 25000;
+  const WS_STALE_AFTER_MS = 55000;
   let syncInFlight = null;
   let syncQueued = false;
   const syncRecovery = new Map();
@@ -1125,7 +1129,11 @@
     return rtcConfigRequest;
   };
   const startRtcRefresh = () => {
-    if (!rtcRefreshTimer) rtcRefreshTimer = setInterval(() => { if (room?.joined) loadRtcConfig(); }, 15000);
+    if (!rtcRefreshTimer) rtcRefreshTimer = setInterval(() => {
+      if (!room?.joined) return;
+      loadRtcConfig();
+      auditRtcPeers('periodic');
+    }, 15000);
   };
 
   const krispAssetPath = (value, fallback) =>
@@ -2152,6 +2160,41 @@
     return syncInFlight;
   };
 
+
+  // Realtime remains the fast path. This low-frequency reconciliation is a
+  // safety net for an event missed without an obvious socket failure (proxy
+  // oddities, suspended mobile tabs, or a server-side subscription race). It
+  // only runs for a visible/authenticated/online tab and refreshes the current
+  // route rather than polling every surface in the application.
+  const APP_RECONCILE_MS = 180000;
+  const reconcileVisibleApp = (reason = 'periodic') => {
+    if (!meId || document.hidden || !navigator.onLine) return;
+    debug('SYNC', 'visible_reconcile', { reason, route: location.hash || '#' });
+    api({ method: 'GET', path: '/sync?since=0' });
+
+    const hash = String(location.hash || '#').replace(/^#\/?/, '');
+    let match = hash.match(/^dm\/(\d+)$/);
+    if (match) {
+      api({ method: 'GET', path: `/messages?scope=direct&scope_id=${match[1]}` });
+      api({ method: 'GET', path: `/conversation/${match[1]}` });
+      return;
+    }
+    match = hash.match(/^channel\/(\d+)$/);
+    if (match) { api({ method: 'GET', path: `/messages?scope=channel&scope_id=${match[1]}` }); return; }
+    match = hash.match(/^server\/(\d+)$/);
+    if (match) { api({ method: 'GET', path: `/server/${match[1]}` }); return; }
+    match = hash.match(/^profile\/(\d+)$/);
+    if (match) { api({ method: 'GET', path: `/profile/${match[1]}` }); return; }
+    match = hash.match(/^(?:f|forum)\/(\d+)$/);
+    if (match) { api({ method: 'GET', path: `/threads?forum_id=${match[1]}` }); return; }
+    match = hash.match(/^(?:t|thread)\/(\d+)$/);
+    if (match) { api({ method: 'GET', path: `/thread/${match[1]}` }); return; }
+    if (hash === 'friends') api({ method: 'GET', path: '/friends' });
+    else if (hash === 'forums') api({ method: 'GET', path: '/forums' });
+  };
+
+  setInterval(() => reconcileVisibleApp('periodic_safety_net'), APP_RECONCILE_MS);
+
   const activeComposer = () => {
     const composers = Array.from(document.querySelectorAll('#compose'));
     return composers.reverse().find((element) => element.offsetParent !== null) || null;
@@ -2383,55 +2426,55 @@
 
   const onboardingSteps = [
     {
-      route: '#dms', selector: '.rail-btn[aria-label="Direct messages"]',
+      route: '#dms', selector: '.rail-btn[aria-label="Direct messages"]', mobileSelector: '.mobile-nav-btn[aria-label^="Messages"]',
       title: 'Your conversations live here',
       body: 'Direct Messages keeps one-to-one chats and groups together. Unread conversations rise naturally, and the × on a one-to-one DM hides it without deleting the history.',
       hint: 'Tip: Alt + Shift + ↑ / ↓ jumps between unread DMs.'
     },
     {
-      route: '#dms', selector: '.dm-inbox .page-heading .btn',
+      route: '#dms', selector: '.dm-inbox .page-heading .btn', mobileSelector: '.dm-inbox .page-heading .btn',
       title: 'Start with people, not setup',
       body: 'New message lets you start a DM or build a group. Group owners can promote moderators, remove members, and manage the conversation without leaving chat.',
       hint: 'Groups keep explicit owner / moderator / member authority.'
     },
     {
-      route: '#friends', selector: '.rail-btn[aria-label="Friends"]',
+      route: '#friends', selector: '.rail-btn[aria-label="Friends"]', mobileSelector: '.mobile-nav-btn[aria-label^="Friends"]',
       title: 'Friends and people',
       body: 'Friends is the cleanest place to find people you already know, handle requests, open profiles, and jump into a conversation or call.',
       hint: 'Clicking @mentions anywhere also opens that person’s profile.'
     },
     {
-      route: '#new-server', selector: '.server-create-form',
+      route: '#new-server', selector: '.server-create-form', mobileSelector: '.server-create-form',
       title: 'Servers can grow with you',
       body: 'A server starts simple, then owners can add channels, categories, colored roles, permissions, per-server profiles, moderation, voice rooms, and Wires for inviting people.',
       hint: 'Nothing here forces you to create one right now.'
     },
     {
-      route: '#dms', selector: '.workspace-menu > summary',
+      route: '#dms', selector: '.workspace-menu > summary', mobileSelector: '.mobile-nav-btn[aria-label^="Servers"]',
       title: 'Wires connect people to servers',
       body: 'Open Workspace whenever you want to create a server or join one with a Wire. Wires are Plainwire’s server access links, with usage and expiry controls for moderators.',
       hint: 'Old invite links still work, but new links are Wires.'
     },
     {
-      route: '#forums', selector: '.rail-btn[aria-label="Forums"]',
+      route: '#forums', selector: '.rail-btn[aria-label="Forums"]', mobileSelector: '.forum-directory-hero',
       title: 'Longer conversations belong in f/ and t/',
       body: 'Forums are f/ spaces and individual discussions are t/ threads. Threads support replies, editing, pinning, locking, moderation, and Markdown while keeping the interface distinctly Plainwire.',
       hint: 'Use chat for live conversation and threads when the discussion should stay easy to revisit.'
     },
     {
-      route: '#dms', selector: '[data-open-switcher]',
+      route: '#dms', selector: '[data-open-switcher]', mobileSelector: '[data-open-switcher]',
       title: 'Jump instead of hunting',
       body: 'The quick switcher searches conversations, servers, channels, and destinations from one keyboard-friendly surface.',
       hint: 'Ctrl / Cmd + K opens it from almost anywhere.'
     },
     {
-      route: '#settings', selector: '.rail-btn[aria-label="Settings"]',
+      route: '#settings', selector: '.rail-btn[aria-label="Settings"]', mobileSelector: '.mobile-nav-btn[aria-label^="You"]',
       title: 'Make Plainwire yours',
       body: 'Settings covers identity, appearance, chat behavior, voice and screen-sharing devices, alerts, privacy, sessions, diagnostics, and the full shortcut sheet.',
       hint: 'The tour can be replayed later from Account settings.'
     },
     {
-      route: '#notifications', selector: '.side a[href="#notifications"]',
+      route: '#notifications', selector: '.side a[href="#notifications"]', mobileSelector: '.notifications-head',
       title: 'Mentions and activity stay out of the way',
       body: 'Notifications collects mentions and useful activity without turning every event into a modal. Calls and live voice still surface immediately when they need you.',
       hint: 'Ctrl / Cmd + I opens activity quickly.'
@@ -2570,22 +2613,39 @@
   };
   window.addEventListener('resize', requestTourSpotlightPosition, { passive: true });
   window.addEventListener('scroll', requestTourSpotlightPosition, { passive: true, capture: true });
+  window.visualViewport?.addEventListener?.('resize', requestTourSpotlightPosition, { passive: true });
+  window.visualViewport?.addEventListener?.('scroll', requestTourSpotlightPosition, { passive: true });
 
+  const usableTourTarget = (selector) => {
+    if (!selector) return null;
+    for (const node of document.querySelectorAll(selector)) {
+      if (!node?.isConnected) continue;
+      const style = getComputedStyle(node);
+      const rect = node.getBoundingClientRect();
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+      if (rect.width < 2 || rect.height < 2) continue;
+      return node;
+    }
+    return null;
+  };
+  const tourSelector = (step) => window.matchMedia?.('(max-width: 760px)').matches
+    ? (step.mobileSelector || step.selector)
+    : step.selector;
   const waitForTourTarget = (selector, timeoutMs = 6500) => new Promise((resolve) => {
-    const immediate = document.querySelector(selector);
+    const immediate = usableTourTarget(selector);
     if (immediate) return resolve(immediate);
     let done = false;
     const observer = new MutationObserver(() => {
-      const found = document.querySelector(selector);
+      const found = usableTourTarget(selector);
       if (found && !done) { done = true; clearTimeout(timeout); observer.disconnect(); resolve(found); }
     });
     const timeout = setTimeout(() => {
       if (done) return;
       done = true;
       observer.disconnect();
-      resolve(document.querySelector(selector));
+      resolve(usableTourTarget(selector));
     }, timeoutMs);
-    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'hidden'] });
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
   });
 
   const closeOnboardingChat = ({ resumeHop = true } = {}) => {
@@ -2705,6 +2765,11 @@
     const typing = document.createElement('pw-typing-indicator'); typing.setAttribute('data-scope', ONBOARDING_SCOPE); body.append(typing);
     const footer = document.createElement('div'); footer.className = 'pw-tour-guide-actions';
     guide.append(head, body, footer); document.body.append(guide); onboardingGuideNode = guide;
+    if (window.matchMedia?.('(max-width: 760px)').matches && target) {
+      const targetRect = target.getBoundingClientRect();
+      const viewportHeight = window.visualViewport?.height || window.innerHeight;
+      guide.classList.toggle('is-top', targetRect.top + targetRect.height / 2 > viewportHeight * 0.58);
+    }
     setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, true);
     await sleep(reducedMotion() ? 220 : 720 + Math.min(480, step.body.length * 3));
     if (epoch !== onboardingEpoch || onboardingGuideNode !== guide) return;
@@ -2743,7 +2808,7 @@
     }
     if (epoch !== onboardingEpoch) return;
     if (location.hash !== step.route) location.hash = step.route;
-    const target = await waitForTourTarget(step.selector);
+    const target = await waitForTourTarget(tourSelector(step));
     if (epoch !== onboardingEpoch) return;
     await renderTourGuide(stepNumber, step, target, epoch);
   };
@@ -3132,6 +3197,9 @@
     const socket = ws;
     ws.onopen = () => {
       if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+      const reconnected = wsEverConnected;
+      wsEverConnected = true;
+      wsLastMessageAt = Date.now();
       wsReconnectAttempt = 0;
       const queued = wsQueue;
       wsQueue = [];
@@ -3159,10 +3227,29 @@
         queued.forEach((value) => sendWs(value));
       }
       if (wsPingTimer) clearInterval(wsPingTimer);
-      wsPingTimer = setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) sendWs({ type: 'ping' }); }, 60000);
+      wsPingTimer = setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const idleFor = Date.now() - wsLastMessageAt;
+        if (idleFor >= WS_STALE_AFTER_MS) {
+          // Browsers and proxies can leave a WebSocket looking OPEN after the
+          // underlying path died. Force the normal reconnect/reconcile path
+          // instead of waiting for the user to refresh the whole application.
+          debug('WS', 'heartbeat_stale_socket', { idle_ms: idleFor }, 'warn');
+          try { ws.close(4000, 'heartbeat timeout'); } catch (_) {}
+          return;
+        }
+        sendWs({ type: 'ping' });
+      }, WS_HEARTBEAT_MS);
+      if (reconnected) {
+        // WsStatus also asks Elm to reconcile the active route. This direct sync
+        // closes the small gap before Elm processes that port event and keeps
+        // account navigation fresh even after an aggressively suspended tab.
+        api({ method: 'GET', path: '/sync?since=0' });
+      }
     };
     ws.onmessage = (event) => {
       try {
+        wsLastMessageAt = Date.now();
         const msg = JSON.parse(event.data);
         debug('WS', 'received', { message: msg });
         if (msg.session && msg.session.user && msg.session.user.id) meId = msg.session.user.id;
@@ -4968,6 +5055,63 @@
     return true;
   }
 
+  const auditRtcPeers = (reason = 'periodic') => {
+    if (!room?.joined) return;
+    const now = Date.now();
+    for (const [uid, pc] of peers) {
+      if (!pc || pc._roomEpoch !== room.epoch) continue;
+      if (pc.signalingState === 'closed' || pc.connectionState === 'closed') {
+        schedulePeerRebuild(uid, pc, `${reason}_closed_peer`);
+        continue;
+      }
+
+      const transportConnected = pc.connectionState === 'connected'
+        || pc.iceConnectionState === 'connected'
+        || pc.iceConnectionState === 'completed';
+      const audioTrack = pc.getReceivers?.()
+        .map((receiver) => receiver.track)
+        .find((track) => track?.kind === 'audio' && track.readyState === 'live')
+        || (pc._remoteAudioTrack?.readyState === 'live' ? pc._remoteAudioTrack : null);
+
+      if (transportConnected && !audioTrack && now - (pc._createdAt || now) > 8000) {
+        pc._mediaConnected = false;
+        pc._publishConnectionState?.(true);
+        schedulePeerRebuild(uid, pc, `${reason}_missing_receiver`);
+        continue;
+      }
+
+      if (!transportConnected || !audioTrack) {
+        pc._stalledAudioSince = 0;
+        continue;
+      }
+
+      // Repair browser playback state without touching the transport. Mobile
+      // browsers in particular can suspend an <audio> element while the WebRTC
+      // receiver itself remains healthy.
+      const audio = remoteAudio(uid);
+      const currentTrack = audio.srcObject?.getAudioTracks?.()[0];
+      if (currentTrack !== audioTrack) audio.srcObject = new MediaStream([audioTrack]);
+      audio.muted = deafened;
+      if (!deafened && (audio.paused || audio.readyState < HTMLMediaElement.HAVE_CURRENT_DATA)) playRemoteAudio(audio);
+
+      const rtpStaleFor = pc._lastRtpProgressAt > 0
+        ? now - pc._lastRtpProgressAt
+        : (pc._lastInboundPackets !== null ? now - (pc._createdAt || now) : 0);
+      const looksStalled = audioTrack.muted === true && rtpStaleFor >= 15000;
+      if (!looksStalled) {
+        pc._stalledAudioSince = 0;
+        continue;
+      }
+      if (!pc._stalledAudioSince) pc._stalledAudioSince = now;
+      if (now - pc._stalledAudioSince >= 15000) {
+        debug('RTC', 'sustained_audio_stall', { peer_user_id: uid, reason, rtp_stale_ms: rtpStaleFor }, 'warn');
+        pc._mediaConnected = false;
+        pc._publishConnectionState?.(true);
+        if (schedulePeerRebuild(uid, pc, `${reason}_stalled_receiver`)) pc._stalledAudioSince = 0;
+      }
+    }
+  };
+
   const cleanupAllFloatWindows = () => {
     floatWindows.forEach((w, id) => {
       if (w.video.srcObject) { w.video.srcObject.getTracks().forEach((t) => t.stop()); w.video.srcObject = null; }
@@ -5374,6 +5518,7 @@
         pc._lastInboundPackets = packets;
         if (progressed) {
           pc._lastRtpProgressAt = Date.now();
+          pc._stalledAudioSince = 0;
           markRemoteAudioHealthy('rtp_progress');
         }
       } catch (error) {
@@ -7235,8 +7380,23 @@
   window.addEventListener('online', () => {
     debug('NETWORK', 'browser_online');
     Array.from(syncRecovery.keys()).forEach(kickSyncRecovery);
+    connectWs();
+    if (meId) api({ method: 'GET', path: '/sync?since=0' });
+    if (room?.joined) {
+      playAllRemoteAudio();
+      auditRtcPeers('browser_online');
+    }
   });
   window.addEventListener('offline', () => debug('NETWORK', 'browser_offline', {}, 'warn'));
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    if (!ws || ws.readyState === WebSocket.CLOSED) connectWs();
+    if (room?.joined) {
+      audioContext()?.resume?.();
+      playAllRemoteAudio();
+      auditRtcPeers('foreground');
+    }
+  }, { passive: true });
   window.addEventListener('unhandledrejection', (event) => debug('ERROR', 'unhandled_promise_rejection', { error: event.reason?.message || String(event.reason) }, 'error'));
   window.addEventListener('error', (event) => {
     if (event.target !== window) return;
@@ -7294,9 +7454,16 @@
   window.addEventListener('pageshow', () => {
     resumeIntent = readRtcIntent();
     resumeAttempted = false;
+    if (!ws || ws.readyState === WebSocket.CLOSED) connectWs();
+    if (meId) api({ method: 'GET', path: '/sync?since=0' });
     if (resumeIntent && !room && meId) {
       if (ws?.readyState === WebSocket.OPEN) maybeResumeRtcRoom();
       else connectWs();
+    }
+    if (room?.joined) {
+      audioContext()?.resume?.();
+      playAllRemoteAudio();
+      auditRtcPeers('pageshow');
     }
   });
   enableDrag();

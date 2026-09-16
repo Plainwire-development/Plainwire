@@ -16,6 +16,7 @@ stop(_State) -> ok.
 ensure_secure_config() ->
     Production = production_env(),
     ensure_upload_config(Production),
+    ensure_admin_config(Production),
     case Production of
         false ->
             ensure_rtc_config(Production);
@@ -27,6 +28,61 @@ ensure_secure_config() ->
             true = public_url_configured(),
             true = password_cost_configured(),
             ensure_rtc_config(Production)
+    end.
+
+ensure_admin_config(Production) ->
+    case pw_util:env_bool("PLAINWIRE_ADMIN_ENABLED", false) of
+        false -> ok;
+        true ->
+            Bind = os:getenv("PLAINWIRE_ADMIN_BIND", "127.0.0.1"),
+            case inet:parse_address(Bind) of
+                {ok, Ip} ->
+                    Remote = not admin_loopback(Ip),
+                    Recovery = pw_util:env_bool("PLAINWIRE_ADMIN_LOCAL_RECOVERY", false),
+                    case Recovery andalso Remote of
+                        true -> erlang:error({insecure_admin_config, local_recovery_requires_loopback});
+                        false -> ok
+                    end,
+                    case Production andalso Remote of
+                        false -> ok;
+                        true ->
+                            true = require_admin_remote_opt_in(),
+                            true = admin_https_url_configured(),
+                            true = admin_secure_cookie_configured()
+                    end;
+                {error, _} -> erlang:error({invalid_admin_bind_address, Bind})
+            end,
+            case Production of
+                true ->
+                    SecretPath = os:getenv("PLAINWIRE_ADMIN_SECRET_FILE", "/var/lib/plainwire/admin-instance.key"),
+                    case filename:pathtype(SecretPath) of
+                        absolute -> ok;
+                        _ -> erlang:error({insecure_production_config, admin_secret_file_must_be_absolute})
+                    end;
+                false -> ok
+            end
+    end.
+
+admin_loopback({127, _, _, _}) -> true;
+admin_loopback({0,0,0,0,0,0,0,1}) -> true;
+admin_loopback(_) -> false.
+
+require_admin_remote_opt_in() ->
+    case pw_util:env_bool("PLAINWIRE_ADMIN_ALLOW_REMOTE", false) of
+        true -> true;
+        false -> erlang:error({insecure_production_config, admin_remote_not_explicitly_allowed})
+    end.
+
+admin_https_url_configured() ->
+    case os:getenv("PLAINWIRE_ADMIN_PUBLIC_URL") of
+        "https://" ++ Host when Host =/= [] -> true;
+        _ -> erlang:error({insecure_production_config, admin_public_https_url})
+    end.
+
+admin_secure_cookie_configured() ->
+    case pw_util:env_bool("PLAINWIRE_ADMIN_COOKIE_SECURE", true) of
+        true -> true;
+        false -> erlang:error({insecure_production_config, admin_cookie_secure})
     end.
 
 ensure_rtc_config(Production) ->

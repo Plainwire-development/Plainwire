@@ -29,7 +29,7 @@ If you just want to use Plainwire, you should not need to worry about any of tha
 * Screen sharing with optional shared audio and collapsible viewers
 * File uploads
 * Profiles, friends, blocking, presence, and realtime typing
-* Message replies and Markdown
+* Message replies, Markdown, and emoji reactions with activity notifications
 * Light, dark, and system themes
 * Audio device selection and mic testing
 * Mobile and desktop layouts
@@ -37,7 +37,8 @@ If you just want to use Plainwire, you should not need to worry about any of tha
 * STUN and TURN support for calls
 * Wires for sharing/joining servers, with legacy invite-link compatibility
 * Optional server-proxied KLIPY GIF search
-* A resumable first-run Plainwire guide for new accounts
+* A resumable, mobile-aware first-run Plainwire guide for new accounts
+* Realtime state recovery and self-healing call audio designed to avoid routine page refreshes
 
 Plainwire is not end-to-end encrypted. Messages may be encrypted at rest, but the server must still be able to read them while operating the service.
 
@@ -223,14 +224,44 @@ For a public instance:
 
 Caddy, nginx, and similar reverse proxies work well in front of Plainwire.
 
+### Service control plane
+
+Plainwire 1.8.0 includes an optional host-level operator console. It administers the configured Plainwire service instance itself; it is not a per-server moderation panel. The control plane is disabled by default and runs on a separate Cowboy listener when enabled.
+
+The console is intentionally private-content blind. It can inspect service health, runtime/build information, database and realtime health, aggregate message/upload/call statistics, registered accounts, hosted server metadata, resource usage, operators, and operator audit history. It has no message-body, DM-text, attachment-content, message-search, or verification-secret endpoint.
+
+Operator access is instance-bound:
+
+* no administrator password or reusable key is stored in the source tree;
+* each deployment creates a local 256-bit instance secret (production default: `/var/lib/plainwire/admin-instance.key`, mode `0600`);
+* the first service owner uses a one-time bootstrap token printed by that running instance plus their normal Plainwire account password;
+* every operator then receives their own high-entropy verification key, stored only as an HMAC bound to that instance secret;
+* cloning Plainwire creates a different instance secret, so keys created by the clone cannot authenticate to another deployment;
+* `viewer` accounts see aggregate overview/host health only, `operator` accounts can inspect content-free user/server/operator/audit metadata, and `owner` accounts additionally manage service-operator access;
+* one-time owner-issued enrollment/recovery codes are account-bound and consumed atomically;
+* losing the last usable owner key can be recovered only by somebody who controls that host: temporarily enable `PLAINWIRE_ADMIN_LOCAL_RECOVERY=true`, keep the admin listener on loopback, restart, use the one-time recovery token printed locally, then disable local recovery before the next restart.
+
+For a local deployment, enable the control plane and leave its bind address on loopback:
+
+```sh
+PLAINWIRE_ADMIN_ENABLED=true
+PLAINWIRE_ADMIN_BIND=127.0.0.1
+PLAINWIRE_ADMIN_PORT=8090
+```
+
+For remote operator access, the recommended deployment is a **separate admin hostname** (for example `control.example.com`) terminated by an HTTPS reverse proxy. Keep the Plainwire admin listener private to the proxy where possible. If you intentionally bind it remotely in production, Plainwire requires `PLAINWIRE_ADMIN_ALLOW_REMOTE=true`, an `https://` `PLAINWIRE_ADMIN_PUBLIC_URL`, and secure admin cookies. Do not expose the emergency local-recovery mode remotely; Plainwire refuses to start with local recovery enabled on a non-loopback admin bind.
+
+Back up the admin instance-secret file together with PostgreSQL. Treat it like other host credentials: source access alone is harmless, but host-secret access is privileged.
+
 Deployment and update instructions are kept in [deploy/README.md](deploy/README.md).
 
 ## Version
 
-Current release: **1.7.5-2**
+Current release: **1.8.0**
 
 Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history and release tags.
 
+* [1.8.0 release notes](RELEASE_NOTES_1.8.0.md)
 * [1.7.5-2 release notes](RELEASE_NOTES_1.7.5-2.md)
 
 ## License

@@ -14,6 +14,7 @@
     "test:rtc": "node test/browser/rtc.mjs",
     "test:rtc-contract": "node test/browser/rtc-contract.mjs",
     "test:ui-contract": "node test/browser/ui-contract.mjs",
+    "test:admin-contract": "node test/browser/admin-contract.mjs",
     "build:rich-text": "node scripts/build-rich-text.mjs",
     "test:health": "node test/browser/call-health.mjs",
     "test:release-contract": "node test/browser/release-contract.mjs"

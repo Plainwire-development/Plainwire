@@ -1,0 +1,66 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+
+const read=p=>readFileSync(p,'utf8');
+const sup=read('src/pw_sup.erl');
+const app=read('src/pw_app.erl');
+const db=read('src/pw_db.erl');
+const api=read('src/pw_admin_api.erl');
+const ident=read('src/pw_admin_identity.erl');
+const runtime=read('src/pw_admin_runtime.erl');
+const page=read('src/pw_admin_page.erl');
+const staticHandler=read('src/pw_admin_static.erl');
+const js=read('priv/admin/admin.js');
+const html=read('priv/admin/index.html');
+const env=read('.env.example');
+
+assert.match(sup,/plainwire_admin_http[\s\S]*PLAINWIRE_ADMIN_BIND[\s\S]*127\.0\.0\.1/,'admin uses a distinct listener and defaults to loopback');
+assert.match(page,/GET[\s\S]*HEAD[\s\S]*405/,'admin page serves only GET/HEAD and rejects other methods');
+assert.match(staticHandler,/GET[\s\S]*HEAD[\s\S]*405/,'admin static assets serve only GET/HEAD and reject other methods');
+assert.match(sup,/\{"\/api\/\[\.\.\.\]", pw_admin_api/,'admin API exists only on the separate admin dispatch');
+const publicDispatch=sup.slice(sup.indexOf('http_listener_spec()'),sup.indexOf('env_range('));
+assert.doesNotMatch(publicDispatch,/pw_admin_api|pw_admin_page|pw_admin_static/,'public Plainwire listener does not mount admin routes');
+assert.match(app,/PLAINWIRE_ADMIN_ALLOW_REMOTE[\s\S]*PLAINWIRE_ADMIN_PUBLIC_URL[\s\S]*admin_secure_cookie_configured/,'remote production admin binding requires explicit HTTPS/secure-cookie posture');
+assert.match(ident,/admin-instance\.key[\s\S]*crypto:strong_rand_bytes\(\?KEY_BYTES\)/,'instance secret is generated at runtime rather than embedded in source');
+assert.match(ident,/crypto:mac\(hmac, sha256, Secret, Value\)/,'operator/enrollment/session secret material is instance-bound with HMAC');
+assert.match(ident,/FIRST-RUN bootstrap token \(one-time\)/,'first-owner bootstrap token is generated at startup');
+assert.match(ident,/PLAINWIRE_ADMIN_LOCAL_RECOVERY[\s\S]*LOCAL RECOVERY token/,'host-local emergency recovery is explicit and runtime-generated');
+assert.match(app,/local_recovery_requires_loopback/,'host-local emergency recovery cannot be exposed on a remote admin bind');
+assert.match(db,/admin_recover_owner[\s\S]*DELETE FROM admin_sessions[\s\S]*DELETE FROM admin_enrollments WHERE used_at IS NULL/,'local owner recovery revokes all admin sessions and outstanding enrollment material');
+assert.match(db,/route\(\{admin_recover_owner[\s\S]*\{ok, Uid, Username, DisplayName\} ->/,'local owner recovery matches the shared account-verification result contract');
+assert.doesNotMatch(ident,/pwadm1\.[A-Za-z0-9_-]{20,}/,'source does not contain a reusable administrator token');
+
+assert.match(db,/\{29, \[[\s\S]*CREATE TABLE IF NOT EXISTS admin_operators[\s\S]*admin_sessions[\s\S]*admin_enrollments[\s\S]*admin_audit/,'migration 29 creates normalized operator/session/enrollment/audit state');
+assert.match(db,/LOCK TABLE admin_operators IN SHARE ROW EXCLUSIVE MODE[\s\S]*can_change_owner[\s\S]*last_owner/,'operator changes serialize and enforce the last-owner invariant');
+assert.match(db,/route\(\{admin_login[\s\S]{0,2600}FOR UPDATE OF u,a/,'admin login locks user/operator credential rows so an old key cannot race key rotation');
+assert.match(db,/route\(\{admin_rotate_key[\s\S]{0,1800}FOR UPDATE OF u,a/,'admin key rotation uses the same user/operator row-lock order as login');
+assert.match(db,/admin_rotate_key[\s\S]{0,2600}DELETE FROM admin_enrollments WHERE used_at IS NULL AND \(user_id=\$1 OR created_by=\$1\)/,'key rotation invalidates pending enrollment and recovery capabilities');
+assert.match(db,/admin_set_operator_role[\s\S]{0,2600}DELETE FROM admin_enrollments WHERE used_at IS NULL AND \(user_id=\$1 OR created_by=\$1\)/,'role changes invalidate pending capabilities for or issued by the changed operator');
+assert.match(db,/admin_remove_operator[\s\S]{0,1800}DELETE FROM admin_enrollments WHERE user_id=\$1 AND used_at IS NULL[\s\S]*DELETE FROM admin_operators/,'operator removal cannot leave a recovery code that recreates the removed operator');
+assert.match(db,/EffectiveRole[\s\S]{0,400}SELECT role FROM admin_operators/,'enrollment redemption returns the authoritative current operator role');
+assert.match(db,/admin_redeem_enrollment[\s\S]*WHERE e\.token_hash=\$1 FOR UPDATE[\s\S]*UPDATE admin_enrollments SET used_at/,'one-time enrollment/recovery redemption is row-locked and consumed atomically');
+assert.match(db,/UPDATE admin_operators SET verification_hash=\$2[\s\S]*DELETE FROM admin_sessions WHERE user_id=\$1/,'verification-key rotation revokes existing admin sessions');
+assert.match(db,/idx_messages_created_global ON messages\(created_at DESC\)/,'admin activity statistics use an indexed global message timestamp');
+assert.match(db,/idx_messages_user ON messages\(user_id,id DESC\)/,'per-user admin message counts use a dedicated user index');
+
+const adminDb=db.slice(db.indexOf('route(admin_operator_count'),db.indexOf('route({register'));
+assert.doesNotMatch(adminDb,/SELECT[^"\n]*(?:\.body|\bbody\b)/i,'admin DB surface never selects message/thread/reply bodies');
+assert.doesNotMatch(adminDb,/avatar_url|banner_url|\bbio\b/,'admin DB surface avoids private/profile-content fields');
+assert.match(api,/content_access => false[\s\S]*message_bodies[\s\S]*attachment_contents[\s\S]*message_search/,'API publishes an explicit private-content blind contract');
+assert.doesNotMatch(api,/messages.*search|search.*messages/i,'admin API has no message-search route');
+assert.match(api,/same_site => strict/,'admin cookies use SameSite Strict');
+assert.match(api,/x-csrf-token/,'mutating admin requests require a separate CSRF token');
+assert.match(api,/can_inspect\(Session\)[\s\S]*owner[\s\S]*operator/,'viewer/operator/owner roles have distinct service-metadata visibility');
+assert.match(js,/applyRoleUi[\s\S]*viewer[\s\S]*users[\s\S]*servers[\s\S]*operators[\s\S]*audit/,'viewer navigation hides account-level control-plane views');
+assert.match(api,/pw_rate:allow\(\{admin_auth/,'admin authentication paths are independently rate limited');
+assert.match(api,/valid_token\(Key, <<"op">>\)/,'login rejects operator keys from a different instance/token class before DB auth');
+assert.match(runtime,/safe_config\(\)[\s\S]*PLAINWIRE_DB_POOL_SIZE/,'host snapshot exposes an allowlist of non-secret configuration');
+assert.doesNotMatch(runtime,/PLAINWIRE_DB_PASS|PLAINWIRE_ENC_KEY|PLAINWIRE_TURN_SECRET|API_TOKEN|COOKIE/i,'host snapshot does not read credential-bearing environment variables');
+assert.doesNotMatch(js,/innerHTML|outerHTML|insertAdjacentHTML/,'admin UI does not interpolate remote data through HTML sinks');
+assert.match(js,/Plainwire cannot recover this plaintext secret later/,'one-time operator secrets are explicitly surfaced as non-recoverable');
+assert.match(js,/modalLocked[\s\S]*closeModal\(true\)/,'one-time secret modal cannot be dismissed before explicit acknowledgement');
+assert.match(html,/Host recovery[\s\S]*local recovery token/i,'host-local recovery is visible only through its explicit emergency UI');
+assert.match(html,/Private-content blind by design/,'login surface states the privacy boundary before operator authentication');
+assert.match(env,/PLAINWIRE_ADMIN_ENABLED/,'deployment example documents explicit admin enablement');
+
+console.log('PASS: isolated host-admin listener, instance-bound operator verification, loopback-only emergency recovery, atomic enrollment/recovery, last-owner safety, privacy-blind queries, CSRF/rate limits, safe host telemetry, and DOM-safe admin UI contracts.');

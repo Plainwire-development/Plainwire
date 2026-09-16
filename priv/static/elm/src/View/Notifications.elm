@@ -105,6 +105,9 @@ notificationLabel kind =
         "thread_reply" ->
             "Thread reply"
 
+        "message_reaction" ->
+            "Reaction"
+
         "message_request" ->
             "Message request"
 

@@ -4,11 +4,9 @@
     base64url/1, base64url_decode/1, pbkdf2/2, verify_password/3, password_needs_rehash/1,
     normalize_username/1, clean_text/2, int/1, bool/1, bin/1, json/1,
     read_json/1, read_json/2, ok_json/2, err_json/3, set_cookie/3, clear_cookie/1, cookie_value/2,
-    require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1, hex_binary/1
+    require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1, hex_binary/1,
+    constant_time/2
 ]).
--ifdef(TEST).
--export([constant_time/2]).
--endif.
 
 env_int(Name, Default) ->
     case os:getenv(Name) of

@@ -1,9 +1,26 @@
 -module(pw_upload_gc).
 -behaviour(gen_server).
--export([start_link/0, lookup/2, invalidate_user/1, invalidate_upload/1, acquire/2, release/2]).
+-export([start_link/0, lookup/2, invalidate_user/1, invalidate_upload/1, acquire/2, release/2, stats/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+stats() ->
+    try
+        #{active_uploads => ets_value(global),
+          inflight_bytes => ets_value(global_bytes),
+          metadata_cache_entries => ets:info(pw_upload_metadata_cache, size),
+          authorization_cache_entries => ets:info(pw_upload_authz_cache, size)}
+    catch _:_ ->
+        #{active_uploads => 0, inflight_bytes => 0,
+          metadata_cache_entries => 0, authorization_cache_entries => 0}
+    end.
+
+ets_value(Key) ->
+    case ets:lookup(pw_upload_active, Key) of
+        [{Key, Value}] when is_integer(Value) -> Value;
+        _ -> 0
+    end.
 
 %% auth cache is per user+upload. sharing that answer would be quite the bug.
 lookup(Uid, Id) ->

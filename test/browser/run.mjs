@@ -42,7 +42,7 @@ async function setup(context){
  await context.route('**/api/**',async route=>{
   const req=route.request(), url=new URL(req.url()), path=url.pathname;
   const reply=(data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify({ok:status<400,data,...(status===401?{error:'not_authenticated'}:{})})});
-  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.7.5-2',asset_version:'1.7.5-2',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
+  if(path==='/api/client-config')return route.fulfill({json:{app_name:'Plainwire',default_theme:'system',version:'1.8.0',asset_version:'1.8.0',registration_enabled:true,instance_description:'A private place for everyday conversations.'}});
   if(path==='/api/me')return authenticated?reply({user:me,csrf:'test-csrf',server_time:now}):reply(null,401);
   if(path==='/api/sync')return reply(sync);
   if(path==='/api/forums')return reply([]);

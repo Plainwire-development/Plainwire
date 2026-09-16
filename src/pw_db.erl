@@ -22,7 +22,12 @@
     subscribable/2,
     begin_upload/6, finish_upload/3, abort_upload/2, get_upload/2, stale_uploads/2, delete_upload/1,
     upload_ref_backfill/1,
-    categories/2, create_category/3, update_category/4, reorder_categories/3, delete_category/3, move_channel/4
+    categories/2, create_category/3, update_category/4, reorder_categories/3, delete_category/3, move_channel/4,
+    admin_operator_count/0, admin_bootstrap_owner/3, admin_recover_owner/3, admin_login/8, admin_session/1, admin_logout/1,
+    admin_create_enrollment/6, admin_redeem_enrollment/9, admin_rotate_key/5,
+    admin_operators/1, admin_set_operator_role/3, admin_remove_operator/2,
+    admin_overview/0, admin_users/3, admin_user/1, admin_servers/3, admin_server/1,
+    admin_audit/2, admin_record_audit/6
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -ifdef(TEST).
@@ -271,6 +276,30 @@ get_upload(Uid, Id) -> call({get_upload, Uid, Id}).
 stale_uploads(PendingBefore, ReadyBefore) -> call({stale_uploads, PendingBefore, ReadyBefore}).
 delete_upload(Id) -> call({delete_upload, Id}).
 upload_ref_backfill(Batch) -> call({upload_ref_backfill, Batch}).
+admin_operator_count() -> call(admin_operator_count).
+admin_bootstrap_owner(Username, Password, VerificationHash) -> call({admin_bootstrap_owner, Username, Password, VerificationHash}).
+admin_recover_owner(Username, Password, VerificationHash) -> call({admin_recover_owner, Username, Password, VerificationHash}).
+admin_login(Username, Password, VerificationHash, SessionHash, Csrf, ExpiresAt, IpHash, UaHash) ->
+    call({admin_login, Username, Password, VerificationHash, SessionHash, Csrf, ExpiresAt, IpHash, UaHash}).
+admin_session(SessionHash) -> call({admin_session, SessionHash}).
+admin_logout(SessionHash) -> call({admin_logout, SessionHash}).
+admin_create_enrollment(ActorUid, TargetUsername, Role, TokenHash, ExpiresAt, Note) ->
+    call({admin_create_enrollment, ActorUid, TargetUsername, Role, TokenHash, ExpiresAt, Note}).
+admin_redeem_enrollment(Username, Password, TokenHash, VerificationHash, SessionHash, Csrf, ExpiresAt, IpHash, UaHash) ->
+    call({admin_redeem_enrollment, Username, Password, TokenHash, VerificationHash, SessionHash, Csrf, ExpiresAt, IpHash, UaHash}).
+admin_rotate_key(Uid, Password, CurrentHash, NewHash, ActorIpHash) ->
+    call({admin_rotate_key, Uid, Password, CurrentHash, NewHash, ActorIpHash}).
+admin_operators(ActorUid) -> call({admin_operators, ActorUid}).
+admin_set_operator_role(ActorUid, TargetUid, Role) -> call({admin_set_operator_role, ActorUid, TargetUid, Role}).
+admin_remove_operator(ActorUid, TargetUid) -> call({admin_remove_operator, ActorUid, TargetUid}).
+admin_overview() -> call(admin_overview).
+admin_users(Query, Limit, Offset) -> call({admin_users, Query, Limit, Offset}).
+admin_user(Uid) -> call({admin_user, Uid}).
+admin_servers(Query, Limit, Offset) -> call({admin_servers, Query, Limit, Offset}).
+admin_server(Sid) -> call({admin_server, Sid}).
+admin_audit(Limit, BeforeId) -> call({admin_audit, Limit, BeforeId}).
+admin_record_audit(ActorUid, Action, TargetType, TargetId, Detail, IpHash) ->
+    call({admin_record_audit, ActorUid, Action, TargetType, TargetId, Detail, IpHash}).
 
 init([]) ->
     application:ensure_all_started(inets),
@@ -369,6 +398,17 @@ transient_db_reason(_) -> false.
 
 read_msg({register, _, _, _}) -> false;
 read_msg({login, _, _}) -> false;
+read_msg({admin_bootstrap_owner, _, _, _}) -> false;
+read_msg({admin_recover_owner, _, _, _}) -> false;
+read_msg({admin_login, _, _, _, _, _, _, _, _}) -> false;
+read_msg({admin_session, _}) -> false;
+read_msg({admin_logout, _}) -> false;
+read_msg({admin_create_enrollment, _, _, _, _, _, _}) -> false;
+read_msg({admin_redeem_enrollment, _, _, _, _, _, _, _, _, _}) -> false;
+read_msg({admin_rotate_key, _, _, _, _, _}) -> false;
+read_msg({admin_set_operator_role, _, _, _}) -> false;
+read_msg({admin_remove_operator, _, _}) -> false;
+read_msg({admin_record_audit, _, _, _, _, _, _}) -> false;
 read_msg({logout, _}) -> false;
 read_msg({logout_other_sessions, _, _}) -> false;
 read_msg({change_password, _, _, _, _}) -> false;
@@ -448,6 +488,14 @@ read_msg(_) -> true.
 
 safe_log_msg({register, _, _, _}) -> {register, redacted};
 safe_log_msg({login, _, _}) -> {login, redacted};
+safe_log_msg({admin_bootstrap_owner, _, _, _}) -> {admin_bootstrap_owner, redacted};
+safe_log_msg({admin_recover_owner, _, _, _}) -> {admin_recover_owner, redacted};
+safe_log_msg({admin_login, _, _, _, _, _, _, _, _}) -> {admin_login, redacted};
+safe_log_msg({admin_session, _}) -> {admin_session, redacted};
+safe_log_msg({admin_logout, _}) -> {admin_logout, redacted};
+safe_log_msg({admin_create_enrollment, Actor, Target, Role, _, Expires, _}) -> {admin_create_enrollment, Actor, Target, Role, redacted, Expires};
+safe_log_msg({admin_redeem_enrollment, _, _, _, _, _, _, _, _, _}) -> {admin_redeem_enrollment, redacted};
+safe_log_msg({admin_rotate_key, Uid, _, _, _, _}) -> {admin_rotate_key, Uid, redacted};
 safe_log_msg({session, _}) -> {session, redacted};
 safe_log_msg({logout, _}) -> {logout, redacted};
 safe_log_msg({logout_other_sessions, Uid, _}) -> {logout_other_sessions, Uid, redacted};
@@ -511,6 +559,366 @@ connect_with_retry(Attempts, DelayMs) ->
         Error -> Error
     end.
 
+route(admin_operator_count, Conn) ->
+    case one(Conn, "SELECT count(*) FROM admin_operators", []) of
+        {ok, [Count]} -> {ok, Count};
+        {error, Reason} -> erlang:error({sql_error, Reason})
+    end;
+route({admin_bootstrap_owner, U0, P0, VerificationHash0}, Conn) ->
+    U = pw_util:normalize_username(U0),
+    P = pw_util:clean_text(P0, 256),
+    VerificationHash = pw_util:clean_text(VerificationHash0, 128),
+    with_tx(Conn, fun() ->
+        ok = exec(Conn, "LOCK TABLE admin_operators IN SHARE ROW EXCLUSIVE MODE", []),
+        case one(Conn, "SELECT count(*) FROM admin_operators", []) of
+            {ok, [0]} ->
+                case verify_admin_user(Conn, U, P) of
+                    {ok, Uid, Username, DisplayName} ->
+                        Now = pw_util:now_ms(),
+                        ok = exec(Conn,
+                            "INSERT INTO admin_operators(user_id,role,verification_hash,created_by,created_at,updated_at) "
+                            "VALUES($1,'owner',$2,$1,$3,$3)", [Uid, VerificationHash, Now]),
+                        admin_audit_insert(Conn, Uid, <<"operator.bootstrap">>, <<"operator">>, integer_to_binary(Uid), <<"first service owner">>, <<>>, Now),
+                        {ok, #{user_id => Uid, username => Username, display_name => DisplayName, role => <<"owner">>}};
+                    Error -> Error
+                end;
+            {ok, [_]} -> {error, bootstrap_unavailable};
+            {error, Reason} -> erlang:error({sql_error, Reason})
+        end
+    end);
+route({admin_recover_owner, U0, P0, VerificationHash0}, Conn) ->
+    U = pw_util:normalize_username(U0),
+    P = pw_util:clean_text(P0, 256),
+    VerificationHash = pw_util:clean_text(VerificationHash0, 128),
+    with_tx(Conn, fun() ->
+        ok = exec(Conn, "LOCK TABLE admin_operators IN SHARE ROW EXCLUSIVE MODE", []),
+        case verify_admin_user(Conn, U, P) of
+            {ok, Uid, Username, DisplayName} ->
+                Now = pw_util:now_ms(),
+                ok = exec(Conn,
+                    "INSERT INTO admin_operators(user_id,role,verification_hash,created_by,created_at,updated_at) "
+                    "VALUES($1,'owner',$2,$1,$3,$3) ON CONFLICT(user_id) DO UPDATE SET role='owner',verification_hash=EXCLUDED.verification_hash,updated_at=EXCLUDED.updated_at",
+                    [Uid, VerificationHash, Now]),
+                ok = exec(Conn, "DELETE FROM admin_sessions", []),
+                ok = exec(Conn, "DELETE FROM admin_enrollments WHERE used_at IS NULL", []),
+                admin_audit_insert(Conn, Uid, <<"operator.local_recovery">>, <<"operator">>, integer_to_binary(Uid),
+                                   <<"host-local emergency owner recovery; all admin sessions revoked">>, <<>>, Now),
+                {ok, #{user_id => Uid, username => Username, display_name => DisplayName, role => <<"owner">>, sessions_revoked => true}};
+            Error -> Error
+        end
+    end);
+route({admin_login, U0, P0, VerificationHash0, SessionHash0, Csrf0, ExpiresAt, IpHash0, UaHash0}, Conn) ->
+    U = pw_util:normalize_username(U0),
+    P = pw_util:clean_text(P0, 256),
+    VerificationHash = pw_util:clean_text(VerificationHash0, 128),
+    SessionHash = pw_util:clean_text(SessionHash0, 128),
+    Csrf = pw_util:clean_text(Csrf0, 128),
+    IpHash = pw_util:clean_text(IpHash0, 128),
+    UaHash = pw_util:clean_text(UaHash0, 128),
+    %% Serialize credential verification against key rotation/removal. Without
+    %% the row lock, an old key could validate immediately before a rotation,
+    %% then insert a new admin session after the rotation deleted old sessions.
+    with_tx(Conn, fun() ->
+        case one(Conn,
+            "SELECT u.id,u.username,u.display_name,u.password_hash,u.password_salt,a.role,a.verification_hash "
+            "FROM users u JOIN admin_operators a ON a.user_id=u.id WHERE u.username=$1 FOR UPDATE OF u,a", [U]) of
+            {ok, [Uid, Username, DisplayName, PasswordHash, Salt, Role, StoredVerification]} ->
+                PasswordOk = pw_util:verify_password(P, Salt, PasswordHash),
+                KeyOk = pw_util:constant_time(VerificationHash, StoredVerification),
+                case PasswordOk andalso KeyOk of
+                    true ->
+                        maybe_upgrade_password_hash(Conn, Uid, P, PasswordHash),
+                        Now = pw_util:now_ms(),
+                        ok = exec(Conn,
+                            "INSERT INTO admin_sessions(token_hash,user_id,csrf,created_at,last_seen,expires_at,ip_hash,user_agent_hash) "
+                            "VALUES($1,$2,$3,$4,$4,$5,$6,$7)",
+                            [SessionHash, Uid, Csrf, Now, ExpiresAt, IpHash, UaHash]),
+                        admin_audit_insert(Conn, Uid, <<"auth.login">>, <<"operator">>, integer_to_binary(Uid), <<>>, IpHash, Now),
+                        {ok, #{user_id => Uid, username => Username, display_name => DisplayName, role => Role, csrf => Csrf, expires_at => ExpiresAt}};
+                    false -> {error, bad_login}
+                end;
+            {ok, undefined} ->
+                _ = pw_util:pbkdf2(P, <<"plainwire-admin-login-timing-pad">>),
+                {error, bad_login};
+            {error, Reason} -> erlang:error({sql_error, Reason})
+        end
+    end);
+route({admin_session, SessionHash0}, Conn) ->
+    SessionHash = pw_util:clean_text(SessionHash0, 128),
+    Now = pw_util:now_ms(),
+    case one(Conn,
+        "SELECT s.user_id,s.csrf,s.created_at,s.last_seen,s.expires_at,u.username,u.display_name,a.role "
+        "FROM admin_sessions s JOIN users u ON u.id=s.user_id JOIN admin_operators a ON a.user_id=s.user_id "
+        "WHERE s.token_hash=$1 AND s.expires_at>$2", [SessionHash, Now]) of
+        {ok, [Uid, Csrf, Created, LastSeen, Expires, Username, DisplayName, Role]} ->
+            Cutoff = Now - 60000,
+            _ = exec(Conn, "UPDATE admin_sessions SET last_seen=$1 WHERE token_hash=$2 AND last_seen<$3", [Now, SessionHash, Cutoff]),
+            {ok, #{user_id => Uid, csrf => Csrf, created_at => Created, last_seen => LastSeen, expires_at => Expires,
+                   username => Username, display_name => DisplayName, role => Role}};
+        {ok, undefined} -> {error, no_session};
+        {error, Reason} -> erlang:error({sql_error, Reason})
+    end;
+route({admin_logout, SessionHash0}, Conn) ->
+    SessionHash = pw_util:clean_text(SessionHash0, 128),
+    ok = exec(Conn, "DELETE FROM admin_sessions WHERE token_hash=$1", [SessionHash]),
+    {ok, #{logged_out => true}};
+route({admin_create_enrollment, ActorUid, TargetUsername0, RequestedRole0, TokenHash0, ExpiresAt, Note0}, Conn) ->
+    TargetUsername = pw_util:normalize_username(TargetUsername0),
+    TokenHash = pw_util:clean_text(TokenHash0, 128),
+    Note = pw_util:clean_text(Note0, 160),
+    case normalize_admin_role(RequestedRole0) of
+        undefined -> {error, invalid_role};
+        RequestedRole -> with_tx(Conn, fun() ->
+        ok = exec(Conn, "LOCK TABLE admin_operators IN SHARE ROW EXCLUSIVE MODE", []),
+        case admin_actor_role(Conn, ActorUid) of
+            <<"owner">> ->
+                case one(Conn, "SELECT id,username,display_name FROM users WHERE username=$1 FOR UPDATE", [TargetUsername]) of
+                    {ok, [TargetUid, Username, DisplayName]} ->
+                        ExistingRole = case one(Conn, "SELECT role FROM admin_operators WHERE user_id=$1", [TargetUid]) of
+                            {ok, [Role]} -> Role;
+                            _ -> undefined
+                        end,
+                        EffectiveRole = case ExistingRole of undefined -> RequestedRole; _ -> ExistingRole end,
+                        Now = pw_util:now_ms(),
+                        ok = exec(Conn, "DELETE FROM admin_enrollments WHERE user_id=$1 AND used_at IS NULL", [TargetUid]),
+                        ok = exec(Conn,
+                            "INSERT INTO admin_enrollments(token_hash,user_id,role,created_by,note,created_at,expires_at,used_at) "
+                            "VALUES($1,$2,$3,$4,$5,$6,$7,NULL)",
+                            [TokenHash, TargetUid, EffectiveRole, ActorUid, Note, Now, ExpiresAt]),
+                        admin_audit_insert(Conn, ActorUid, <<"operator.enrollment_created">>, <<"operator">>, integer_to_binary(TargetUid), Note, <<>>, Now),
+                        {ok, #{user_id => TargetUid, username => Username, display_name => DisplayName, role => EffectiveRole, expires_at => ExpiresAt}};
+                    _ -> {error, user_not_found}
+                end;
+            _ -> {error, forbidden}
+        end
+    end)
+    end;
+route({admin_redeem_enrollment, U0, P0, TokenHash0, VerificationHash0, SessionHash0, Csrf0, ExpiresAt, IpHash0, UaHash0}, Conn) ->
+    U = pw_util:normalize_username(U0),
+    P = pw_util:clean_text(P0, 256),
+    TokenHash = pw_util:clean_text(TokenHash0, 128),
+    VerificationHash = pw_util:clean_text(VerificationHash0, 128),
+    SessionHash = pw_util:clean_text(SessionHash0, 128),
+    Csrf = pw_util:clean_text(Csrf0, 128),
+    IpHash = pw_util:clean_text(IpHash0, 128),
+    UaHash = pw_util:clean_text(UaHash0, 128),
+    with_tx(Conn, fun() ->
+        Now = pw_util:now_ms(),
+        case one(Conn,
+            "SELECT e.user_id,e.role,u.username,u.display_name,u.password_hash,u.password_salt,e.expires_at,e.used_at "
+            "FROM admin_enrollments e JOIN users u ON u.id=e.user_id WHERE e.token_hash=$1 FOR UPDATE", [TokenHash]) of
+            {ok, [Uid, _EnrollmentRole, Username, DisplayName, PasswordHash, Salt, EnrollExpires, null]} when EnrollExpires > Now, Username =:= U ->
+                case pw_util:verify_password(P, Salt, PasswordHash) of
+                    false -> {error, bad_login};
+                    true ->
+                        maybe_upgrade_password_hash(Conn, Uid, P, PasswordHash),
+                        ok = exec(Conn,
+                            "INSERT INTO admin_operators(user_id,role,verification_hash,created_by,created_at,updated_at) "
+                            "SELECT user_id,role,$2,created_by,$3,$3 FROM admin_enrollments WHERE token_hash=$1 "
+                            "ON CONFLICT(user_id) DO UPDATE SET verification_hash=EXCLUDED.verification_hash,updated_at=EXCLUDED.updated_at",
+                            [TokenHash, VerificationHash, Now]),
+                        ok = exec(Conn, "UPDATE admin_enrollments SET used_at=$2 WHERE token_hash=$1 AND used_at IS NULL", [TokenHash, Now]),
+                        ok = exec(Conn, "DELETE FROM admin_sessions WHERE user_id=$1", [Uid]),
+                        ok = exec(Conn,
+                            "INSERT INTO admin_sessions(token_hash,user_id,csrf,created_at,last_seen,expires_at,ip_hash,user_agent_hash) "
+                            "VALUES($1,$2,$3,$4,$4,$5,$6,$7)", [SessionHash, Uid, Csrf, Now, ExpiresAt, IpHash, UaHash]),
+                        %% Existing operators keep their current role. An older recovery
+                        %% code must never resurrect a role that was changed after the
+                        %% code was issued, so return the authoritative role as well.
+                        {ok, [EffectiveRole]} = one(Conn, "SELECT role FROM admin_operators WHERE user_id=$1", [Uid]),
+                        admin_audit_insert(Conn, Uid, <<"operator.enrollment_redeemed">>, <<"operator">>, integer_to_binary(Uid), <<>>, IpHash, Now),
+                        {ok, #{user_id => Uid, username => Username, display_name => DisplayName, role => EffectiveRole, csrf => Csrf, expires_at => ExpiresAt}}
+                end;
+            {ok, [_Uid, _Role, _Username, _DisplayName, _PasswordHash, _Salt, _EnrollExpires, _UsedAt]} -> {error, invalid_enrollment};
+            _ ->
+                _ = pw_util:pbkdf2(P, <<"plainwire-admin-enrollment-timing-pad">>),
+                {error, invalid_enrollment}
+        end
+    end);
+route({admin_rotate_key, Uid, P0, CurrentHash0, NewHash0, ActorIpHash0}, Conn) ->
+    P = pw_util:clean_text(P0, 256),
+    CurrentHash = pw_util:clean_text(CurrentHash0, 128),
+    NewHash = pw_util:clean_text(NewHash0, 128),
+    ActorIpHash = pw_util:clean_text(ActorIpHash0, 128),
+    with_tx(Conn, fun() ->
+        case one(Conn,
+            "SELECT u.password_hash,u.password_salt,a.verification_hash FROM users u JOIN admin_operators a ON a.user_id=u.id WHERE u.id=$1 FOR UPDATE OF u,a",
+            [Uid]) of
+            {ok, [PasswordHash, Salt, StoredVerification]} ->
+                case pw_util:verify_password(P, Salt, PasswordHash) andalso pw_util:constant_time(CurrentHash, StoredVerification) of
+                    false -> {error, bad_login};
+                    true ->
+                        Now = pw_util:now_ms(),
+                        ok = exec(Conn, "UPDATE admin_operators SET verification_hash=$2,updated_at=$3 WHERE user_id=$1", [Uid, NewHash, Now]),
+                        ok = exec(Conn, "DELETE FROM admin_sessions WHERE user_id=$1", [Uid]),
+                        %% Key rotation is a credential-reset boundary. Revoke unused
+                        %% recovery/enrollment capabilities for this account, and any
+                        %% outstanding codes it issued while acting as an owner.
+                        ok = exec(Conn, "DELETE FROM admin_enrollments WHERE used_at IS NULL AND (user_id=$1 OR created_by=$1)", [Uid]),
+                        admin_audit_insert(Conn, Uid, <<"operator.key_rotated">>, <<"operator">>, integer_to_binary(Uid), <<>>, ActorIpHash, Now),
+                        {ok, #{rotated => true}}
+                end;
+            _ -> {error, not_found}
+        end
+    end);
+route({admin_operators, _ActorUid}, Conn) ->
+    {ok, Rows} = rows(Conn,
+        "SELECT a.user_id,u.username,u.display_name,a.role,a.created_at,a.updated_at,"
+        "(SELECT max(last_seen) FROM admin_sessions s WHERE s.user_id=a.user_id AND s.expires_at>$1) "
+        "FROM admin_operators a JOIN users u ON u.id=a.user_id ORDER BY CASE a.role WHEN 'owner' THEN 0 WHEN 'operator' THEN 1 ELSE 2 END,u.username",
+        [pw_util:now_ms()]),
+    {ok, [#{user_id => Uid, username => Username, display_name => DisplayName, role => Role,
+            created_at => Created, updated_at => Updated, last_admin_seen => LastSeen}
+          || [Uid, Username, DisplayName, Role, Created, Updated, LastSeen] <- Rows]};
+route({admin_set_operator_role, ActorUid, TargetUid, Role0}, Conn) ->
+    case normalize_admin_role(Role0) of
+        undefined -> {error, invalid_role};
+        Role -> with_tx(Conn, fun() ->
+        ok = exec(Conn, "LOCK TABLE admin_operators IN SHARE ROW EXCLUSIVE MODE", []),
+        case admin_actor_role(Conn, ActorUid) of
+            <<"owner">> ->
+                case one(Conn, "SELECT role FROM admin_operators WHERE user_id=$1 FOR UPDATE", [TargetUid]) of
+                    {ok, [CurrentRole]} ->
+                        case can_change_owner(Conn, CurrentRole, Role) of
+                            false -> {error, last_owner};
+                            true ->
+                                Now = pw_util:now_ms(),
+                                ok = exec(Conn, "UPDATE admin_operators SET role=$2,updated_at=$3 WHERE user_id=$1", [TargetUid, Role, Now]),
+                                ok = exec(Conn, "DELETE FROM admin_sessions WHERE user_id=$1", [TargetUid]),
+                                ok = exec(Conn, "DELETE FROM admin_enrollments WHERE used_at IS NULL AND (user_id=$1 OR created_by=$1)", [TargetUid]),
+                                admin_audit_insert(Conn, ActorUid, <<"operator.role_changed">>, <<"operator">>, integer_to_binary(TargetUid), Role, <<>>, Now),
+                                {ok, #{user_id => TargetUid, role => Role, sessions_revoked => true}}
+                        end;
+                    _ -> {error, not_found}
+                end;
+            _ -> {error, forbidden}
+        end
+    end)
+    end;
+route({admin_remove_operator, ActorUid, TargetUid}, Conn) ->
+    with_tx(Conn, fun() ->
+        ok = exec(Conn, "LOCK TABLE admin_operators IN SHARE ROW EXCLUSIVE MODE", []),
+        case admin_actor_role(Conn, ActorUid) of
+            <<"owner">> ->
+                case one(Conn, "SELECT role FROM admin_operators WHERE user_id=$1 FOR UPDATE", [TargetUid]) of
+                    {ok, [Role]} ->
+                        case can_remove_owner(Conn, Role) of
+                            false -> {error, last_owner};
+                            true ->
+                                Now = pw_util:now_ms(),
+                                %% A pending recovery code targets users, not operator
+                                %% rows, so invalidate it explicitly before removing the
+                                %% operator. Codes issued by the operator cascade via
+                                %% admin_enrollments.created_by.
+                                ok = exec(Conn, "DELETE FROM admin_enrollments WHERE user_id=$1 AND used_at IS NULL", [TargetUid]),
+                                ok = exec(Conn, "DELETE FROM admin_operators WHERE user_id=$1", [TargetUid]),
+                                admin_audit_insert(Conn, ActorUid, <<"operator.removed">>, <<"operator">>, integer_to_binary(TargetUid), <<>>, <<>>, Now),
+                                {ok, #{removed => true, user_id => TargetUid}}
+                        end;
+                    _ -> {error, not_found}
+                end;
+            _ -> {error, forbidden}
+        end
+    end);
+route(admin_overview, Conn) ->
+    Now = pw_util:now_ms(),
+    DayAgo = Now - 86400000,
+    HourAgo = Now - 3600000,
+    {ok, [Users, Servers, Channels, DirectThreads, Messages, Uploads, Reactions]} = one(Conn,
+        "SELECT "
+        "COALESCE((SELECT n_live_tup::bigint FROM pg_stat_user_tables WHERE relname='users'),0),"
+        "COALESCE((SELECT n_live_tup::bigint FROM pg_stat_user_tables WHERE relname='servers'),0),"
+        "COALESCE((SELECT n_live_tup::bigint FROM pg_stat_user_tables WHERE relname='channels'),0),"
+        "COALESCE((SELECT n_live_tup::bigint FROM pg_stat_user_tables WHERE relname='direct_threads'),0),"
+        "COALESCE((SELECT n_live_tup::bigint FROM pg_stat_user_tables WHERE relname='messages'),0),"
+        "COALESCE((SELECT n_live_tup::bigint FROM pg_stat_user_tables WHERE relname='uploads'),0),"
+        "COALESCE((SELECT n_live_tup::bigint FROM pg_stat_user_tables WHERE relname='message_reactions'),0)", []),
+    {ok, [ActiveHour, ActiveDay, ActiveSessions, MessagesDay, UploadBytes, ReadyUploads, AdminSessions]} = one(Conn,
+        "SELECT "
+        "(SELECT count(*) FROM users WHERE last_seen >= $1),"
+        "(SELECT count(*) FROM users WHERE last_seen >= $2),"
+        "(SELECT count(*) FROM sessions WHERE expires_at > $3),"
+        "(SELECT count(*) FROM messages WHERE created_at >= $2),"
+        "COALESCE((SELECT sum(size) FROM uploads WHERE status='ready'),0),"
+        "(SELECT count(*) FROM uploads WHERE status='ready'),"
+        "(SELECT count(*) FROM admin_sessions WHERE expires_at > $3)", [HourAgo, DayAgo, Now]),
+    {ok, #{totals_approximate => true, users => Users, servers => Servers, channels => Channels, direct_threads => DirectThreads,
+           messages => Messages, uploads => Uploads, reactions => Reactions, active_users_1h => ActiveHour,
+           active_users_24h => ActiveDay, active_sessions => ActiveSessions, messages_24h => MessagesDay,
+           upload_bytes => UploadBytes, ready_uploads => ReadyUploads, admin_sessions => AdminSessions}};
+route({admin_users, Q0, Limit0, Offset0}, Conn) ->
+    Q = pw_util:clean_text(Q0, 80),
+    Limit = clamp_page_limit(Limit0),
+    Offset = clamp_offset(Offset0),
+    Like = <<"%", Q/binary, "%">>,
+    {ok, Rows} = rows(Conn,
+        "SELECT u.id,u.username,u.display_name,u.created_at,u.last_seen,"
+        "(SELECT count(*) FROM server_members sm WHERE sm.user_id=u.id),"
+        "(SELECT count(*) FROM direct_members dm WHERE dm.user_id=u.id),"
+        "(SELECT count(*) FROM sessions s WHERE s.user_id=u.id AND s.expires_at>$4),"
+        "COALESCE((SELECT sum(size) FROM uploads up WHERE up.user_id=u.id AND up.status='ready'),0) "
+        "FROM users u WHERE ($1='' OR u.username ILIKE $2 OR u.display_name ILIKE $2) "
+        "ORDER BY u.last_seen DESC,u.id DESC LIMIT $3 OFFSET $5",
+        [Q, Like, Limit, pw_util:now_ms(), Offset]),
+    {ok, [admin_user_summary(R) || R <- Rows]};
+route({admin_user, Uid}, Conn) ->
+    case one(Conn,
+        "SELECT u.id,u.username,u.display_name,u.created_at,u.updated_at,u.last_seen,"
+        "(SELECT count(*) FROM server_members sm WHERE sm.user_id=u.id),"
+        "(SELECT count(*) FROM servers s WHERE s.owner_id=u.id),"
+        "(SELECT count(*) FROM direct_members dm WHERE dm.user_id=u.id),"
+        "(SELECT count(*) FROM messages m WHERE m.user_id=u.id),"
+        "(SELECT count(*) FROM uploads up WHERE up.user_id=u.id AND up.status='ready'),"
+        "COALESCE((SELECT sum(size) FROM uploads up WHERE up.user_id=u.id AND up.status='ready'),0),"
+        "(SELECT count(*) FROM sessions s WHERE s.user_id=u.id AND s.expires_at>$2) "
+        "FROM users u WHERE u.id=$1", [Uid, pw_util:now_ms()]) of
+        {ok, Row} when is_list(Row) -> {ok, admin_user_detail(Row)};
+        _ -> {error, not_found}
+    end;
+route({admin_servers, Q0, Limit0, Offset0}, Conn) ->
+    Q = pw_util:clean_text(Q0, 100),
+    Limit = clamp_page_limit(Limit0),
+    Offset = clamp_offset(Offset0),
+    Like = <<"%", Q/binary, "%">>,
+    {ok, Rows} = rows(Conn,
+        "SELECT s.id,s.name,s.created_at,s.updated_at,u.id,u.username,u.display_name,"
+        "(SELECT count(*) FROM server_members sm WHERE sm.server_id=s.id),"
+        "(SELECT count(*) FROM channels c WHERE c.server_id=s.id) "
+        "FROM servers s JOIN users u ON u.id=s.owner_id "
+        "WHERE ($1='' OR s.name ILIKE $2 OR u.username ILIKE $2) ORDER BY s.updated_at DESC,s.id DESC LIMIT $3 OFFSET $4",
+        [Q, Like, Limit, Offset]),
+    {ok, [admin_server_summary(R) || R <- Rows]};
+route({admin_server, Sid}, Conn) ->
+    case one(Conn,
+        "SELECT s.id,s.name,s.created_at,s.updated_at,u.id,u.username,u.display_name,"
+        "(SELECT count(*) FROM server_members sm WHERE sm.server_id=s.id),"
+        "(SELECT count(*) FROM channels c WHERE c.server_id=s.id),"
+        "(SELECT count(*) FROM server_roles r WHERE r.server_id=s.id),"
+        "(SELECT count(*) FROM server_invites i WHERE i.server_id=s.id AND i.revoked=false AND (i.expires_at=0 OR i.expires_at>$2)),"
+        "(SELECT count(*) FROM messages m JOIN channels c ON c.id=m.scope_id WHERE m.scope='channel' AND c.server_id=s.id),"
+        "(SELECT max(m.created_at) FROM messages m JOIN channels c ON c.id=m.scope_id WHERE m.scope='channel' AND c.server_id=s.id) "
+        "FROM servers s JOIN users u ON u.id=s.owner_id WHERE s.id=$1", [Sid, pw_util:now_ms()]) of
+        {ok, Row} when is_list(Row) -> {ok, admin_server_detail(Row)};
+        _ -> {error, not_found}
+    end;
+route({admin_audit, Limit0, BeforeId0}, Conn) ->
+    Limit = min(200, max(1, case pw_util:int(Limit0) of undefined -> 80; LimitI -> LimitI end)),
+    BeforeId = case pw_util:int(BeforeId0) of undefined -> 9223372036854775807; BeforeI -> max(1, BeforeI) end,
+    {ok, Rows} = rows(Conn,
+        "SELECT a.id,a.actor_user_id,u.username,a.action,a.target_type,a.target_id,a.detail,a.created_at "
+        "FROM admin_audit a LEFT JOIN users u ON u.id=a.actor_user_id WHERE a.id<$1 ORDER BY a.id DESC LIMIT $2",
+        [BeforeId, Limit]),
+    {ok, [#{id => Id, actor_user_id => Actor, actor_username => Username, action => Action,
+            target_type => TargetType, target_id => TargetId, detail => Detail, created_at => Created}
+          || [Id, Actor, Username, Action, TargetType, TargetId, Detail, Created] <- Rows]};
+route({admin_record_audit, ActorUid, Action0, TargetType0, TargetId0, Detail0, IpHash0}, Conn) ->
+    Action = pw_util:clean_text(Action0, 80),
+    TargetType = pw_util:clean_text(TargetType0, 40),
+    TargetId = pw_util:clean_text(TargetId0, 80),
+    Detail = pw_util:clean_text(Detail0, 240),
+    IpHash = pw_util:clean_text(IpHash0, 128),
+    admin_audit_insert(Conn, ActorUid, Action, TargetType, TargetId, Detail, IpHash, pw_util:now_ms()),
+    {ok, #{recorded => true}};
 route({register, U0, D0, P0}, Conn) ->
     U = pw_util:normalize_username(U0),
     D0b = pw_util:clean_text(D0, 48),
@@ -553,6 +961,14 @@ route({prune_sessions, Now}, Conn) ->
     ok = exec(Conn,
         "DELETE FROM sessions WHERE token_hash IN "
         "(SELECT token_hash FROM sessions WHERE expires_at <= $1 LIMIT 10000)",
+        [Now]),
+    ok = exec(Conn,
+        "DELETE FROM admin_sessions WHERE token_hash IN "
+        "(SELECT token_hash FROM admin_sessions WHERE expires_at <= $1 LIMIT 10000)",
+        [Now]),
+    ok = exec(Conn,
+        "DELETE FROM admin_enrollments WHERE token_hash IN "
+        "(SELECT token_hash FROM admin_enrollments WHERE expires_at <= $1 OR used_at IS NOT NULL LIMIT 10000)",
         [Now]),
     {ok, pruned};
 route({session, Token}, Conn) ->
@@ -2193,8 +2609,8 @@ route({toggle_message_reaction, Uid, Mid0, Emoji0}, Conn) ->
         false -> {error, invalid_reaction};
         true ->
             Result = with_tx(Conn, fun() ->
-                case one(Conn, "SELECT scope,scope_id FROM messages WHERE id=$1 AND kind='text' AND deleted_at IS NULL FOR UPDATE", [Mid]) of
-                    {ok, [Scope, ScopeId]} ->
+                case one(Conn, "SELECT scope,scope_id,user_id FROM messages WHERE id=$1 AND kind='text' AND deleted_at IS NULL FOR UPDATE", [Mid]) of
+                    {ok, [Scope, ScopeId, AuthorUid]} ->
                         Allowed = case Scope of
                             <<"channel">> ->
                                 case channel_message_access(Conn, Uid, ScopeId) of
@@ -2219,17 +2635,26 @@ route({toggle_message_reaction, Uid, Mid0, Emoji0}, Conn) ->
                                         true
                                 end,
                                 {ok, [Count]} = one(Conn, "SELECT count(*) FROM message_reactions WHERE message_id=$1 AND emoji=$2", [Mid, Emoji]),
+                                ReactorName = case one(Conn, "SELECT display_name FROM users WHERE id=$1", [Uid]) of
+                                    {ok, [Name]} -> pw_util:clean_text(Name, 80);
+                                    _ -> <<"Someone">>
+                                end,
                                 {ok, #{message_id => Mid, emoji => Emoji, count => Count, added => Added,
-                                       user_id => Uid, scope => Scope, scope_id => ScopeId}}
+                                       user_id => Uid, author_id => AuthorUid, reactor_name => ReactorName,
+                                       scope => Scope, scope_id => ScopeId}}
                         end;
                     _ -> {error, not_found}
                 end
             end),
             case Result of
-                {ok, #{scope := Scope, scope_id := ScopeId} = Data} ->
-                    Event = maps:merge(#{type => message_reaction_changed}, Data),
+                {ok, #{scope := Scope, scope_id := ScopeId, author_id := AuthorUid,
+                       reactor_name := ReactorName, added := Added} = Data} ->
+                    PublicData = maps:without([scope, scope_id, author_id, reactor_name], Data),
+                    Event = maps:merge(#{type => message_reaction_changed}, PublicData),
                     pw_hub:broadcast(message_broadcast_key(Scope, ScopeId), Event),
-                    {ok, maps:without([scope, scope_id], Data)};
+                    best_effort_reaction_notification(Conn, AuthorUid, Uid, ReactorName, Mid, Emoji,
+                                                      Scope, ScopeId, Added),
+                    {ok, PublicData};
                 Other -> Other
             end
     end;
@@ -3203,6 +3628,30 @@ migrations() -> [
         "PRIMARY KEY(message_id,user_id,emoji), CHECK(char_length(emoji) BETWEEN 1 AND 16))",
         "CREATE INDEX IF NOT EXISTS idx_message_reactions_message ON message_reactions(message_id,created_at ASC)",
         "CREATE INDEX IF NOT EXISTS idx_message_reactions_user ON message_reactions(user_id,message_id)"
+    ]},
+    {29, [
+        "CREATE TABLE IF NOT EXISTS admin_operators(user_id integer PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, "
+        "role text NOT NULL CHECK(role IN ('owner','operator','viewer')), verification_hash text NOT NULL, "
+        "created_by integer REFERENCES users(id) ON DELETE SET NULL, created_at bigint NOT NULL, updated_at bigint NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS admin_sessions(token_hash text PRIMARY KEY, user_id integer NOT NULL REFERENCES admin_operators(user_id) ON DELETE CASCADE, "
+        "csrf text NOT NULL, created_at bigint NOT NULL, last_seen bigint NOT NULL, expires_at bigint NOT NULL, "
+        "ip_hash text NOT NULL DEFAULT '', user_agent_hash text NOT NULL DEFAULT '')",
+        "CREATE INDEX IF NOT EXISTS idx_admin_sessions_user ON admin_sessions(user_id,expires_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_admin_sessions_expiry ON admin_sessions(expires_at)",
+        "CREATE TABLE IF NOT EXISTS admin_enrollments(token_hash text PRIMARY KEY, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+        "role text NOT NULL CHECK(role IN ('owner','operator','viewer')), created_by integer REFERENCES admin_operators(user_id) ON DELETE CASCADE, "
+        "note text NOT NULL DEFAULT '', created_at bigint NOT NULL, expires_at bigint NOT NULL, used_at bigint)",
+        "CREATE INDEX IF NOT EXISTS idx_admin_enrollments_user ON admin_enrollments(user_id,expires_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_admin_enrollments_creator_unused ON admin_enrollments(created_by) WHERE used_at IS NULL",
+        "CREATE TABLE IF NOT EXISTS admin_audit(id bigserial PRIMARY KEY, actor_user_id integer REFERENCES users(id) ON DELETE SET NULL, "
+        "action text NOT NULL, target_type text NOT NULL DEFAULT '', target_id text NOT NULL DEFAULT '', detail text NOT NULL DEFAULT '', "
+        "ip_hash text NOT NULL DEFAULT '', created_at bigint NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit(created_at DESC,id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_created_global ON messages(created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id,id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_user_expiry ON sessions(user_id,expires_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_uploads_user_status ON uploads(user_id,status)"
     ]}
 ].
 
@@ -4451,6 +4900,38 @@ publish_conversation_event(Conn, Cid, Event) ->
 message_broadcast_key(<<"direct">>, ScopeId) -> {direct, ScopeId};
 message_broadcast_key(<<"channel">>, ScopeId) -> {channel, ScopeId}.
 
+
+best_effort_reaction_notification(_Conn, AuthorUid, ReactorUid, _ReactorName, _Mid, _Emoji, _Scope, _ScopeId, _Added)
+  when AuthorUid =:= ReactorUid ->
+    ok;
+best_effort_reaction_notification(_Conn, _AuthorUid, _ReactorUid, _ReactorName, _Mid, _Emoji, _Scope, _ScopeId, false) ->
+    ok;
+best_effort_reaction_notification(Conn, AuthorUid, ReactorUid, ReactorName, Mid, Emoji, Scope, ScopeId, true) ->
+    %% Reactions are lightweight and reversible. Keep the notification useful
+    %% without allowing add/remove loops to flood somebody's activity inbox.
+    case can_read_messages(Conn, AuthorUid, Scope, ScopeId)
+         andalso pw_rate:allow({reaction_notify, ReactorUid, AuthorUid, Mid}, 3, 300000) of
+        false -> ok;
+        true ->
+            try
+                Url = case Scope of
+                    <<"direct">> -> <<"#/dm/", (integer_to_binary(ScopeId))/binary>>;
+                    <<"channel">> -> <<"#/channel/", (integer_to_binary(ScopeId))/binary>>
+                end,
+                Body = <<ReactorName/binary, " reacted ", Emoji/binary, " to your message">>,
+                Now = pw_util:now_ms(),
+                create_notification(Conn, AuthorUid, <<"message_reaction">>, Body, Url, Now),
+                pw_hub:notify_user(AuthorUid, #{type => notification, kind => message_reaction,
+                    body => pw_util:clean_text(Body, 180), url => Url, message_id => Mid,
+                    emoji => Emoji, reactor_user_id => ReactorUid}),
+                ok
+            catch C:R:S ->
+                error_logger:error_msg("reaction notification failure ~p:~p ~p author=~p reactor=~p message=~p~n",
+                    [C,R,S,AuthorUid,ReactorUid,Mid]),
+                ok
+            end
+    end.
+
 best_effort_user_notification(Conn, Uid, Kind, Body, Url, Now, Event) ->
     try
         create_notification(Conn, Uid, Kind, Body, Url, Now),
@@ -4572,6 +5053,89 @@ seed_forums(Conn) ->
         _ ->
             ok
     end.
+
+verify_admin_user(Conn, Username, Password) ->
+    case one(Conn,
+        "SELECT id,username,display_name,password_hash,password_salt FROM users WHERE username=$1 FOR UPDATE",
+        [Username]) of
+        {ok, [Uid, StoredUsername, DisplayName, PasswordHash, Salt]} ->
+            case pw_util:verify_password(Password, Salt, PasswordHash) of
+                true ->
+                    maybe_upgrade_password_hash(Conn, Uid, Password, PasswordHash),
+                    {ok, Uid, StoredUsername, DisplayName};
+                false -> {error, bad_login}
+            end;
+        _ ->
+            _ = pw_util:pbkdf2(Password, <<"plainwire-admin-user-timing-pad">>),
+            {error, bad_login}
+    end.
+
+normalize_admin_role(<<"owner">>) -> <<"owner">>;
+normalize_admin_role(<<"operator">>) -> <<"operator">>;
+normalize_admin_role(<<"viewer">>) -> <<"viewer">>;
+normalize_admin_role(owner) -> <<"owner">>;
+normalize_admin_role(operator) -> <<"operator">>;
+normalize_admin_role(viewer) -> <<"viewer">>;
+normalize_admin_role(_) -> undefined.
+
+admin_actor_role(Conn, Uid) ->
+    case one(Conn, "SELECT role FROM admin_operators WHERE user_id=$1", [Uid]) of
+        {ok, [Role]} -> Role;
+        _ -> undefined
+    end.
+
+can_change_owner(Conn, <<"owner">>, NewRole) when NewRole =/= <<"owner">> ->
+    admin_owner_count(Conn) > 1;
+can_change_owner(_Conn, _CurrentRole, _NewRole) -> true.
+
+can_remove_owner(Conn, <<"owner">>) -> admin_owner_count(Conn) > 1;
+can_remove_owner(_Conn, _Role) -> true.
+
+admin_owner_count(Conn) ->
+    case one(Conn, "SELECT count(*) FROM admin_operators WHERE role='owner'", []) of
+        {ok, [N]} -> N;
+        _ -> 0
+    end.
+
+admin_audit_insert(Conn, ActorUid, Action, TargetType, TargetId, Detail, IpHash, Now) ->
+    ok = exec(Conn,
+        "INSERT INTO admin_audit(actor_user_id,action,target_type,target_id,detail,ip_hash,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)",
+        [ActorUid, Action, TargetType, TargetId, Detail, IpHash, Now]).
+
+clamp_page_limit(Value) ->
+    case pw_util:int(Value) of
+        undefined -> 50;
+        N -> min(100, max(1, N))
+    end.
+
+clamp_offset(Value) ->
+    case pw_util:int(Value) of
+        undefined -> 0;
+        N -> min(1000000, max(0, N))
+    end.
+
+admin_user_summary([Uid, Username, DisplayName, CreatedAt, LastSeen, Servers, Conversations, ActiveSessions, UploadBytes]) ->
+    #{id => Uid, username => Username, display_name => DisplayName, created_at => CreatedAt, last_seen => LastSeen,
+      server_count => Servers, conversation_count => Conversations, active_sessions => ActiveSessions, upload_bytes => UploadBytes}.
+
+admin_user_detail([Uid, Username, DisplayName, CreatedAt, UpdatedAt, LastSeen, Servers, OwnedServers,
+                   Conversations, Messages, Uploads, UploadBytes, ActiveSessions]) ->
+    #{id => Uid, username => Username, display_name => DisplayName, created_at => CreatedAt, updated_at => UpdatedAt,
+      last_seen => LastSeen, server_count => Servers, owned_server_count => OwnedServers,
+      conversation_count => Conversations, message_count => Messages, upload_count => Uploads,
+      upload_bytes => UploadBytes, active_sessions => ActiveSessions}.
+
+admin_server_summary([Sid, Name, CreatedAt, UpdatedAt, OwnerId, OwnerUsername, OwnerDisplayName, Members, Channels]) ->
+    #{id => Sid, name => Name, created_at => CreatedAt, updated_at => UpdatedAt,
+      owner => #{id => OwnerId, username => OwnerUsername, display_name => OwnerDisplayName},
+      member_count => Members, channel_count => Channels}.
+
+admin_server_detail([Sid, Name, CreatedAt, UpdatedAt, OwnerId, OwnerUsername, OwnerDisplayName,
+                     Members, Channels, Roles, Invites, Messages, LastMessageAt]) ->
+    #{id => Sid, name => Name, created_at => CreatedAt, updated_at => UpdatedAt,
+      owner => #{id => OwnerId, username => OwnerUsername, display_name => OwnerDisplayName},
+      member_count => Members, channel_count => Channels, role_count => Roles,
+      active_invite_count => Invites, message_count => Messages, last_message_at => LastMessageAt}.
 
 maybe_upgrade_password_hash(Conn, Uid, Password, StoredHash) ->
     case pw_util:password_needs_rehash(StoredHash) of

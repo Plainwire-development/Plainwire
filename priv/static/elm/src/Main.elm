@@ -3431,8 +3431,8 @@ handleWsEvent val model =
         Ok ( "mention", _ ) ->
             handleMention val model
 
-        Ok ( "notification", _ ) ->
-            ( model, bridgeSend (E.object [ ( "tag", E.string "silent_sync" ), ( "data", E.null ) ]) )
+        Ok ( "notification", ev ) ->
+            handleNotificationEvent ev model
 
         Ok ( "friend_request", _ ) ->
             ( model, bridgeSend (E.object [ ( "tag", E.string "silent_sync" ), ( "data", E.null ) ]) )
@@ -4287,6 +4287,83 @@ handleNotifiedMessage ev model =
 
         Err _ ->
             ( model, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), playNotification model.soundEnabled ] )
+
+
+notificationEventDecoder : Decoder { kind : String, body : String, url : String, messageId : Int, emoji : String }
+notificationEventDecoder =
+    D.map5
+        (\kind body url messageId emoji -> { kind = kind, body = body, url = url, messageId = messageId, emoji = emoji })
+        (D.field "kind" D.string |> defaultValue "notification")
+        (D.field "body" D.string |> defaultValue "New activity")
+        (D.field "url" D.string |> defaultValue "#notifications")
+        (D.field "message_id" D.int |> defaultValue 0)
+        (D.field "emoji" D.string |> defaultValue "")
+
+
+handleNotificationEvent : E.Value -> Model -> ( Model, Cmd Msg )
+handleNotificationEvent ev model =
+    let
+        decoded =
+            D.decodeValue (D.oneOf [ D.field "event" notificationEventDecoder, notificationEventDecoder ]) ev
+
+        sync =
+            bridgeSend (E.object [ ( "tag", E.string "silent_sync" ), ( "data", E.null ) ])
+    in
+    case decoded of
+        Ok event ->
+            if event.kind == "message_reaction" then
+                let
+                    notificationTitle =
+                        if String.isEmpty event.emoji then
+                            "New reaction"
+
+                        else
+                            event.emoji ++ " New reaction"
+
+                    tagText =
+                        if event.messageId > 0 then
+                            "reaction:" ++ String.fromInt event.messageId ++ ":" ++ event.emoji
+
+                        else
+                            "reaction:" ++ event.url ++ ":" ++ event.emoji
+
+                    visibleToast =
+                        if model.pageVisible then
+                            Just event.body
+
+                        else
+                            model.toast
+
+                    dismiss =
+                        if model.pageVisible then
+                            Process.sleep 4500 |> Task.perform (\_ -> DismissToast)
+
+                        else
+                            Cmd.none
+
+                    desktop =
+                        if model.pageVisible then
+                            Cmd.none
+
+                        else
+                            notify
+                                (E.object
+                                    [ ( "title", E.string notificationTitle )
+                                    , ( "body", E.string event.body )
+                                    , ( "url", E.string event.url )
+                                    , ( "tag", E.string tagText )
+                                    ]
+                                )
+                in
+                ( { model | toast = visibleToast }
+                , Cmd.batch [ sync, playNotification model.soundEnabled, desktop, dismiss ]
+                )
+
+            else
+                ( model, sync )
+
+        Err _ ->
+            ( model, sync )
 
 
 handleMention : E.Value -> Model -> ( Model, Cmd Msg )
@@ -6793,7 +6870,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.7.5-2", attribute "data-ui-revision" "interface-4" ]
+    div [ class "layout", attribute "data-ui-version" "1.8.0", attribute "data-ui-revision" "interface-4" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]

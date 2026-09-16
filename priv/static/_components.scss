@@ -9061,18 +9061,31 @@ pw-typing-indicator {
   .pw-tour-guide {
     top: auto;
     right: 10px;
-    bottom: calc(12px + env(safe-area-inset-bottom));
+    bottom: calc(var(--mobile-nav-h, 64px) + env(safe-area-inset-bottom) + 10px);
     width: calc(100vw - 20px);
+    max-height: min(62dvh, 520px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
     transform-origin: bottom center;
   }
 
-  .pw-onboarding-chat-layer { z-index: 190; }
-  .pw-onboarding-chat-head { padding-inline: 12px; }
-  .pw-onboarding-messages { padding: 20px 13px 26px; }
+  .pw-tour-guide.is-top {
+    top: calc(10px + env(safe-area-inset-top));
+    bottom: auto;
+    transform-origin: top center;
+  }
+
+  .pw-onboarding-chat-layer { z-index: 190; min-height: 0; }
+  .pw-onboarding-chat-head { min-height: 60px; padding: 9px 12px; padding-top: calc(9px + env(safe-area-inset-top)); }
+  .pw-onboarding-messages { padding: 16px 12px 22px; overscroll-behavior: contain; }
   .pw-onboarding-actions { justify-content: stretch; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); }
-  .pw-onboarding-actions .btn { flex: 1 1 auto; }
-  .pw-tour-source-card { grid-template-columns: auto minmax(0, 1fr); margin-left: 50px; }
-  .pw-tour-source-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .pw-onboarding-actions .btn { flex: 1 1 120px; }
+  .pw-tour-message { grid-template-columns: 32px minmax(0, 1fr); gap: 9px; }
+  .pw-tour-message-avatar { width: 32px; height: 32px; border-radius: 10px; }
+  .pw-tour-message-body p { max-width: 100%; overflow-wrap: anywhere; }
+  .pw-tour-source-card { grid-template-columns: auto minmax(0, 1fr); margin-left: 0; padding: 12px; }
+  .pw-tour-source-actions { grid-column: 1 / -1; justify-content: stretch; }
+  .pw-tour-source-actions .btn { flex: 1 1 130px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

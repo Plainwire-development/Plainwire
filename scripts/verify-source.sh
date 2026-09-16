@@ -5,11 +5,13 @@ cd "${ROOT}"
 node --check priv/static/bootstrap.js
 node --check priv/static/elm-bridge.js
 node --check priv/static/call-health.js
+node --check priv/admin/admin.js
 node --check web/markdown.js
 node --check web/interface.js
 node --check scripts/build-rich-text.mjs
 npm run test:rtc-contract
 npm run test:ui-contract
+npm run test:admin-contract
 npm run test:release-contract
 for script in scripts/*.sh; do bash -n "${script}"; done
 python3 - <<'PY'
@@ -44,6 +46,50 @@ for path in [*Path('scripts').glob('*.py'), *Path('test').glob('*.py')]:
     ast.parse(path.read_text(), filename=str(path))
 for path in Path('src').glob('*.erl'):
     body = path.read_text()
+    # Source-only Erlang sanity pass for environments without erlc. This is not
+    # a compiler replacement, but it catches broken delimiter edits while ignoring
+    # strings, quoted atoms, comments, and single-character literals.
+    stack = []
+    mode = None
+    escaped = False
+    line = 1
+    i = 0
+    pairs = {')': '(', ']': '[', '}': '{'}
+    while i < len(body):
+        ch = body[i]
+        if ch == '\n':
+            line += 1
+        if mode is not None:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif (mode == 'string' and ch == '"') or (mode == 'atom' and ch == "'"):
+                mode = None
+            i += 1
+            continue
+        if ch == '%':
+            next_line = body.find('\n', i)
+            i = len(body) if next_line < 0 else next_line
+            continue
+        if ch == '$' and i + 1 < len(body):
+            i += 2
+            continue
+        if ch == '"':
+            mode = 'string'
+            i += 1
+            continue
+        if ch == "'":
+            mode = 'atom'
+            i += 1
+            continue
+        if ch in '([{':
+            stack.append((ch, line))
+        elif ch in ')]}':
+            assert stack and stack[-1][0] == pairs[ch], f'unmatched Erlang delimiter in {path}:{line}: {ch}'
+            stack.pop()
+        i += 1
+    assert mode is None and not stack, f'unclosed Erlang delimiter/string in {path}: {stack[-5:]}'
     # Catch accidental duplicated standalone result expressions such as two
     # consecutive `{error, forbidden}` terms inside one case arm. Erlang's real
     # compiler remains the authority; this protects source-only verification too.
@@ -59,6 +105,7 @@ authored_sources = [
     *Path('src').glob('*.erl'),
     *Path('priv/static/elm/src').rglob('*.elm'),
     Path('priv/static/elm-bridge.js'), Path('priv/static/bootstrap.js'), Path('priv/static/call-health.js'),
+    *Path('priv/admin').glob('*'),
     *Path('native').rglob('*.c'), *Path('native').rglob('*.f90'), *Path('web').glob('*.js'),
 ]
 unfinished = re.compile(r'(?i)\b(?:TODO|FIXME|XXX|unimplemented|stubbed|placeholder implementation|not implemented)\b')

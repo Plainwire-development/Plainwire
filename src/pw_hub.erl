@@ -7,7 +7,7 @@
     voice_join/4, voice_leave/3, voice_state/5, voice_signal/5, voice_activity/5,
     call_ring/5, call_decline/2, call_cancel/3, call_accept/5,
     call_join/5, call_rejoin/5, call_leave/3, call_state/5, call_signal/5,
-    room_capacity/0, share_capacity/0, status_update/3
+    room_capacity/0, share_capacity/0, status_update/3, stats/0
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -52,6 +52,9 @@ call_rejoin(ConversationId, Uid, Pid, Profile, Audience) -> join_call({call_rejo
 call_leave(ConversationId, Uid, Pid) -> gen_server:cast(?MODULE, {call_leave, ConversationId, Uid, Pid}).
 call_state(ConversationId, Uid, Pid, Patch, Profile) -> gen_server:cast(?MODULE, {call_state, ConversationId, Uid, Pid, Patch, Profile}).
 call_signal(ConversationId, From, FromPid, To, Signal) -> gen_server:cast(?MODULE, {call_signal, ConversationId, From, FromPid, To, Signal}).
+stats() ->
+    try gen_server:call(?MODULE, stats, 500)
+    catch exit:_ -> #{available => false} end.
 
 %% don't wedge the socket if the hub is having a day.
 join_call(Msg) ->
@@ -102,6 +105,19 @@ handle_call({call_rejoin, ConversationId, Uid, Pid, Profile, Audience}, _From, S
 handle_call({call_accept, Cid, Uid, Pid, Profile, Audience0}, _From, St0) ->
     {Reply, St} = accept_ring(Cid, Uid, Pid, Profile, Audience0, St0),
     {reply, Reply, St};
+handle_call(stats, _From, St) ->
+    VoiceRooms = maps:values(St#st.voices),
+    CallRooms = maps:values(St#st.calls),
+    SubscriptionCount = lists:sum([length(Pids) || Pids <- maps:values(St#st.subs)]),
+    {reply, #{available => true,
+              websocket_connections => map_size(St#st.pids),
+              online_users => map_size(St#st.online),
+              subscription_links => SubscriptionCount,
+              voice_rooms => length(VoiceRooms),
+              voice_participants => lists:sum([map_size(Room) || Room <- VoiceRooms]),
+              call_rooms => length(CallRooms),
+              call_participants => lists:sum([map_size(Room) || Room <- CallRooms]),
+              ringing_calls => map_size(St#st.rings)}, St};
 handle_call(_, _, St) -> {reply, ok, St}.
 
 %% reconnecting users don't count against themselves.

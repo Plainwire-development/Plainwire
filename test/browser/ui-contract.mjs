@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
-const [elm, types, bridge, markdown, api, db, less, scss, contentLess, callsScss] = await Promise.all([
+const [elm, types, bridge, markdown, api, db, less, scss, contentLess, callsScss, notificationView, componentsScss] = await Promise.all([
   readFile('priv/static/elm/src/Main.elm', 'utf8'),
   readFile('priv/static/elm/src/Types.elm', 'utf8'),
   readFile('priv/static/elm-bridge.js', 'utf8'),
@@ -11,7 +11,9 @@ const [elm, types, bridge, markdown, api, db, less, scss, contentLess, callsScss
   readFile('priv/static/_theme-hooks.less', 'utf8'),
   readFile('priv/static/_message-extras.scss', 'utf8'),
   readFile('priv/static/_content.less', 'utf8'),
-  readFile('priv/static/_calls.scss', 'utf8')
+  readFile('priv/static/_calls.scss', 'utf8'),
+  readFile('priv/static/elm/src/View/Notifications.elm', 'utf8'),
+  readFile('priv/static/_components.scss', 'utf8')
 ]);
 
 assert.match(markdown, /eyes:\s*'👀'/u, ':eyes: renders as the eyes emoji');
@@ -105,5 +107,28 @@ assert.match(elm, /String\.trim model\.modalBody == model\.modalTitle/, 'server 
 assert.match(elm, /server-danger-zone/, 'owner server settings expose deletion without replacing existing customization controls');
 assert.match(contentLess, /\.server-danger-zone/, 'server danger controls follow the existing settings visual language');
 assert.match(callsScss, /\.call-popup-copy[\s\S]*\.call-popup-kicker[\s\S]*\.call-popup-sub/, 'call popup hierarchy is enhanced without replacing its existing actions');
+
+
+
+// Reaction activity should be useful without becoming a notification-abuse surface.
+assert.match(db, /best_effort_reaction_notification[\s\S]*AuthorUid =:= ReactorUid[\s\S]*can_read_messages\(Conn, AuthorUid, Scope, ScopeId\)[\s\S]*reaction_notify[\s\S]*3, 300000/, 'reaction notifications exclude self-reactions, require current recipient access, and are per-message rate bounded');
+assert.match(db, /create_notification\(Conn, AuthorUid, <<"message_reaction">>[\s\S]*pw_hub:notify_user\(AuthorUid/, 'reaction additions are persisted and delivered through the normal notification channel');
+assert.match(elm, /handleNotificationEvent[\s\S]*message_reaction[\s\S]*playNotification model\.soundEnabled[\s\S]*notify/, 'reaction realtime notifications update the activity feed and surface sound/desktop feedback');
+assert.match(notificationView, /"message_reaction"[\s\S]*"Reaction"/, 'reaction notifications have a human-facing activity label');
+
+// Mobile onboarding follows visible mobile controls instead of spotlighting hidden desktop chrome.
+assert.match(bridge, /mobileSelector:\s*'\.mobile-nav-btn\[aria-label\^="Messages"\]'/, 'tour defines mobile-first targets for hidden desktop navigation');
+assert.match(bridge, /usableTourTarget[\s\S]*getBoundingClientRect[\s\S]*style\.display === 'none'/, 'tour target resolution rejects hidden or zero-size elements');
+assert.match(bridge, /const tourSelector = \(step\)[\s\S]*step\.mobileSelector/, 'tour selects responsive targets at runtime');
+assert.match(bridge, /guide\.classList\.toggle\('is-top'[\s\S]*viewportHeight/, 'mobile guide moves away from lower-screen targets');
+assert.match(componentsScss, /\.pw-tour-guide\.is-top[\s\S]*safe-area-inset-top/, 'mobile guide supports safe-area-aware top placement');
+assert.match(componentsScss, /\.pw-tour-source-card[\s\S]*margin-left:\s*0/, 'mobile completion/source card no longer inherits desktop indentation');
+
+
+// Realtime is the fast path, with a bounded visible-tab safety net for missed events.
+assert.match(bridge, /APP_RECONCILE_MS\s*=\s*180000/, 'visible-tab state reconciliation is deliberately low-frequency');
+assert.match(bridge, /reconcileVisibleApp[\s\S]*document\.hidden[\s\S]*navigator\.onLine[\s\S]*\/sync\?since=0/, 'fallback reconciliation only runs for visible online authenticated sessions');
+assert.match(bridge, /periodic_safety_net[\s\S]*APP_RECONCILE_MS/, 'periodic fallback state reconciliation is scheduled');
+assert.match(bridge, /messages\?scope=direct&scope_id=\$\{match\[1\]\}[\s\S]*messages\?scope=channel&scope_id=\$\{match\[1\]\}/, 'fallback reconciliation refreshes the active conversation/channel without polling every route');
 
 console.log('PASS: emoji, mentions, DM sender summaries, edit/forward, context menus, shortcuts, attachment ACLs, and SCSS/Less layering contracts.');

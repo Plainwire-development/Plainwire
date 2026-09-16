@@ -1,6 +1,6 @@
 -module(pw_media).
 -behaviour(gen_server).
--export([start_link/0, proxy_url/1, fetch/2, fetch_page/2, validate_url/1, cache_data_url/1]).
+-export([start_link/0, proxy_url/1, fetch/2, fetch_page/2, validate_url/1, cache_data_url/1, stats/0]).
 -ifdef(TEST).
 -export([resolve_redirect/2]).
 -endif.
@@ -23,6 +23,20 @@
 
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+
+stats() ->
+    try
+        Active = case ets:lookup(?LIMITS, active_fetches) of
+            [{active_fetches, N}] when is_integer(N) -> N;
+            _ -> 0
+        end,
+        #{active_fetches => Active,
+          cache_entries => ets:info(?CACHE, size),
+          inflight_fetches => ets:info(?INFLIGHT, size),
+          coalescing_results => ets:info(?RESULTS, size)}
+    catch _:_ ->
+        #{active_fetches => 0, cache_entries => 0, inflight_fetches => 0, coalescing_results => 0}
+    end.
 
 proxy_url(Url) when is_binary(Url) ->
     <<"/api/media/", (pw_crypto:proxy_token(Url))/binary>>.
