@@ -8,7 +8,7 @@ Plainwire is built with Erlang/OTP, Cowboy, PostgreSQL, Elm, WebSocket, and WebR
 
 Plainwire can also be used as a self hosted service on your own servers, it isnt tied to ours; but it is recommended to use our provided servers. Much like how Stoat handles it.
 
-Our [Plainwire Server](https://plainwire.kokonico.me)
+Our central, and official [Plainwire Server](https://plainwire.kokonico.me)
 
 ----------------------------
 
