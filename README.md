@@ -266,6 +266,9 @@ Release-specific changes are kept in the release notes rather than this README. 
 
 ## License
 
+Licensed under AGPL-3, and PlainSimple License 1.
+Choose what license you want to abide by.
+
 See the repository license file.
 
 ## Notice
