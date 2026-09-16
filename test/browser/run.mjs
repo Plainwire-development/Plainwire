@@ -124,7 +124,7 @@ try {
  const sourceEmbedHits=embedHits.length;
  await page.getByRole('button',{name:'Repositories',exact:true}).click();
  await page.locator('.source-repo-card[data-repo="Plainwire"]').getByRole('button',{name:'Explore source',exact:true}).click();
- await page.getByRole('main').getByRole('heading',{name:'Plainwire',exact:true}).waitFor();
+ await page.locator('.source-repo-hero').getByRole('heading',{name:'Plainwire',exact:true}).waitFor();
  await page.locator('.source-readme strong').waitFor();
  await page.waitForTimeout(80);
  assert.equal(embedHits.length,sourceEmbedHits,'repository Markdown never triggers chat link-unfurl requests');
