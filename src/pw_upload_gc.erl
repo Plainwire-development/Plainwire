@@ -1,9 +1,10 @@
 -module(pw_upload_gc).
 -behaviour(gen_server).
--export([start_link/0, lookup/2, invalidate_user/1, invalidate_upload/1, acquire/2, release/2, stats/0]).
+-export([start_link/0, wake/0, lookup/2, invalidate_user/1, invalidate_upload/1, acquire/2, release/2, stats/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+wake() -> gen_server:cast(?MODULE, wake).
 
 stats() ->
     try
@@ -128,6 +129,7 @@ init([]) ->
     _ = ets:new(pw_upload_active, [named_table, public, set, {write_concurrency, true}]),
     erlang:send_after(60000, self(), sweep),
     erlang:send_after(5000, self(), upload_ref_backfill),
+    erlang:send_after(1000, self(), drain_delete_queue),
     {ok, #{}}.
 
 handle_info(sweep, State) ->
@@ -137,22 +139,21 @@ handle_info(sweep, State) ->
     %% Database timestamps are wall-clock values; ETS cache expiry is deliberately
     %% monotonic. Mixing the two makes every cache entry look expired after a sweep.
     %% Profile files stay; stale_uploads filters them out.
-    case pw_db:stale_uploads(WallNow - 86400000, WallNow - RetentionDays * 86400000) of
-        {ok, Items} ->
-            lists:foreach(fun(#{id := Id, path := Path}) ->
-                _ = file:delete(binary_to_list(Path)),
-                _ = file:delete(binary_to_list(<<Path/binary, ".part">>)),
-                ets:delete(pw_upload_metadata_cache, Id),
-                _ = pw_db:delete_upload(Id)
-            end, Items);
+    case pw_db:queue_stale_upload_deletes(WallNow - 86400000, WallNow - RetentionDays * 86400000) of
+        {ok, #{ids := Ids}} -> [invalidate_upload(Id) || Id <- Ids];
         _ -> ok
     end,
+    _ = drain_delete_queue(32),
     Expiry = [{{'_', '_', '$1'}, [{'<', '$1', MonoNow}], [true]}],
     _ = ets:select_delete(pw_upload_metadata_cache, Expiry),
     _ = ets:select_delete(pw_upload_authz_cache, Expiry),
     erlang:send_after(3600000, self(), sweep),
     {noreply, State};
 %% backfill old encrypted messages in restart-safe batches.
+handle_info(drain_delete_queue, State) ->
+    _ = drain_delete_queue(32),
+    erlang:send_after(5000, self(), drain_delete_queue),
+    {noreply, State};
 handle_info(upload_ref_backfill, State) ->
     case pw_db:upload_ref_backfill(500) of
         {ok, done} ->
@@ -168,7 +169,35 @@ handle_info(upload_ref_backfill, State) ->
     end;
 handle_info(_, State) -> {noreply, State}.
 
+drain_delete_queue(Limit) ->
+    case pw_db:upload_delete_claim(Limit) of
+        {ok, Jobs} when is_list(Jobs) ->
+            lists:foreach(fun(#{path := Path}) ->
+                Result = delete_path_pair(Path),
+                _ = pw_db:upload_delete_finish(Path, Result)
+            end, Jobs),
+            {ok, length(Jobs)};
+        Error -> Error
+    end.
+
+delete_path_pair(Path) when is_binary(Path), byte_size(Path) > 0 ->
+    case safe_delete(Path) of
+        ok -> safe_delete(<<Path/binary, ".part">>);
+        Error -> Error
+    end;
+delete_path_pair(_) -> {error, invalid_path}.
+
+safe_delete(Path) ->
+    case file:delete(binary_to_list(Path)) of
+        ok -> ok;
+        {error, enoent} -> ok;
+        {error, Reason} -> {error, Reason}
+    end.
+
 handle_call(_, _, State) -> {reply, ok, State}.
+handle_cast(wake, State) ->
+    self() ! drain_delete_queue,
+    {noreply, State};
 handle_cast(_, State) -> {noreply, State}.
 terminate(_, _) -> ok.
 code_change(_, State, _) -> {ok, State}.

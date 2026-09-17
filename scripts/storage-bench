@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT"
+BIN=${PLAINWIRE_RELEASE_BIN:-"$ROOT/_build/default/rel/plainwire_relay/bin/plainwire_relay"}
+[[ -x "$BIN" ]] || { echo "Plainwire release control script not found: $BIN" >&2; exit 2; }
+
+scope=${1:-channel}
+scope_id=${2:-9000000000000}
+iterations=${3:-100}
+concurrency=${4:-8}
+[[ "$scope" == channel || "$scope" == direct ]] || { echo 'scope must be channel or direct' >&2; exit 2; }
+[[ "$scope_id" =~ ^[1-9][0-9]*$ ]] || { echo 'scope_id must be a positive integer' >&2; exit 2; }
+[[ "$iterations" =~ ^[1-9][0-9]*$ ]] && (( iterations <= 10000 )) || { echo 'iterations must be 1..10000' >&2; exit 2; }
+[[ "$concurrency" =~ ^[1-9][0-9]*$ ]] && (( concurrency <= 64 )) || { echo 'concurrency must be 1..64' >&2; exit 2; }
+
+"$BIN" rpc "pw_storage_bench:run(#{scope => <<\"${scope}\">>, scope_id => ${scope_id}, server_id => ${scope_id}, iterations => ${iterations}, concurrency => ${concurrency}})."

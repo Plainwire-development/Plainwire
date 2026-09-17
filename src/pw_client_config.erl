@@ -38,7 +38,7 @@ source_repository() ->
 version() ->
     case application:get_key(plainwire_relay, vsn) of
         {ok, Vsn} -> pw_util:bin(Vsn);
-        _ -> <<"1.9.0">>
+        _ -> <<"2.0.0">>
     end.
 
 asset_version() ->

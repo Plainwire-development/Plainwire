@@ -28,6 +28,7 @@ snapshot() ->
       uptime_ms => UptimeMs,
       memory => Memory,
       database => Db,
+      storage => pw_storage_health:snapshot(),
       realtime => pw_hub:stats(),
       cluster => pw_cluster:status(),
       rate_limiter => pw_rate:stats(),

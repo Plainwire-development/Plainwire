@@ -26,9 +26,9 @@ qs(Req, Key) -> proplists:get_value(Key, cowboy_req:parse_qs(Req)).
 auth_attempt_allowed(Kind, Req, Username0) ->
     Username = pw_util:normalize_username(Username0),
     Ip = pw_util:ip(Req),
-    pw_rate:allow({Kind, ip, Ip}, 30, 600000) andalso
-        pw_rate:allow({Kind, username, Username}, 12, 600000) andalso
-        pw_rate:allow({Kind, pair, Ip, Username}, 8, 600000).
+    pw_rate:allow_shared({Kind, ip, Ip}, 30, 600000) andalso
+        pw_rate:allow_shared({Kind, username, Username}, 12, 600000) andalso
+        pw_rate:allow_shared({Kind, pair, Ip, Username}, 8, 600000).
 
 handle(<<"POST">>, [<<"register">>], Req0, _) ->
     case pw_client_config:registration_enabled() of
@@ -89,16 +89,72 @@ handle(<<"GET">>, [<<"version">>], Req0, _) ->
         api_version => 1
     }});
 %% public gets alive/dead; signed-in users get the nerdy bits.
+handle(<<"GET">>, [<<"bot">>, <<"me">>], Req0, _) ->
+    with_bot(Req0, fun(Bot, Req) -> pw_util:ok_json(Req, #{ok => true, data => Bot}) end);
+handle(<<"GET">>, [<<"bot">>, <<"server">>], Req0, _) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case pw_db:server(maps:get(user_id, Bot), maps:get(server_id, Bot)) of
+            {ok, Data} ->
+                %% Bot applications do not need the full server member directory
+                %% for basic operation. Keep this endpoint intentionally narrow.
+                Public = maps:with([server, channels, categories], Data),
+                pw_util:ok_json(Req, #{ok => true, data => Public});
+            {error, E} -> pw_util:err_json(Req, 403, atom_to_binary(E, utf8))
+        end
+    end);
+handle(<<"GET">>, [<<"bot">>, <<"channels">>], Req0, _) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case pw_db:server(maps:get(user_id, Bot), maps:get(server_id, Bot)) of
+            {ok, #{channels := Channels}} -> pw_util:ok_json(Req, #{ok => true, data => Channels});
+            {error, E} -> pw_util:err_json(Req, 403, atom_to_binary(E, utf8))
+        end
+    end);
+handle(<<"GET">>, [<<"bot">>, <<"channels">>, ChannelId, <<"messages">>], Req0, _) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case pw_rate:allow_shared({bot_read, maps:get(id, Bot)}, 600, 60000) of
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>);
+            true -> result(Req, pw_db:messages(maps:get(user_id, Bot), <<"channel">>, ChannelId, qs(Req, <<"before">>), qs(Req, <<"after">>)))
+        end
+    end);
+handle(<<"POST">>, [<<"bot">>, <<"channels">>, ChannelId, <<"messages">>], Req0, _) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        BotUid = maps:get(user_id, Bot),
+        case pw_rate:allow_shared({bot_message, maps:get(id, Bot)}, 120, 60000) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:bot_post_channel_message(BotUid, ChannelId, maps:get(<<"body">>, M, <<>>), maps:get(<<"reply_to_id">>, M, undefined)))
+            end)
+        end
+    end);
+handle(<<"POST">>, [<<"bot">>, <<"messages">>, MessageId, <<"delete">>], Req0, _) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case pw_rate:allow_shared({bot_mutation, maps:get(id, Bot)}, 240, 60000) of
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>);
+            true -> result(Req, pw_db:delete_message(maps:get(user_id, Bot), MessageId))
+        end
+    end);
+handle(<<"POST">>, [<<"bot">>, <<"messages">>, MessageId, <<"reaction">>], Req0, _) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case pw_rate:allow_shared({bot_mutation, maps:get(id, Bot)}, 240, 60000) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:toggle_message_reaction(maps:get(user_id, Bot), MessageId, maps:get(<<"emoji">>, M, <<>>)))
+            end)
+        end
+    end);
 handle(<<"GET">>, [<<"health">>], Req0, _) ->
     case pw_db:health() of
         {ok, Data} ->
             Body = case auth(Req0) of
                 {ok, _} ->
+                    Storage = pw_storage_health:snapshot(),
                     Data#{app => ok,
                         schedulers => erlang:system_info(schedulers_online),
                         processes => erlang:system_info(process_count),
                         process_limit => erlang:system_info(process_limit),
-                        rate_limiter => pw_rate:stats()};
+                        rate_limiter => pw_rate:stats(),
+                        storage => Storage,
+                        redis => maps:get(redis, Storage)};
                 _ ->
                     #{app => ok, database => maps:get(database, Data, ok)}
             end,
@@ -160,6 +216,30 @@ authed(<<"POST">>, [<<"password">>], Req0, Session, _) ->
                 result(Req, pw_db:change_password(Uid, Token, maps:get(<<"current_password">>, M, <<>>), maps:get(<<"new_password">>, M, <<>>)))
             end)
     end;
+authed(<<"POST">>, [<<"account">>, <<"disable">>], Req0, Session, _) ->
+    Uid = uid(Session),
+    case pw_rate:allow_shared({account_disable, Uid}, 4, 3600000) of
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+        true -> with_json(Req0, fun(M, Req) ->
+            case pw_db:disable_account(Uid, maps:get(<<"password">>, M, <<>>)) of
+                {ok, Data} -> pw_util:ok_json(pw_util:clear_cookie(Req), #{ok => true, data => Data});
+                {error, bad_password} -> pw_util:err_json(Req, 401, <<"bad_password">>);
+                {error, E} -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8))
+            end
+        end)
+    end;
+authed(<<"POST">>, [<<"account">>, <<"delete">>], Req0, Session, _) ->
+    Uid = uid(Session),
+    case pw_rate:allow_shared({account_delete, Uid}, 3, 3600000) of
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+        true -> with_json(Req0, fun(M, Req) ->
+            case pw_db:delete_account(Uid, maps:get(<<"password">>, M, <<>>)) of
+                {ok, Data} -> pw_util:ok_json(pw_util:clear_cookie(Req), #{ok => true, data => Data});
+                {error, bad_password} -> pw_util:err_json(Req, 401, <<"bad_password">>);
+                {error, E} -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8))
+            end
+        end)
+    end;
 authed(<<"POST">>, [<<"username">>], Req0, Session, _) ->
     Uid = uid(Session),
     case pw_rate:allow({username_change, Uid}, 5, 3600000) of
@@ -219,6 +299,32 @@ authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"roles">>], Req0, 
     with_json(Req0, fun(M, Req) -> result(Req, pw_db:set_server_member_roles(uid(Session), Id, UserId, maps:get(<<"role_ids">>,M,[]))) end);
 authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"kick">>], Req, Session, _) ->
     result(Req, pw_db:kick_server_member(uid(Session), Id, UserId));
+authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"ban">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:ban_server_member(uid(Session), Id, UserId, maps:get(<<"reason">>, M, <<>>))) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"unban">>], Req, Session, _) ->
+    result(Req, pw_db:unban_server_member(uid(Session), Id, UserId));
+authed(<<"GET">>, [<<"server">>, Id, <<"bans">>], Req, Session, _) ->
+    result(Req, pw_db:server_bans(uid(Session), Id));
+authed(<<"GET">>, [<<"server">>, Id, <<"webhooks">>], Req, Session, _) ->
+    result(Req, pw_db:server_webhooks(uid(Session), Id));
+authed(<<"POST">>, [<<"server">>, Id, <<"webhooks">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_server_webhook(uid(Session), Id, maps:get(<<"name">>, M, <<>>), maps:get(<<"url">>, M, <<>>), maps:get(<<"events">>, M, []))) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"webhook">>, WebhookId], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_server_webhook(uid(Session), Id, WebhookId, M, maps:get(<<"updated_at">>, M, 0))) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"webhook">>, WebhookId, <<"delete">>], Req, Session, _) ->
+    result(Req, pw_db:delete_server_webhook(uid(Session), Id, WebhookId));
+authed(<<"POST">>, [<<"server">>, Id, <<"webhook">>, WebhookId, <<"rotate">>], Req, Session, _) ->
+    result(Req, pw_db:rotate_server_webhook(uid(Session), Id, WebhookId));
+authed(<<"POST">>, [<<"server">>, Id, <<"webhook">>, WebhookId, <<"test">>], Req, Session, _) ->
+    result(Req, pw_db:test_server_webhook(uid(Session), Id, WebhookId));
+authed(<<"GET">>, [<<"server">>, Id, <<"bots">>], Req, Session, _) ->
+    result(Req, pw_db:server_bots(uid(Session), Id));
+authed(<<"POST">>, [<<"server">>, Id, <<"bots">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_server_bot(uid(Session), Id, maps:get(<<"name">>, M, <<>>))) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"bot">>, BotId, <<"rotate">>], Req, Session, _) ->
+    result(Req, pw_db:rotate_server_bot(uid(Session), Id, BotId));
+authed(<<"POST">>, [<<"server">>, Id, <<"bot">>, BotId, <<"delete">>], Req, Session, _) ->
+    result(Req, pw_db:delete_server_bot(uid(Session), Id, BotId));
 authed(<<"GET">>, [<<"server">>, Id, <<"member">>, UserId, <<"profile">>], Req, Session, _) ->
     result(Req, pw_db:server_member_profile(uid(Session), Id, UserId));
 authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"profile">>], Req0, Session, _) ->
@@ -329,6 +435,21 @@ authed(<<"GET">>, [<<"notifications">>], Req, Session, _) -> result(Req, pw_db:n
 authed(<<"POST">>, [<<"notifications">>, <<"seen">>], Req, Session, _) -> result(Req, pw_db:mark_notifications_seen(uid(Session)));
 authed(<<"POST">>, [<<"friends">>, <<"unblock">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:friend_unblock(uid(Session), maps:get(<<"user_id">>,M,undefined))) end);
 authed(_, _, Req, _, _) -> pw_util:err_json(Req, 404, <<"not_found">>).
+
+with_bot(Req0, Fun) ->
+    case cowboy_req:header(<<"authorization">>, Req0) of
+        <<"Bot ", Token/binary>> when byte_size(Token) >= 16, byte_size(Token) =< 256 ->
+            case pw_db:authenticate_bot(Token) of
+                {ok, Bot} -> Fun(Bot, Req0);
+                _ -> pw_util:err_json(Req0, 401, <<"invalid_bot_token">>)
+            end;
+        <<"Bearer ", Token/binary>> when byte_size(Token) >= 16, byte_size(Token) =< 256 ->
+            case pw_db:authenticate_bot(Token) of
+                {ok, Bot} -> Fun(Bot, Req0);
+                _ -> pw_util:err_json(Req0, 401, <<"invalid_bot_token">>)
+            end;
+        _ -> pw_util:err_json(Req0, 401, <<"bot_auth_required">>)
+    end.
 
 with_json_public(Req0, Fun) ->
     case pw_util:read_json(Req0) of

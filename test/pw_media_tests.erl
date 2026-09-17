@@ -13,6 +13,10 @@ rejects_invalid_url_schemes_test() ->
     ?assertEqual({error, invalid_url}, pw_media:validate_url(<<"data:image/png;base64,abc">>)),
     ?assertEqual({error, invalid_url}, pw_media:validate_url(<<"/local/path.png">>)).
 
+rejects_oversized_or_malformed_urls_without_throwing_test() ->
+    ?assertEqual({error, invalid_url}, pw_media:validate_url(binary:copy(<<"x">>, 4096))),
+    ?assertEqual({error, invalid_url}, pw_media:validate_url(<<"http://[">>)).
+
 malformed_data_avatar_fails_closed_test() ->
     ?assertEqual(<<>>, pw_media:cache_data_url(<<"data:image/svg+xml;base64,PHN2Zz4=">>)),
     ?assertEqual(<<>>, pw_media:cache_data_url(<<"data:image/png;base64,not actually base64!">>)).

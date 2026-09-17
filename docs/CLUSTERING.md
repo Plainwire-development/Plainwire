@@ -4,11 +4,11 @@ The default backend is local OTP messaging. Partisan is downloaded only with the
 
 The supported topology is deliberately narrow: **one WebSocket/call owner plus additional HTTP API nodes**. All `/ws` traffic must go to the owner. API nodes reject WebSockets with 503. Presence, subscriptions, room membership, call signaling and session connection ownership remain in `pw_hub` on the owner. This release does not distribute media, split a voice room across nodes, automatically elect a replacement owner, or preserve calls when the owner fails.
 
-After PostgreSQL operations, API nodes route eligible user/topic events through the Plainwire-owned `pw_cluster` interface. PostgreSQL remains authoritative for messages, sessions, permissions and invitations. Cluster mode bypasses the per-node HTTP session cache so revocation is checked against the database. All nodes must share the same database, encryption/media keys, origin configuration, release and durable upload storage. Budget database pool sizes across nodes. Complete migrations on the first node before starting others.
+After PostgreSQL operations, API nodes route eligible user/topic events through the Plainwire-owned `pw_cluster` interface. PostgreSQL remains authoritative for relational state such as sessions, memberships, permissions and invitations. Message history follows `PLAINWIRE_MESSAGE_BACKEND`: PostgreSQL in `postgres`/migration-read mode, and ScyllaDB after the documented storage cutover. Redis remains ephemeral. Cluster mode bypasses the per-node HTTP session cache so revocation is checked against the database. All nodes must share the same database, encryption/media keys, origin configuration, release and durable upload storage. Budget database pool sizes across nodes. Complete migrations on the first node before starting others.
 
 ## Build and configure
 
-The pinned Partisan revision is `45474ceb710dafa91a4af2dc87b34512354f6ba8` (6.2.0). It requires OTP 27+ **with OTP sources installed**, because its build transforms OTP modules. The standard app was compiled here with OTP 25; the actual Partisan dependency and two-node TLS topology could not be exercised here. Keep this profile off until staging verification succeeds.
+The pinned Partisan revision is `45474ceb710dafa91a4af2dc87b34512354f6ba8` (6.2.0). It requires OTP 27+ **with OTP sources installed**, because its build transforms OTP modules. The standard 2.0 dependency set also requires OTP 27+. The optional Partisan profile additionally requires installed OTP sources; exercise its two-node TLS topology in staging before enabling it in production.
 
 ```sh
 npm ci

@@ -76,3 +76,20 @@ serve_once(Listen, Parent) ->
     Parent ! {captured_request, Request},
     _ = gen_tcp:send(Socket, <<"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}">>),
     gen_tcp:close(Socket).
+
+reserved_transport_headers_are_not_forwarded_test() ->
+    Headers = pw_http_fetch:test_normalize_extra_headers([
+        {<<"host">>, <<"evil.example">>},
+        {<<"content-length">>, <<"999999">>},
+        {<<"transfer-encoding">>, <<"chunked">>},
+        {<<"connection">>, <<"upgrade">>},
+        {<<"authorization">>, <<"Bearer allowed">>},
+        {<<"x-plainwire-test">>, <<"ok">>}
+    ]),
+    LowerNames = [string:lowercase(pw_util:bin(K)) || {K, _} <- Headers],
+    ?assertNot(lists:member(<<"host">>, LowerNames)),
+    ?assertNot(lists:member(<<"content-length">>, LowerNames)),
+    ?assertNot(lists:member(<<"transfer-encoding">>, LowerNames)),
+    ?assertNot(lists:member(<<"connection">>, LowerNames)),
+    ?assert(lists:member(<<"authorization">>, LowerNames)),
+    ?assert(lists:member(<<"x-plainwire-test">>, LowerNames)).

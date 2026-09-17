@@ -439,6 +439,235 @@
     const el = document.createElement('p'); el.className = `admin-inline-message ${kind}`; el.textContent = message; container.append(el); return el;
   };
 
+  const extensionStorageKey = 'plainwire_extensions_v2';
+  const extensionWorkers = new Map();
+  let lessCompilerPromise = null;
+
+  const readExtensions = () => {
+    try {
+      const parsed = JSON.parse(storage.getItem(extensionStorageKey) || '{"themes":[],"plugins":[]}');
+      return {
+        themes: Array.isArray(parsed.themes) ? parsed.themes.filter(Boolean).slice(0, 40) : [],
+        plugins: Array.isArray(parsed.plugins) ? parsed.plugins.filter(Boolean).slice(0, 40).map((plugin) => ({
+          ...plugin,
+          permissions: { apiWrite: plugin?.permissions?.apiWrite === true }
+        })) : []
+      };
+    } catch (_) { return { themes: [], plugins: [] }; }
+  };
+  const writeExtensions = (value) => storage.setItem(extensionStorageKey, JSON.stringify(value));
+  const extensionId = () => `${Date.now().toString(36)}-${crypto.getRandomValues(new Uint32Array(1))[0].toString(36)}`;
+  const loadLessCompiler = () => {
+    if (window.less?.render) return Promise.resolve(window.less);
+    if (lessCompilerPromise) return lessCompilerPromise;
+    lessCompilerPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = `/assets/less.min.js?v=${encodeURIComponent(clientConfig.assetVersion || clientConfig.version)}`;
+      script.onload = () => window.less?.render ? resolve(window.less) : reject(new Error('Less compiler failed to initialize'));
+      script.onerror = () => reject(new Error('Could not load the Less compiler'));
+      document.head.append(script);
+    }).catch((error) => { lessCompilerPromise = null; throw error; });
+    return lessCompilerPromise;
+  };
+  const validateThemeSource = (source) => {
+    if (typeof source !== 'string' || !source.trim() || source.length > 131072) throw new Error('Theme source must be between 1 byte and 128 KiB.');
+    if (/@import\b/i.test(source)) throw new Error('Theme @import is disabled. Keep themes self-contained.');
+    if (/`[^`]*`/.test(source)) throw new Error('Less JavaScript expressions are disabled.');
+    return source;
+  };
+  const applyClientThemes = async () => {
+    document.querySelectorAll('style[data-plainwire-extension-theme]').forEach((node) => node.remove());
+    const { themes } = readExtensions();
+    const active = themes.filter((theme) => theme.enabled === true);
+    if (!active.length) return;
+    const less = await loadLessCompiler();
+    for (const theme of active) {
+      try {
+        const source = validateThemeSource(String(theme.source || ''));
+        const result = await less.render(source, { javascriptEnabled: false, math: 'parens-division' });
+        const style = document.createElement('style');
+        style.dataset.plainwireExtensionTheme = String(theme.id || 'theme');
+        style.textContent = result.css;
+        document.head.append(style);
+      } catch (error) {
+        console.warn('[Plainwire:EXT] theme_failed', theme?.name, error);
+      }
+    }
+  };
+  const stopClientPlugins = () => {
+    extensionWorkers.forEach((worker) => { try { worker.terminate(); } catch (_) {} });
+    extensionWorkers.clear();
+  };
+  const pluginStorageKey = (id, key) => `plainwire_plugin_${String(id).slice(0, 80)}_${String(key).slice(0, 120)}`;
+  const createPluginWorker = (plugin) => {
+    const source = String(plugin.source || '');
+    const permissions = Object.freeze({ apiWrite: plugin?.permissions?.apiWrite === true });
+    if (!source.trim() || source.length > 262144) throw new Error('Plugin source must be between 1 byte and 256 KiB.');
+    const bootstrap = `
+      'use strict';
+      const __pending = new Map(); let __seq = 0;
+      try { self.fetch = undefined; self.XMLHttpRequest = undefined; self.WebSocket = undefined; self.EventSource = undefined; self.importScripts = undefined; } catch (_) {}
+      const rpc = (op, data={}) => new Promise((resolve,reject)=>{ const id=++__seq; __pending.set(id,{resolve,reject}); postMessage({kind:'rpc',id,op,data}); });
+      const Plainwire = Object.freeze({
+        version: ${JSON.stringify(clientConfig.version)},
+        toast(text){ postMessage({kind:'toast',text:String(text).slice(0,500)}); },
+        request(path, options={}){ return rpc('request',{path:String(path),method:String(options.method||'GET'),body:options.body??null}); },
+        insertText(text){ postMessage({kind:'insert_text',text:String(text).slice(0,5000)}); },
+        storage: Object.freeze({ get(key){ return rpc('storage_get',{key:String(key)}); }, set(key,value){ return rpc('storage_set',{key:String(key),value}); }, remove(key){ return rpc('storage_remove',{key:String(key)}); } })
+      });
+      self.onmessage = (event)=>{ const m=event.data||{}; if(m.kind==='rpc_result'){ const p=__pending.get(m.id); if(!p)return; __pending.delete(m.id); m.ok?p.resolve(m.value):p.reject(new Error(m.error||'plugin_rpc_failed')); } };
+      try { (new Function('Plainwire', ${JSON.stringify(source)}))(Plainwire); postMessage({kind:'ready'}); }
+      catch (error) { postMessage({kind:'error',error:String(error?.stack||error)}); }
+    `;
+    const url = URL.createObjectURL(new Blob([bootstrap], { type: 'text/javascript' }));
+    const worker = new Worker(url, { name: `Plainwire plugin: ${String(plugin.name || plugin.id || 'plugin').slice(0, 80)}` });
+    URL.revokeObjectURL(url);
+    worker.addEventListener('message', async (event) => {
+      const msg = event.data || {};
+      if (msg.kind === 'toast') { send(app.ports.bridgeReceive, { tag: 'toast', data: String(msg.text || '').slice(0, 500) }); return; }
+      if (msg.kind === 'insert_text') { insertIntoComposer(String(msg.text || '').slice(0, 5000)); return; }
+      if (msg.kind === 'error') { console.error('[Plainwire:EXT] plugin_error', plugin.name, msg.error); return; }
+      if (msg.kind !== 'rpc') return;
+      const respond = (ok, value, error = '') => worker.postMessage({ kind: 'rpc_result', id: msg.id, ok, value, error });
+      try {
+        if (msg.op === 'request') {
+          const path = String(msg.data?.path || '');
+          if (!/^\/[A-Za-z0-9_?&=.%+\-\/]*$/.test(path) || path.includes('..')) throw new Error('Only same-origin Plainwire API paths are allowed.');
+          const method = String(msg.data?.method || 'GET').toUpperCase();
+          if (!['GET','POST','DELETE'].includes(method)) throw new Error('Unsupported plugin request method.');
+          if (method !== 'GET' && !permissions.apiWrite) throw new Error('This plugin has read-only API access. Grant API write access in plugin settings to allow changes.');
+          const value = await directApi(path, { method, body: msg.data?.body ?? null, timeoutMs: 15000 }); respond(true, value);
+        } else if (msg.op === 'storage_get') {
+          const raw = storage.getItem(pluginStorageKey(plugin.id, msg.data?.key)); respond(true, raw === null ? null : JSON.parse(raw));
+        } else if (msg.op === 'storage_set') {
+          const raw = JSON.stringify(msg.data?.value ?? null); if (raw.length > 65536) throw new Error('Plugin storage value too large.'); storage.setItem(pluginStorageKey(plugin.id, msg.data?.key), raw); respond(true, true);
+        } else if (msg.op === 'storage_remove') {
+          storage.removeItem(pluginStorageKey(plugin.id, msg.data?.key)); respond(true, true);
+        } else throw new Error('Unsupported plugin operation.');
+      } catch (error) { respond(false, null, String(error?.message || error).slice(0, 500)); }
+    });
+    return worker;
+  };
+  const startClientPlugins = () => {
+    stopClientPlugins();
+    const { plugins } = readExtensions();
+    for (const plugin of plugins.filter((item) => item.enabled === true)) {
+      try { extensionWorkers.set(plugin.id, createPluginWorker(plugin)); }
+      catch (error) { console.error('[Plainwire:EXT] plugin_start_failed', plugin?.name, error); }
+    }
+  };
+  const applyClientExtensions = async () => { await applyClientThemes(); startClientPlugins(); };
+
+  const openExtensionsManager = async () => {
+    const shell = modalShell('Themes & plugins', "Client extensions live only in this browser. Themes use Less; plugins run in a Worker under Plainwire's restrictive network policy and use an explicit Plainwire capability API.");
+    let activeTab = 'themes';
+    const renderEditor = (kind, existing = null) => {
+      const isTheme = kind === 'themes';
+      const wrap = document.createElement('form'); wrap.className = 'admin-form-stack';
+      const name = makeField(isTheme ? 'Theme name' : 'Plugin name', existing?.name || '', { maxLength: 80 });
+      const source = makeField(isTheme ? 'Less source' : 'Plugin JavaScript', existing?.source || '', { multiline: true, maxLength: isTheme ? 131072 : 262144 });
+      source.input.rows = 15; source.input.spellcheck = false;
+      source.input.placeholder = isTheme ? ':root { --pw-accent: #7c5cff; }' : "Plainwire.toast('plugin loaded');";
+      const status = document.createElement('div'); status.className = 'admin-inline-message muted';
+      let apiWrite = null;
+      if (!isTheme) {
+        const permission = document.createElement('label'); permission.className = 'admin-permission';
+        apiWrite = document.createElement('input'); apiWrite.type = 'checkbox'; apiWrite.checked = existing?.permissions?.apiWrite === true;
+        const permissionCopy = document.createElement('span');
+        const permissionTitle = document.createElement('strong'); permissionTitle.textContent = 'Allow API write access';
+        const permissionHint = document.createElement('small'); permissionHint.textContent = 'Lets this plugin perform POST/DELETE actions as your signed-in account. Leave off unless you trust the plugin.';
+        permissionCopy.append(permissionTitle, permissionHint); permission.append(apiWrite, permissionCopy); wrap.append(permission);
+      }
+      const actions = document.createElement('div'); actions.className = 'admin-row-actions';
+      const cancel = document.createElement('button'); cancel.type='button'; cancel.className='btn secondary'; cancel.textContent='Cancel'; cancel.addEventListener('click', render);
+      const save = document.createElement('button'); save.type='submit'; save.className='btn'; save.textContent='Save';
+      actions.append(cancel, save);
+      const existingPermission = apiWrite ? wrap.lastElementChild : null;
+      wrap.replaceChildren(name.label, source.label);
+      if (existingPermission) wrap.append(existingPermission);
+      wrap.append(status, actions);
+      wrap.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const cleanName = name.input.value.trim(); if (cleanName.length < 2) { status.textContent='Use a name with at least 2 characters.'; return; }
+        try { if (isTheme) validateThemeSource(source.input.value); else if (!source.input.value.trim() || source.input.value.length > 262144) throw new Error('Plugin source must be between 1 byte and 256 KiB.'); }
+        catch (error) { status.textContent=error.message; status.className='admin-inline-message error'; return; }
+        const wantsApiWrite = !isTheme && apiWrite?.checked === true;
+        if (wantsApiWrite && existing?.permissions?.apiWrite !== true && !window.confirm('Grant this plugin API write access? It will be able to perform account actions through Plainwire as you. Only continue if you trust its source.')) return;
+        const all = readExtensions(); const list = all[kind];
+        const item = { id: existing?.id || extensionId(), name: cleanName, source: source.input.value, enabled: existing?.enabled !== false,
+          ...(isTheme ? {} : { permissions: { apiWrite: wantsApiWrite } }), updatedAt: Date.now() };
+        const index = list.findIndex((entry) => entry.id === item.id); if (index >= 0) list[index]=item; else list.push(item);
+        writeExtensions(all); save.disabled=true;
+        try { await applyClientExtensions(); render(); }
+        catch (error) { status.textContent=error.message; status.className='admin-inline-message error'; save.disabled=false; }
+      });
+      shell.body.replaceChildren(wrap);
+    };
+    const render = () => {
+      shell.body.replaceChildren();
+      const nav = document.createElement('nav'); nav.className='admin-tabs';
+      [['themes','Themes'],['plugins','Plugins']].forEach(([id,label])=>{ const b=document.createElement('button'); b.type='button'; b.textContent=label; b.classList.toggle('active',activeTab===id); b.addEventListener('click',()=>{activeTab=id;render()}); nav.append(b); });
+      const panel=document.createElement('div'); panel.className='admin-panel'; const all=readExtensions(); const list=all[activeTab] || [];
+      const info=document.createElement('p'); info.className='muted'; info.textContent = activeTab==='themes' ? 'Less themes can style the entire Plainwire client. Imports and Less JavaScript are disabled.' : "Plugins have no DOM access. Their Plainwire.request API is read-only by default; write access must be granted explicitly. Outbound connections are restricted by Plainwire's same-origin Content Security Policy.";
+      const add=document.createElement('button'); add.type='button'; add.className='btn'; add.textContent=activeTab==='themes'?'Add theme':'Add plugin'; add.addEventListener('click',()=>renderEditor(activeTab)); panel.append(info,add);
+      const stack=document.createElement('div'); stack.className='admin-role-stack';
+      for (const item of list) {
+        const row=document.createElement('section'); row.className='admin-role-card'; const head=document.createElement('div'); head.className='admin-role-head'; const copy=document.createElement('div'); const strong=document.createElement('strong'); strong.textContent=item.name || 'Unnamed'; const small=document.createElement('small'); small.textContent = activeTab === 'plugins' ? `${item.enabled ? 'Enabled' : 'Disabled'} · ${item.permissions?.apiWrite === true ? 'API write access' : 'read-only API'}` : (item.enabled?'Enabled':'Disabled'); copy.append(strong,small);
+        const controls=document.createElement('div'); controls.className='admin-row-actions';
+        const toggle=document.createElement('button'); toggle.type='button'; toggle.className='btn secondary'; toggle.textContent=item.enabled?'Disable':'Enable'; toggle.addEventListener('click',async()=>{ const next=readExtensions(); const entry=next[activeTab].find((x)=>x.id===item.id); if(entry) entry.enabled=!entry.enabled; writeExtensions(next); await applyClientExtensions(); render(); });
+        const edit=document.createElement('button'); edit.type='button'; edit.className='btn secondary'; edit.textContent='Edit'; edit.addEventListener('click',()=>renderEditor(activeTab,item));
+        const remove=document.createElement('button'); remove.type='button'; remove.className='btn danger'; remove.textContent='Remove'; remove.addEventListener('click',async()=>{ if(!window.confirm(`Remove ${item.name}?`)) return; const next=readExtensions(); next[activeTab]=next[activeTab].filter((x)=>x.id!==item.id); writeExtensions(next); await applyClientExtensions(); render(); });
+        controls.append(toggle,edit,remove); head.append(copy,controls); row.append(head); stack.append(row);
+      }
+      if(!list.length) adminMessage(stack, activeTab==='themes'?'No client themes installed.':'No client plugins installed.'); panel.append(stack); shell.body.append(nav,panel);
+    };
+    render();
+  };
+
+  const openServerProfileRoleEditor = async (payload) => {
+    const serverId = Number(payload?.server_id);
+    const userId = Number(payload?.user_id);
+    if (!Number.isInteger(serverId) || serverId <= 0 || !Number.isInteger(userId) || userId <= 0) throw new Error('invalid_member');
+    const [state, profile] = await Promise.all([
+      directApi(`/server/${serverId}/roles`),
+      directApi(`/server/${serverId}/member/${userId}/profile`)
+    ]);
+    const member = (state?.members || []).find((item) => Number(item?.user?.id) === userId);
+    if (!member) throw new Error('member_not_found');
+    const current = new Set((member.role_ids || []).map(Number));
+    const shell = modalShell(`Roles for ${member.nickname || member.user?.display_name || member.user?.username || 'member'}`,
+      'Changes are validated against Plainwire role hierarchy on the server.');
+    const form = document.createElement('form'); form.className = 'admin-form-stack server-profile-role-editor';
+    const list = document.createElement('div'); list.className = 'admin-member-roles';
+    for (const role of state?.roles || []) {
+      const label = document.createElement('label'); label.className = 'admin-permission';
+      const input = document.createElement('input'); input.type = 'checkbox'; input.checked = current.has(Number(role.id)); input.dataset.roleId = String(role.id);
+      const copy = document.createElement('span');
+      const strong = document.createElement('strong'); strong.textContent = role.name || 'Role'; strong.style.color = role.color || '';
+      const small = document.createElement('small'); small.textContent = `Position ${Number(role.position || 0)}`;
+      copy.append(strong, small); label.append(input, copy); list.append(label);
+    }
+    if (!(state?.roles || []).length) adminMessage(list, 'This server has no custom roles yet.');
+    const status = document.createElement('div'); status.className = 'account-dialog-status';
+    const actions = document.createElement('div'); actions.className = 'admin-row-actions';
+    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'btn secondary'; cancel.textContent = 'Cancel'; cancel.addEventListener('click', () => shell.destroy());
+    const save = document.createElement('button'); save.type = 'submit'; save.className = 'btn'; save.textContent = 'Save roles';
+    actions.append(cancel, save); form.append(list, status, actions); shell.body.append(form);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault(); save.disabled = true; status.textContent = '';
+      const ids = [...list.querySelectorAll('input:checked')].map((input) => Number(input.dataset.roleId));
+      try {
+        await directApi(`/server/${serverId}/member/${userId}/roles`, { method: 'POST', body: { role_ids: ids } });
+        shell.destroy();
+        await Promise.allSettled([api({ method: 'GET', path: `/server/${serverId}` }), api({ method: 'GET', path: `/server/${serverId}/member/${userId}/profile` })]);
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Member roles updated' });
+      } catch (error) {
+        status.textContent = ({ role_hierarchy: 'You cannot assign a role at or above your highest manageable role.', owner_role_locked: 'The owner role cannot be reassigned.', forbidden: 'You do not have permission to edit this member’s roles.' })[error.message] || `Could not update roles: ${error.message}`;
+        save.disabled = false;
+      }
+    });
+  };
+
   const openGroupAdmin = async (conversationId) => {
     if (!Number.isInteger(Number(conversationId)) || Number(conversationId) <= 0) return;
     const shell = modalShell('Group moderation', 'Manage roles and membership without leaving the conversation.');
@@ -450,7 +679,10 @@
         shell.setTitle(conversation.name || 'Group moderation'); shell.body.replaceChildren();
         const me = members.find(member => Number(member.user?.id) === Number(meId));
         const actorRole = me?.role || me?.group_role || (Number(conversation.owner_id) === Number(meId) ? 'owner' : 'member');
-        const intro = document.createElement('div'); intro.className = 'admin-summary'; intro.innerHTML = `<strong>${members.length} members</strong><span>Your role: ${actorRole}</span>`; shell.body.append(intro);
+        const intro = document.createElement('div'); intro.className = 'admin-summary';
+        const memberCount = document.createElement('strong'); memberCount.textContent = `${members.length} members`;
+        const roleSummary = document.createElement('span'); roleSummary.textContent = `Your role: ${actorRole}`;
+        intro.append(memberCount, roleSummary); shell.body.append(intro);
         const list = document.createElement('div'); list.className = 'admin-member-list';
         const roleRank = role => ({ owner: 3, moderator: 2, member: 1 }[role] || 1);
         for (const member of members) {
@@ -510,6 +742,7 @@
       if (!actor || !member || Number(member.user?.id) === Number(meId) || member.legacy_role === 'owner') return false;
       return actorOwnsServer() || memberRank(actor) > memberRank(member);
     };
+    const canEditMemberRoles = (member) => canActOnMember(member) || (actorOwnsServer() && Number(member?.user?.id) === Number(meId));
     const canEditRole = (role) => {
       if (!hasPermission(state, 'manage_roles')) return false;
       return actorOwnsServer() || memberRank(actorMember()) > Number(role?.position || 0);
@@ -619,13 +852,13 @@
       return wrap;
     };
     const renderMembers = () => {
-      const wrap = document.createElement('div'); wrap.className = 'admin-member-list'; const canRoles = hasPermission(state, 'manage_roles'); const canKick = hasPermission(state, 'kick_members'); const canProfiles = hasPermission(state, 'manage_profiles');
+      const wrap = document.createElement('div'); wrap.className = 'admin-member-list'; const canRoles = hasPermission(state, 'manage_roles'); const canKick = hasPermission(state, 'kick_members'); const canBan = hasPermission(state, 'ban_members'); const canProfiles = hasPermission(state, 'manage_profiles');
       const roles = state?.roles || [];
       for (const member of state?.members || []) {
         const row = document.createElement('div'); row.className = 'admin-member-card'; const top = document.createElement('div'); top.className = 'admin-member-row';
         const avatar = document.createElement(member.server_avatar_url || member.user?.avatar_url ? 'img' : 'div'); avatar.className = 'admin-member-avatar'; if (avatar instanceof HTMLImageElement) { avatar.src = member.server_avatar_url || member.user.avatar_url; avatar.alt=''; } else avatar.textContent = String(member.nickname || member.user?.display_name || '?').slice(0,1).toUpperCase();
         const copy = document.createElement('div'); copy.className = 'admin-member-copy'; const strong=document.createElement('strong'); strong.textContent=member.nickname || member.user?.display_name || member.user?.username || 'Unknown'; const small=document.createElement('small'); small.textContent=`@${member.user?.username || ''} · ${member.legacy_role || 'member'}`; copy.append(strong,small); top.append(avatar,copy); row.append(top);
-        if (canRoles && canActOnMember(member)) {
+        if (canRoles && canEditMemberRoles(member)) {
           const roleBox = document.createElement('div'); roleBox.className='admin-member-roles';
           roles.forEach(role => {
             const label=document.createElement('label'); const cb=document.createElement('input'); cb.type='checkbox';
@@ -648,8 +881,34 @@
           buttons.append(cancel,save);form.append(nick.label,avatarField.label,bio.label,buttons);editor.body.append(form);
         }));
         if (canKick && canActOnMember(member)) actions.append(actionButton('Kick',async()=>{if(!confirm(`Kick ${member.user?.display_name||member.user?.username} from this server?`))return;try{await directApi(`/server/${serverId}/member/${member.user.id}/kick`,{method:'POST',body:{}});await refresh();await api({method:'GET',path:`/server/${serverId}`});render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:`Could not kick member: ${error.message}`});}},true));
+        if (canBan && canActOnMember(member)) actions.append(actionButton('Ban',async()=>{if(!confirm(`Ban ${member.user?.display_name||member.user?.username} from this server? They will be unable to rejoin with a Wire until unbanned.`))return;const reason=(prompt('Ban reason (optional):','')||'').trim().slice(0,512);try{await directApi(`/server/${serverId}/member/${member.user.id}/ban`,{method:'POST',body:{reason}});await refresh();await api({method:'GET',path:`/server/${serverId}`});render();send(app.ports.bridgeReceive,{tag:'toast',data:'Member banned'});}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:`Could not ban member: ${error.message}`});}},true));
         if(actions.children.length)row.append(actions); wrap.append(row);
       }
+      return wrap;
+    };
+    const renderBans = () => {
+      const wrap = document.createElement('div'); wrap.className = 'admin-form-stack';
+      if (!hasPermission(state, 'ban_members')) { adminMessage(wrap, 'Your roles do not grant Ban Members.'); return wrap; }
+      const list = document.createElement('div'); list.className = 'admin-member-list'; list.setAttribute('aria-busy','true'); wrap.append(list);
+      directApi(`/server/${serverId}/bans`).then(items => {
+        list.replaceChildren(); list.removeAttribute('aria-busy');
+        const bans = Array.isArray(items) ? items : [];
+        for (const ban of bans) {
+          const row=document.createElement('div'); row.className='admin-member-card';
+          const top=document.createElement('div'); top.className='admin-member-row';
+          const avatar=document.createElement(ban.avatar_url ? 'img':'div'); avatar.className='admin-member-avatar';
+          if (avatar instanceof HTMLImageElement) { avatar.src=ban.avatar_url; avatar.alt=''; } else avatar.textContent=String(ban.display_name||ban.username||'?').slice(0,1).toUpperCase();
+          const copy=document.createElement('div'); copy.className='admin-member-copy';
+          const strong=document.createElement('strong'); strong.textContent=ban.display_name||ban.username||'Unknown';
+          const small=document.createElement('small'); small.textContent=`@${ban.username||''}${ban.banned_by_username ? ` · banned by @${ban.banned_by_username}` : ''}`;
+          copy.append(strong,small); if (ban.reason) { const reason=document.createElement('p'); reason.className='muted'; reason.textContent=ban.reason; copy.append(reason); }
+          top.append(avatar,copy); row.append(top);
+          const actions=document.createElement('div'); actions.className='admin-row-actions';
+          actions.append(actionButton('Unban', async event => { event.currentTarget.disabled=true; try { await directApi(`/server/${serverId}/member/${ban.user_id}/unban`,{method:'POST',body:{}}); render(); send(app.ports.bridgeReceive,{tag:'toast',data:'Member unbanned'}); } catch(error) { send(app.ports.bridgeReceive,{tag:'toast',data:`Could not unban member: ${error.message}`}); event.currentTarget.disabled=false; } }));
+          row.append(actions); list.append(row);
+        }
+        if (!bans.length) adminMessage(list,'No banned members.');
+      }).catch(error => { list.removeAttribute('aria-busy'); adminMessage(list,`Could not load bans: ${error.message}`,'error'); });
       return wrap;
     };
     const renderWires = () => {
@@ -820,12 +1079,48 @@
       }
       return wrap;
     };
+    const renderIntegrations = () => {
+      const wrap = document.createElement('div'); wrap.className = 'admin-form-stack';
+      const canWebhooks = hasPermission(state, 'manage_webhooks');
+      const canBots = hasPermission(state, 'manage_bots');
+
+      const webhooksSection = document.createElement('section'); webhooksSection.className = 'admin-role-card';
+      const webhookTitle = document.createElement('div'); webhookTitle.className='admin-role-head';
+      const webhookCopy = document.createElement('div'); const webhookStrong=document.createElement('strong'); webhookStrong.textContent='Webhooks'; const webhookSmall=document.createElement('small'); webhookSmall.textContent='Signed outbound HTTPS events with retry and delivery tracking.'; webhookCopy.append(webhookStrong,webhookSmall); webhookTitle.append(webhookCopy); webhooksSection.append(webhookTitle);
+      const webhookList = document.createElement('div'); webhookList.className='admin-role-stack'; webhooksSection.append(webhookList);
+      if (canWebhooks) {
+        const create = document.createElement('form'); create.className='admin-form-stack';
+        const name=makeField('Webhook name','',{maxLength:80,placeholder:'Build notifications'}); const url=makeField('HTTPS endpoint','',{maxLength:2048,placeholder:'https://example.com/plainwire'});
+        const events = ['message.created','message.updated','message.deleted','message.reaction','member.joined','member.removed','server.updated'];
+        const eventGrid=document.createElement('div'); eventGrid.className='admin-permission-grid';
+        events.forEach((key)=>{ const label=document.createElement('label'); label.className='admin-permission'; const input=document.createElement('input'); input.type='checkbox'; input.value=key; input.checked=key==='message.created'; const copy=document.createElement('span'); const strong=document.createElement('strong'); strong.textContent=key; copy.append(strong); label.append(input,copy); eventGrid.append(label); });
+        const status=document.createElement('div'); status.className='admin-inline-message muted'; const submit=document.createElement('button'); submit.type='submit'; submit.className='btn'; submit.textContent='Create webhook';
+        create.append(name.label,url.label,eventGrid,status,submit); webhooksSection.insertBefore(create,webhookList);
+        create.addEventListener('submit',async(event)=>{ event.preventDefault(); submit.disabled=true; try { const selected=[...eventGrid.querySelectorAll('input:checked')].map((input)=>input.value); const data=await directApi(`/server/${serverId}/webhooks`,{method:'POST',body:{name:name.input.value.trim(),url:url.input.value.trim(),events:selected}}); if(data?.secret){ await copySecretDialog('Webhook secret',data.secret,'Use this secret to verify x-plainwire-signature. Plainwire only reveals it on creation or rotation.'); } render(); } catch(error){ status.textContent=error.message; status.className='admin-inline-message error'; submit.disabled=false; } });
+        webhookList.setAttribute('aria-busy','true');
+        directApi(`/server/${serverId}/webhooks`).then((items)=>{ webhookList.replaceChildren(); webhookList.removeAttribute('aria-busy'); for(const hook of (Array.isArray(items)?items:[])){ const row=document.createElement('section'); row.className='admin-role-card'; const head=document.createElement('div'); head.className='admin-role-head'; const copy=document.createElement('div'); const strong=document.createElement('strong'); strong.textContent=hook.name; const small=document.createElement('small'); small.textContent=`${hook.enabled?'Enabled':'Disabled'} · ${hook.failure_count||0} recent failures · ${(hook.events||[]).join(', ')}`; copy.append(strong,small); const actions=document.createElement('div'); actions.className='admin-row-actions';
+          const test=actionButton('Test',async(e)=>{ e.currentTarget.disabled=true; try{await directApi(`/server/${serverId}/webhook/${hook.id}/test`,{method:'POST',body:{}}); send(app.ports.bridgeReceive,{tag:'toast',data:'Webhook test queued'});}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{e.currentTarget.disabled=false;}});
+          const rotate=actionButton('Rotate secret',async(e)=>{ if(!window.confirm(`Rotate the secret for ${hook.name}? Existing signatures will immediately stop validating.`))return; e.currentTarget.disabled=true; try{const data=await directApi(`/server/${serverId}/webhook/${hook.id}/rotate`,{method:'POST',body:{}}); await copySecretDialog('New webhook secret',data.secret,'Update your receiver before closing this dialog.');}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{e.currentTarget.disabled=false;}});
+          const remove=actionButton('Delete',async(e)=>{if(!window.confirm(`Delete webhook ${hook.name}?`))return;e.currentTarget.disabled=true;try{await directApi(`/server/${serverId}/webhook/${hook.id}/delete`,{method:'POST',body:{}});render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});e.currentTarget.disabled=false;}},true);
+          actions.append(test,rotate,remove); head.append(copy,actions); row.append(head); const endpoint=document.createElement('code'); endpoint.textContent=hook.url; row.append(endpoint); webhookList.append(row); } if(!webhookList.children.length)adminMessage(webhookList,'No webhooks yet.'); }).catch((error)=>{webhookList.removeAttribute('aria-busy');adminMessage(webhookList,error.message,'error');});
+      } else adminMessage(webhookList,'Your roles do not grant Manage Webhooks.');
+      wrap.append(webhooksSection);
+
+      const botsSection=document.createElement('section'); botsSection.className='admin-role-card'; const botHead=document.createElement('div'); botHead.className='admin-role-head'; const botCopy=document.createElement('div'); const botStrong=document.createElement('strong'); botStrong.textContent='Bots'; const botSmall=document.createElement('small'); botSmall.textContent='Server-scoped bot accounts use the same role and permission model as members.'; botCopy.append(botStrong,botSmall); botHead.append(botCopy); botsSection.append(botHead); const botList=document.createElement('div'); botList.className='admin-role-stack'; botsSection.append(botList);
+      if(canBots){ const create=document.createElement('form'); create.className='admin-role-create'; const input=document.createElement('input'); input.placeholder='Bot name'; input.maxLength=48; const submit=document.createElement('button'); submit.type='submit'; submit.className='btn'; submit.textContent='Create bot'; create.append(input,submit); botsSection.insertBefore(create,botList); create.addEventListener('submit',async(event)=>{event.preventDefault();submit.disabled=true;try{const data=await directApi(`/server/${serverId}/bots`,{method:'POST',body:{name:input.value.trim()}}); await copySecretDialog('Bot token',data.token,'This token authenticates the bot SDK and is shown only once. Give the bot roles after creation to control what it can do.'); render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});submit.disabled=false;}});
+        botList.setAttribute('aria-busy','true'); directApi(`/server/${serverId}/bots`).then((items)=>{botList.replaceChildren();botList.removeAttribute('aria-busy');for(const bot of (Array.isArray(items)?items:[])){const row=document.createElement('section');row.className='admin-role-card';const head=document.createElement('div');head.className='admin-role-head';const copy=document.createElement('div');const strong=document.createElement('strong');strong.textContent=bot.name;const small=document.createElement('small');small.textContent=`@${bot.username} · user ${bot.user_id}`;copy.append(strong,small);const actions=document.createElement('div');actions.className='admin-row-actions';const rotate=actionButton('Rotate token',async(e)=>{if(!window.confirm(`Rotate ${bot.name}'s token?`))return;e.currentTarget.disabled=true;try{const data=await directApi(`/server/${serverId}/bot/${bot.id}/rotate`,{method:'POST',body:{}});await copySecretDialog('New bot token',data.token,'The previous token is no longer valid.');}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{e.currentTarget.disabled=false;}});const remove=actionButton('Delete bot',async(e)=>{if(!window.confirm(`Delete bot ${bot.name} and its authored messages?`))return;e.currentTarget.disabled=true;try{await directApi(`/server/${serverId}/bot/${bot.id}/delete`,{method:'POST',body:{}});render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});e.currentTarget.disabled=false;}},true);actions.append(rotate,remove);head.append(copy,actions);row.append(head);botList.append(row);}if(!botList.children.length)adminMessage(botList,'No bots yet.');}).catch((error)=>{botList.removeAttribute('aria-busy');adminMessage(botList,error.message,'error');});
+      } else adminMessage(botList,'Your roles do not grant Manage Bots.');
+      wrap.append(botsSection); return wrap;
+    };
+    const copySecretDialog = async (title, secret, note) => {
+      const modal=modalShell(title,note); const field=document.createElement('textarea'); field.readOnly=true; field.rows=4; field.value=String(secret||''); field.className='admin-secret-value'; const actions=document.createElement('div');actions.className='admin-row-actions';const copy=document.createElement('button');copy.type='button';copy.className='btn';copy.textContent='Copy';copy.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(field.value);copy.textContent='Copied';}catch(_){field.focus();field.select();}});const close=document.createElement('button');close.type='button';close.className='btn secondary';close.textContent='I saved it';close.addEventListener('click',modal.destroy);actions.append(copy,close);modal.body.append(field,actions);field.focus();field.select();
+    };
     const render = () => {
       shell.body.replaceChildren(); const nav=document.createElement('nav');nav.className='admin-tabs';
-      const tabs=[['profile','My profile'],['overview','Overview'],['roles','Roles'],['members','Members'],['wires','Wires']];
+      const tabs=[['profile','My profile'],['overview','Overview'],['roles','Roles'],['members','Members'],['bans','Bans'],['wires','Wires'],['integrations','Integrations']];
       tabs.forEach(([id,label])=>{const b=document.createElement('button');b.type='button';b.textContent=label;b.classList.toggle('active',activeTab===id);b.addEventListener('click',()=>{activeTab=id;render()});nav.append(b)});shell.body.append(nav);
       const panel=document.createElement('div');panel.className='admin-panel';
-      panel.append(activeTab==='overview'?renderOverview():activeTab==='roles'?renderRoles():activeTab==='members'?renderMembers():activeTab==='wires'?renderWires():renderProfile());shell.body.append(panel);
+      panel.append(activeTab==='overview'?renderOverview():activeTab==='roles'?renderRoles():activeTab==='members'?renderMembers():activeTab==='bans'?renderBans():activeTab==='wires'?renderWires():activeTab==='integrations'?renderIntegrations():renderProfile());shell.body.append(panel);
     };
     try { await refresh(); shell.setTitle(serverData?.server?.name || 'Server settings'); render(); }
     catch (error) { shell.body.replaceChildren(); adminMessage(shell.body, `Could not load server settings: ${error.message}`, 'error'); }
@@ -1626,9 +1921,34 @@
     }
   };
 
+  const parseWireUrl = (url) => {
+    try {
+      const parsed = new URL(url, location.href);
+      if (parsed.origin !== location.origin) return null;
+      const hash = parsed.hash || '';
+      const prefix = hash.startsWith('#wire/') ? '#wire/' : hash.startsWith('#invite/') ? '#invite/' : '';
+      if (!prefix) return null;
+      const code = decodeURIComponent(hash.slice(prefix.length)).split(/[?&/]/, 1)[0].trim();
+      return /^[A-Za-z0-9_-]{8,80}$/.test(code) ? code : null;
+    } catch (_) { return null; }
+  };
+
   const fetchEmbed = (url) => {
     if (embedCache.has(url)) return Promise.resolve(embedCache.get(url));
     if (embedInFlight.has(url)) return embedInFlight.get(url);
+    const wireCode = parseWireUrl(url);
+    if (wireCode) {
+      const request = directApi(`/wires/${encodeURIComponent(wireCode)}`)
+        .then((invite) => {
+          const server = invite?.server || {};
+          const value = { type: 'plainwire_wire', url, code: wireCode, ...invite, server };
+          setEmbedCache(url, value); return value;
+        })
+        .catch(() => { setEmbedCache(url, null); return null; })
+        .finally(() => embedInFlight.delete(url));
+      embedInFlight.set(url, request);
+      return request;
+    }
     const request = fetch('/api/embed?url=' + encodeURIComponent(url), {
       headers: { accept: 'application/json' },
       credentials: 'same-origin'
@@ -1648,7 +1968,29 @@
     return request;
   };
 
+  const createWireEmbedCard = (meta) => {
+    const card=document.createElement('div'); card.className='link-embed wire-embed'; card.style.setProperty('--wire-accent', meta.server?.accent_color || '#5865f2');
+    if (meta.server?.banner_url) { const banner=document.createElement('img'); banner.className='wire-embed-banner'; banner.src=meta.server.banner_url; banner.alt=''; banner.loading='lazy'; banner.addEventListener('error',()=>banner.remove(),{once:true}); card.append(banner); }
+    const body=document.createElement('div'); body.className='wire-embed-body';
+    const identity=document.createElement('div'); identity.className='wire-embed-identity';
+    const icon=document.createElement(meta.server?.icon_url ? 'img':'div'); icon.className='wire-embed-icon';
+    if (icon instanceof HTMLImageElement) { icon.src=meta.server.icon_url; icon.alt=''; } else icon.textContent=String(meta.server?.name||'P').slice(0,1).toUpperCase();
+    const copy=document.createElement('div'); const eyebrow=document.createElement('small'); eyebrow.textContent='PLAINWIRE SERVER INVITE';
+    const title=document.createElement('strong'); title.textContent=meta.server?.name || 'Plainwire server';
+    const desc=document.createElement('p'); desc.textContent=meta.server?.description || meta.server?.welcome_message || 'You have been invited to join this server.';
+    copy.append(eyebrow,title,desc); identity.append(icon,copy); body.append(identity);
+    const metaRow=document.createElement('div'); metaRow.className='wire-embed-meta';
+    const members=document.createElement('span'); members.textContent=`${Number(meta.server?.member_count||0)} members`; metaRow.append(members);
+    if (meta.channel_name) { const channel=document.createElement('span'); channel.textContent=`# ${meta.channel_name}`; metaRow.append(channel); }
+    if (Number(meta.expires_at||0)>0) { const expiry=document.createElement('span'); expiry.textContent=Number(meta.expires_at)<=Date.now()?'Expired':`Expires ${new Date(Number(meta.expires_at)).toLocaleString()}`; metaRow.append(expiry); }
+    body.append(metaRow);
+    const actions=document.createElement('div'); actions.className='wire-embed-actions';
+    const open=document.createElement('a'); open.className='btn'; open.href=`#wire/${encodeURIComponent(meta.code)}`; open.textContent=meta.valid===false?'View invite':'Open Wire'; if(meta.valid===false) open.classList.add('secondary');
+    actions.append(open); body.append(actions); card.append(body); return card;
+  };
+
   const createEmbedCard = (meta) => {
+    if (meta?.type === 'plainwire_wire') return createWireEmbedCard(meta);
     const card = document.createElement('a');
     card.className = 'link-embed';
     card.href = meta.url;
@@ -2257,7 +2599,8 @@
     if (!meId || document.hidden || !navigator.onLine) return;
     debug('SYNC', 'visible_reconcile', { reason, route: location.hash || '#' });
     api({ method: 'GET', path: '/sync?since=0' });
-    refreshGlobalBanners();
+    applyClientExtensions().catch((error) => console.warn('[Plainwire:EXT] apply_failed', error));
+  refreshGlobalBanners();
 
     const hash = String(location.hash || '#').replace(/^#\/?/, '');
     let match = hash.match(/^dm\/(\d+)$/);
@@ -3244,6 +3587,112 @@
   attachmentInput.type = 'file';
   attachmentInput.multiple = true;
   attachmentInput.hidden = true;
+  const formatVoiceDuration = (seconds) => {
+    const whole = Math.max(0, Math.round(Number(seconds) || 0));
+    return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
+  };
+
+  const voiceNoteMimeType = () => {
+    const candidates = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/mp4'];
+    return candidates.find((type) => globalThis.MediaRecorder?.isTypeSupported?.(type)) || '';
+  };
+
+  const openVoiceNoteRecorder = async () => {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== 'function') {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Voice notes are not supported by this browser.' });
+      return;
+    }
+    if (!activeComposer()) {
+      send(app.ports.bridgeReceive, { tag: 'toast', data: 'Open a DM, thread, or text channel before recording a voice note.' });
+      return;
+    }
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints('standard'), video: false }); }
+    catch (_) { send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone access is required to record a voice note.' }); return; }
+    const mimeType = voiceNoteMimeType();
+    let recorder;
+    try { recorder = new MediaRecorder(stream, mimeType ? { mimeType, audioBitsPerSecond: 96000 } : { audioBitsPerSecond: 96000 }); }
+    catch (_) { stream.getTracks().forEach((track) => track.stop()); send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not start the voice recorder.' }); return; }
+    const chunks = [];
+    const startedAt = performance.now();
+    let stopped = false;
+    let durationSeconds = 0;
+    const shell = document.createElement('div'); shell.className = 'account-password-fields voice-note-recorder';
+    const meter = document.createElement('div'); meter.className = 'voice-note-live';
+    const dot = document.createElement('span'); dot.className = 'voice-note-live-dot';
+    const elapsed = document.createElement('strong'); elapsed.textContent = '0:00';
+    const hint = document.createElement('p'); hint.className = 'muted'; hint.textContent = 'Recording locally. Nothing uploads until you choose Use voice note.';
+    meter.append(dot, elapsed); shell.append(meter, hint);
+    const dialog = showAccountDialog({ title: 'Record voice note', subtitle: 'Up to 5 minutes. Opus is used when your browser supports it.', content: shell, actions: [] });
+    const footer = document.createElement('div'); footer.className = 'account-dialog-actions'; dialog.dialog.append(footer);
+    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'btn secondary'; cancel.textContent = 'Cancel';
+    const stop = document.createElement('button'); stop.type = 'button'; stop.className = 'btn danger'; stop.textContent = 'Stop recording';
+    const use = document.createElement('button'); use.type = 'button'; use.className = 'btn'; use.textContent = 'Use voice note'; use.disabled = true;
+    footer.append(cancel, stop, use);
+    const finishTracks = () => stream.getTracks().forEach((track) => { try { track.stop(); } catch (_) {} });
+    const timer = setInterval(() => {
+      if (stopped) return;
+      durationSeconds = Math.min(300, (performance.now() - startedAt) / 1000);
+      elapsed.textContent = formatVoiceDuration(durationSeconds);
+      if (durationSeconds >= 300) recorder.stop();
+    }, 200);
+    recorder.addEventListener('dataavailable', (event) => { if (event.data?.size) chunks.push(event.data); });
+    recorder.addEventListener('stop', () => {
+      stopped = true; clearInterval(timer); finishTracks();
+      durationSeconds = Math.min(300, Math.max(0.1, (performance.now() - startedAt) / 1000));
+      elapsed.textContent = formatVoiceDuration(durationSeconds); dot.classList.add('stopped'); stop.disabled = true; stop.textContent = 'Recorded'; use.disabled = chunks.length === 0;
+    }, { once: true });
+    recorder.start(250);
+    const closeCleanly = () => {
+      clearInterval(timer);
+      if (!stopped && recorder.state !== 'inactive') { try { recorder.stop(); } catch (_) {} }
+      finishTracks(); closeAccountDialog();
+    };
+    cancel.addEventListener('click', closeCleanly);
+    stop.addEventListener('click', () => { if (recorder.state !== 'inactive') recorder.stop(); });
+    use.addEventListener('click', async () => {
+      if (!stopped || !chunks.length) return;
+      use.disabled = true; cancel.disabled = true;
+      use.textContent = 'Uploading…';
+      try {
+        const type = recorder.mimeType || mimeType || 'audio/webm';
+        const ext = type.includes('ogg') ? 'ogg' : type.includes('mp4') ? 'm4a' : 'webm';
+        const blob = new Blob(chunks, { type });
+        if (!blob.size) throw new Error('empty_voice_note');
+        const file = new File([blob], `voice-note-${Date.now()}.${ext}`, { type, lastModified: Date.now() });
+        const uploaded = await uploadOne(file);
+        const markup = `[Voice note · ${formatVoiceDuration(durationSeconds)}](${uploaded.url}#plainwire-voice-note)`;
+        closeAccountDialog();
+        if (!insertIntoComposer(markup)) {
+          send(app.ports.bridgeReceive, { tag: 'attachment_ready', route: location.hash, data: markup });
+        }
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Voice note attached. Send when ready.' });
+      } catch (error) {
+        use.disabled = false; cancel.disabled = false; use.textContent = 'Retry upload';
+        send(app.ports.bridgeReceive, { tag: 'toast', data: `Voice note upload failed: ${error.message}` });
+      }
+    });
+  };
+
+  const upgradeVoiceNoteLinks = (root = document) => {
+    root.querySelectorAll?.('a[href*="#plainwire-voice-note"]:not([data-voice-upgraded])').forEach((link) => {
+      link.dataset.voiceUpgraded = 'true';
+      const href = link.getAttribute('href') || '';
+      if (!href.startsWith('/api/files/')) return;
+      const wrap = document.createElement('span'); wrap.className = 'voice-note-player';
+      const label = document.createElement('span'); label.className = 'voice-note-label'; label.textContent = link.textContent || 'Voice note';
+      const audio = document.createElement('audio'); audio.controls = true; audio.preload = 'metadata'; audio.src = href.replace('#plainwire-voice-note', '');
+      wrap.append(label, audio);
+      const parent = link.parentNode;
+      if (parent) { parent.insertBefore(wrap, link); link.remove(); }
+    });
+  };
+  const voiceNoteObserver = new MutationObserver((records) => {
+    for (const record of records) for (const node of record.addedNodes) if (node.nodeType === 1) upgradeVoiceNoteLinks(node);
+  });
+  voiceNoteObserver.observe(document.documentElement, { childList: true, subtree: true });
+  upgradeVoiceNoteLinks();
+
   attachmentInput.addEventListener('change', () => { uploadFiles(attachmentInput.files); attachmentInput.value = ''; });
   document.body.appendChild(attachmentInput);
   document.addEventListener('paste', (event) => {
@@ -6988,6 +7437,53 @@
     });
   };
 
+  const openAccountLifecycleDialog = (mode) => {
+    const deleting = mode === 'delete';
+    const content = document.createElement('div');
+    content.className = 'account-password-fields';
+    const warning = document.createElement('p');
+    warning.className = deleting ? 'account-destructive-warning' : 'muted';
+    warning.textContent = deleting
+      ? 'This permanently removes your account row and account-owned data that cannot survive without an owner. Servers, group DMs, and forums with other members are transferred to an existing member where possible. This cannot be undone.'
+      : 'Disabling signs out every session immediately. Your durable data stays in PostgreSQL, and signing in again with your password reactivates the account.';
+    const field = document.createElement('label'); field.className = 'field';
+    const label = document.createElement('span'); label.textContent = 'Current password';
+    const password = document.createElement('input'); password.type = 'password'; password.autocomplete = 'current-password'; password.maxLength = 256;
+    field.append(label, password);
+    const confirm = document.createElement('label'); confirm.className = 'field';
+    const confirmLabel = document.createElement('span'); confirmLabel.textContent = deleting ? 'Type DELETE to confirm' : 'Type DISABLE to confirm';
+    const confirmInput = document.createElement('input'); confirmInput.type = 'text'; confirmInput.autocomplete = 'off'; confirmInput.spellcheck = false;
+    confirm.append(confirmLabel, confirmInput);
+    const status = document.createElement('div'); status.className = 'account-dialog-status';
+    content.append(warning, field, confirm, status);
+    showAccountDialog({
+      title: deleting ? 'Delete account permanently' : 'Disable account',
+      subtitle: deleting ? 'Plainwire will not keep a ghost user profile behind.' : 'This is reversible by signing in again.',
+      content,
+      actions: [
+        { label: 'Cancel', onClick: closeAccountDialog },
+        { label: deleting ? 'Delete account' : 'Disable account', className: 'btn danger', onClick: async (button) => {
+          status.textContent = '';
+          const expected = deleting ? 'DELETE' : 'DISABLE';
+          if (confirmInput.value.trim() !== expected) { status.textContent = `Type ${expected} exactly to continue.`; confirmInput.focus(); return; }
+          if (!password.value) { status.textContent = 'Enter your current password.'; password.focus(); return; }
+          button.disabled = true;
+          try {
+            await accountApi('POST', deleting ? '/account/delete' : '/account/disable', { password: password.value });
+            closeAccountDialog();
+            try { ws?.close?.(1000, deleting ? 'account deleted' : 'account disabled'); } catch (_) {}
+            location.hash = '#login';
+            location.reload();
+          } catch (error) {
+            status.textContent = ({ bad_password: 'Current password is incorrect.', rate_limited: 'Too many attempts. Try again later.' })[error.message]
+              || (deleting ? 'Could not delete the account.' : 'Could not disable the account.');
+            button.disabled = false;
+          }
+        } }
+      ]
+    });
+  };
+
   const openSessionsDialog = async () => {
     const content = document.createElement('div');
     content.className = 'session-list';
@@ -7231,6 +7727,20 @@
       case 'open_server_admin':
         openServerAdmin(Number(data)).catch(error => send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not open server settings: ${error.message}` }));
         break;
+      case 'server_profile_edit_roles':
+        openServerProfileRoleEditor(data).catch(error => send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not edit member roles: ${error.message}` }));
+        break;
+      case 'server_profile_ban': {
+        const serverId = Number(data?.server_id); const userId = Number(data?.user_id); const name = String(data?.display_name || 'this member');
+        if (!Number.isInteger(serverId) || !Number.isInteger(userId) || !window.confirm(`Ban ${name} from this server? They will be unable to rejoin with a Wire until unbanned.`)) break;
+        const reason = (window.prompt('Ban reason (optional):', '') || '').trim().slice(0, 512);
+        directApi(`/server/${serverId}/member/${userId}/ban`, { method: 'POST', body: { reason } }).then(async () => {
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Member banned' });
+          await api({ method: 'GET', path: '/sync?since=0' });
+          location.hash = `#server/${serverId}`;
+        }).catch(error => send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not ban member: ${error.message}` }));
+        break;
+      }
       case 'open_group_admin':
         openGroupAdmin(Number(data)).catch(error => send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not open group moderation: ${error.message}` }));
         break;
@@ -7520,11 +8030,23 @@
       case 'account_change_password':
         openPasswordDialog();
         break;
+      case 'account_disable':
+        openAccountLifecycleDialog('disable');
+        break;
+      case 'account_delete':
+        openAccountLifecycleDialog('delete');
+        break;
+      case 'record_voice_note':
+        openVoiceNoteRecorder();
+        break;
       case 'account_sessions':
         openSessionsDialog();
         break;
       case 'account_diagnostics':
         openDiagnosticsDialog();
+        break;
+      case 'open_extensions':
+        openExtensionsManager();
         break;
       case 'request_notifications':
         if ('Notification' in window) {

@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT"
+
+: "${PLAINWIRE_SCYLLA_CONTACT_POINTS:=127.0.0.1}"
+: "${PLAINWIRE_SCYLLA_PORT:=9042}"
+: "${PLAINWIRE_SCYLLA_KEYSPACE:=plainwire}"
+: "${PLAINWIRE_SCYLLA_LOCAL_DC:=datacenter1}"
+: "${PLAINWIRE_SCYLLA_REPLICATION_FACTOR:=1}"
+
+command -v cqlsh >/dev/null 2>&1 || { echo "cqlsh is required" >&2; exit 127; }
+HOST="${PLAINWIRE_SCYLLA_CONTACT_POINTS%%,*}"
+KEYSPACE="$PLAINWIRE_SCYLLA_KEYSPACE"
+DC="$PLAINWIRE_SCYLLA_LOCAL_DC"
+RF="$PLAINWIRE_SCYLLA_REPLICATION_FACTOR"
+[[ "$KEYSPACE" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || { echo "invalid keyspace name" >&2; exit 2; }
+[[ "$DC" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || { echo "invalid local datacenter name" >&2; exit 2; }
+[[ "$RF" =~ ^[1-9][0-9]*$ ]] && (( RF <= 16 )) || { echo "replication factor must be 1..16" >&2; exit 2; }
+[[ "$PLAINWIRE_SCYLLA_PORT" =~ ^[0-9]+$ ]] && (( PLAINWIRE_SCYLLA_PORT >= 1 && PLAINWIRE_SCYLLA_PORT <= 65535 )) || { echo "invalid Scylla port" >&2; exit 2; }
+
+reject_config_newlines() {
+  local label=$1 value=${2:-}
+  # Bash/environment strings cannot contain NUL. Testing with $'\0' creates an
+  # empty pattern and would reject every value, so guard the actual cqlshrc
+  # injection delimiters: CR/LF. Tabs stay within the value and are harmless.
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || {
+    printf '%s must not contain newline characters\n' "$label" >&2
+    exit 2
+  }
+}
+
+parse_bool() {
+  local label=$1 raw=${2:-false}
+  case "${raw,,}" in
+    1|true|yes|on) printf 'true' ;;
+    0|false|no|off|'') printf 'false' ;;
+    *) printf '%s must be a boolean (true/false, 1/0, yes/no, on/off)\n' "$label" >&2; return 2 ;;
+  esac
+}
+reject_config_newlines PLAINWIRE_SCYLLA_USERNAME "${PLAINWIRE_SCYLLA_USERNAME:-}"
+reject_config_newlines PLAINWIRE_SCYLLA_PASSWORD "${PLAINWIRE_SCYLLA_PASSWORD:-}"
+reject_config_newlines PLAINWIRE_SCYLLA_CA_FILE "${PLAINWIRE_SCYLLA_CA_FILE:-}"
+reject_config_newlines PLAINWIRE_SCYLLA_CERT_FILE "${PLAINWIRE_SCYLLA_CERT_FILE:-}"
+reject_config_newlines PLAINWIRE_SCYLLA_KEY_FILE "${PLAINWIRE_SCYLLA_KEY_FILE:-}"
+reject_config_newlines PLAINWIRE_SCYLLA_CONTACT_POINTS "$PLAINWIRE_SCYLLA_CONTACT_POINTS"
+
+SCYLLA_USER=${PLAINWIRE_SCYLLA_USERNAME:-}
+SCYLLA_PASS=${PLAINWIRE_SCYLLA_PASSWORD:-}
+if [[ -n "$SCYLLA_USER" || -n "$SCYLLA_PASS" ]]; then
+  [[ -n "$SCYLLA_USER" && -n "$SCYLLA_PASS" ]] || { echo "Scylla authentication requires both PLAINWIRE_SCYLLA_USERNAME and PLAINWIRE_SCYLLA_PASSWORD" >&2; exit 2; }
+fi
+
+TLS_ENABLED=$(parse_bool PLAINWIRE_SCYLLA_TLS "${PLAINWIRE_SCYLLA_TLS:-false}")
+
+CQLSHRC=$(mktemp "${TMPDIR:-/tmp}/plainwire-cqlshrc.XXXXXX")
+chmod 600 "$CQLSHRC"
+cleanup() { rm -f "$CQLSHRC"; }
+trap cleanup EXIT HUP INT TERM
+{
+  if [[ -n "$SCYLLA_USER" ]]; then
+    printf '[authentication]\n'
+    printf 'username = %s\n' "$SCYLLA_USER"
+    printf 'password = %s\n' "$SCYLLA_PASS"
+  fi
+  if [[ "$TLS_ENABLED" == "true" ]]; then
+    [[ -n "${PLAINWIRE_SCYLLA_CA_FILE:-}" && -r "$PLAINWIRE_SCYLLA_CA_FILE" ]] || { echo "TLS requires readable PLAINWIRE_SCYLLA_CA_FILE" >&2; exit 2; }
+    cert=${PLAINWIRE_SCYLLA_CERT_FILE:-}
+    key=${PLAINWIRE_SCYLLA_KEY_FILE:-}
+    if [[ -n "$cert" || -n "$key" ]]; then
+      [[ -n "$cert" && -n "$key" ]] || { echo "mTLS requires both PLAINWIRE_SCYLLA_CERT_FILE and PLAINWIRE_SCYLLA_KEY_FILE" >&2; exit 2; }
+      [[ -r "$cert" && -r "$key" ]] || { echo "Scylla client certificate/key must be readable" >&2; exit 2; }
+    fi
+    printf '\n[ssl]\nvalidate = true\ncertfile = %s\n' "$PLAINWIRE_SCYLLA_CA_FILE"
+    if [[ -n "$cert" ]]; then
+      printf 'usercert = %s\nuserkey = %s\n' "$cert" "$key"
+    fi
+  elif [[ -n "${PLAINWIRE_SCYLLA_CERT_FILE:-}" || -n "${PLAINWIRE_SCYLLA_KEY_FILE:-}" ]]; then
+    echo "client certificate/key require PLAINWIRE_SCYLLA_TLS=true" >&2
+    exit 2
+  fi
+} > "$CQLSHRC"
+
+SSL=()
+[[ "$TLS_ENABLED" == "true" ]] && SSL+=(--ssl)
+REPLICATION="{'class':'NetworkTopologyStrategy','${DC}':${RF}}"
+
+cqlsh "$HOST" "$PLAINWIRE_SCYLLA_PORT" --cqlshrc "$CQLSHRC" "${SSL[@]}" -e \
+  "CREATE KEYSPACE IF NOT EXISTS ${KEYSPACE} WITH replication = ${REPLICATION};"
+cqlsh "$HOST" "$PLAINWIRE_SCYLLA_PORT" --cqlshrc "$CQLSHRC" "${SSL[@]}" -k "$KEYSPACE" -e \
+  "CREATE TABLE IF NOT EXISTS plainwire_schema_migrations (name text PRIMARY KEY, applied_at timestamp);"
+cqlsh "$HOST" "$PLAINWIRE_SCYLLA_PORT" --cqlshrc "$CQLSHRC" "${SSL[@]}" -k "$KEYSPACE" -e \
+  "CREATE TABLE IF NOT EXISTS plainwire_schema_migration_checksums (name text PRIMARY KEY, sha256 text, applied_at timestamp);"
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" | awk '{print $NF}'
+  else echo 'sha256sum, shasum, or openssl is required for migration integrity checks' >&2; return 127
+  fi
+}
+
+shopt -s nullglob
+MIGRATIONS=(priv/scylla/[0-9][0-9][0-9]_*.cql)
+(( ${#MIGRATIONS[@]} > 0 )) || { echo "no Scylla migrations found" >&2; exit 2; }
+for migration in "${MIGRATIONS[@]}"; do
+  name=$(basename "$migration" .cql)
+  [[ "$name" =~ ^[0-9]{3}_[A-Za-z0-9_-]+$ ]] || { echo "invalid Scylla migration filename: $migration" >&2; exit 2; }
+  checksum=$(sha256_file "$migration")
+  if cqlsh "$HOST" "$PLAINWIRE_SCYLLA_PORT" --cqlshrc "$CQLSHRC" "${SSL[@]}" -k "$KEYSPACE" \
+      -e "SELECT name FROM plainwire_schema_migrations WHERE name='${name}';" | grep -Eq "(^|[[:space:]|])${name}([[:space:]|]|$)"; then
+    if cqlsh "$HOST" "$PLAINWIRE_SCYLLA_PORT" --cqlshrc "$CQLSHRC" "${SSL[@]}" -k "$KEYSPACE" \
+        -e "SELECT sha256 FROM plainwire_schema_migration_checksums WHERE name='${name}';" | grep -Fq "$checksum"; then
+      printf 'Scylla migration already applied and verified: %s\n' "$name"
+      continue
+    fi
+    echo "applied Scylla migration checksum mismatch or missing checksum: ${name}" >&2
+    echo "Refusing to continue. Never edit an applied migration; add a new numbered migration instead." >&2
+    exit 3
+  fi
+  printf 'Applying Scylla migration: %s\n' "$name"
+  cqlsh "$HOST" "$PLAINWIRE_SCYLLA_PORT" --cqlshrc "$CQLSHRC" "${SSL[@]}" -k "$KEYSPACE" -f "$migration"
+  cqlsh "$HOST" "$PLAINWIRE_SCYLLA_PORT" --cqlshrc "$CQLSHRC" "${SSL[@]}" -k "$KEYSPACE" -e \
+    "INSERT INTO plainwire_schema_migrations(name,applied_at) VALUES('${name}',toTimestamp(now())); INSERT INTO plainwire_schema_migration_checksums(name,sha256,applied_at) VALUES('${name}','${checksum}',toTimestamp(now()));"
+done
+printf 'Plainwire Scylla schema is current for keyspace %s (dc=%s rf=%s)\n' "$KEYSPACE" "$DC" "$RF"

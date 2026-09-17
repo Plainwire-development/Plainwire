@@ -242,7 +242,7 @@ authed(_, _, Req, _Session, _Hash, State) -> reply_error(Req, 404, <<"not_found"
 
 public_json(Req0, Kind, Limit, Fun, State) ->
     Ip = pw_util:ip(Req0),
-    case pw_rate:allow({admin_auth, Kind, Ip}, Limit, 300000) of
+    case pw_rate:allow_shared({admin_auth, Kind, Ip}, Limit, 300000) of
         false -> reply_error(Req0, 429, <<"rate_limited">>, State);
         true -> with_json(Req0, Fun, State)
     end.

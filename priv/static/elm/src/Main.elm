@@ -2766,11 +2766,13 @@ serverProfileRoleDecoder =
 
 serverProfileDecoder : Decoder ServerProfile
 serverProfileDecoder =
-    D.map4 ServerProfile
+    D.map6 ServerProfile
         (D.field "server_id" D.int)
         (D.field "server_name" D.string)
         (D.field "member" decodeServerMember)
         (D.field "roles" (D.list serverProfileRoleDecoder) |> defaultValue [])
+        (D.field "can_manage_roles" D.bool |> defaultValue False)
+        (D.field "can_ban_members" D.bool |> defaultValue False)
 
 
 handleServerProfile : E.Value -> Model -> ( Model, Cmd Msg )
@@ -5590,6 +5592,22 @@ serverProfileModal model profile =
             ]
         , div [ class "profile-actions server-profile-actions" ]
             [ button [ class "btn secondary", onClick (Go ("#profile/" ++ String.fromInt user.id)) ] [ text "View full profile" ]
+            , if profile.canManageRoles then
+                button
+                    [ class "btn secondary"
+                    , onClick
+                        (BridgeEvent "server_profile_edit_roles"
+                            (E.object
+                                [ ( "server_id", E.int profile.serverId )
+                                , ( "user_id", E.int user.id )
+                                ]
+                            )
+                        )
+                    ]
+                    [ text "Edit roles" ]
+
+              else
+                text ""
             , if viewingSelf then
                 text ""
 
@@ -5600,6 +5618,23 @@ serverProfileModal model profile =
 
               else
                 button [ class "btn secondary", onClick (BridgeEvent "call_user" (E.int user.id)) ] [ text "Call" ]
+            , if profile.canBanMembers && not viewingSelf then
+                button
+                    [ class "btn danger"
+                    , onClick
+                        (BridgeEvent "server_profile_ban"
+                            (E.object
+                                [ ( "server_id", E.int profile.serverId )
+                                , ( "user_id", E.int user.id )
+                                , ( "display_name", E.string displayName )
+                                ]
+                            )
+                        )
+                    ]
+                    [ text "Ban" ]
+
+              else
+                text ""
             ]
         ]
     ]
@@ -6881,7 +6916,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "1.9.0", attribute "data-ui-revision" "interface-4" ]
+    div [ class "layout", attribute "data-ui-version" "2.0.0", attribute "data-ui-revision" "interface-5" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -9891,10 +9926,14 @@ renderAccountSettings user model =
             ]
         , div [ class "danger-zone" ]
             [ div []
-                [ b [] [ text "Log out" ]
-                , p [ class "muted" ] [ text "End this browser session." ]
+                [ b [] [ text "Account lifecycle" ]
+                , p [ class "muted" ] [ text "Log out, temporarily disable the account, or permanently delete it and its account row." ]
                 ]
-            , button [ class "btn danger", onClick Logout ] [ text "Log out" ]
+            , div [ class "danger-zone-actions" ]
+                [ button [ class "btn secondary", onClick Logout ] [ text "Log out" ]
+                , button [ class "btn danger", onClick (BridgeEvent "account_disable" E.null) ] [ text "Disable account" ]
+                , button [ class "btn danger", onClick (BridgeEvent "account_delete" E.null) ] [ text "Delete account" ]
+                ]
             ]
         ]
 
@@ -10079,6 +10118,13 @@ renderAppearanceSettings model =
                 [ settingsChoice (not model.reduceMotion) "Standard" (BridgeEvent "reduce_motion" (E.bool False))
                 , settingsChoice model.reduceMotion "Reduced" (BridgeEvent "reduce_motion" (E.bool True))
                 ]
+            ]
+        , div [ class "setting-row" ]
+            [ div []
+                [ b [] [ text "Themes & plugins" ]
+                , small [ class "muted" ] [ text "Install client-side Less themes and sandboxed plugins for this browser." ]
+                ]
+            , button [ class "btn secondary settings-action", onClick (BridgeEvent "open_extensions" E.null) ] [ text "Manage" ]
             ]
         ]
 

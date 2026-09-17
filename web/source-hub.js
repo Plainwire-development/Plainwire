@@ -1,4 +1,4 @@
-// Plainwire Source Hub: live, read-only GitHub development visibility.
+// Plainwire Source Hub: refreshed, read-only GitHub development visibility.
 // All GitHub API traffic is proxied by the Plainwire backend. The browser only
 // receives public metadata and never sees a GitHub token.
 const SOURCE_ORG = 'Plainwire-development';
@@ -167,10 +167,22 @@ const emptyState = (title, copy) => {
   return node;
 };
 
+const pushCommitCount = payload => {
+  const candidates = [payload?.distinct_size, payload?.size, Array.isArray(payload?.commits) ? payload.commits.length : undefined];
+  for (const value of candidates) {
+    const count = Number(value);
+    if (Number.isInteger(count) && count > 0) return count;
+  }
+  return null;
+};
+
 const eventLabel = event => {
   const payload = event?.payload || {};
   switch (event?.type) {
-    case 'PushEvent': return `pushed ${Array.isArray(payload.commits) ? payload.commits.length : 0} commit${payload.commits?.length === 1 ? '' : 's'}`;
+    case 'PushEvent': {
+      const count = pushCommitCount(payload);
+      return count ? `pushed ${count} commit${count === 1 ? '' : 's'}` : 'pushed updates';
+    }
     case 'CreateEvent': return `created ${payload.ref_type || 'repository item'}${payload.ref ? ` ${payload.ref}` : ''}`;
     case 'DeleteEvent': return `deleted ${payload.ref_type || 'repository item'}${payload.ref ? ` ${payload.ref}` : ''}`;
     case 'ReleaseEvent': return `${payload.action || 'published'} release ${payload.release?.tag_name || ''}`.trim();
@@ -309,7 +321,7 @@ class PlainwireSourceHub extends HTMLElement {
   }
 
   hasDataErrors() {
-    const nested = [this.state.overview?.errors, this.state.repo?.errors, this.state.profile?.errors];
+    const nested = [this.state.overview?.errors, this.state.overview?.contributor_errors, this.state.repo?.errors, this.state.profile?.errors];
     return Boolean(this.state.overviewError || this.state.repoError || this.state.profileError || this.state.fileError || nested.some(value => value && typeof value === 'object' && Object.keys(value).length));
   }
 
@@ -323,10 +335,10 @@ class PlainwireSourceHub extends HTMLElement {
       chip.classList.toggle('is-loading', loading);
       chip.classList.toggle('is-warning', degraded);
       chip.textContent = loading
-        ? 'Updating live data…'
+        ? 'Refreshing GitHub data…'
         : degraded
           ? `Cached · refresh incomplete · ${relativeDate(this.state.lastRefresh || Date.now())}`
-          : `Live · refreshed ${relativeDate(this.state.lastRefresh || Date.now())}`;
+          : `GitHub · refreshed ${relativeDate(this.state.lastRefresh || Date.now())}`;
     }
   }
 
@@ -453,7 +465,7 @@ class PlainwireSourceHub extends HTMLElement {
       invalid_profile: 'That GitHub profile name is invalid.', invalid_path: 'That source path is invalid.', invalid_ref: 'That Git reference is invalid.',
       not_authenticated: 'Your Plainwire session is no longer authenticated. Sign in again to refresh development data.',
       github_unavailable: 'GitHub is temporarily unavailable from this Plainwire server.'
-    })[error] || 'Live GitHub data could not be loaded right now.';
+    })[error] || 'GitHub data could not be loaded right now.';
   }
 
   renderShell() { this.replaceChildren(textNode('div', 'source-hub-skeleton', 'Loading Plainwire development data…')); }
@@ -473,9 +485,9 @@ class PlainwireSourceHub extends HTMLElement {
     const hero = textNode('section', 'source-hero card');
     const copy = textNode('div', 'source-hero-copy');
     copy.append(textNode('span', 'eyebrow', 'Open development'), textNode('h1', '', 'Plainwire, under the hood'));
-    copy.append(textNode('p', 'muted', 'A live view of the code, releases, contributors, architecture, and public work happening across Plainwire.'));
+    copy.append(textNode('p', 'muted', 'A current view of Plainwire’s public code, releases, contributors, architecture, and development activity.'));
     const actions = textNode('div', 'source-hero-actions');
-    const status = textNode('span', 'source-live-chip', 'Live'); status.dataset.sourceStatus = 'true';
+    const status = textNode('span', 'source-live-chip', 'GitHub'); status.dataset.sourceStatus = 'true';
     actions.append(status, button('Take the tour', 'btn secondary source-tour-button', () => this.startTour()), button('Refresh', 'btn secondary', () => this.refreshVisible()), githubLink('Open GitHub ↗', SOURCE_ROOT, 'btn ghost source-external'));
     hero.append(copy, actions);
     return hero;
@@ -538,43 +550,82 @@ class PlainwireSourceHub extends HTMLElement {
     head.firstChild.append(textNode('span', 'eyebrow', 'Development pulse'), textNode('h2', '', 'What changed recently'));
     panel.append(head);
     const events = Array.isArray(this.state.overview?.activity) ? this.state.overview.activity : [];
-    if (!events.length) { panel.append(emptyState('No recent public activity', 'GitHub did not return recent organization events. Repository pages still show commits and releases directly.')); return panel; }
     const grid = textNode('div', 'source-activity-grid');
     const list = textNode('div', 'source-activity-list');
-    for (const event of events.slice(0, 40)) list.append(this.renderEvent(event));
-    grid.append(list, this.renderActiveContributors(events));
+    if (events.length) {
+      for (const event of events.slice(0, 40)) list.append(this.renderEvent(event));
+    } else {
+      list.append(emptyState('No recent public activity', 'GitHub did not return recent organization events. Commit authors are still loaded independently from repository history.'));
+    }
+    grid.append(list, this.renderActiveContributors(events, this.state.overview?.contributors || []));
     panel.append(grid);
     return panel;
   }
 
-  renderActiveContributors(events) {
+  renderActiveContributors(events, contributors) {
     const card = textNode('aside', 'card source-active-contributors source-tour-contributors');
-    card.append(textNode('span', 'eyebrow', 'Active contributors'), textNode('h3', '', 'Recently active on Plainwire'));
-    const actors = new Map();
-    for (const event of events) {
+    card.append(textNode('span', 'eyebrow', 'Contributors'), textNode('h3', '', 'People committing across Plainwire'));
+    const people = new Map();
+    const orgKey = SOURCE_ORG.toLowerCase();
+
+    for (const raw of Array.isArray(contributors) ? contributors : []) {
+      const login = String(raw?.login || '').trim();
+      const name = String(raw?.name || '').trim();
+      if (login && login.toLowerCase() === orgKey) continue;
+      const anonymous = raw?.anonymous === true || !login;
+      const key = login ? `login:${login.toLowerCase()}` : name ? `anonymous:${name.toLowerCase()}` : '';
+      if (!key) continue;
+      people.set(key, {
+        person: raw,
+        anonymous,
+        contributions: Math.max(0, Number(raw?.contributions || 0)),
+        repositories: Array.isArray(raw?.repositories) ? raw.repositories : [],
+        events: 0,
+        last: ''
+      });
+    }
+
+    for (const event of Array.isArray(events) ? events : []) {
       const actor = event?.actor || {};
       const login = String(actor.login || '').trim();
-      if (!login) continue;
-      const key = login.toLowerCase();
-      const current = actors.get(key) || { actor, count: 0, last: event.created_at || '' };
-      current.count += 1;
-      if (String(event.created_at || '') > String(current.last || '')) current.last = event.created_at;
-      if (!current.actor?.avatar_url && actor.avatar_url) current.actor = actor;
-      actors.set(key, current);
+      if (!login || login.toLowerCase() === orgKey || !validGitHubLogin(login)) continue;
+      const key = `login:${login.toLowerCase()}`;
+      const current = people.get(key) || { person: actor, anonymous: false, contributions: 0, repositories: [], events: 0, last: '' };
+      current.events += 1;
+      if (String(event.created_at || '') > String(current.last || '')) current.last = event.created_at || '';
+      if (!current.person?.avatar_url && actor.avatar_url) current.person = { ...current.person, ...actor };
+      people.set(key, current);
     }
-    const ranked = [...actors.values()].sort((a, b) => b.count - a.count || String(b.last).localeCompare(String(a.last))).slice(0, 10);
-    if (!ranked.length) { card.append(textNode('p', 'muted', 'No contributor activity was returned in the current public event window.')); return card; }
+
+    const ranked = [...people.values()].sort((a, b) =>
+      b.contributions - a.contributions || b.events - a.events || String(b.last).localeCompare(String(a.last))
+    );
+    if (!ranked.length) {
+      card.append(textNode('p', 'muted', 'No public commit authors were returned for the current Plainwire repositories.'));
+      return card;
+    }
+
     const list = textNode('div', 'source-active-contributor-list');
     for (const entry of ranked) {
-      const login = entry.actor.login;
-      const row = textNode('button', 'source-active-contributor'); row.type = 'button';
+      const person = entry.person || {};
+      const login = String(person.login || '').trim();
+      const name = String(person.name || login || 'Unlinked author').trim();
+      const interactive = !entry.anonymous && validGitHubLogin(login);
+      const row = textNode(interactive ? 'button' : 'div', `source-active-contributor${entry.anonymous ? ' is-anonymous' : ''}`);
+      if (interactive) row.type = 'button';
       const copy = textNode('span', 'source-active-contributor-copy');
-      copy.append(textNode('strong', '', login), textNode('small', 'muted', `${entry.count} recent event${entry.count === 1 ? '' : 's'} · ${relativeDate(entry.last)}`));
-      row.append(avatar(entry.actor, 'sm'), copy, textNode('span', 'source-row-chevron', '›'));
-      row.addEventListener('click', () => this.navigateSource(`profile/${encodeURIComponent(login)}`));
+      const repositoryCount = entry.repositories.length;
+      const detail = entry.contributions > 0
+        ? `${formatNumber(entry.contributions)} commit contribution${entry.contributions === 1 ? '' : 's'}${repositoryCount ? ` · ${repositoryCount} repo${repositoryCount === 1 ? '' : 's'}` : ''}`
+        : entry.events > 0
+          ? `${entry.events} recent public event${entry.events === 1 ? '' : 's'}`
+          : 'Public commit author';
+      copy.append(textNode('strong', '', interactive ? login : name), textNode('small', 'muted', detail));
+      row.append(avatar(person, 'sm'), copy, interactive ? textNode('span', 'source-row-chevron', '›') : pill('Unlinked', 'subtle'));
+      if (interactive) row.addEventListener('click', () => this.navigateSource(`profile/${encodeURIComponent(login)}`));
       list.append(row);
     }
-    card.append(list, textNode('p', 'muted source-active-note', 'Activity is derived from GitHub’s current public organization event window, not an all-time ranking.'));
+    card.append(list, textNode('p', 'muted source-active-note', 'Commit counts come from GitHub’s contributor data across every public Plainwire repository. Unlinked authors are counted without exposing commit e-mail addresses.'));
     return card;
   }
 
@@ -584,7 +635,11 @@ class PlainwireSourceHub extends HTMLElement {
     const av = avatar(actor, 'sm');
     const body = textNode('div', 'source-activity-copy');
     const line = textNode('div', 'source-activity-line');
-    const actorBtn = button(actor.login || 'GitHub user', 'source-inline-button', () => actor.login && this.navigateSource(`profile/${encodeURIComponent(actor.login)}`));
+    const actorLogin = String(actor.login || '').trim();
+    const actorIsOrganization = actorLogin.toLowerCase() === SOURCE_ORG.toLowerCase();
+    const actorBtn = actorIsOrganization || !validGitHubLogin(actorLogin)
+      ? textNode('strong', 'source-activity-actor', actorIsOrganization ? 'Plainwire Development' : (actorLogin || 'GitHub user'))
+      : button(actorLogin, 'source-inline-button', () => this.navigateSource(`profile/${encodeURIComponent(actorLogin)}`));
     const repo = repoShortName(event.repo?.name);
     const repoBtn = button(repo || 'repository', 'source-inline-button', () => repo && this.navigateSource(`repo/${encodeURIComponent(repo)}`));
     line.append(actorBtn, document.createTextNode(` ${eventLabel(event)} in `), repoBtn);
@@ -847,14 +902,25 @@ class PlainwireSourceHub extends HTMLElement {
 
   renderContributors(data) {
     const panel = textNode('div', 'source-panel source-tour-contributors');
-    const head = textNode('div', 'source-section-head'); const title = textNode('div'); title.append(textNode('span', 'eyebrow', 'Contributors'), textNode('h2', '', 'People active in this repository'), textNode('p', 'muted', 'Select a contributor to open a live mirror of their public GitHub profile.')); head.append(title); panel.append(head);
+    const head = textNode('div', 'source-section-head');
+    const title = textNode('div');
+    title.append(textNode('span', 'eyebrow', 'Contributors'), textNode('h2', '', 'Commit authors in this repository'), textNode('p', 'muted', 'GitHub-linked authors open a public profile mirror. Commits from unlinked e-mail addresses are still counted and shown without exposing the address.'));
+    head.append(title); panel.append(head);
     const people = Array.isArray(data.contributors) ? data.contributors : [];
     if (!people.length) { panel.append(emptyState('No contributor list returned', 'GitHub may omit contributor data for a new or empty repository.')); return panel; }
     const grid = textNode('div', 'source-contributor-grid');
     for (const person of people) {
-      const card = textNode('button', 'source-contributor-card card'); card.type = 'button';
-      const copy = textNode('span', 'source-contributor-copy'); copy.append(textNode('strong', '', person.login || 'Contributor'), textNode('small', 'muted', `${formatNumber(person.contributions)} contribution${Number(person.contributions) === 1 ? '' : 's'}`));
-      card.append(avatar(person, 'lg'), copy, textNode('span', 'source-row-chevron', '›')); card.addEventListener('click', () => person.login && this.navigateSource(`profile/${encodeURIComponent(person.login)}`)); grid.append(card);
+      const login = String(person?.login || '').trim();
+      const anonymous = person?.anonymous === true || !login;
+      const name = String(person?.name || login || 'Unlinked author');
+      const interactive = !anonymous && validGitHubLogin(login) && login.toLowerCase() !== SOURCE_ORG.toLowerCase();
+      const card = textNode(interactive ? 'button' : 'article', `source-contributor-card card${anonymous ? ' is-anonymous' : ''}`);
+      if (interactive) card.type = 'button';
+      const copy = textNode('span', 'source-contributor-copy');
+      copy.append(textNode('strong', '', interactive ? login : name), textNode('small', 'muted', `${formatNumber(person.contributions)} commit contribution${Number(person.contributions) === 1 ? '' : 's'}${anonymous ? ' · unlinked author' : ''}`));
+      card.append(avatar(person, 'lg'), copy, interactive ? textNode('span', 'source-row-chevron', '›') : pill('Unlinked', 'subtle'));
+      if (interactive) card.addEventListener('click', () => this.navigateSource(`profile/${encodeURIComponent(login)}`));
+      grid.append(card);
     }
     panel.append(grid); return panel;
   }
@@ -874,7 +940,9 @@ class PlainwireSourceHub extends HTMLElement {
     const profile = data.profile || {};
     const hero = textNode('section', 'source-profile-hero card source-tour-profile');
     const identity = textNode('div', 'source-profile-identity'); identity.append(avatar(profile, 'xl'));
-    const copy = textNode('div', 'source-profile-copy'); copy.append(textNode('span', 'eyebrow', 'GitHub profile mirror'), textNode('h1', '', profile.name || profile.login || this.state.profileLogin), textNode('div', 'source-profile-login', `@${profile.login || this.state.profileLogin}`));
+    const isOrganization = String(profile.type || '').toLowerCase() === 'organization';
+    const copy = textNode('div', 'source-profile-copy');
+    copy.append(textNode('span', 'eyebrow', isOrganization ? 'GitHub organization' : 'GitHub profile mirror'), textNode('h1', '', profile.name || profile.login || this.state.profileLogin), textNode('div', 'source-profile-login', isOrganization ? (profile.login || this.state.profileLogin) : `@${profile.login || this.state.profileLogin}`));
     if (profile.bio) copy.append(textNode('p', '', profile.bio));
     const facts = textNode('div', 'source-profile-facts');
     for (const value of [profile.company, profile.location]) if (value) facts.append(pill(value, 'subtle'));
@@ -1027,12 +1095,12 @@ class PlainwireSourceHub extends HTMLElement {
 
   tourSteps() {
     return [
-      { title: 'Plainwire Source', copy: 'This page is a live, read-only window into Plainwire’s public development work. It is not a cached marketing screenshot.', section: 'pulse', selector: '.source-tour-overview' },
+      { title: 'Plainwire Source', copy: 'This page is a read-only window into Plainwire’s public development work, refreshed from GitHub through the Plainwire server.', section: 'pulse', selector: '.source-tour-overview' },
       { title: 'Development pulse', copy: 'Public organization events update here: pushes, releases, pull requests, issues, forks, and other GitHub activity.', section: 'pulse', selector: '.source-tour-pulse' },
       { title: 'Every public repository', copy: 'Browse the main server, desktop app, forum, license, and any future public repositories without hard-coding the page to four projects.', section: 'repositories', selector: '.source-tour-repos' },
       { title: 'Source architecture', copy: 'The architecture map connects the UI, browser bridge, Cowboy API, realtime hub, PostgreSQL data layer, media boundary, and native worker to their real source files.', section: 'architecture', selector: '.source-tour-architecture' },
       { title: 'Repository inspector', copy: 'Open any repository for commits and diffs, releases, tags, branches, README, files, language statistics, contributors, and raw GitHub metadata.', section: 'repositories', selector: '.source-repo-card', fallbackSelector: '.source-tour-repos' },
-      { title: 'Contributor mirrors', copy: 'Contributor names open live public GitHub profile mirrors with follower counts, repositories, organizations, and recent activity.', section: 'pulse', selector: '.source-active-contributors', fallbackSelector: '.source-tour-pulse' },
+      { title: 'Contributor mirrors', copy: 'Linked contributor names open current public GitHub profile mirrors with follower counts, repositories, organizations, and recent activity. Unlinked commit authors remain visible without exposing their e-mail.', section: 'pulse', selector: '.source-active-contributors', fallbackSelector: '.source-tour-pulse' },
       { title: 'Raw metadata when you need it', copy: 'The polished UI never hides the underlying public response: metadata panels expose the full bounded GitHub objects for debugging and curiosity.', section: 'metadata', selector: '.source-tour-metadata' }
     ];
   }
@@ -1065,7 +1133,7 @@ class PlainwireSourceHub extends HTMLElement {
     const close = button('×', 'pw-tour-guide-close', () => this.stopTour()); close.setAttribute('aria-label', 'Close source tour');
     head.append(brand, headCopy, close);
     const body = textNode('div', 'pw-tour-guide-body');
-    body.append(textNode('h3', '', step.title), textNode('p', '', step.copy), textNode('small', 'pw-tour-guide-hint', 'Live data comes through this Plainwire server; GitHub credentials are never exposed to the browser.'));
+    body.append(textNode('h3', '', step.title), textNode('p', '', step.copy), textNode('small', 'pw-tour-guide-hint', 'GitHub data comes through this Plainwire server; credentials are never exposed to the browser, and GitHub’s public event feed can be delayed.'));
     const foot = textNode('div', 'pw-tour-guide-actions');
     if (index > 0) foot.append(button('Back', 'btn ghost', () => this.showTourStep(index - 1)));
     foot.append(button(index === total - 1 ? 'Done' : 'Next', 'btn', () => index === total - 1 ? this.stopTour() : this.showTourStep(index + 1)));

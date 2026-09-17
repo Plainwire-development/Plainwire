@@ -224,13 +224,13 @@ headers() ->
 security_headers() ->
     ScriptPolicy = case env_bool("PLAINWIRE_KRISP_ENABLED", false) of
         true -> <<"script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; ">>;
-        false -> <<"script-src 'self'; worker-src 'self'; ">>
+        false -> <<"script-src 'self'; worker-src 'self' blob:; ">>
     end,
     %% YouTube/Vimeo link cards load a poster and, after a click, the player frame.
     Csp = <<"default-src 'self'; ", ScriptPolicy/binary,
         "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://i.ytimg.com https://avatars.githubusercontent.com; media-src 'self' blob:; ",
         "frame-src https://www.youtube-nocookie.com https://player.vimeo.com; ",
-        "connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'">>,
+        "connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'">>,
     #{
         <<"cache-control">> => <<"no-store">>,
         <<"x-content-type-options">> => <<"nosniff">>,

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT"
+
+BIN=${PLAINWIRE_RELEASE_BIN:-"$ROOT/_build/default/rel/plainwire_relay/bin/plainwire_relay"}
+[[ -x "$BIN" ]] || {
+  printf 'Plainwire release control script not found: %s\n' "$BIN" >&2
+  printf 'Build a release with `make release`, or set PLAINWIRE_RELEASE_BIN to the installed release bin/plainwire_relay.\n' >&2
+  exit 2
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/storage-migrate COMMAND [arguments]
+
+  status
+  backfill [max_rows]
+  verify [after_id] [limit]
+  shadow [limit]
+  parity [sample_rows]
+  reconcile-intents [limit]
+  reconcile [limit]
+  flush-outbox
+
+Commands run against the already-running Plainwire release. They do not start a
+second application instance or mutate Scylla schema. Use scripts/scylla-migrate
+for schema changes.
+USAGE
+}
+
+nat() { [[ ${1:-} =~ ^[0-9]+$ ]]; }
+pos() { [[ ${1:-} =~ ^[1-9][0-9]*$ ]]; }
+rpc() { "$BIN" rpc "$1"; }
+
+cmd=${1:-}
+case "$cmd" in
+  status)
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    rpc 'pw_db:storage_status().'
+    ;;
+  backfill)
+    [[ $# -le 2 ]] || { usage >&2; exit 2; }
+    max=${2:-0}; nat "$max" || { echo 'max_rows must be a non-negative integer' >&2; exit 2; }
+    rpc "case pw_storage_migration:backfill(#{max_rows => ${max}}) of {ok,R=#{status := S}} when S =:= backfill_complete; S =:= backfill_paused -> R; {ok,R} -> erlang:error({storage_backfill_failed,R}); {error,R} -> erlang:error({storage_backfill_error,R}) end."
+    ;;
+  verify)
+    [[ $# -le 3 ]] || { usage >&2; exit 2; }
+    after=${2:-0}; limit=${3:-1000}
+    nat "$after" || { echo 'after_id must be a non-negative integer' >&2; exit 2; }
+    pos "$limit" || { echo 'limit must be a positive integer' >&2; exit 2; }
+    (( limit <= 5000 )) || { echo 'limit must be <= 5000' >&2; exit 2; }
+    rpc "case pw_storage_migration:verify(${after}, ${limit}) of {ok,R=#{ok := true}} -> R; {ok,R} -> erlang:error({storage_verify_failed,R}); {error,R} -> erlang:error({storage_verify_error,R}) end."
+    ;;
+  shadow)
+    [[ $# -le 2 ]] || { usage >&2; exit 2; }
+    limit=${2:-200}; pos "$limit" || { echo 'limit must be a positive integer' >&2; exit 2; }
+    (( limit <= 2000 )) || { echo 'limit must be <= 2000' >&2; exit 2; }
+    rpc "case pw_storage_migration:shadow_sample(${limit}) of {ok,R=#{ok := true}} -> R; {ok,R} -> erlang:error({storage_shadow_failed,R}); {error,R} -> erlang:error({storage_shadow_error,R}) end."
+    ;;
+  parity)
+    [[ $# -le 2 ]] || { usage >&2; exit 2; }
+    rows=${2:-500}; pos "$rows" || { echo 'sample_rows must be a positive integer' >&2; exit 2; }
+    (( rows >= 50 && rows <= 5000 )) || { echo 'sample_rows must be 50..5000' >&2; exit 2; }
+    rpc "case pw_storage_migration:parity(${rows}) of {ok,R=#{ok := true}} -> R; {ok,R} -> erlang:error({storage_parity_failed,R}); {error,R} -> erlang:error({storage_parity_error,R}) end."
+    ;;
+  reconcile-intents)
+    [[ $# -le 2 ]] || { usage >&2; exit 2; }
+    limit=${2:-500}; pos "$limit" || { echo 'limit must be a positive integer' >&2; exit 2; }
+    (( limit <= 5000 )) || { echo 'limit must be <= 5000' >&2; exit 2; }
+    rpc "case pw_storage_migration:reconcile_write_intents(${limit}) of {ok,R=#{errors := []}} -> R; {ok,R} -> erlang:error({storage_intent_reconcile_failed,R}); {error,R} -> erlang:error({storage_intent_reconcile_error,R}) end."
+    ;;
+  reconcile)
+    [[ $# -le 2 ]] || { usage >&2; exit 2; }
+    limit=${2:-500}; pos "$limit" || { echo 'limit must be a positive integer' >&2; exit 2; }
+    (( limit <= 5000 )) || { echo 'limit must be <= 5000' >&2; exit 2; }
+    rpc "case pw_storage_migration:reconcile(${limit}) of {ok,R=#{errors := []}} -> R; {ok,R} -> erlang:error({storage_reconcile_failed,R}); {error,R} -> erlang:error({storage_reconcile_error,R}) end."
+    ;;
+  flush-outbox)
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    rpc "case pw_storage_outbox:flush_once() of ok -> ok; {ok,R} -> R; {error,R} -> erlang:error({storage_outbox_flush_failed,R}); R -> erlang:error({storage_outbox_flush_unexpected,R}) end."
+    ;;
+  -h|--help|help|'') usage ;;
+  *) echo "unknown command: $cmd" >&2; usage >&2; exit 2 ;;
+esac

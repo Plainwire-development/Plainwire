@@ -17,6 +17,7 @@
 -define(MAX_CACHE_ENTRIES, 500).
 -define(MAX_CACHE_MEM, 104857600).
 -define(MAX_FETCH_RESULTS, 4096).
+-define(MAX_URL_BYTES, 2048).
 -define(FETCH_SLOT_WAIT_MS, 10000).
 -define(FETCH_RESULT_TTL_MS, 5000).
 -define(FETCH_BUDGET_GRACE_MS, 3000).
@@ -323,23 +324,61 @@ decode_token(Token) ->
 cache_key(Url) -> pw_util:sha256_hex(Url).
 
 validate_url(Url) ->
-    case uri_string:parse(binary_to_list(Url)) of
-        #{scheme := Scheme, host := Host} when Scheme =:= "http"; Scheme =:= "https" ->
-            LowerHost = string:lowercase(Host),
-            %% Reject a disallowed hostname before DNS. Aside from being faster in
-            %% production allow-list mode, this avoids pointless resolver work for
-            %% every blocked avatar on a large friends list.
-            case host_allowed(LowerHost) of
-                false -> {error, blocked_url};
-                true ->
-                    case blocked_host_or_addr(LowerHost) of
-                        true -> {error, blocked_url};
-                        false -> ok
-                    end
-            end;
-        _ ->
-            {error, invalid_url}
+    case resolve_url(Url) of
+        {ok, _Address} -> ok;
+        Error -> Error
     end.
+
+%% Return the exact public address that passed policy validation. Network callers
+%% must connect to this tuple instead of resolving the hostname a second time.
+resolve_url(Url0) ->
+    Url = pw_util:bin(Url0),
+    case byte_size(Url) > 0 andalso byte_size(Url) =< ?MAX_URL_BYTES of
+        false -> {error, invalid_url};
+        true ->
+            try uri_string:parse(Url) of
+                #{scheme := Scheme0, host := Host0} ->
+                    Scheme = string:lowercase(pw_util:bin(Scheme0)),
+                    Host = binary_to_list(string:lowercase(pw_util:bin(Host0))),
+                    case (Scheme =:= <<"http">> orelse Scheme =:= <<"https">>) andalso Host =/= [] of
+                        false -> {error, invalid_url};
+                        true ->
+                            case host_allowed(Host) of
+                                false -> {error, blocked_url};
+                                true -> resolve_public_host(Host)
+                            end
+                    end;
+                _ -> {error, invalid_url}
+            catch _:_ -> {error, invalid_url} end
+    end.
+
+resolve_public_host(Host) ->
+    case host_to_addr(Host) of
+        {ok, Addr} ->
+            case pw_outbound_url:public_ip(Addr) of true -> {ok, Addr}; false -> {error, blocked_url} end;
+        error ->
+            case Host =:= "localhost" orelse lists:suffix(".localhost", Host) of
+                true -> {error, blocked_url};
+                false ->
+                    Addrs4 = resolve_addrs(Host, inet),
+                    Addrs6 = resolve_addrs(Host, inet6),
+                    Addrs = lists:usort(Addrs4 ++ Addrs6),
+                    %% Reject the whole hostname if *any* current answer is private.
+                    %% Picking only after this check prevents mixed public/private DNS
+                    %% from becoming a probabilistic SSRF bypass.
+                    case Addrs of
+                        [] -> {error, blocked_url};
+                        _ ->
+                            case lists:all(fun pw_outbound_url:public_ip/1, Addrs) of
+                                false -> {error, blocked_url};
+                                true -> {ok, pick_public_address(Addrs4, Addrs6)}
+                            end
+                    end
+            end
+    end.
+
+pick_public_address([_|_] = V4, _V6) -> lists:nth(rand:uniform(length(V4)), V4);
+pick_public_address([], V6) -> lists:nth(rand:uniform(length(V6)), V6).
 
 host_allowed(Host) ->
     case pw_util:env_str("PLAINWIRE_MEDIA_ALLOWED_HOSTS", <<>>) of
@@ -357,13 +396,6 @@ production_env() ->
     lists:member(os:getenv("PLAINWIRE_ENV"), ["prod", "production"]) orelse
         lists:member(os:getenv("NODE_ENV"), ["prod", "production"]).
 
-%% only IP literals use the blocked-address table; 0.gravatar.com is a hostname.
-blocked_host(H) ->
-    case host_to_addr(H) of
-        {ok, Addr} -> blocked_addr(Addr);
-        error -> H =:= "localhost" orelse lists:suffix(".localhost", H)
-    end.
-
 host_to_addr([$[ | Rest]) ->
     case string:split(Rest, "]") of
         [Inner, _] -> parse_addr(Inner);
@@ -376,43 +408,6 @@ parse_addr(S) ->
         {ok, Addr} -> {ok, Addr};
         _ -> error
     end.
-
-blocked_host_or_addr(H) ->
-    blocked_host(H) orelse addresses_blocked(H).
-
-addresses_blocked(H) ->
-    Addrs = resolve_addrs(H, inet) ++ resolve_addrs(H, inet6),
-    case Addrs of
-        [] -> true;
-        _ -> lists:any(fun blocked_addr/1, Addrs)
-    end.
-
-resolve_addrs(H, Family) ->
-    case inet:getaddrs(H, Family) of
-        {ok, Addrs} -> Addrs;
-        _ -> []
-    end.
-
-blocked_addr({10,_,_,_}) -> true;
-blocked_addr({127,_,_,_}) -> true;
-blocked_addr({0,_,_,_}) -> true;
-blocked_addr({169,254,_,_}) -> true;
-blocked_addr({100,B,_,_}) when B >= 64, B =< 127 -> true;
-blocked_addr({172,B,_,_}) when B >= 16, B =< 31 -> true;
-blocked_addr({192,0,0,_}) -> true;
-blocked_addr({192,0,2,_}) -> true;
-blocked_addr({192,168,_,_}) -> true;
-blocked_addr({198,18,_,_}) -> true;
-blocked_addr({198,19,_,_}) -> true;
-blocked_addr({198,51,100,_}) -> true;
-blocked_addr({203,0,113,_}) -> true;
-    blocked_addr({_,_,_,_}) -> false;
-blocked_addr({0,0,0,0,0,0,0,1}) -> true;
-blocked_addr({0,0,0,0,0,16#ffff,A,B}) -> blocked_addr({A bsr 8, A band 255, B bsr 8, B band 255});
-blocked_addr({S,_,_,_,_,_,_,_}) when S >= 16#fc00, S =< 16#fdff -> true;
-blocked_addr({S,_,_,_,_,_,_,_}) when S >= 16#fe80, S =< 16#febf -> true;
-blocked_addr({_,_,_,_,_,_,_,_}) -> false;
-blocked_addr(_) -> true.
 
 http_get(Url) ->
     case follow_redirects(Url, ?MAX_BYTES, #{}, 5) of
@@ -444,23 +439,24 @@ fetch_page(Url, MaxBytes) ->
 follow_redirects(_Url, _MaxBytes, _Opts, 0) ->
     {error, too_many_redirects};
 follow_redirects(Url, MaxBytes, Opts, Depth) ->
-    case pw_http_fetch:get(Url, MaxBytes, Opts) of
-        {ok, Code, RespHeaders, Body} when Code >= 200, Code < 300 ->
-            {ok, RespHeaders, Body};
-        {ok, Code, RespHeaders, _} when Code >= 300, Code < 400 ->
-            case header_value("location", RespHeaders) of
-                undefined -> {error, {http, Code}};
-                Location0 ->
-                    Location = resolve_redirect(Url, pw_util:bin(Location0)),
-                    case validate_url(Location) of
-                        ok -> follow_redirects(Location, MaxBytes, Opts, Depth - 1);
-                        _ -> {error, blocked_url}
-                    end
-            end;
-        {ok, Code, _, _} ->
-            {error, {http, Code}};
-        {error, Reason} ->
-            {error, Reason}
+    %% Resolve and policy-check every hop exactly once, then connect to that exact
+    %% address. TLS still authenticates the hostname from Url in pw_http_fetch.
+    case resolve_url(Url) of
+        {error, _} -> {error, blocked_url};
+        {ok, Address} ->
+            case pw_http_fetch:get_pinned(Url, Address, MaxBytes, Opts) of
+                {ok, Code, RespHeaders, Body} when Code >= 200, Code < 300 ->
+                    {ok, RespHeaders, Body};
+                {ok, Code, RespHeaders, _} when Code >= 300, Code < 400 ->
+                    case header_value("location", RespHeaders) of
+                        undefined -> {error, {http, Code}};
+                        Location0 ->
+                            Location = resolve_redirect(Url, pw_util:bin(Location0)),
+                            follow_redirects(Location, MaxBytes, Opts, Depth - 1)
+                    end;
+                {ok, Code, _, _} -> {error, {http, Code}};
+                {error, Reason} -> {error, Reason}
+            end
     end.
 
 %% Locations may be absolute, host-relative, protocol-relative or path-relative.

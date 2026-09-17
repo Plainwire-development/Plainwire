@@ -62,6 +62,8 @@ help:
 doctor:
 	@missing=0; for tool in "$(NODE)" "$(NPM)" "$(PYTHON)" erl "$(REBAR3)" $(if $(filter 1,$(NATIVE)),"$(CC)" "$(FC)"); do \
 	  if command -v "$$tool" >/dev/null; then printf 'Found: %s\n' "$$tool"; else printf 'Missing: %s\n' "$$tool"; missing=1; fi; done; \
+	  if command -v erl >/dev/null 2>&1; then otp=$$(erl -noshell -eval 'io:format("~s",[erlang:system_info(otp_release)]),halt().' 2>/dev/null); major=$${otp%%.*}; \
+	    if [ -n "$$major" ] && [ "$$major" -ge 27 ] 2>/dev/null; then printf 'Erlang/OTP: %s (supported)\n' "$$otp"; else printf 'Unsupported Erlang/OTP: %s (Plainwire 2.0 requires OTP 27+)\n' "$$otp"; missing=1; fi; fi; \
 	  printf 'Tests also need Chromium; make browsers installs it. Production needs PostgreSQL and HTTPS.\n'; exit $$missing
 
 node_modules/.plainwire-deps: package.json package-lock.json

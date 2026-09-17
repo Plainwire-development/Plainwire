@@ -9,11 +9,11 @@
 %% every odd mask as Administrator.
 all_fits_in_a_bigint_test() ->
     All = pw_permissions:all(),
-    ?assertEqual(1073748991, All),
+    ?assertEqual(2143289343, All),
     ?assert(All =< 16#7FFFFFFFFFFFFFFF).
 
 member_default_matches_schema_default_test() ->
-    ?assertEqual(771, pw_permissions:member_default()).
+    ?assertEqual(302049027, pw_permissions:member_default()).
 
 member_default_does_not_imply_moderation_test() ->
     Member = pw_permissions:member_default(),

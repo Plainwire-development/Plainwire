@@ -70,7 +70,8 @@ assert.match(db, /<<"channel">>\s*->\s*channel_message_access\(Conn, Uid, Target
 assert.match(elm, /List\.map \(managedChannelRow canManageChannels data\.categories\) channels/, 'server channel manager uses the in-scope capability variable');
 
 // Roles/moderation remain backend-authoritative and hierarchy-aware.
-assert.match(db, /has_server_permission\(Conn, Uid, Sid, <<"manage_roles">>\) andalso can_moderate_server_member/, 'role assignment requires both permission and hierarchy');
+assert.match(db, /has_server_permission\(Conn, Uid, Sid, <<"manage_roles">>\)[\s\S]*can_moderate_server_member\(Conn, Uid, Sid, Target\)/, 'role assignment still requires Manage Roles and hierarchy for ordinary targets');
+assert.match(db, /Uid =:= Target andalso server_member_is_owner\(Conn, Sid, Uid\)/, 'only the actual server owner may use the self-role assignment exception');
 assert.match(db, /has_server_permission\(Conn, Uid, Sid, <<"kick_members">>\) andalso can_moderate_server_member/, 'server kicks require both permission and hierarchy');
 assert.match(bridge, /const canActOnMember = \(member\)/, 'server admin UI mirrors member hierarchy decisions');
 assert.match(bridge, /cb\.disabled=!canAssignRole\(role\)/, 'unassignable roles are disabled in the UI');
@@ -201,6 +202,19 @@ assert.doesNotMatch(bridge, /avatarTries|avatar-retrying|replaceWith\(/, 'obsole
 assert.match(elm, /attribute "loading" "lazy"[\s\S]*attribute "fetchpriority" "low"/, 'list icons use browser-managed lazy loading instead of eager request stampedes');
 
 
+// Server bans, owner role control, and first-party Wire embeds are authoritative rather than cosmetic.
+assert.match(db, /CREATE TABLE IF NOT EXISTS server_bans[\s\S]*PRIMARY KEY\(server_id,user_id\)/, 'server bans are durable relational state, not a transient kick flag');
+assert.match(db, /route\(\{ban_server_member[\s\S]*<<"ban_members">>[\s\S]*can_moderate_server_member/, 'server bans require the dedicated permission and target hierarchy');
+assert.match(db, /INSERT INTO server_bans[\s\S]*DELETE FROM server_member_roles[\s\S]*DELETE FROM server_members/, 'banning records durable state before removing membership and roles');
+assert.match(db, /pw_cluster:revoke_server_access\(Target, Sid, ChannelIds\)/, 'banning revokes the target live server/channel/voice access across the cluster');
+assert.match(db, /join_invite_tx[\s\S]*SELECT user_id FROM server_bans WHERE server_id=\$1 AND user_id=\$2[\s\S]*\{error, banned\}/, 'Wire joins cannot be used to bypass a durable server ban');
+assert.match(db, /queue_server_storage_event\(Conn, <<"member\.banned">>/, 'ban actions enter the durable server audit timeline when Scylla storage is enabled');
+assert.match(bridge, /const parseWireUrl = \(url\)/, 'client recognizes first-party Plainwire Wire links before generic unfurling');
+assert.match(bridge, /directApi\(`\/wires\/\$\{encodeURIComponent\(wireCode\)\}`\)/, 'Wire embeds resolve through Plainwire invite metadata instead of fetching URL fragments server-side');
+assert.match(bridge, /createWireEmbedCard[\s\S]*PLAINWIRE SERVER INVITE[\s\S]*Open Wire/, 'Wire links render a dedicated Discord-style server invite card with an explicit action');
+assert.match(bridge, /const renderBans = \(\) =>[\s\S]*directApi\(`\/server\/\$\{serverId\}\/bans`\)[\s\S]*actionButton\('Unban'/, 'server administration has a real bans management view backed by the bans API and unban action');
+assert.match(elm, /profile\.canBanMembers && not viewingSelf/, 'server profile popup exposes Ban only when backend capability permits it and never as self moderation');
+
 // Username changes preserve numeric identity and propagate the new handle without rewriting ownership relations.
 assert.match(elm, /BridgeEvent "account_change_username"[\s\S]*Change username/, 'Account settings exposes the recovered username-change flow');
 assert.match(bridge, /openUsernameDialog[\s\S]*Current password[\s\S]*POST', '\/username'/, 'username change requires current-password confirmation');
@@ -244,4 +258,4 @@ assert.match(db, /batch_message_reactions[\s\S]*bool_or\(mr\.user_id=\$5\)/, 'me
 assert.match(db, /server_member_profile[\s\S]*server_permissions0\(Conn, Uid, Sid\)[\s\S]*mr\.user_id=\$2/, 'targeted server profiles require server membership and fetch one member');
 assert.match(db, /\(r\.permissions & 1073741824\) DESC[\s\S]*\(r\.permissions & 16\) DESC[\s\S]*r\.position DESC/, 'presentation role color prioritizes actual privilege strength before display position');
 
-console.log('PASS: 1.9.0 release contracts: stabilization, identity rename, vector branding, onboarding, realtime, moderation, reactions, deletion, and route integrity.');
+console.log('PASS: 2.0.0 release contracts: stabilization, identity rename, vector branding, onboarding, realtime, moderation, reactions, deletion, and route integrity.');

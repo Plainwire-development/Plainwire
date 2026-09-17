@@ -14,6 +14,8 @@
 -define(RING_MS, 45000).
 -define(JOIN_TIMEOUT, 5000).
 -define(RECONNECT_GRACE_MS, 15000).
+-define(REDIS_PRESENCE_TTL_MS, 45000).
+-define(REDIS_PRESENCE_REFRESH_MS, 15000).
 
 %% full mesh gets expensive fast. browsers are not tiny SFUs.
 room_capacity() -> min(32, max(2, pw_util:env_int("PLAINWIRE_VOICE_MAX_PARTICIPANTS", 8))).
@@ -65,7 +67,9 @@ join_call(Msg) ->
         exit:{{shutdown, _}, _} -> {error, unavailable}
     end.
 
-init([]) -> {ok, #st{}}.
+init([]) ->
+    erlang:send_after(?REDIS_PRESENCE_REFRESH_MS, self(), redis_presence_refresh),
+    {ok, #st{}}.
 
 handle_call({voice_join, ChannelId, Uid, Pid, Profile}, _From, St0) ->
     Room = maps:get({voice, ChannelId}, St0#st.voices, #{}),
@@ -158,6 +162,7 @@ handle_cast({connect, Uid, Pid, Status0}, St) ->
     Prev = maps:get(Uid, St#st.online, undefined),
     Effective = effective_status(Uid, Users, PidStatuses),
     Online = update_presence(Uid, Prev, Effective, St#st.watchers, Pid, St#st.online),
+    pw_redis:presence_set(Uid, Effective, ?REDIS_PRESENCE_TTL_MS),
     %% Seed the new socket with the account-wide effective status immediately.
     %% A second tab being idle or invisible must not make an active tab look
     %% offline to itself or to other presence watchers.
@@ -199,7 +204,11 @@ handle_cast({watch_presence, Pid, Uids0}, St0) ->
     Watchers0 = lists:foldl(fun(U, Acc) -> update_set(U, Pid, Acc) end, St0#st.watchers, Old),
     Watchers = lists:foldl(fun(U, Acc) -> add_to_set(U, Pid, Acc) end, Watchers0, Uids),
     Watches = case Uids of [] -> maps:remove(Pid, St0#st.watches); _ -> maps:put(Pid, Uids, St0#st.watches) end,
-    Statuses = maps:from_list([{U, S} || U <- Uids, {ok, S} <- [maps:find(U, St0#st.online)]]),
+    %% Local state wins. Redis fills in presence from websocket nodes that do
+    %% not share this BEAM's hub state; stale keys expire automatically.
+    RemoteStatuses = pw_redis:presence_get(Uids),
+    LocalStatuses = maps:from_list([{U, S} || U <- Uids, {ok, S} <- [maps:find(U, St0#st.online)]]),
+    Statuses = maps:merge(RemoteStatuses, LocalStatuses),
     Pid ! {hub_json, #{type => presence_state, online => maps:keys(Statuses), statuses => Statuses}},
     {noreply, St0#st{watches = Watches, watchers = Watchers}};
 handle_cast(cluster_resync, St) ->
@@ -328,6 +337,7 @@ handle_cast({status_update, Uid, Pid0, Status0}, St) ->
             PidStatuses = maps:put(Pid, Status, St#st.pid_statuses),
             Effective = effective_status(Uid, St#st.users, PidStatuses),
             Online = update_presence(Uid, Prev, Effective, St#st.watchers, undefined, St#st.online),
+            pw_redis:presence_set(Uid, Effective, ?REDIS_PRESENCE_TTL_MS),
             {noreply, St#st{pid_statuses = PidStatuses, online = Online}}
     end;
 handle_cast(_, St) -> {noreply, St}.
@@ -375,6 +385,10 @@ start_ring(Cid, Uid, Pid, Profile, Targets, St0) ->
         profile => strip_profile(Profile), timeout_ms => RingMs, expires_at => ExpiresAt}) || T <- Targets1],
     St1#st{rings = maps:put(Key, Ring, St1#st.rings)}.
 
+handle_info(redis_presence_refresh, St) ->
+    [pw_redis:presence_set(Uid, Status, ?REDIS_PRESENCE_TTL_MS) || {Uid, Status} <- maps:to_list(St#st.online)],
+    erlang:send_after(?REDIS_PRESENCE_REFRESH_MS, self(), redis_presence_refresh),
+    {noreply, St};
 handle_info({ring_timeout, Cid, Uid}, St0) ->
     Key = {ring, Cid},
     case maps:get(Key, St0#st.rings, undefined) of
@@ -691,7 +705,11 @@ remove_pid(Pid, St0) ->
         _ ->
             Prev = maps:get(Uid, St0#st.online, undefined),
             Effective = effective_status(Uid, Users, PidStatuses),
-            update_presence(Uid, Prev, Effective, St0#st.watchers, Pid, St0#st.online)
+            Updated = update_presence(Uid, Prev, Effective, St0#st.watchers, Pid, St0#st.online),
+            %% Clear only this node's Redis presence slot when its last visible
+            %% session disappears; another Plainwire node may still be online.
+            pw_redis:presence_set(Uid, Effective, ?REDIS_PRESENCE_TTL_MS),
+            Updated
     end,
     Subs = remove_from_all(Pid, St0#st.subs),
     Voices = detach_pid_from_rooms(Pid, St0#st.voices, voice, Users),

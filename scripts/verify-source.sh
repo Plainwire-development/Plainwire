@@ -13,6 +13,9 @@ node --check scripts/build-rich-text.mjs
 npm run test:rtc-contract
 npm run test:ui-contract
 npm run test:admin-contract
+npm run test:integrations-contract
+npm run test:storage-contract
+npm run test:storage-tools
 npm run test:release-contract
 for script in scripts/*.sh; do bash -n "${script}"; done
 python3 - <<'PY'
@@ -52,7 +55,7 @@ for deploy_script in ['scripts/update-openrc-release.sh', 'scripts/install-openr
     assert 'CSS_FINGERPRINT="Plainwire ${VERSION} workspace"' in body
 for path in [*Path('scripts').glob('*.py'), *Path('test').glob('*.py')]:
     ast.parse(path.read_text(), filename=str(path))
-for path in Path('src').glob('*.erl'):
+for path in [*Path('src').glob('*.erl'), *Path('sdk/erlang/src').glob('*.erl'), *Path('sdk/erlang/examples').glob('*.erl')]:
     body = path.read_text()
     # Source-only Erlang sanity pass for environments without erlc. This is not
     # a compiler replacement, but it catches broken delimiter edits while ignoring
@@ -120,7 +123,7 @@ for path in Path('src').glob('*.erl'):
     duplicated_heads = {head: at for head, at in function_heads.items() if len(at) > 1}
     assert not duplicated_heads, f'exact duplicate Erlang function clause(s) in {path}: {duplicated_heads}'
 authored_sources = [
-    *Path('src').glob('*.erl'),
+    *Path('src').glob('*.erl'), *Path('sdk/erlang/src').glob('*.erl'), *Path('sdk/erlang/examples').glob('*.erl'),
     *Path('priv/static/elm/src').rglob('*.elm'),
     Path('priv/static/elm-bridge.js'), Path('priv/static/bootstrap.js'), Path('priv/static/call-health.js'),
     *Path('priv/admin').glob('*'),

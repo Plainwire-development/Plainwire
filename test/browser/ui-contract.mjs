@@ -45,6 +45,17 @@ assert.match(sourceHub, /no-mentions/, 'GitHub Markdown does not resolve @mentio
 assert.match(markdown, /no-embeds/, 'safe Markdown supports an explicit no-embed mode');
 assert.match(markdown, /no-mentions/, 'safe Markdown supports an explicit no-mention mode');
 assert.match(sourceHub, /source-active-contributors/, 'recent GitHub actors are surfaced as active contributors');
+assert.match(githubBackend, /anon=1&per_page=100&page=/, 'GitHub contributor requests include anonymous/unlinked commit authors and page through GitHub’s maximum page size');
+assert.match(githubBackend, /cached_contributor_pages[\s\S]*length\(People\) < 100/, 'Source Hub keeps paging contributor history until GitHub returns the final contributor page');
+assert.match(githubBackend, /organization_contributors\(Repos\)/, 'Source overview aggregates contributors across public Plainwire repositories');
+assert.match(githubBackend, /public_contributor\(Person\)[\s\S]*anonymous[\s\S]*Unlinked author/, 'anonymous contributor records are projected to a safe public shape');
+assert.match(githubBackend, /public_git_identity\(Identity\)[\s\S]*maps:remove\(<<"email">>/, 'commit author e-mail is removed before GitHub commit metadata reaches the cache or browser');
+assert.match(githubBackend, /public_event_commit\(Commit\)[\s\S]*maps:remove\(<<"email">>/, 'event commit author e-mail is removed before GitHub activity reaches the cache or browser');
+assert.match(sourceHub, /pushCommitCount[\s\S]*'pushed updates'/, 'push events never invent a zero-commit count when GitHub omits push commit details');
+assert.match(sourceHub, /SOURCE_ORG\.toLowerCase\(\)/, 'the Plainwire organization is not treated as a person in contributor activity');
+assert.doesNotMatch(sourceHub, /ranked\.slice\(0,\s*18\)/, 'organization contributor view does not silently cap visible commit authors');
+assert.match(sourceHub, /No recent public activity[\s\S]*Commit authors are still loaded independently/, 'an empty delayed Events feed does not hide repository contributor data');
+assert.doesNotMatch(sourceLess, /(?:linear|radial)-gradient\(/, 'Source Hub avoids decorative gradients and keeps Plainwire’s flat UI language');
 assert.match(sourceHub, /source-event-commit-button/, 'push-event commits can open a bounded commit diff');
 assert.match(sourceHub, /renderLanguages/, 'repository language metadata has a dedicated detector view');
 assert.match(sourceHub, /decoded_content/, 'bounded source-file contents are rendered without raw HTML insertion');

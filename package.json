@@ -17,7 +17,10 @@
     "test:admin-contract": "node test/browser/admin-contract.mjs",
     "build:rich-text": "node scripts/build-rich-text.mjs",
     "test:health": "node test/browser/call-health.mjs",
-    "test:release-contract": "node test/browser/release-contract.mjs"
+    "test:release-contract": "node test/browser/release-contract.mjs",
+    "test:integrations-contract": "node test/browser/integrations-contract.mjs",
+    "test:storage-contract": "node test/browser/storage-contract.mjs",
+    "test:storage-tools": "node test/browser/storage-tools.mjs"
   },
   "devDependencies": {
     "elm": "0.19.1-6",

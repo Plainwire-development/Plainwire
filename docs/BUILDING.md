@@ -1,6 +1,6 @@
 # Building Plainwire
 
-Use GNU Make 4.3 or newer (`gmake` on FreeBSD). Node.js 20.19+ (22+ recommended), npm, Python 3.9+, Erlang/OTP 25+ and rebar3 are required for the standard build. Native call health additionally needs a C11 compiler, gfortran and the matching libgfortran runtime on the deployment host. The optional cluster profile requires OTP 27+ and installed OTP sources.
+Use GNU Make 4.3 or newer (`gmake` on FreeBSD). Node.js 20.19+ (22+ recommended), npm, Python 3.9+, Erlang/OTP 27+ and rebar3 are required for the standard build. Native call health additionally needs a C11 compiler, gfortran and the matching libgfortran runtime on the deployment host. The optional cluster profile requires OTP 27+ and installed OTP sources.
 
 ```sh
 make help

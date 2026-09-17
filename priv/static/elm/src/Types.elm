@@ -305,6 +305,8 @@ type alias ServerProfile =
     , serverName : String
     , member : ServerMember
     , roles : List ServerProfileRole
+    , canManageRoles : Bool
+    , canBanMembers : Bool
     }
 
 

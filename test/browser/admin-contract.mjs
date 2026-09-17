@@ -64,7 +64,7 @@ assert.match(api,/same_site => strict/,'admin cookies use SameSite Strict');
 assert.match(api,/x-csrf-token/,'mutating admin requests require a separate CSRF token');
 assert.match(api,/can_inspect\(Session\)[\s\S]*owner[\s\S]*operator/,'viewer/operator/owner roles have distinct service-metadata visibility');
 assert.match(js,/applyRoleUi[\s\S]*viewer[\s\S]*users[\s\S]*servers[\s\S]*operators[\s\S]*audit/,'viewer navigation hides account-level control-plane views');
-assert.match(api,/pw_rate:allow\(\{admin_auth/,'admin authentication paths are independently rate limited');
+assert.match(api,/pw_rate:allow(?:_shared)?\(\{admin_auth/,'admin authentication paths are independently rate limited');
 assert.match(api,/valid_token\(Key, <<"op">>\)/,'login rejects operator keys from a different instance/token class before DB auth');
 assert.match(runtime,/safe_config\(\)[\s\S]*PLAINWIRE_DB_POOL_SIZE/,'host snapshot exposes an allowlist of non-secret configuration');
 assert.doesNotMatch(runtime,/PLAINWIRE_DB_PASS|PLAINWIRE_ENC_KEY|PLAINWIRE_TURN_SECRET|API_TOKEN|COOKIE/i,'host snapshot does not read credential-bearing environment variables');

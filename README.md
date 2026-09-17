@@ -4,7 +4,7 @@ Plainwire is a chat app for communities, friends, and small groups.
 
 It has servers, channels, DMs, group chats, forums, voice calls, screen sharing, file uploads, profiles, and live presence without trying to turn every feature into its own product.
 
-Plainwire is built with Erlang/OTP, Cowboy, PostgreSQL, Elm, WebSocket, and WebRTC.
+Plainwire is built with Erlang/OTP, Cowboy, PostgreSQL, Elm, WebSocket, and WebRTC. Redis is an optional ephemeral acceleration layer, and larger deployments can use ScyllaDB as the high-volume message/event history backend.
 
 Plainwire can also be used as a self hosted service on your own servers, it isnt tied to ours; but it is recommended to use our provided servers. Much like how Stoat handles it.
 
@@ -41,7 +41,10 @@ If you just want to use Plainwire, you should not need to worry about any of tha
 * Light, dark, and system themes
 * Audio device selection and mic testing
 * Mobile and desktop layouts
-* PostgreSQL-backed persistence
+* PostgreSQL-backed relational persistence, with optional Redis acceleration and ScyllaDB timeline storage
+* Voice notes with server permission controls
+* Signed outbound webhooks and first-class bot accounts/SDK support
+* Whole-app Less themes and sandboxed client plugins
 * STUN and TURN support for calls
 * Wires for sharing/joining servers, with legacy invite-link compatibility
 * Optional server-proxied KLIPY GIF search
@@ -278,10 +281,11 @@ Deployment and update instructions are kept in [deploy/README.md](deploy/README.
 
 ## Version
 
-Current release: **1.9.0**
+Current release: **2.0.0**
 
 Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history.
 
+* [2.0.0 release notes](RELEASE_NOTES_2.0.0.md)
 * [1.9.0 release notes](RELEASE_NOTES_1.9.0.md)
 
 ## License

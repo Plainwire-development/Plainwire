@@ -1,6 +1,6 @@
 import * as sass from 'sass';
 import less from 'less';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, copyFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,4 +18,5 @@ const layer = await less.render(layerSource, {
 const fingerprint = `/* Plainwire ${version} workspace */\n`;
 const css = fingerprint + base.css.trim() + '\n' + layer.css.trim() + '\n';
 await writeFile(resolve(root, 'priv/static/app.css'), css);
+await copyFile(resolve(root, 'node_modules/less/dist/less.min.js'), resolve(root, 'priv/static/less.min.js'));
 console.log(`css: app.css (${css.length} bytes; scss ${base.css.length} + less ${layer.css.length}; version ${version})`);

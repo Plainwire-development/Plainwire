@@ -1,6 +1,6 @@
 -module(pw_rate).
 -behaviour(gen_server).
--export([start_link/0, allow/3, stats/0]).
+-export([start_link/0, allow/3, allow_shared/3, stats/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(TABLE, pw_rate_counters).
@@ -20,6 +20,19 @@ allow(Key, Limit, WindowMs) when Limit > 0, WindowMs > 0 ->
         error:badarg -> false
     end;
 allow(_, _, _) -> false.
+
+%% Add Redis as a distributed second gate only where callers explicitly need it.
+%% The local ETS gate remains first and authoritative during Redis outages.
+allow_shared(Key, Limit, WindowMs) ->
+    case allow(Key, Limit, WindowMs) of
+        false -> false;
+        true ->
+            case pw_redis:rate_allow(Key, Limit, WindowMs) of
+                false -> false;
+                true -> true;
+                unavailable -> true
+            end
+    end.
 
 stats() ->
     try #{entries => ets:info(?TABLE, size), memory_words => ets:info(?TABLE, memory)}

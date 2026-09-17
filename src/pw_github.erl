@@ -10,6 +10,7 @@
 -define(MAX_TEXT_PREVIEW, 524288).
 -define(CACHE_MAX_ENTRIES, 128).
 -define(CACHE_TARGET_ENTRIES, 96).
+-define(MAX_CONTRIBUTOR_PAGES, 10).
 
 %% Public GitHub metadata is fetched server-side so self-hosters can optionally
 %% use a token without ever exposing it to browsers. Paths are constructed only
@@ -20,16 +21,19 @@ overview() ->
     Tasks = [
         {organization, fun() -> cached_json(<<"org">>, <<"/orgs/", ?ORG/binary>>, ?MAX_JSON, fun public_organization/1) end},
         {repositories, fun() -> cached_json(<<"org-repos">>, <<"/orgs/", ?ORG/binary, "/repos?type=public&sort=updated&per_page=100">>, ?MAX_JSON, fun public_repositories/1) end},
-        {activity, fun() -> cached_json(<<"org-events">>, <<"/orgs/", ?ORG/binary, "/events?per_page=50">>, ?MAX_JSON) end}
+        {activity, fun() -> cached_json(<<"org-events">>, <<"/orgs/", ?ORG/binary, "/events?per_page=50">>, ?MAX_JSON, fun public_events/1) end}
     ],
     Results = parallel(Tasks),
     Repos = value_or(maps:get(repositories, Results, undefined), []),
+    {Contributors, ContributorErrors} = organization_contributors(Repos),
     FeaturedNames = [<<"Plainwire">>, <<"PlainSimple-License">>, <<"Plainwire-desktop">>, <<"Plainwire-Forum">>],
     Featured = [#{name => Name, available => repo_present(Name, Repos)} || Name <- FeaturedNames],
     {ok, #{
         organization => value_or(maps:get(organization, Results, undefined), #{}),
         repositories => Repos,
         activity => value_or(maps:get(activity, Results, undefined), []),
+        contributors => Contributors,
+        contributor_errors => ContributorErrors,
         featured => Featured,
         errors => errors(Results),
         fetched_at => erlang:system_time(millisecond),
@@ -51,11 +55,11 @@ repository_public(Repo, Meta) ->
     Prefix = <<"repo:", Repo/binary, ":">>,
     Tasks = [
         {languages, fun() -> cached_json(<<Prefix/binary, "languages">>, <<Base/binary, "/languages">>, ?MAX_JSON) end},
-        {commits, fun() -> cached_json(<<Prefix/binary, "commits">>, <<Base/binary, "/commits?per_page=30">>, ?MAX_JSON) end},
+        {commits, fun() -> cached_json(<<Prefix/binary, "commits">>, <<Base/binary, "/commits?per_page=30">>, ?MAX_JSON, fun public_commits/1) end},
         {releases, fun() -> cached_json(<<Prefix/binary, "releases">>, <<Base/binary, "/releases?per_page=20">>, ?MAX_JSON) end},
         {tags, fun() -> cached_json(<<Prefix/binary, "tags">>, <<Base/binary, "/tags?per_page=30">>, ?MAX_JSON) end},
         {branches, fun() -> cached_json(<<Prefix/binary, "branches">>, <<Base/binary, "/branches?per_page=30">>, ?MAX_JSON) end},
-        {contributors, fun() -> cached_json(<<Prefix/binary, "contributors">>, <<Base/binary, "/contributors?per_page=50">>, ?MAX_JSON) end},
+        {contributors, fun() -> cached_contributors(<<Prefix/binary, "contributors">>, <<Base/binary, "/contributors">>) end},
         {contents, fun() -> cached_json(<<Prefix/binary, "contents-root">>, <<Base/binary, "/contents">>, ?MAX_CONTENT_JSON) end},
         {readme, fun() -> cached_json(<<Prefix/binary, "readme">>, <<Base/binary, "/readme">>, ?MAX_CONTENT_JSON, fun decoded_content/1) end}
     ],
@@ -81,7 +85,7 @@ commit(Repo0, Sha0) ->
             case ensure_public_repository(Repo) of
                 ok ->
                     Path = <<"/repos/", ?ORG/binary, "/", Repo/binary, "/commits/", Sha/binary>>,
-                    cached_json(<<"commit:", Repo/binary, ":", Sha/binary>>, Path, ?MAX_CONTENT_JSON);
+                    cached_json(<<"commit:", Repo/binary, ":", Sha/binary>>, Path, ?MAX_CONTENT_JSON, fun public_commit/1);
                 Error -> Error
             end;
         {{error, _} = Error, _} -> Error;
@@ -96,7 +100,7 @@ profile(Login0) ->
                 {profile, fun() -> cached_json(<<Prefix/binary, "meta">>, <<"/users/", Login/binary>>, ?MAX_JSON, fun public_profile/1) end},
                 {repositories, fun() -> cached_json(<<Prefix/binary, "repos">>, <<"/users/", Login/binary, "/repos?sort=updated&per_page=100">>, ?MAX_JSON, fun public_repositories/1) end},
                 {organizations, fun() -> cached_json(<<Prefix/binary, "orgs">>, <<"/users/", Login/binary, "/orgs?per_page=100">>, ?MAX_JSON, fun public_organizations/1) end},
-                {activity, fun() -> cached_json(<<Prefix/binary, "events">>, <<"/users/", Login/binary, "/events/public?per_page=30">>, ?MAX_JSON) end}
+                {activity, fun() -> cached_json(<<Prefix/binary, "events">>, <<"/users/", Login/binary, "/events/public?per_page=30">>, ?MAX_JSON, fun public_events/1) end}
             ],
             Results = parallel(Tasks),
             case maps:get(profile, Results, undefined) of
@@ -193,6 +197,150 @@ public_repository_metadata(_) -> #{}.
 public_repositories(Repos) when is_list(Repos) ->
     [public_repository_metadata(Repo) || Repo <- Repos, public_repository(Repo)];
 public_repositories(_) -> [].
+
+
+public_commits(Commits) when is_list(Commits) -> [public_commit(Commit) || Commit <- Commits, is_map(Commit)];
+public_commits(_) -> [].
+
+public_commit(Commit) when is_map(Commit) ->
+    case maps:get(<<"commit">>, Commit, undefined) of
+        GitCommit when is_map(GitCommit) ->
+            Author = public_git_identity(maps:get(<<"author">>, GitCommit, undefined)),
+            Committer = public_git_identity(maps:get(<<"committer">>, GitCommit, undefined)),
+            Commit#{<<"commit">> => GitCommit#{<<"author">> => Author, <<"committer">> => Committer}};
+        _ -> Commit
+    end;
+public_commit(Other) -> Other.
+
+public_git_identity(Identity) when is_map(Identity) -> maps:remove(<<"email">>, Identity);
+public_git_identity(Other) -> Other.
+
+public_events(Events) when is_list(Events) -> [public_event(Event) || Event <- Events, is_map(Event)];
+public_events(_) -> [].
+
+public_event(Event) when is_map(Event) ->
+    case maps:get(<<"payload">>, Event, undefined) of
+        Payload when is_map(Payload) ->
+            Commits0 = maps:get(<<"commits">>, Payload, undefined),
+            Payload1 = case Commits0 of
+                Commits when is_list(Commits) -> Payload#{<<"commits">> => [public_event_commit(C) || C <- Commits, is_map(C)]};
+                _ -> Payload
+            end,
+            Event#{<<"payload">> => Payload1};
+        _ -> Event
+    end;
+public_event(Other) -> Other.
+
+public_event_commit(Commit) when is_map(Commit) ->
+    case maps:get(<<"author">>, Commit, undefined) of
+        Author when is_map(Author) -> Commit#{<<"author">> => maps:remove(<<"email">>, Author)};
+        _ -> Commit
+    end;
+public_event_commit(Other) -> Other.
+
+public_contributors(Contributors) when is_list(Contributors) ->
+    [Contributor || Raw <- Contributors,
+                    Contributor <- [public_contributor(Raw)],
+                    map_size(Contributor) > 0];
+public_contributors(_) -> [].
+
+cached_contributors(KeyPrefix, BasePath) ->
+    cached_contributor_pages(KeyPrefix, BasePath, 1, []).
+
+cached_contributor_pages(_KeyPrefix, _BasePath, Page, Acc) when Page > ?MAX_CONTRIBUTOR_PAGES ->
+    {ok, Acc};
+cached_contributor_pages(KeyPrefix, BasePath, Page, Acc) ->
+    PageBin = integer_to_binary(Page),
+    Key = <<KeyPrefix/binary, ":page:", PageBin/binary>>,
+    Path = <<BasePath/binary, "?anon=1&per_page=100&page=", PageBin/binary>>,
+    case cached_json(Key, Path, ?MAX_JSON, fun public_contributors/1) of
+        {ok, People} when is_list(People) ->
+            Combined = Acc ++ People,
+            case length(People) < 100 of
+                true -> {ok, Combined};
+                false -> cached_contributor_pages(KeyPrefix, BasePath, Page + 1, Combined)
+            end;
+        Error -> Error
+    end.
+
+public_contributor(Person) when is_map(Person) ->
+    Contributions = nonnegative_int(maps:get(<<"contributions">>, Person, 0)),
+    case maps:get(<<"login">>, Person, undefined) of
+        Login when is_binary(Login), byte_size(Login) > 0 ->
+            Base = maps:with([
+                <<"login">>, <<"id">>, <<"node_id">>, <<"avatar_url">>, <<"html_url">>,
+                <<"type">>, <<"site_admin">>
+            ], Person),
+            Base#{<<"contributions">> => Contributions, <<"anonymous">> => false};
+        _ ->
+            %% Anonymous contributor responses can contain an author e-mail. It is
+            %% useful to count an unlinked author, but there is no reason to mirror
+            %% their e-mail into Plainwire's public Source Hub.
+            Name0 = string:trim(pw_util:bin(maps:get(<<"name">>, Person, <<"Unlinked author">>))),
+            Name = case byte_size(Name0) of 0 -> <<"Unlinked author">>; _ -> truncate_utf8(Name0, 120) end,
+            #{<<"name">> => Name, <<"contributions">> => Contributions, <<"anonymous">> => true}
+    end;
+public_contributor(_) -> #{}.
+
+organization_contributors(Repos) when is_list(Repos) ->
+    RepoNames = [Name || Repo <- Repos,
+                         public_repository(Repo),
+                         Name <- [maps:get(<<"name">>, Repo, <<>>)],
+                         is_binary(Name), Name =/= <<>>],
+    Tasks = [{Name, fun() ->
+        Base = <<"/repos/", ?ORG/binary, "/", Name/binary, "/contributors">>,
+        cached_contributors(<<"org-contributors:", Name/binary>>, Base)
+    end} || Name <- RepoNames],
+    Results = parallel(Tasks),
+    Pairs = [{Name, value_or(maps:get(Name, Results, undefined), [])} || Name <- RepoNames],
+    {aggregate_contributors(Pairs), errors(Results)};
+organization_contributors(_) -> {[], #{}}.
+
+aggregate_contributors(Pairs) ->
+    Acc = lists:foldl(fun({Repo, People}, Outer) ->
+        lists:foldl(fun(Person, Inner) -> merge_contributor(Repo, Person, Inner) end,
+                    Outer, People)
+    end, #{}, Pairs),
+    lists:sort(fun(A, B) ->
+        maps:get(<<"contributions">>, A, 0) > maps:get(<<"contributions">>, B, 0)
+    end, maps:values(Acc)).
+
+merge_contributor(Repo, Person, Acc) when is_map(Person) ->
+    Key = contributor_key(Repo, Person),
+    case Key of
+        undefined -> Acc;
+        _ ->
+            Existing = maps:get(Key, Acc, #{}),
+            OldRepos = maps:get(<<"repositories">>, Existing, []),
+            Repos = lists:usort([Repo | OldRepos]),
+            Contributions = nonnegative_int(maps:get(<<"contributions">>, Existing, 0)) +
+                            nonnegative_int(maps:get(<<"contributions">>, Person, 0)),
+            Identity = case map_size(Existing) of 0 -> Person; _ -> maps:merge(Person, Existing) end,
+            Acc#{Key => Identity#{<<"contributions">> => Contributions, <<"repositories">> => Repos}}
+    end;
+merge_contributor(_, _, Acc) -> Acc.
+
+contributor_key(Repo, Person) ->
+    case maps:get(<<"login">>, Person, undefined) of
+        Login when is_binary(Login), byte_size(Login) > 0 -> {login, string:lowercase(Login)};
+        _ ->
+            %% GitHub identifies anonymous contributors by author e-mail, but the
+            %% public Source response intentionally drops that e-mail. Keep the
+            %% repository in the internal key rather than accidentally merging two
+            %% unrelated people who happen to use the same display name.
+            case maps:get(<<"name">>, Person, undefined) of
+                Name when is_binary(Name), byte_size(Name) > 0 -> {anonymous, Repo, string:lowercase(Name)};
+                _ -> undefined
+            end
+    end.
+
+truncate_utf8(Bin, MaxChars) when is_binary(Bin), is_integer(MaxChars), MaxChars > 0 ->
+    try unicode:characters_to_binary(lists:sublist(unicode:characters_to_list(Bin), MaxChars))
+    catch _:_ -> <<"Unlinked author">>
+    end.
+
+nonnegative_int(Value) when is_integer(Value), Value >= 0 -> Value;
+nonnegative_int(_) -> 0.
 
 public_profile(Profile) when is_map(Profile) ->
     %% Deliberately project the public-user shape. Authenticated /users/:login
@@ -315,7 +463,7 @@ fetch_json(Path, MaxBytes, Etag, Transform) ->
     Url = <<?API/binary, Path/binary>>,
     Opts = #{
         accept => "application/vnd.github+json",
-        user_agent => "PlainwireRelay/1.8 SourceHub",
+        user_agent => "PlainwireRelay/1.9 SourceHub",
         headers => github_headers(Etag)
     },
     case pw_http_fetch:get(Url, MaxBytes, Opts) of

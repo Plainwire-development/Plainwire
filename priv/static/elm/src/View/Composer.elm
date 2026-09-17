@@ -57,6 +57,16 @@ view key placeholderText model =
                 , span [ class "composer-action-label" ] [ text "Attach" ]
                 ]
             , button
+                [ class "btn secondary composer-action voice-note-action"
+                , type_ "button"
+                , title "Record a voice note"
+                , attribute "aria-label" "Record a voice note"
+                , onClick (BridgeEvent "record_voice_note" E.null)
+                ]
+                [ span [ class "composer-action-voice", attribute "aria-hidden" "true" ] [ text "●" ]
+                , span [ class "composer-action-label" ] [ text "Voice" ]
+                ]
+            , button
                 [ class "btn secondary composer-action gif-action"
                 , type_ "button"
                 , title "Search GIFs (Ctrl / Cmd + G)"

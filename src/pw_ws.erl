@@ -14,6 +14,15 @@ init(Req0, _State) ->
     end.
 
 init_owner(Req0) ->
+    %% Bot credentials are explicit Authorization headers, not ambient browser
+    %% credentials, so they do not rely on an Origin header. Cookie sessions keep
+    %% the stricter browser-origin contract below.
+    case bot_authorization(Req0) of
+        {ok, BotToken} -> init_bot_socket(Req0, BotToken);
+        error -> init_user_socket(Req0)
+    end.
+
+init_user_socket(Req0) ->
     case origin_allowed(Req0) of
         false ->
             logger:warning("[plainwire:ws] connection_rejected reason=origin host=~p origin=~p", [cowboy_req:header(<<"host">>, Req0), cowboy_req:header(<<"origin">>, Req0)]),
@@ -28,11 +37,7 @@ init_owner(Req0) ->
                         {ok, Session} ->
                             User = maps:get(user, Session),
                             Status = maps:get(status, User, <<"online">>),
-                            CleanSession = strip_session_urls(Session),
-                            WsOpts = #{idle_timeout => 300000, max_frame_size => 65536, compress => true},
-                            {cowboy_websocket, Req0, #{session=>CleanSession, token=>Token,
-                                last_auth_check=>erlang:monotonic_time(millisecond),
-                                uid=>maps:get(id,User), subs=>[], voice=>undefined, voice_profile=>undefined, call=>undefined, status=>Status}, WsOpts};
+                            websocket_accept(Req0, Session, Token, maps:get(id, User), Status, user);
                         {error, no_session} ->
                             {ok, cowboy_req:reply(401, #{}, <<"not authenticated">>, Req0), #{}};
                         {error, Reason} ->
@@ -40,6 +45,33 @@ init_owner(Req0) ->
                             {ok, cowboy_req:reply(503, #{<<"retry-after">> => <<"2">>}, <<"session service unavailable">>, Req0), #{}}
                     end
             end
+    end.
+
+init_bot_socket(Req0, Token) ->
+    case pw_db:authenticate_bot(Token) of
+        {ok, Bot} ->
+            Uid = maps:get(user_id, Bot),
+            User = #{id => Uid, username => maps:get(username, Bot, <<>>),
+                     display_name => maps:get(display_name, Bot, maps:get(name, Bot, <<"Bot">>)),
+                     avatar_url => <<>>, status => <<"online">>, is_bot => true},
+            Session = #{user => User, bot => maps:without([user_id], Bot)},
+            websocket_accept(Req0, Session, Token, Uid, <<"online">>, bot);
+        _ ->
+            logger:warning("[plainwire:ws] connection_rejected reason=invalid_bot_token"),
+            {ok, cowboy_req:reply(401, #{}, <<"invalid bot token">>, Req0), #{}}
+    end.
+
+websocket_accept(Req0, Session0, Token, Uid, Status, AuthKind) ->
+    Session = strip_session_urls(Session0),
+    WsOpts = #{idle_timeout => 300000, max_frame_size => 65536, compress => true},
+    {cowboy_websocket, Req0, #{session=>Session, token=>Token, auth_kind=>AuthKind,
+        last_auth_check=>erlang:monotonic_time(millisecond), uid=>Uid, subs=>[], voice=>undefined,
+        voice_profile=>undefined, call=>undefined, status=>Status}, WsOpts}.
+
+bot_authorization(Req) ->
+    case cowboy_req:header(<<"authorization">>, Req) of
+        <<"Bot ", Token/binary>> when byte_size(Token) >= 16, byte_size(Token) =< 256 -> {ok, Token};
+        _ -> error
     end.
 
 websocket_init(State=#{uid:=Uid, status:=Status}) ->
@@ -60,12 +92,17 @@ websocket_handle({text, Data}, State0=#{uid:=Uid}) ->
                 true ->
                     case safe_json_decode(Data) of
                         M when is_map(M) ->
-                            case message_allowed(Uid, M) of
-                                true ->
-                                    debug(debug_level(M), "received", #{uid => Uid, type => event_type(M), bytes => byte_size(Data), room => room_summary(State)}),
-                                    handle_msg(M, State);
+                            case auth_message_allowed(State, M) of
                                 false ->
-                                    reply_error(State, rate_limited)
+                                    reply_error(State, forbidden);
+                                true ->
+                                    case message_allowed(Uid, M) of
+                                        true ->
+                                            debug(debug_level(M), "received", #{uid => Uid, type => event_type(M), bytes => byte_size(Data), room => room_summary(State)}),
+                                            handle_msg(M, State);
+                                        false ->
+                                            reply_error(State, rate_limited)
+                                    end
                             end;
                         _ ->
                             debug(warning, "invalid_json", #{uid => Uid, bytes => byte_size(Data)}),
@@ -76,6 +113,11 @@ websocket_handle({text, Data}, State0=#{uid:=Uid}) ->
             end
     end;
 websocket_handle(_Frame, State) -> {ok, State}.
+
+
+auth_message_allowed(#{auth_kind := bot}, #{<<"type">> := Type}) ->
+    lists:member(Type, [<<"ping">>, <<"subscribe">>, <<"unsubscribe_all">>]);
+auth_message_allowed(_, _) -> true.
 
 %% speaking and quality samples are limited in their handlers and just dropped.
 message_allowed(_Uid, #{<<"type">> := Type}) when Type =:= <<"voice_activity">>; Type =:= <<"call_quality">>; Type =:= <<"typing">> ->
@@ -136,7 +178,7 @@ handle_msg(#{<<"type">> := <<"typing">>, <<"scope">> := Scope0, <<"scope_id">> :
         {thread, Id} when is_integer(Id), Id > 0 -> {thread, Id};
         _ -> undefined
     end,
-    case Key =/= undefined andalso pw_rate:allow({ws_typing, Uid}, 180, 60000) of
+    case Key =/= undefined andalso pw_rate:allow_shared({ws_typing, Uid}, 180, 60000) of
         true ->
             case typing_profile(Uid, Key, Session) of
                 {ok, User} ->
@@ -173,8 +215,14 @@ handle_msg(#{<<"type">> := <<"voice_join">>, <<"channel_id">> := Cid0}, State=#{
     end;
 handle_msg(#{<<"type">> := <<"voice_leave">>}, State) -> S1 = maybe_leave_voice(State), {ok, S1#{voice=>undefined, voice_profile=>undefined}};
 handle_msg(#{<<"type">> := <<"voice_state">>, <<"patch">> := Patch}, State=#{uid:=Uid, voice:=Cid}) when is_integer(Cid), is_map(Patch) ->
-    VoiceProfile = maps:get(voice_profile, State, #{}),
-    pw_hub:voice_state(Cid, Uid, self(), clean_room_patch(Patch), VoiceProfile), {ok, State};
+    Clean = clean_room_patch(Patch),
+    WantsScreen = maps:get(screen, Clean, false) orelse maps:get(screen_audio, Clean, false),
+    case WantsScreen andalso not pw_db:stream_access(Uid, Cid) of
+        true -> reply_error(State, forbidden);
+        false ->
+            VoiceProfile = maps:get(voice_profile, State, #{}),
+            pw_hub:voice_state(Cid, Uid, self(), Clean, VoiceProfile), {ok, State}
+    end;
 handle_msg(#{<<"type">> := <<"voice_signal">>, <<"to_user_id">> := To0, <<"signal">> := Sig}, State=#{uid:=Uid, voice:=Cid}) when is_integer(Cid) ->
     case {pw_util:int(To0), signal_ok(Sig)} of
         {To, true} when is_integer(To), To > 0 -> pw_hub:voice_signal(Cid, Uid, self(), To, Sig), {ok, State};
@@ -384,6 +432,16 @@ production_env() ->
     lists:member(os:getenv("PLAINWIRE_ENV"), ["prod", "production"]) orelse
         lists:member(os:getenv("NODE_ENV"), ["prod", "production"]).
 
+revalidate_session(State=#{auth_kind := bot, last_auth_check := Last, token := Token, uid := Uid}) ->
+    Now = erlang:monotonic_time(millisecond),
+    case Now - Last < 60000 of
+        true -> {ok, State};
+        false ->
+            case pw_db:authenticate_bot(Token) of
+                {ok, #{user_id := Uid}} -> {ok, revalidate_subscriptions(State#{last_auth_check=>Now})};
+                _ -> {error, expired}
+            end
+    end;
 revalidate_session(State=#{last_auth_check := Last, token := Token, uid := Uid}) ->
     Now = erlang:monotonic_time(millisecond),
     case Now - Last < 60000 of
