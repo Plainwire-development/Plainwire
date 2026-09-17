@@ -7,13 +7,25 @@
 %% tighter than bsl, so defining them without parentheses silently turns all/0
 %% into a 99-bit value that no bigint column can hold, and makes has/2 treat
 %% every odd mask as Administrator.
+%% 1142489087 is every bit pw_permissions:catalog/0 exposes, and only those.
+%% mask/1 also answers for reserved bits (mute_members, view_audit_log,
+%% create_threads and the rest) that no product feature enforces yet; those are
+%% deliberately outside all/0, which means sanitize/1 strips them and no role
+%% can be saved holding one. Widening all/0 is how a reserved bit graduates —
+%% and it has to happen in the same change that adds the catalog entry, or the
+%% UI offers a permission the database throws away.
 all_fits_in_a_bigint_test() ->
     All = pw_permissions:all(),
-    ?assertEqual(2143289343, All),
+    ?assertEqual(1142489087, All),
     ?assert(All =< 16#7FFFFFFFFFFFFFFF).
 
+%% Must stay equal to the servers.default_permissions default in pw_db's
+%% migrations. A server created through the API takes its baseline from this
+%% function while one created by a direct INSERT takes it from the column, and
+%% the two disagreeing means the same server grants different permissions
+%% depending on how it was made.
 member_default_matches_schema_default_test() ->
-    ?assertEqual(302049027, pw_permissions:member_default()).
+    ?assertEqual(59139, pw_permissions:member_default()).
 
 member_default_does_not_imply_moderation_test() ->
     Member = pw_permissions:member_default(),

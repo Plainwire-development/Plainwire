@@ -303,7 +303,7 @@ connect_socket(Host0, Port, Timeout, State) ->
             end
     end.
 
-ssl_options(Host, #{tls_insecure := true}) -> [{verify, verify_none}];
+ssl_options(_Host, #{tls_insecure := true}) -> [{verify, verify_none}];
 ssl_options(Host, _) ->
     Base = [{verify, verify_peer}, {cacerts, public_key:cacerts_get()}],
     case inet:parse_address(Host) of

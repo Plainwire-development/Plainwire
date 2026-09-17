@@ -51,7 +51,7 @@ handle_call(_Req, _From, S) -> {reply, {error, bad_request}, S}.
 
 handle_cast(_Msg, S) -> {noreply, S}.
 
-handle_info({'DOWN', Ref, process, _Pid, Reason}, S0) ->
+handle_info({'DOWN', Ref, process, _DownPid, Reason}, S0) ->
     case maps:take(Ref, S0#state.workers) of
         error -> {noreply, S0};
         {{Key, From, _Pid, TimerRef}, Workers1} ->

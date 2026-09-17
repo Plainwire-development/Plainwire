@@ -380,6 +380,16 @@ resolve_public_host(Host) ->
 pick_public_address([_|_] = V4, _V6) -> lists:nth(rand:uniform(length(V4)), V4);
 pick_public_address([], V6) -> lists:nth(rand:uniform(length(V6)), V6).
 
+%% A DNS failure and a host with no records of this family are the same answer
+%% here: no addresses. resolve_public_host/1 decides what an empty result means,
+%% and treats "every answer must be public" over the union of both families, so
+%% this must never invent an address or raise.
+resolve_addrs(Host, Family) ->
+    case inet:getaddrs(Host, Family) of
+        {ok, Addrs} -> Addrs;
+        _ -> []
+    end.
+
 host_allowed(Host) ->
     case pw_util:env_str("PLAINWIRE_MEDIA_ALLOWED_HOSTS", <<>>) of
         <<>> ->

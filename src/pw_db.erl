@@ -3060,7 +3060,7 @@ route({storage_pg_message_recent, Scope0, ScopeId0, Limit0}, Conn) ->
 route({storage_pg_message_before, Scope0, ScopeId0, Before0, Limit0}, Conn) ->
     storage_pg_timeline(Conn, Scope0, ScopeId0, before, Before0, Limit0);
 route({storage_pg_message_after, Scope0, ScopeId0, After0, Limit0}, Conn) ->
-    storage_pg_timeline(Conn, Scope0, ScopeId0, after, After0, Limit0);
+    storage_pg_timeline(Conn, Scope0, ScopeId0, 'after', After0, Limit0);
 route({storage_pg_message_bulk, Ids0}, Conn) ->
     Ids = lists:sublist(lists:usort([I || X <- normalize_list(Ids0), I <- [pw_util:int(X)], is_integer(I), I > 0]), 250),
     case Ids of
@@ -3076,7 +3076,7 @@ route({storage_pg_message_bulk, Ids0}, Conn) ->
     end;
 route({storage_pg_message_edit, Id0, Body0, EditedAt0}, Conn) ->
     Id = pw_util:int(Id0), EditedAt = pw_util:int(EditedAt0),
-    Body = case Body0 of B when is_binary(B) -> B; _ -> invalid end,
+    Body = case Body0 of Bin when is_binary(Bin) -> Bin; _ -> invalid end,
     case {Id, Body, EditedAt} of
         {I, B, T} when is_integer(I), I > 0, is_binary(B), is_integer(T), T > 0 ->
             case one(Conn, "UPDATE messages SET body=$1,edited_at=$2 WHERE id=$3 AND deleted_at IS NULL RETURNING id", [B,T,I]) of
@@ -6871,7 +6871,7 @@ storage_pg_timeline(Conn, Scope0, ScopeId0, Mode, Cursor0, Limit0) ->
         {_, Sid, _, _} when not is_integer(Sid); Sid =< 0 -> {error, bad_request};
         {S, Sid, recent, _} -> storage_pg_timeline_query(Conn, S, Sid, "", [], "DESC", Limit);
         {S, Sid, before, C} when is_integer(C), C > 0 -> storage_pg_timeline_query(Conn, S, Sid, " AND id < $3", [C], "DESC", Limit);
-        {S, Sid, after, C} when is_integer(C), C > 0 -> storage_pg_timeline_query(Conn, S, Sid, " AND id > $3", [C], "ASC", Limit);
+        {S, Sid, 'after', C} when is_integer(C), C > 0 -> storage_pg_timeline_query(Conn, S, Sid, " AND id > $3", [C], "ASC", Limit);
         _ -> {error, bad_request}
     end.
 

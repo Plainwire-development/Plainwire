@@ -16,7 +16,7 @@ for_timestamp(Ts, month) when is_integer(Ts), Ts >= 0 ->
 start_ms(Bucket) when is_integer(Bucket), Bucket >= 0 -> Bucket.
 
 previous(Bucket, Count) -> previous(Bucket, Count, policy()).
-previous(Bucket, Count, Policy) when Count =< 0 -> [];
+previous(_Bucket, Count, _Policy) when Count =< 0 -> [];
 previous(Bucket, Count, day) -> [Bucket - I * ?DAY_MS || I <- lists:seq(0, Count - 1), Bucket - I * ?DAY_MS >= 0];
 previous(Bucket, Count, week) -> [Bucket - I * 7 * ?DAY_MS || I <- lists:seq(0, Count - 1), Bucket - I * 7 * ?DAY_MS >= 0];
 previous(Bucket, Count, month) ->
@@ -34,7 +34,7 @@ epoch_offset_ms() ->
     calendar:datetime_to_gregorian_seconds({{1970,1,1},{0,0,0}}) * 1000.
 
 next(Bucket, Count) -> next(Bucket, Count, policy()).
-next(Bucket, Count, _Policy) when Count =< 0 -> [];
+next(_Bucket, Count, _Policy) when Count =< 0 -> [];
 next(Bucket, Count, day) -> [Bucket + I * ?DAY_MS || I <- lists:seq(0, Count - 1)];
 next(Bucket, Count, week) -> [Bucket + I * 7 * ?DAY_MS || I <- lists:seq(0, Count - 1)];
 next(Bucket, Count, month) ->
