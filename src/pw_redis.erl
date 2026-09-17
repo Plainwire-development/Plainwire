@@ -404,11 +404,21 @@ redis_key(Namespace, Raw0) ->
     Digest = binary:encode_hex(crypto:hash(sha256, Raw), lowercase),
     <<Prefix/binary, $:, Namespace/binary, $:, Digest/binary>>.
 
+%% pw_hub:effective_status/3 hands these over as binaries, and "invisible" has
+%% to survive the trip: presence_set/3's script treats it as "remove this node's
+%% field", which is how a user who went invisible — or whose last socket closed —
+%% stops being published. Without an explicit clause it fell through to the
+%% catch-all and was rewritten to <<"online">>, so the script never saw
+%% 'invisible', the HDEL branch was unreachable, and an invisible account was
+%% broadcast to every other node as online until its field expired.
 safe_status(online) -> <<"online">>;
 safe_status(away) -> <<"away">>;
 safe_status(busy) -> <<"busy">>;
+safe_status(invisible) -> <<"invisible">>;
+safe_status(<<"online">>) -> <<"online">>;
 safe_status(<<"away">>) -> <<"away">>;
 safe_status(<<"busy">>) -> <<"busy">>;
+safe_status(<<"invisible">>) -> <<"invisible">>;
 safe_status(_) -> <<"online">>.
 
 normalize_presence(<<"away">>) -> <<"away">>;
