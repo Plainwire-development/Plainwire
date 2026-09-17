@@ -123,7 +123,13 @@ for (const stmt of ['pw_msg_insert','pw_msg_locator_get','pw_event_insert','pw_a
 }
 must(coreSchema.includes('messages_by_scope_bucket') && coreSchema.includes('message_locator_by_id'), 'core Scylla message schema incomplete');
 must(coreSchema.includes('TimeWindowCompactionStrategy'), 'append-oriented timeline tables must use time-window compaction');
-must(mutableCompaction.includes('IncrementalCompactionStrategy') && mutableCompaction.includes('messages_by_scope_bucket'),
+// The point is that the canonical message table is off TWCS, not which
+// replacement it uses. IncrementalCompactionStrategy is ScyllaDB Enterprise
+// only: requiring it by name made the migration unapplicable on open-source
+// Scylla, which fails with "Unable to find compaction strategy class" and
+// leaves the schema permanently half-applied. Accept either, and keep the
+// assertion that actually matters.
+must(/'(Incremental|Leveled)CompactionStrategy'/.test(mutableCompaction) && mutableCompaction.includes('messages_by_scope_bucket'),
   'mutable canonical messages must not remain on TWCS');
 must(bucketSchema.includes('message_buckets_by_scope'), 'message bucket directory schema missing');
 must(eventBuckets.includes('event_buckets_by_scope') && eventBuckets.includes('audit_buckets_by_server') && eventBuckets.includes('delivery_buckets_by_server'),
