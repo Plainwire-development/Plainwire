@@ -715,7 +715,11 @@ connect_with_retry(Attempts, DelayMs) ->
     end.
 
 route(admin_operator_count, Conn) ->
+    %% No parameters, so rows/3 takes the simple-query path (epgsql:squery),
+    %% which returns every column as text: count(*) arrives as <<"0">>, and
+    %% pw_admin_identity's {ok, 0} first-run check would never match.
     case one(Conn, "SELECT count(*) FROM admin_operators", []) of
+        {ok, [Count]} when is_binary(Count) -> {ok, binary_to_integer(Count)};
         {ok, [Count]} -> {ok, Count};
         {error, Reason} -> erlang:error({sql_error, Reason})
     end;
@@ -726,7 +730,8 @@ route({admin_bootstrap_owner, U0, P0, VerificationHash0}, Conn) ->
     with_tx(Conn, fun() ->
         ok = exec(Conn, "LOCK TABLE admin_operators IN SHARE ROW EXCLUSIVE MODE", []),
         case one(Conn, "SELECT count(*) FROM admin_operators", []) of
-            {ok, [0]} ->
+            %% simple-query text result; see route(admin_operator_count, _)
+            {ok, [Zero]} when Zero =:= 0; Zero =:= <<"0">> ->
                 case verify_admin_user(Conn, U, P) of
                     {ok, Uid, Username, DisplayName} ->
                         Now = pw_util:now_ms(),
@@ -4112,8 +4117,13 @@ route({get_upload, Uid, Id}, Conn) ->
     end;
 route({upload_ref_backfill, Batch0}, Conn) ->
     Batch = min(2000, max(1, pw_util:int(Batch0))),
+    %% No parameters, so rows/3 takes the simple-query path (epgsql:squery) and
+    %% `done` arrives as text: <<"t">>, never the atom true. Without accepting
+    %% both, a finished backfill re-walks messages forever and dies writing a
+    %% 64-bit message id into the int4 cursor column, killing a pool connection
+    %% every 30 seconds.
     case one(Conn, "SELECT cursor, done FROM upload_ref_backfill WHERE id = 1", []) of
-        {ok, [_, true]} -> {ok, done};
+        {ok, [_, Done]} when Done =:= true; Done =:= <<"t">> -> {ok, done};
         {ok, [Cursor0, _]} ->
             Cursor = pw_util:int(Cursor0),
             {ok, Rows} = rows(Conn,
