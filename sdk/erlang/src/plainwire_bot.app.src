@@ -1,6 +1,6 @@
 {application, plainwire_bot,
  [{description, "Plainwire bot SDK"},
-  {vsn, "2.0.0"},
+  {vsn, "2.0.3"},
   {applications, [kernel, stdlib, crypto, public_key, ssl, gun, jsx]},
   {env, []},
   {modules, []}] }.

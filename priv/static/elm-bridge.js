@@ -361,7 +361,10 @@
         stack.id = 'pw-global-banners';
         stack.className = 'pw-global-banner-stack';
         stack.setAttribute('aria-label', 'Service announcements');
-        document.body.prepend(stack);
+        // Browser.application owns every child of <body> and patches them by
+        // index, so a node inserted there corrupts Elm's view. Mount the stack
+        // beside <body> instead; the theme and font live on <html>.
+        document.documentElement.append(stack);
       }
       stack.replaceChildren();
       visible.slice(0, 3).forEach((banner) => {
@@ -374,9 +377,9 @@
         if (banner?.title) { const title = document.createElement('strong'); title.textContent = String(banner.title).slice(0, 80); copy.append(title); }
         const body = document.createElement('span'); body.textContent = String(banner?.body || '').slice(0, 500); copy.append(body);
         const href = safeBannerHref(banner?.link_url || '');
-        if (href && banner?.link_label) {
+        if (href) {
           const link = document.createElement('a'); link.className = 'pw-global-banner-link'; link.href = href;
-          link.textContent = String(banner.link_label).slice(0, 40);
+          link.textContent = String(banner?.link_label || '').trim().slice(0, 40) || 'Learn more';
           if (new URL(href).origin !== location.origin) { link.target = '_blank'; link.rel = 'noopener noreferrer'; }
           copy.append(link);
         }
