@@ -85,6 +85,14 @@ checked_rows(Rows, Decoded, Metric) ->
         false -> pw_storage_metrics:incr(Metric), {error, malformed_row}
     end.
 
+%% Payloads go in through pw_storage_sanitize:encode_payload/1, so they are
+%% always JSON — but a row written by an older build, or truncated by the
+%% encoder's size cap, must degrade to an empty map rather than take down the
+%% read. Same contract as pw_audit_store and pw_delivery_store.
+decode_payload(B) when is_binary(B) ->
+    try jsx:decode(B, [return_maps]) catch _:_ -> #{} end;
+decode_payload(_) -> #{}.
+
 resolve_event_identity(Event) ->
     case resolve_event_id(Event) of
         {ok, EventId} ->

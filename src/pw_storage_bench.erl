@@ -167,7 +167,7 @@ collect_batch(Pending, Acc, Deadline, WorkerTimeout) ->
             end;
         {'DOWN', Mon, process, _Pid, Reason} ->
             case take_pending_monitor(Mon, Pending) of
-                {ok, Ref, Rest} ->
+                {ok, _Ref, Rest} ->
                     Sample = case Reason of
                         normal -> {{error, worker_exited_before_result}, 0};
                         _ -> {{error, {worker_crash, sanitize(Reason)}}, 0}

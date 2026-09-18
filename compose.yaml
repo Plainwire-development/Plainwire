@@ -1,0 +1,78 @@
+# Local development services for Plainwire. Not a production topology — see
+# docs/SCYLLA.md for what a real Scylla deployment needs, and the deploy/
+# directory for running Plainwire itself.
+#
+# PostgreSQL is the only service you always need. Redis and ScyllaDB are behind
+# profiles so a small checkout is not paying for a two-gigabyte database it has
+# not switched on yet:
+#
+#   docker compose up -d postgres                              # PostgreSQL only
+#   docker compose --profile realtime up -d                    # + Redis
+#   docker compose --profile realtime --profile scylla up -d   # + ScyllaDB
+#
+# Defaults match .env.development.example, so a fresh checkout works with no
+# configuration. Every credential here is a development placeholder.
+services:
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: plainwire
+      POSTGRES_PASSWORD: plainwire
+      POSTGRES_DB: plainwire
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plainwire -d plainwire"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Ephemeral only: presence, rate gates and the hot message cache. No volume
+  # and no persistence on purpose — Plainwire treats an empty Redis as a cold
+  # cache, never as data loss, and a development instance should be restartable
+  # without inheriting yesterday's presence snapshot.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    profiles: ["realtime"]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Single-node ScyllaDB for development. --developer-mode relaxes the
+  # production checks (XFS, aio limits, clocksource) a laptop or container
+  # cannot satisfy and --overprovisioned tells the scheduler it is sharing the
+  # CPU; neither belongs on a real cluster. Apply the schema with
+  # ./scripts/scylla-migrate once this reports healthy — Plainwire never
+  # mutates Scylla schema at startup.
+  scylla:
+    image: scylladb/scylla:6.2
+    restart: unless-stopped
+    profiles: ["scylla"]
+    command:
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned=1
+      - --developer-mode=1
+    ports:
+      - "127.0.0.1:9042:9042"
+    volumes:
+      - scylladata:/var/lib/scylla
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool status | grep -q '^UN'"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+
+volumes:
+  pgdata:
+  scylladata:

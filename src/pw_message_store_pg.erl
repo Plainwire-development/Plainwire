@@ -1,4 +1,6 @@
 -module(pw_message_store_pg).
+%% get/1 here is a storage lookup, not erlang:get/1's process dictionary.
+-compile({no_auto_import, [get/1]}).
 -export([get/1, get_recent/3, get_before/4, get_after/4, get_around/5,
          bulk_get/1, edit/3, delete/2]).
 

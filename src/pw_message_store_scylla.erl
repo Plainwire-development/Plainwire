@@ -1,4 +1,6 @@
 -module(pw_message_store_scylla).
+%% get/1 here is a storage lookup, not erlang:get/1's process dictionary.
+-compile({no_auto_import, [get/1]}).
 -export([insert/1, transactional_upsert/1, complete_transactional_upsert/1, pending_write_intents/1,
          get/1, get_recent/3, get_before/4, get_after/4, get_around/5, bulk_get/1,
          edit/3, delete/2, hard_delete/1, hard_delete_scoped/4, hard_delete_at/4, append_lifecycle/4]).
@@ -161,7 +163,7 @@ get_after(Scope, ScopeId, AfterId, Limit0) ->
     Limit = limit(Limit0, ?MAX_LIMIT),
     case locator(AfterId) of
         {ok, #{scope := Scope, scope_id := ScopeId, bucket := Bucket}} ->
-            case message_buckets(Scope, ScopeId, after, Bucket) of
+            case message_buckets(Scope, ScopeId, 'after', Bucket) of
                 {ok, Buckets} -> collect_asc(Scope, ScopeId, Buckets, AfterId, Limit, []);
                 Error -> Error
             end;
@@ -300,7 +302,7 @@ message_buckets(Scope, ScopeId, recent, _Bucket) ->
 message_buckets(Scope, ScopeId, before, Bucket) ->
     bucket_rows(pw_scylla:execute({bucket_index, Scope, ScopeId}, pw_msg_buckets_before,
                                   [Scope, ScopeId, Bucket, bucket_scan_limit()]));
-message_buckets(Scope, ScopeId, after, Bucket) ->
+message_buckets(Scope, ScopeId, 'after', Bucket) ->
     bucket_rows(pw_scylla:execute({bucket_index, Scope, ScopeId}, pw_msg_buckets_after,
                                   [Scope, ScopeId, Bucket, bucket_scan_limit()])).
 
@@ -529,7 +531,7 @@ valid_optional_timestamp(0) -> true;
 valid_optional_timestamp(V) when is_integer(V), V > 0 -> true;
 valid_optional_timestamp(_) -> false.
 
-get_scope_from_extra_or_locator(Id, #{scope := Scope, scope_id := ScopeId}) -> {ok, Scope, ScopeId};
+get_scope_from_extra_or_locator(_Id, #{scope := Scope, scope_id := ScopeId}) -> {ok, Scope, ScopeId};
 get_scope_from_extra_or_locator(Id, _Extra) ->
     case locator(Id) of
         {ok, #{scope := Scope, scope_id := ScopeId}} -> {ok, Scope, ScopeId};

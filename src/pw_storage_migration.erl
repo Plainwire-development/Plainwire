@@ -108,7 +108,7 @@ parity_scope(Scope, ScopeId) ->
                     Ids = lists:sublist([maps:get(id, M) || M <- Recent], 25),
                     [{before, parity_check(compare_store_call(fun() -> pw_message_store_pg:get_before(Scope, ScopeId, Oldest, 80) end,
                                                                fun() -> pw_message_store_scylla:get_before(Scope, ScopeId, Oldest, 80) end))},
-                     {after, parity_check(compare_store_call(fun() -> pw_message_store_pg:get_after(Scope, ScopeId, Mid, 80) end,
+                     {'after', parity_check(compare_store_call(fun() -> pw_message_store_pg:get_after(Scope, ScopeId, Mid, 80) end,
                                                               fun() -> pw_message_store_scylla:get_after(Scope, ScopeId, Mid, 80) end))},
                      {around, parity_check(compare_store_call(fun() -> pw_message_store_pg:get_around(Scope, ScopeId, Mid, 10, 10) end,
                                                                fun() -> pw_message_store_scylla:get_around(Scope, ScopeId, Mid, 10, 10) end))},

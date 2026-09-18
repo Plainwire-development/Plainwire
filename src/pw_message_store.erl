@@ -10,14 +10,14 @@ backend() -> pw_scylla_config:backend().
 %% Message writes are intentionally coordinated by pw_db so PostgreSQL transactions,
 %% Scylla write intents, and the durable outbox cannot be bypassed accidentally.
 
-get(Id) -> store_module():get(Id).
-get_recent(Scope, ScopeId, Limit) -> store_module():get_recent(Scope, ScopeId, Limit).
-get_before(Scope, ScopeId, Before, Limit) -> store_module():get_before(Scope, ScopeId, Before, Limit).
-get_after(Scope, ScopeId, After, Limit) -> store_module():get_after(Scope, ScopeId, After, Limit).
-get_around(Scope, ScopeId, Id, Before, After) -> store_module():get_around(Scope, ScopeId, Id, Before, After).
-bulk_get(Ids) -> store_module():bulk_get(Ids).
-edit(Id, Body, EditedAt) -> store_module():edit(Id, Body, EditedAt).
-delete(Id, ActorId) -> store_module():delete(Id, ActorId).
+get(Id) -> (store_module()):get(Id).
+get_recent(Scope, ScopeId, Limit) -> (store_module()):get_recent(Scope, ScopeId, Limit).
+get_before(Scope, ScopeId, Before, Limit) -> (store_module()):get_before(Scope, ScopeId, Before, Limit).
+get_after(Scope, ScopeId, After, Limit) -> (store_module()):get_after(Scope, ScopeId, After, Limit).
+get_around(Scope, ScopeId, Id, Before, After) -> (store_module()):get_around(Scope, ScopeId, Id, Before, After).
+bulk_get(Ids) -> (store_module()):bulk_get(Ids).
+edit(Id, Body, EditedAt) -> (store_module()):edit(Id, Body, EditedAt).
+delete(Id, ActorId) -> (store_module()):delete(Id, ActorId).
 
 store_module() ->
     case backend() of
