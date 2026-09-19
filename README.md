@@ -30,20 +30,20 @@ If you just want to use Plainwire, you should not need to worry about any of tha
 
 ## Features
 
-* Servers and channels with custom roles and per-server profiles
+* Servers and channels with custom roles, channel topics/slowmode, and per-server profiles
 * Direct messages and group chats
 * Forums and threads using f/ and t/ navigation
 * Voice calls
 * Screen sharing with optional shared audio and collapsible viewers
 * File uploads
-* Profiles, friends, blocking, presence, and realtime typing
-* Message replies, Markdown, and emoji reactions with activity notifications
+* Profiles, friends, blocking, presence, realtime typing, and permission-filtered message search
+* Message replies with jump-to-source highlighting, pinned messages, Markdown, and emoji reactions with activity notifications
 * Light, dark, and system themes
 * Audio device selection and mic testing
 * Mobile and desktop layouts
 * PostgreSQL-backed relational persistence, with optional Redis acceleration and ScyllaDB timeline storage
 * Voice notes with server permission controls
-* Signed outbound webhooks and first-class bot accounts/SDK support
+* Signed outbound webhooks, write-only incoming channel webhooks, and first-class bot accounts/SDK support
 * Whole-app Less themes and sandboxed client plugins
 * STUN and TURN support for calls
 * Wires for sharing/joining servers, with legacy invite-link compatibility
@@ -59,7 +59,7 @@ Plainwire is self-hostable, but expect a little setup.
 
 You will need:
 
-* Erlang/OTP 25+
+* Erlang/OTP 27+
 * PostgreSQL 13+
 * rebar3
 * Node.js 22+
@@ -216,6 +216,7 @@ Portable source archives intentionally omit generated `app.js`, `app.css`, `inde
 
 Plainwire has a few optional backend components that are not required for a normal installation.
 
+* [Scaling and load testing](docs/SCALING.md)
 * [Partisan clustering](docs/CLUSTERING.md)
 * [Native call-health analysis](docs/CALL_HEALTH.md)
 
@@ -281,10 +282,13 @@ Deployment and update instructions are kept in [deploy/README.md](deploy/README.
 
 ## Version
 
-Current release: **2.0.3**
+Current release: **2.1.0**
+
+* [Build and validation status](BUILD_STATUS.md)
 
 Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history.
 
+* [2.1.0 release notes](RELEASE_NOTES_2.1.0.md)
 * [2.0.3 release notes](RELEASE_NOTES_2.0.3.md)
 * [2.0.2 release notes](RELEASE_NOTES_2.0.2.md)
 * [2.0.1 release notes](RELEASE_NOTES_2.0.1.md)

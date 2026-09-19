@@ -1,0 +1,76 @@
+name: bot-sdks
+
+on:
+  push:
+    paths:
+      - 'sdk/**'
+      - 'scripts/test-bot-sdks.sh'
+      - '.github/workflows/bot-sdks.yml'
+  pull_request:
+    paths:
+      - 'sdk/**'
+      - 'scripts/test-bot-sdks.sh'
+      - '.github/workflows/bot-sdks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-and-managed:
+    name: C, C++, Go, Python, JavaScript
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.24.x'
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Install native SDK build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config libcurl4-openssl-dev
+      - name: C SDK
+        run: cmake -S sdk/c -B /tmp/pw-c && cmake --build /tmp/pw-c -j2 && ctest --test-dir /tmp/pw-c --output-on-failure
+      - name: C++ SDK
+        run: cmake -S sdk/cpp -B /tmp/pw-cpp && cmake --build /tmp/pw-cpp -j2
+      - name: Go SDK
+        working-directory: sdk/go
+        run: go test ./...
+      - name: Python SDK
+        run: PYTHONPATH=sdk/python python -m unittest discover -s sdk/python/tests -v
+      - name: JavaScript SDK
+        run: node --test sdk/javascript/tests/client.test.mjs
+
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust SDK
+        working-directory: sdk/rust
+        run: cargo test
+
+  erlang:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          rebar3-version: '3.25'
+      - name: Erlang SDK
+        working-directory: sdk/erlang
+        run: rebar3 eunit

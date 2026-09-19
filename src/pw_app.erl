@@ -7,12 +7,24 @@ start(_Type, _Args) ->
         ok -> ok;
         {error, Reason} -> erlang:error({cluster_configuration_error, Reason})
     end,
+    ensure_crypto_config(),
     ensure_secure_config(),
     ensure_storage_config(),
     %% listener belongs under the supervisor. dead-but-running is a bad look.
     pw_sup:start_link().
 
 stop(_State) -> ok.
+
+ensure_crypto_config() ->
+    case pw_crypto:validate() of
+        ok -> ok;
+        {error, no_encryption_key} ->
+            case production_env() of
+                true -> erlang:error({insecure_production_config, encryption_key});
+                false -> ok
+            end;
+        {error, Reason} -> erlang:error({invalid_crypto_config, Reason})
+    end.
 
 ensure_storage_config() ->
     case pw_scylla_config:validate() of

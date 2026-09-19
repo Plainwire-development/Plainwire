@@ -2,8 +2,13 @@
 -behaviour(gen_server).
 
 -export([start_link/1, stop/1,
-         me/1, server/1, channels/1, messages/2, messages/3,
-         send_message/3, send_message/4, delete_message/2, toggle_reaction/3,
+         capabilities/1, me/1, server/1, channels/1, messages/2, messages/3,
+         send_message/3, send_message/4, delete_message/2, toggle_reaction/3, edit_message/3, pin_message/3,
+         channel_pins/2, message_context/2, create_channel/4, update_channel/3,
+         roles/1, create_role/3, update_role/3, delete_role/2, member/2, set_member_roles/3,
+         kick_member/2, ban_member/3, unban_member/2, bans/1, wires/1, create_wire/4,
+         commands/1, register_command/4, delete_command/2, claim_commands/2,
+         respond_command/4, fail_command/4,
          subscribe/2, unsubscribe_all/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -ifdef(TEST).
@@ -12,39 +17,106 @@
 
 -define(DEFAULT_TIMEOUT, 10000).
 -define(MAX_BACKOFF, 30000).
+-define(MAX_RESPONSE, 2097152).
 
 start_link(Opts0) when is_map(Opts0) ->
     Opts = Opts0#{owner => maps:get(owner, Opts0, self())},
     gen_server:start_link(?MODULE, Opts, []).
 
 stop(Pid) -> gen_server:stop(Pid).
-me(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/me">>, undefined}, ?DEFAULT_TIMEOUT + 2000).
-server(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/server">>, undefined}, ?DEFAULT_TIMEOUT + 2000).
-channels(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/channels">>, undefined}, ?DEFAULT_TIMEOUT + 2000).
+capabilities(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/v1">>, undefined}, ?DEFAULT_TIMEOUT + 2000).
+me(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/v1/me">>, undefined}, ?DEFAULT_TIMEOUT + 2000).
+server(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/v1/server">>, undefined}, ?DEFAULT_TIMEOUT + 2000).
+channels(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/v1/channels">>, undefined}, ?DEFAULT_TIMEOUT + 2000).
 messages(Pid, ChannelId) -> messages(Pid, ChannelId, #{}).
 messages(Pid, ChannelId, Params) ->
-    Path0 = iolist_to_binary([<<"/api/bot/channels/">>, id(ChannelId), <<"/messages">>]),
+    Path0 = iolist_to_binary([<<"/api/bot/v1/channels/">>, id(ChannelId), <<"/messages">>]),
     Path = with_query(Path0, Params),
     gen_server:call(Pid, {request, get, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
 send_message(Pid, ChannelId, Body) -> send_message(Pid, ChannelId, Body, undefined).
 send_message(Pid, ChannelId, Body, ReplyTo) ->
     Payload0 = #{body => bin(Body)},
     Payload = case ReplyTo of undefined -> Payload0; _ -> Payload0#{reply_to_id => ReplyTo} end,
-    Path = iolist_to_binary([<<"/api/bot/channels/">>, id(ChannelId), <<"/messages">>]),
+    Path = iolist_to_binary([<<"/api/bot/v1/channels/">>, id(ChannelId), <<"/messages">>]),
     gen_server:call(Pid, {request, post, Path, Payload}, ?DEFAULT_TIMEOUT + 2000).
 delete_message(Pid, MessageId) ->
-    Path = iolist_to_binary([<<"/api/bot/messages/">>, id(MessageId), <<"/delete">>]),
+    Path = iolist_to_binary([<<"/api/bot/v1/messages/">>, id(MessageId), <<"/delete">>]),
     gen_server:call(Pid, {request, post, Path, #{}}, ?DEFAULT_TIMEOUT + 2000).
 toggle_reaction(Pid, MessageId, Emoji) ->
-    Path = iolist_to_binary([<<"/api/bot/messages/">>, id(MessageId), <<"/reaction">>]),
+    Path = iolist_to_binary([<<"/api/bot/v1/messages/">>, id(MessageId), <<"/reaction">>]),
     gen_server:call(Pid, {request, post, Path, #{emoji => bin(Emoji)}}, ?DEFAULT_TIMEOUT + 2000).
+edit_message(Pid, MessageId, Body) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/messages/">>, id(MessageId), <<"/edit">>]),
+    gen_server:call(Pid, {request, post, Path, #{body => bin(Body)}}, ?DEFAULT_TIMEOUT + 2000).
+pin_message(Pid, MessageId, Pinned) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/messages/">>, id(MessageId), <<"/pin">>]),
+    gen_server:call(Pid, {request, post, Path, #{pinned => Pinned =:= true}}, ?DEFAULT_TIMEOUT + 2000).
+channel_pins(Pid, ChannelId) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/channels/">>, id(ChannelId), <<"/pins">>]),
+    gen_server:call(Pid, {request, get, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
+message_context(Pid, MessageId) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/messages/">>, id(MessageId), <<"/context">>]),
+    gen_server:call(Pid, {request, get, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
+create_channel(Pid, Name, Kind, CategoryId) ->
+    Payload0 = #{name => bin(Name), kind => bin(Kind)},
+    Payload = case CategoryId of undefined -> Payload0; 0 -> Payload0; _ -> Payload0#{category_id => CategoryId} end,
+    gen_server:call(Pid, {request, post, <<"/api/bot/v1/channels">>, Payload}, ?DEFAULT_TIMEOUT + 2000).
+update_channel(Pid, ChannelId, Patch) when is_map(Patch) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/channels/">>, id(ChannelId), <<"/settings">>]),
+    gen_server:call(Pid, {request, post, Path, Patch}, ?DEFAULT_TIMEOUT + 2000).
+roles(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/v1/roles">>, undefined}, ?DEFAULT_TIMEOUT + 2000).
+create_role(Pid, Name, Patch) when is_map(Patch) ->
+    gen_server:call(Pid, {request, post, <<"/api/bot/v1/roles">>, Patch#{name => bin(Name)}}, ?DEFAULT_TIMEOUT + 2000).
+update_role(Pid, RoleId, Patch) when is_map(Patch) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/roles/">>, id(RoleId)]),
+    gen_server:call(Pid, {request, post, Path, Patch}, ?DEFAULT_TIMEOUT + 2000).
+delete_role(Pid, RoleId) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/roles/">>, id(RoleId)]),
+    gen_server:call(Pid, {request, delete, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
+member(Pid, UserId) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/members/">>, id(UserId)]),
+    gen_server:call(Pid, {request, get, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
+set_member_roles(Pid, UserId, RoleIds) when is_list(RoleIds) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/members/">>, id(UserId), <<"/roles">>]),
+    gen_server:call(Pid, {request, post, Path, #{role_ids => RoleIds}}, ?DEFAULT_TIMEOUT + 2000).
+kick_member(Pid, UserId) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/members/">>, id(UserId), <<"/kick">>]),
+    gen_server:call(Pid, {request, post, Path, #{}}, ?DEFAULT_TIMEOUT + 2000).
+ban_member(Pid, UserId, Reason) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/members/">>, id(UserId), <<"/ban">>]),
+    gen_server:call(Pid, {request, post, Path, #{reason => bin(Reason)}}, ?DEFAULT_TIMEOUT + 2000).
+unban_member(Pid, UserId) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/members/">>, id(UserId), <<"/unban">>]),
+    gen_server:call(Pid, {request, post, Path, #{}}, ?DEFAULT_TIMEOUT + 2000).
+bans(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/v1/bans">>, undefined}, ?DEFAULT_TIMEOUT + 2000).
+wires(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/v1/wires">>, undefined}, ?DEFAULT_TIMEOUT + 2000).
+create_wire(Pid, ChannelId, MaxUses, ExpiresIn) ->
+    Payload = #{channel_id => ChannelId, max_uses => MaxUses, expires_in => ExpiresIn},
+    gen_server:call(Pid, {request, post, <<"/api/bot/v1/wires">>, Payload}, ?DEFAULT_TIMEOUT + 2000).
+commands(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/v1/commands">>, undefined}, ?DEFAULT_TIMEOUT + 2000).
+register_command(Pid, Name, Description, Options) ->
+    Payload = #{name => bin(Name), description => bin(Description), options => Options},
+    gen_server:call(Pid, {request, post, <<"/api/bot/v1/commands">>, Payload}, ?DEFAULT_TIMEOUT + 2000).
+delete_command(Pid, CommandId) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/commands/">>, id(CommandId)]),
+    gen_server:call(Pid, {request, delete, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
+claim_commands(Pid, Limit0) ->
+    Limit = min(50, max(1, case Limit0 of I when is_integer(I) -> I; _ -> 10 end)),
+    Path = <<"/api/bot/v1/commands/claims?limit=", (integer_to_binary(Limit))/binary>>,
+    gen_server:call(Pid, {request, get, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
+respond_command(Pid, InvocationId, ClaimToken, Body) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/commands/claims/">>, id(InvocationId), <<"/respond">>]),
+    gen_server:call(Pid, {request, post, Path, #{claim_token => bin(ClaimToken), body => bin(Body)}}, ?DEFAULT_TIMEOUT + 2000).
+fail_command(Pid, InvocationId, ClaimToken, Reason) ->
+    Path = iolist_to_binary([<<"/api/bot/v1/commands/claims/">>, id(InvocationId), <<"/fail">>]),
+    gen_server:call(Pid, {request, post, Path, #{claim_token => bin(ClaimToken), reason => bin(Reason)}}, ?DEFAULT_TIMEOUT + 2000).
 subscribe(Pid, Key) -> gen_server:call(Pid, {subscribe, bin(Key)}).
 unsubscribe_all(Pid) -> gen_server:call(Pid, unsubscribe_all).
 
 init(Opts) ->
     process_flag(trap_exit, true),
     Token = bin(maps:get(token, Opts, <<>>)),
-    case {byte_size(Token) >= 16, parse_base(maps:get(base_url, Opts, <<"http://127.0.0.1:8080">>))} of
+    case {valid_bot_token(Token), parse_base(maps:get(base_url, Opts, <<"http://127.0.0.1:8080">>))} of
         {false, _} -> {stop, invalid_bot_token};
         {true, {error, Reason}} -> {stop, {invalid_base_url, Reason}};
         {true, {ok, Base}} ->
@@ -201,7 +273,7 @@ request_body(Body, State) ->
     {[{<<"content-type">>, <<"application/json">>} | auth_headers(State)], jsx:encode(Body)}.
 
 auth_headers(State) -> [{<<"authorization">>, <<"Bot ", (maps:get(token, State))/binary>>},
-                        {<<"user-agent">>, <<"plainwire-erlang-bot/2.0">>}].
+                        {<<"user-agent">>, <<"plainwire-erlang-bot/2.1">>}].
 
 await_response(Conn, Ref) ->
     Deadline = erlang:monotonic_time(millisecond) + ?DEFAULT_TIMEOUT,
@@ -215,16 +287,46 @@ await_final_response(Conn, Ref, Deadline) ->
                 {inform, _Status, _Headers} -> await_final_response(Conn, Ref, Deadline);
                 {response, fin, Status, _Headers} -> decode_response(Status, <<>>);
                 {response, nofin, Status, _Headers} ->
-                    case remaining_timeout(Deadline) of
-                        0 -> {error, {body_failed, timeout}};
-                        BodyTimeout ->
-                            case gun:await_body(Conn, Ref, BodyTimeout) of
-                                {ok, Data} -> decode_response(Status, Data);
-                                {error, Reason} -> {error, {body_failed, Reason}}
-                            end
-                    end;
+                    await_bounded_body(Conn, Ref, Status, Deadline, [], 0);
                 {error, Reason} -> {error, {request_failed, Reason}};
                 Other -> {error, {request_failed, {unexpected_gun_reply, Other}}}
+            end
+    end.
+
+
+await_bounded_body(Conn, Ref, Status, Deadline, Acc, Size) ->
+    case remaining_timeout(Deadline) of
+        0 ->
+            %% Stop delivery for this stream as soon as our total request
+            %% budget expires.  Do not leave a large response accumulating in
+            %% the owner mailbox after the API call has already failed.
+            catch gun:cancel(Conn, Ref),
+            {error, {body_failed, timeout}};
+        Remaining ->
+            case gun:await(Conn, Ref, Remaining) of
+                {data, IsFin, Chunk} when is_binary(Chunk) ->
+                    NewSize = Size + byte_size(Chunk),
+                    case NewSize =< ?MAX_RESPONSE of
+                        false ->
+                            %% gun:await_body/3 first materializes the entire
+                            %% response.  Reading chunks ourselves lets us
+                            %% enforce the cap before untrusted response data is
+                            %% accumulated into one large binary.
+                            catch gun:cancel(Conn, Ref),
+                            {error, response_too_large};
+                        true when IsFin =:= fin ->
+                            decode_response(Status, iolist_to_binary(lists:reverse([Chunk | Acc])));
+                        true ->
+                            await_bounded_body(Conn, Ref, Status, Deadline,
+                                               [Chunk | Acc], NewSize)
+                    end;
+                {trailers, _Headers} ->
+                    decode_response(Status, iolist_to_binary(lists:reverse(Acc)));
+                {error, Reason} ->
+                    {error, {body_failed, Reason}};
+                Other ->
+                    catch gun:cancel(Conn, Ref),
+                    {error, {body_failed, {unexpected_gun_reply, Other}}}
             end
     end.
 
@@ -268,6 +370,14 @@ notify(State, Event) ->
     maps:get(owner, State) ! {plainwire_bot, self(), Event},
     ok.
 
+valid_bot_token(Token) when is_binary(Token) ->
+    Size = byte_size(Token),
+    Size >= 20 andalso Size =< 256 andalso
+    binary:match(Token, <<"pwb_">>) =:= {0, 4} andalso
+    binary:match(Token, <<"\r">>) =:= nomatch andalso
+    binary:match(Token, <<"\n">>) =:= nomatch;
+valid_bot_token(_) -> false.
+
 parse_base(Url0) ->
     try uri_string:parse(binary_to_list(bin(Url0))) of
         M when is_map(M) ->
@@ -287,6 +397,14 @@ parse_base(Url0) ->
                         {_, _, U, _, _} when U =/= undefined, U =/= <<>>, U =/= "" -> {error, userinfo_not_allowed};
                         {_, _, _, Q, _} when Q =/= undefined, Q =/= <<>>, Q =/= "" -> {error, query_not_allowed};
                         {_, _, _, _, F} when F =/= undefined, F =/= <<>>, F =/= "" -> {error, fragment_not_allowed};
+                        _ when Scheme =:= http ->
+                            case loopback_host(Host) of
+                                false -> {error, plaintext_remote_not_allowed};
+                                true ->
+                                    RawPath = bin(maps:get(path, M, <<>>)),
+                                    Path = case RawPath of <<"/">> -> <<>>; _ -> trim_slash(RawPath) end,
+                                    {ok, #{scheme => Scheme, host => Host, port => Port, path => Path}}
+                            end;
                         _ ->
                             RawPath = bin(maps:get(path, M, <<>>)),
                             Path = case RawPath of <<"/">> -> <<>>; _ -> trim_slash(RawPath) end,
@@ -301,6 +419,18 @@ normalize_scheme(<<"http">>) -> http;
 normalize_scheme("https") -> https;
 normalize_scheme(<<"https">>) -> https;
 normalize_scheme(_) -> invalid.
+
+loopback_host(Host) ->
+    Lower = string:lowercase(binary_to_list(Host)),
+    case Lower of
+        "localhost" -> true;
+        _ ->
+            case inet:parse_address(Lower) of
+                {ok, {127, _, _, _}} -> true;
+                {ok, {0,0,0,0,0,0,0,1}} -> true;
+                _ -> false
+            end
+    end.
 
 -ifdef(TEST).
 test_parse_base(Url) -> parse_base(Url).

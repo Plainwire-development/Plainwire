@@ -19,7 +19,7 @@
  {<<"jsx">>,{pkg,<<"jsx">>,<<"3.1.0">>},0},
  {<<"ranch">>,
   {git,"https://github.com/ninenines/ranch.git",
-       {ref,"10b51304b26062e0dbfd5e74824324e9a911e269"}},
+       {ref,"70ae2ff5d5f5740a60b3d68a5898be3edf4e4802"}},
   0}]}.
 [
 {pkg_hash,[

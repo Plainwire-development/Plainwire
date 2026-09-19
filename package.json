@@ -20,17 +20,20 @@
     "test:release-contract": "node test/browser/release-contract.mjs",
     "test:integrations-contract": "node test/browser/integrations-contract.mjs",
     "test:storage-contract": "node test/browser/storage-contract.mjs",
-    "test:storage-tools": "node test/browser/storage-tools.mjs"
+    "test:storage-tools": "node test/browser/storage-tools.mjs",
+    "test:v21-contract": "node test/browser/v21-contract.mjs",
+    "test:v21-app-contract": "node test/browser/v21-app-contract.mjs"
+    ,"test:scalability-contract": "node test/browser/scalability-contract.mjs"
   },
   "devDependencies": {
     "elm": "0.19.1-6",
     "esbuild": "0.28.2",
-    "less": "^4.9.1",
-    "playwright": "^1.62.1",
-    "sass": "^1.101.0"
+    "less": "4.9.1",
+    "playwright": "1.62.1",
+    "sass": "1.101.0"
   },
   "dependencies": {
-    "haml": "^0.4.3",
+    "haml": "0.4.3",
     "highlight.js": "11.12.0",
     "markdown-it": "15.0.2"
   },

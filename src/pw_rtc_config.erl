@@ -16,7 +16,8 @@ get(UserId) ->
         _ -> <<"all">>
     end,
     #{iceServers => IceServers, iceTransportPolicy => Policy, turnStatus => Status,
-      turnLimitReached => Status =:= over_limit, refreshAfterSeconds => Refresh, turnTtlSeconds => Remaining}.
+      turnLimitReached => Status =:= over_limit, refreshAfterSeconds => Refresh, turnTtlSeconds => Remaining,
+      mediaTopology => pw_media_topology:capabilities()}.
 
 turn_entry(UserId) ->
     case pw_cf_turn:configured() of

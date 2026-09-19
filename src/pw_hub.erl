@@ -1,7 +1,7 @@
 -module(pw_hub).
 -behaviour(gen_server).
 -export([
-    start_link/0, connect/2, connect/3, disconnect/1, subscribe/2, unsubscribe_all/1, watch_presence/2,
+    start_link/0, connect/2, connect/3, disconnect/1, disconnect/2, subscribe/2, unsubscribe_all/1, watch_presence/2,
     revoke_server_access/3, revoke_conversation_access/2,
     notify_user/2, broadcast/2, status_update/2,
     voice_join/4, voice_leave/3, voice_state/5, voice_signal/5, voice_activity/5,
@@ -17,16 +17,20 @@
 -define(REDIS_PRESENCE_TTL_MS, 45000).
 -define(REDIS_PRESENCE_REFRESH_MS, 15000).
 
-%% full mesh gets expensive fast. browsers are not tiny SFUs.
-room_capacity() -> min(32, max(2, pw_util:env_int("PLAINWIRE_VOICE_MAX_PARTICIPANTS", 8))).
-share_capacity() -> min(8, max(1, pw_util:env_int("PLAINWIRE_VOICE_MAX_SHARES", 2))).
+%% Capacity is centralized so the call state machine is not coupled to a
+%% particular media topology. Plainwire 2.1.0 intentionally remains mesh-only.
+room_capacity() -> pw_media_topology:room_capacity().
+share_capacity() -> pw_media_topology:share_capacity().
 
--record(st, {users = #{}, pids = #{}, pid_statuses = #{}, subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}, watches = #{}, watchers = #{}}).
+-record(st, {users = #{}, pids = #{}, pid_statuses = #{}, subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}}).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 connect(Uid, Pid) -> connect(Uid, Pid, <<"online">>).
 connect(Uid, Pid, Status) -> gen_server:cast(?MODULE, {connect, Uid, Pid, Status}).
 disconnect(Pid) -> gen_server:cast(?MODULE, {disconnect, Pid}).
+disconnect(Pid, RtcMemberships) when is_list(RtcMemberships) ->
+    gen_server:cast(?MODULE, {disconnect, Pid, RtcMemberships});
+disconnect(Pid, _) -> disconnect(Pid).
 subscribe(Pid, Key) -> gen_server:cast(?MODULE, {subscribe, Pid, Key}).
 unsubscribe_all(Pid) -> gen_server:cast(?MODULE, {unsubscribe_all, Pid}).
 watch_presence(Pid, Uids) -> gen_server:cast(?MODULE, {watch_presence, Pid, Uids}).
@@ -40,8 +44,18 @@ status_update(Uid, Pid, Status) -> gen_server:cast(?MODULE, {status_update, Uid,
 voice_join(ChannelId, Uid, Pid, Profile) -> join_call({voice_join, ChannelId, Uid, Pid, Profile}).
 voice_leave(ChannelId, Uid, Pid) -> gen_server:cast(?MODULE, {voice_leave, ChannelId, Uid, Pid}).
 voice_state(ChannelId, Uid, Pid, Patch, Profile) -> gen_server:cast(?MODULE, {voice_state, ChannelId, Uid, Pid, Patch, Profile}).
-voice_signal(ChannelId, From, FromPid, To, Signal) -> gen_server:cast(?MODULE, {voice_signal, ChannelId, From, FromPid, To, Signal}).
-voice_activity(Kind, Id, Uid, Pid, Active) -> gen_server:cast(?MODULE, {room_activity, Kind, Id, Uid, Pid, Active}).
+voice_signal(ChannelId, From, FromPid, To, Signal) ->
+    Event = #{type => voice_signal, channel_id => ChannelId, from_user_id => From, signal => Signal},
+    case pw_realtime_registry:relay_signal(voice, ChannelId, From, FromPid, To, Event) of
+        unavailable -> gen_server:cast(?MODULE, {voice_signal, ChannelId, From, FromPid, To, Signal});
+        _ -> ok
+    end.
+voice_activity(Kind, Id, Uid, Pid, Active) ->
+    Event = activity_event(Kind, Id, Uid, Active),
+    case pw_realtime_registry:relay_activity(Kind, Id, Uid, Pid, Event) of
+        unavailable -> gen_server:cast(?MODULE, {room_activity, Kind, Id, Uid, Pid, Active});
+        _ -> ok
+    end.
 call_ring(Cid, Uid, Pid, Profile, Targets) -> gen_server:cast(?MODULE, {call_ring, Cid, Uid, Pid, Profile, Targets}).
 call_decline(Cid, Uid) -> gen_server:cast(?MODULE, {call_decline, Cid, Uid}).
 call_cancel(Cid, Uid, Pid) -> gen_server:cast(?MODULE, {call_cancel, Cid, Uid, Pid}).
@@ -53,7 +67,12 @@ call_join(ConversationId, Uid, Pid, Profile, Audience) -> join_call({call_join, 
 call_rejoin(ConversationId, Uid, Pid, Profile, Audience) -> join_call({call_rejoin, ConversationId, Uid, Pid, Profile, Audience}).
 call_leave(ConversationId, Uid, Pid) -> gen_server:cast(?MODULE, {call_leave, ConversationId, Uid, Pid}).
 call_state(ConversationId, Uid, Pid, Patch, Profile) -> gen_server:cast(?MODULE, {call_state, ConversationId, Uid, Pid, Patch, Profile}).
-call_signal(ConversationId, From, FromPid, To, Signal) -> gen_server:cast(?MODULE, {call_signal, ConversationId, From, FromPid, To, Signal}).
+call_signal(ConversationId, From, FromPid, To, Signal) ->
+    Event = #{type => call_signal, conversation_id => ConversationId, from_user_id => From, signal => Signal},
+    case pw_realtime_registry:relay_signal(call, ConversationId, From, FromPid, To, Event) of
+        unavailable -> gen_server:cast(?MODULE, {call_signal, ConversationId, From, FromPid, To, Signal});
+        _ -> ok
+    end.
 stats() ->
     try gen_server:call(?MODULE, stats, 500)
     catch exit:_ -> #{available => false} end.
@@ -154,6 +173,8 @@ accept_ring(Cid, Uid, Pid, Profile, Audience0, St0) ->
 
 handle_cast({connect, Uid, Pid, Status0}, St) ->
     monitor(process, Pid),
+    pw_realtime_registry:register(Uid, Pid),
+    pw_realtime_registry:subscribe(Pid, {system, global}),
     Users = add_to_set(Uid, Pid, St#st.users),
     Pids = maps:put(Pid, Uid, St#st.pids),
     Subs = add_to_set({system, global}, Pid, St#st.subs),
@@ -161,26 +182,39 @@ handle_cast({connect, Uid, Pid, Status0}, St) ->
     PidStatuses = maps:put(Pid, Status, St#st.pid_statuses),
     Prev = maps:get(Uid, St#st.online, undefined),
     Effective = effective_status(Uid, Users, PidStatuses),
-    Online = update_presence(Uid, Prev, Effective, St#st.watchers, Pid, St#st.online),
+    Online = update_presence(Uid, Prev, Effective, Pid, St#st.online),
     pw_redis:presence_set(Uid, Effective, ?REDIS_PRESENCE_TTL_MS),
     %% Seed the new socket with the account-wide effective status immediately.
     %% A second tab being idle or invisible must not make an active tab look
     %% offline to itself or to other presence watchers.
     Visible = case visible_status(Effective) of true -> [Uid]; false -> [] end,
     Statuses = case Visible of [] -> #{}; _ -> #{Uid => Effective} end,
-    Pid ! {hub_json, #{type => presence_state, online => Visible, statuses => Statuses}},
+    pw_realtime_delivery:send_event(Pid, #{type => presence_state, online => Visible, statuses => Statuses}),
     send_active_calls(Pid, Uid, St#st.calls),
     log("client_connected", #{uid => Uid, sessions => length(maps:get(Uid, Users, [])), online_users => map_size(Online)}),
     {noreply, St#st{users = Users, pids = Pids, pid_statuses = PidStatuses, online = Online, subs = Subs}};
 handle_cast({disconnect, Pid}, St) ->
     log("client_disconnected", #{uid => maps:get(Pid, St#st.pids, undefined)}),
-    {noreply, remove_pid(Pid, St)};
-handle_cast({unsubscribe_all, Pid}, St) -> {noreply, St#st{subs = remove_from_all(Pid, St#st.subs)}};
-handle_cast({subscribe, Pid, Key}, St) -> {noreply, St#st{subs = add_to_set(Key, Pid, St#st.subs)}};
+    {noreply, remove_pid(Pid, St, registry)};
+handle_cast({disconnect, Pid, RtcMemberships}, St) when is_list(RtcMemberships) ->
+    log("client_disconnected", #{uid => maps:get(Pid, St#st.pids, undefined)}),
+    {noreply, remove_pid(Pid, St, RtcMemberships)};
+handle_cast({unsubscribe_all, Pid}, St) ->
+    Keys = pw_realtime_registry:subscriptions(Pid),
+    pw_realtime_registry:unsubscribe_all(Pid),
+    Subs = case Keys of
+        unavailable -> remove_from_all(Pid, St#st.subs);
+        _ -> remove_pid_from_keys(Pid, Keys, St#st.subs)
+    end,
+    {noreply, St#st{subs = Subs}};
+handle_cast({subscribe, Pid, Key}, St) ->
+    pw_realtime_registry:subscribe(Pid, Key),
+    {noreply, St#st{subs = add_to_set(Key, Pid, St#st.subs)}};
 handle_cast({revoke_server_access, Uid, ServerId, ChannelIds0}, St0) ->
     ChannelIds = lists:usort([Id || Id <- ChannelIds0, is_integer(Id), Id > 0]),
     Pids = maps:get(Uid, St0#st.users, []),
     Keys = [{server, ServerId} | [{channel, Id} || Id <- ChannelIds]],
+    pw_realtime_registry:remove_subscriptions(Pids, Keys),
     Subs = lists:foldl(fun(Key, Acc) -> remove_pids_from_key(Key, Pids, Acc) end, St0#st.subs, Keys),
     Voices = lists:foldl(fun(ChannelId, Acc) -> remove_user_from_room_now(voice, ChannelId, Uid, Acc, St0#st.users) end, St0#st.voices, ChannelIds),
     send_many(Pids, #{type => access_revoked, scope => server, server_id => ServerId, channel_ids => ChannelIds}),
@@ -188,6 +222,7 @@ handle_cast({revoke_server_access, Uid, ServerId, ChannelIds0}, St0) ->
     {noreply, St0#st{subs = Subs, voices = Voices}};
 handle_cast({revoke_conversation_access, Uid, ConversationId}, St0) ->
     Pids = maps:get(Uid, St0#st.users, []),
+    pw_realtime_registry:remove_subscriptions(Pids, [{direct, ConversationId}]),
     Subs = remove_pids_from_key({direct, ConversationId}, Pids, St0#st.subs),
     Calls = remove_user_from_room_now(call, ConversationId, Uid, St0#st.calls, St0#st.users),
     send_many(Pids, #{type => access_revoked, scope => direct, conversation_id => ConversationId}),
@@ -200,18 +235,31 @@ handle_cast({watch_presence, Pid, Uids0}, St0) ->
         SelfUid when is_integer(SelfUid), SelfUid > 0 -> lists:usort([SelfUid | Requested]);
         _ -> lists:usort(Requested)
     end,
-    Old = maps:get(Pid, St0#st.watches, []),
-    Watchers0 = lists:foldl(fun(U, Acc) -> update_set(U, Pid, Acc) end, St0#st.watchers, Old),
-    Watchers = lists:foldl(fun(U, Acc) -> add_to_set(U, Pid, Acc) end, Watchers0, Uids),
-    Watches = case Uids of [] -> maps:remove(Pid, St0#st.watches); _ -> maps:put(Pid, Uids, St0#st.watches) end,
-    %% Local state wins. Redis fills in presence from websocket nodes that do
-    %% not share this BEAM's hub state; stale keys expire automatically.
-    RemoteStatuses = pw_redis:presence_get(Uids),
+    _ = pw_realtime_registry:replace_presence_watch(Pid, Uids),
     LocalStatuses = maps:from_list([{U, S} || U <- Uids, {ok, S} <- [maps:find(U, St0#st.online)]]),
-    Statuses = maps:merge(RemoteStatuses, LocalStatuses),
-    Pid ! {hub_json, #{type => presence_state, online => maps:keys(Statuses), statuses => Statuses}},
-    {noreply, St0#st{watches = Watches, watchers = Watchers}};
+    %% Redis may be remote or briefly slow. Never block the hub control-plane
+    %% mailbox on a presence read; a bounded worker fills in cross-node state.
+    Tag = {presence_snapshot, Pid, Uids},
+    case pw_async_pool:submit(Tag, fun() -> pw_redis:presence_get(Uids) end, self()) of
+        ok -> ok;
+        {error, _} ->
+            pw_realtime_delivery:send_event(Pid, #{type => presence_state,
+                online => maps:keys(LocalStatuses), statuses => LocalStatuses})
+    end,
+    {noreply, St0};
 handle_cast(cluster_resync, St) ->
+    Pids = maps:keys(St#st.pids),
+    send_many(Pids, #{type => realtime_resync}),
+    %% A recovered API-node link may have missed a durable access revocation
+    %% after the bounded cluster replay window expired. Re-check subscriptions
+    %% and media membership against PostgreSQL on each socket. The websocket
+    %% process jitters this work so recovery cannot stampede the DB pool.
+    lists:foreach(fun(Pid) -> Pid ! cluster_revalidate_access end, Pids),
+    {noreply, St};
+handle_cast(realtime_registry_ready, St) ->
+    _ = pw_realtime_registry:replace_snapshot(St#st.users, St#st.subs, St#st.voices, St#st.calls),
+    %% Presence-watch links intentionally live only in the scalable registry.
+    %% After a registry restart, ask clients to replay their current watch set.
     send_many(maps:keys(St#st.pids), #{type => realtime_resync}),
     {noreply, St};
 handle_cast({notify_user, Uid, Event}, St) ->
@@ -240,6 +288,7 @@ handle_cast({voice_leave, ChannelId, Uid, Pid}, St0) ->
         false -> {noreply, St0};
         true ->
             Room = maps:remove(Uid, Room0),
+            sync_room(voice, ChannelId, Room),
             log("voice_leave", #{uid => Uid, channel_id => ChannelId, participants => map_size(Room)}),
             send_many(room_pids(Room), #{type => voice_peer_left, channel_id => ChannelId, user_id => Uid}),
             Voices = put_or_remove(Key, Room, St0#st.voices),
@@ -257,7 +306,10 @@ handle_cast({room_activity, Kind, Id, Uid, Pid, Active}, St) ->
 handle_cast({voice_signal, ChannelId, From, FromPid, To, Signal}, St) ->
     Key = {voice, ChannelId},
     Room = maps:get(Key, St#st.voices, #{}),
-    logger:debug("[plainwire:hub] voice_signal ~p", [#{channel_id => ChannelId, from => From, to => To, kind => signal_kind(Signal)}]),
+    case pw_util:env_bool_cached("PLAINWIRE_WS_TRACE", false) of
+        true -> logger:debug("[plainwire:hub] voice_signal ~p", [#{channel_id => ChannelId, from => From, to => To, kind => signal_kind(Signal)}]);
+        false -> ok
+    end,
     relay_signal(Room, From, FromPid, To, #{type => voice_signal, channel_id => ChannelId, from_user_id => From, signal => Signal}),
     {noreply, St};
 handle_cast({call_ring, Cid, Uid, Pid, Profile, Targets}, St0) ->
@@ -305,6 +357,7 @@ handle_cast({call_leave, ConversationId, Uid, Pid}, St0) ->
         true ->
             Audience = room_audience(Room0),
             Room = maps:remove(Uid, Room0),
+            sync_room(call, ConversationId, Room),
             log("call_leave", #{uid => Uid, conversation_id => ConversationId, participants => map_size(Room)}),
             send_many(room_pids(Room), #{type => call_peer_left, conversation_id => ConversationId, user_id => Uid}),
             send_many(room_pids(Room), #{type => call_state, conversation_id => ConversationId, users => room_users(Room)}),
@@ -336,7 +389,7 @@ handle_cast({status_update, Uid, Pid0, Status0}, St) ->
             Prev = maps:get(Uid, St#st.online, undefined),
             PidStatuses = maps:put(Pid, Status, St#st.pid_statuses),
             Effective = effective_status(Uid, St#st.users, PidStatuses),
-            Online = update_presence(Uid, Prev, Effective, St#st.watchers, undefined, St#st.online),
+            Online = update_presence(Uid, Prev, Effective, undefined, St#st.online),
             pw_redis:presence_set(Uid, Effective, ?REDIS_PRESENCE_TTL_MS),
             {noreply, St#st{pid_statuses = PidStatuses, online = Online}}
     end;
@@ -379,16 +432,31 @@ start_ring(Cid, Uid, Pid, Profile, Targets, St0) ->
         timer => Ref
     },
     ExpiresAt = pw_util:now_ms() + RingMs,
-    Pid ! {hub_json, #{type => call_ringing, conversation_id => Cid, targets => length(Targets1),
-        profile => strip_profile(Profile), timeout_ms => RingMs, expires_at => ExpiresAt}},
+    pw_realtime_delivery:send_event(Pid, #{type => call_ringing, conversation_id => Cid, targets => length(Targets1),
+        profile => strip_profile(Profile), timeout_ms => RingMs, expires_at => ExpiresAt}),
     [notify_user(T, #{type => call_incoming, conversation_id => Cid, from_user_id => Uid,
         profile => strip_profile(Profile), timeout_ms => RingMs, expires_at => ExpiresAt}) || T <- Targets1],
     St1#st{rings = maps:put(Key, Ring, St1#st.rings)}.
 
 handle_info(redis_presence_refresh, St) ->
-    [pw_redis:presence_set(Uid, Status, ?REDIS_PRESENCE_TTL_MS) || {Uid, Status} <- maps:to_list(St#st.online)],
+    pw_redis:presence_set_many(maps:to_list(St#st.online), ?REDIS_PRESENCE_TTL_MS),
     erlang:send_after(?REDIS_PRESENCE_REFRESH_MS, self(), redis_presence_refresh),
     {noreply, St};
+handle_info({pw_async_result, {presence_snapshot, Pid, Uids}, Remote0}, St) ->
+    CurrentWatch = pw_realtime_registry:presence_watches(Pid),
+    case CurrentWatch =/= unavailable andalso lists:sort(CurrentWatch) =:= Uids of
+        true ->
+            Remote = case Remote0 of M when is_map(M) -> M; _ -> #{} end,
+            Local = maps:from_list([{U, S} || U <- Uids, {ok, S} <- [maps:find(U, St#st.online)]]),
+            Statuses = maps:merge(Remote, Local),
+            pw_realtime_delivery:send_event(Pid, #{type => presence_state,
+                online => maps:keys(Statuses), statuses => Statuses}),
+            {noreply, St};
+        false ->
+            %% The socket changed its watch set (or disconnected) while the
+            %% remote lookup was in flight. Discard the stale snapshot.
+            {noreply, St}
+    end;
 handle_info({ring_timeout, Cid, Uid}, St0) ->
     Key = {ring, Cid},
     case maps:get(Key, St0#st.rings, undefined) of
@@ -400,7 +468,8 @@ handle_info({ring_timeout, Cid, Uid}, St0) ->
     end;
 handle_info({room_reconnect_expired, Kind, Id, Uid, Token}, St0) ->
     {noreply, expire_reconnecting_member(Kind, Id, Uid, Token, St0)};
-handle_info({'DOWN', _, process, Pid, _}, St) -> {noreply, remove_pid(Pid, St)};
+
+handle_info({'DOWN', _, process, Pid, _}, St) -> {noreply, remove_pid(Pid, St, registry)};
 handle_info(_, St) -> {noreply, St}.
 
 terminate(_, _) -> ok.
@@ -413,6 +482,7 @@ do_voice_join(ChannelId, Uid, Pid, Profile, St0) ->
     send_many(room_pids(maps:remove(Uid, Room0)),
         #{type => voice_peer_joined, channel_id => ChannelId, user_id => Uid, profile => strip_profile(Profile)}),
     Room = maps:put(Uid, new_member(Pid, Profile, maps:get(Uid, Room0, #{})), Room0),
+    sync_room(voice, ChannelId, Room),
     log("voice_join", #{uid => Uid, channel_id => ChannelId, participants => map_size(Room)}),
     send_many(room_pids(Room), #{type => voice_state, channel_id => ChannelId, users => room_users(Room)}),
     St0#st{voices = maps:put(Key, Room, St0#st.voices)}.
@@ -425,6 +495,7 @@ do_call_join(ConversationId, Uid, Pid, Profile, Audience0, St0) ->
         #{type => call_peer_joined, conversation_id => ConversationId, user_id => Uid, profile => strip_profile(Profile)}),
     Audience = lists:usort([Uid | [U || U <- Audience0, is_integer(U), U > 0]]),
     Room = maps:put(Uid, new_call_member(Pid, Profile, Audience, maps:get(Uid, Room0, #{})), Room0),
+    sync_room(call, ConversationId, Room),
     log("call_join", #{uid => Uid, conversation_id => ConversationId, participants => map_size(Room)}),
     send_many(room_pids(Room), #{type => call_state, conversation_id => ConversationId, users => room_users(Room)}),
     send_call_presence(ConversationId, Room, room_audience(Room), St0#st.users),
@@ -433,7 +504,7 @@ do_call_join(ConversationId, Uid, Pid, Profile, Audience0, St0) ->
 %% a second tab takes the seat and tells the first to drop its mic.
 notify_superseded(Room, Uid, Pid, Event) ->
     case maps:get(Uid, Room, undefined) of
-        #{pid := Old} when is_pid(Old), Old =/= Pid -> Old ! {hub_json, Event}, ok;
+        #{pid := Old} when is_pid(Old), Old =/= Pid -> pw_realtime_delivery:send_event(Old, Event), ok;
         _ -> ok
     end.
 
@@ -451,32 +522,51 @@ new_call_member(Pid, Profile, Audience, Previous) ->
 
 %% one user, one RTC room. enforce it here too; tabs are sneaky.
 evict_other_rooms(Uid, NewPid, KeepKey, St0) ->
-    Voices = evict_from_rooms(Uid, NewPid, KeepKey, St0#st.voices, voice, St0#st.users),
-    Calls = evict_from_rooms(Uid, NewPid, KeepKey, St0#st.calls, call, St0#st.users),
+    Memberships = pw_realtime_registry:user_rtc_memberships(Uid),
+    Voices = evict_from_rooms(Uid, NewPid, KeepKey, St0#st.voices, voice, St0#st.users, Memberships),
+    Calls = evict_from_rooms(Uid, NewPid, KeepKey, St0#st.calls, call, St0#st.users, Memberships),
     St0#st{voices = Voices, calls = Calls}.
 
-evict_from_rooms(Uid, NewPid, KeepKey, Rooms, Kind, Users) ->
+evict_from_rooms(Uid, NewPid, KeepKey, Rooms, Kind, Users, Memberships) when is_list(Memberships) ->
+    Entries = [{Id, OldPid} || {Kind0, Id, OldPid} <- Memberships, Kind0 =:= Kind, {Kind, Id} =/= KeepKey],
+    lists:foldl(fun({Id, OldPid}, Acc) ->
+        evict_one_room(Uid, NewPid, OldPid, Id, Acc, Kind, Users)
+    end, Rooms, Entries);
+evict_from_rooms(Uid, NewPid, KeepKey, Rooms, Kind, Users, _) ->
+    %% Registry restarts are rare; preserve correctness with the original scan
+    %% fallback until the mirrored indexes have been rebuilt.
     maps:fold(fun(Key, Room0, Acc) ->
         case Key =:= KeepKey orelse not maps:is_key(Uid, Room0) of
-            true -> maps:put(Key, Room0, Acc);
+            true -> Acc;
             false ->
-                Info = maps:get(Uid, Room0),
-                OldPid = maps:get(pid, Info, undefined),
-                Id = element(2, Key),
-                Room = maps:remove(Uid, Room0),
-                case OldPid =/= NewPid of
-                    true -> notify_pid(OldPid, superseded_event(Kind, Id));
-                    false -> ok
-                end,
-                send_many(room_pids(Room), peer_left_event(Kind, Id, Uid)),
-                send_many(room_pids(Room), state_event(Kind, Id, Room)),
-                case Kind of
-                    call -> send_call_presence(Id, Room, room_audience(Room0), Users);
-                    voice -> ok
-                end,
-                put_or_remove(Key, Room, Acc)
+                OldPid = maps:get(pid, maps:get(Uid, Room0), undefined),
+                evict_one_room(Uid, NewPid, OldPid, element(2, Key), Acc, Kind, Users)
         end
-    end, #{}, Rooms).
+    end, Rooms, Rooms).
+
+evict_one_room(Uid, NewPid, OldPid, Id, Rooms, Kind, Users) ->
+    Key = {Kind, Id},
+    case maps:get(Key, Rooms, undefined) of
+        Room0 when is_map(Room0) ->
+            case maps:is_key(Uid, Room0) of
+                false -> Rooms;
+                true ->
+                    Room = maps:remove(Uid, Room0),
+                    sync_room(Kind, Id, Room),
+                    case OldPid =/= NewPid of
+                        true -> notify_pid(OldPid, superseded_event(Kind, Id));
+                        false -> ok
+                    end,
+                    send_many(room_pids(Room), peer_left_event(Kind, Id, Uid)),
+                    send_many(room_pids(Room), state_event(Kind, Id, Room)),
+                    case Kind of
+                        call -> send_call_presence(Id, Room, room_audience(Room0), Users);
+                        voice -> ok
+                    end,
+                    put_or_remove(Key, Room, Rooms)
+            end;
+        _ -> Rooms
+    end.
 
 superseded_event(voice, Id) -> #{type => voice_superseded, channel_id => Id};
 superseded_event(call, Id) -> #{type => call_superseded, conversation_id => Id}.
@@ -521,6 +611,7 @@ apply_member_state(Kind, Id, Uid, Patch, Profile, Key, Rooms0, Room0, Info0, St0
     Info = maps:merge(Info0, Patch#{profile => Profile, muted => Muted, deafened => Deafened,
                                    screen => Screen, screen_audio => ScreenAudio}),
     Room = maps:put(Uid, Info, Room0),
+    sync_room(Kind, Id, Room),
     case Denied of
         true ->
             log("share_denied", #{uid => Uid, kind => Kind, id => Id, limit => share_capacity()}),
@@ -542,7 +633,7 @@ clamp_screen(Room, Uid, _Requested) ->
         false -> {false, true}
     end.
 
-notify_pid(Pid, Event) when is_pid(Pid) -> Pid ! {hub_json, Event}, ok;
+notify_pid(Pid, Event) when is_pid(Pid) -> pw_realtime_delivery:send_event(Pid, Event), ok;
 notify_pid(_, _) -> ok.
 
 room_pids(Room) -> [maps:get(pid, Info) || {_Uid, Info} <- maps:to_list(Room), is_pid(maps:get(pid, Info, undefined))].
@@ -560,13 +651,27 @@ send_call_presence(ConversationId, Room, Audience, Users) ->
     send_many(Pids, Event).
 
 send_active_calls(Pid, Uid, Calls) ->
-    maps:foreach(fun({call, ConversationId}, Room) ->
-        case lists:member(Uid, room_audience(Room)) of
-            true -> Pid ! {hub_json, #{type => call_presence, conversation_id => ConversationId,
-                active => true, users => room_users(Room)}};
-            false -> ok
-        end
-    end, Calls).
+    case pw_realtime_registry:active_calls(Uid) of
+        unavailable ->
+            %% Correctness fallback during registry restart.
+            maps:foreach(fun({call, ConversationId}, Room) ->
+                case lists:member(Uid, room_audience(Room)) of
+                    true -> send_active_call(Pid, ConversationId, Room);
+                    false -> ok
+                end
+            end, Calls);
+        ConversationIds when is_list(ConversationIds) ->
+            lists:foreach(fun(ConversationId) ->
+                case maps:get({call, ConversationId}, Calls, undefined) of
+                    Room when is_map(Room) -> send_active_call(Pid, ConversationId, Room);
+                    _ -> ok
+                end
+            end, lists:usort(ConversationIds))
+    end.
+
+send_active_call(Pid, ConversationId, Room) ->
+    pw_realtime_delivery:send_event(Pid, #{type => call_presence, conversation_id => ConversationId,
+        active => true, users => room_users(Room)}).
 
 end_ring(St0, Key, EventType, Reason) ->
     case maps:get(Key, St0#st.rings, undefined) of
@@ -575,7 +680,7 @@ end_ring(St0, Key, EventType, Reason) ->
             cancel_timer(Ref),
             Event = #{type => EventType, conversation_id => element(2, Key), reason => Reason,
                 from_user_id => Caller, profile => strip_profile(Profile)},
-            CPid ! {hub_json, Event},
+            pw_realtime_delivery:send_event(CPid, Event),
             notify_ring_parties(Targets, Event, undefined),
             St0#st{rings = maps:remove(Key, St0#st.rings)};
         undefined ->
@@ -598,21 +703,27 @@ ring_timeout_ms() ->
     min(120000, max(10000, pw_util:env_int("PLAINWIRE_CALL_RING_MS", ?RING_MS))).
 
 persist_missed_call(Uid, Cid) ->
-    spawn(fun() ->
+    Job = fun() ->
         case pw_db:record_missed_call(Uid, Cid) of
             {ok, _} -> ok;
             {error, Reason} ->
                 logger:warning("[plainwire:hub] missed_call_not_persisted ~p",
                     [#{uid => Uid, conversation_id => Cid, reason => Reason}])
         end
-    end),
+    end,
+    case pw_async_pool:submit(Job) of
+        ok -> ok;
+        {error, Reason} ->
+            logger:warning("[plainwire:hub] missed_call_queue_full ~p",
+                [#{uid => Uid, conversation_id => Cid, reason => Reason}])
+    end,
     ok.
 
 relay_signal(Room, From, FromPid, To, Event) ->
     case {member_owned(Room, From, FromPid), maps:get(To, Room, undefined)} of
         %% reconnecting members have no pid yet. atoms make poor WebSockets.
         {true, #{pid := TargetPid}} when is_pid(TargetPid) ->
-            TargetPid ! {hub_json, Event};
+            pw_realtime_delivery:send_event(TargetPid, Event);
         _ -> ok
     end,
     ok.
@@ -624,14 +735,12 @@ member_owned(Room, Uid, Pid) ->
     end.
 
 send_many([], _Event) -> ok;
-send_many(Pids, Event) ->
-    %% encode once. recipients do not need artisanal JSON.
-    Payload = pw_util:json(Event),
-    Type = maps:get(type, Event, unknown),
-    [Pid ! {hub_text, Payload, Type} || Pid <- Pids, is_pid(Pid)],
-    ok.
-send_presence_watchers(Watchers, Uid, Event, Skip) ->
-    send_many([Pid || Pid <- maps:get(Uid, Watchers, []), Pid =/= Skip], Event).
+send_many(Pids, Event) -> pw_realtime_delivery:send_many(Pids, Event).
+send_presence_watchers(Uid, Event, Skip) ->
+    case pw_realtime_registry:presence_watchers(Uid) of
+        unavailable -> ok;
+        Pids when is_list(Pids) -> send_many([Pid || Pid <- Pids, Pid =/= Skip], Event)
+    end.
 
 signal_kind(Signal) when is_map(Signal) -> maps:get(<<"kind">>, Signal, unknown);
 signal_kind(_) -> unknown.
@@ -656,6 +765,22 @@ remove_pids_from_key(Key, Pids, Map) ->
             end
     end.
 
+remove_pid_from_keys(Pid, Keys, Map) ->
+    lists:foldl(fun(Key, Acc) ->
+        case maps:get(Key, Acc, []) of
+            [] -> Acc;
+            Existing ->
+                case lists:delete(Pid, Existing) of
+                    [] -> maps:remove(Key, Acc);
+                    Remaining -> maps:put(Key, Remaining, Acc)
+                end
+        end
+    end, Map, Keys).
+
+sync_room(Kind, Id, Room) ->
+    _ = pw_realtime_registry:sync_room(Kind, Id, Room),
+    ok.
+
 remove_user_from_room_now(Kind, Id, Uid, Rooms0, Users) ->
     Key = {Kind, Id},
     Room0 = maps:get(Key, Rooms0, #{}),
@@ -663,6 +788,7 @@ remove_user_from_room_now(Kind, Id, Uid, Rooms0, Users) ->
         error -> Rooms0;
         {Info, Room} ->
             cancel_member_reconnect(Info),
+            sync_room(Kind, Id, Room),
             send_many(room_pids(Room), peer_left_event(Kind, Id, Uid)),
             send_many(room_pids(Room), state_event(Kind, Id, Room)),
             case Kind of
@@ -695,7 +821,15 @@ normalize_status(_) -> <<"online">>.
 visible_status(<<"invisible">>) -> false;
 visible_status(_) -> true.
 
-remove_pid(Pid, St0) ->
+remove_pid(Pid, St0, RtcHint) ->
+    SubKeys = pw_realtime_registry:subscriptions(Pid),
+    RtcMemberships = case RtcHint of
+        registry -> pw_realtime_registry:rtc_memberships(Pid);
+        
+HintMemberships when is_list(HintMemberships) -> HintMemberships;
+        _ -> unavailable
+    end,
+    pw_realtime_registry:unregister(Pid),
     Uid = maps:get(Pid, St0#st.pids, undefined),
     Users = case Uid of undefined -> St0#st.users; _ -> update_set(Uid, Pid, St0#st.users) end,
     Pids = maps:remove(Pid, St0#st.pids),
@@ -705,20 +839,27 @@ remove_pid(Pid, St0) ->
         _ ->
             Prev = maps:get(Uid, St0#st.online, undefined),
             Effective = effective_status(Uid, Users, PidStatuses),
-            Updated = update_presence(Uid, Prev, Effective, St0#st.watchers, Pid, St0#st.online),
+            Updated = update_presence(Uid, Prev, Effective, Pid, St0#st.online),
             %% Clear only this node's Redis presence slot when its last visible
             %% session disappears; another Plainwire node may still be online.
             pw_redis:presence_set(Uid, Effective, ?REDIS_PRESENCE_TTL_MS),
             Updated
     end,
-    Subs = remove_from_all(Pid, St0#st.subs),
-    Voices = detach_pid_from_rooms(Pid, St0#st.voices, voice, Users),
-    Calls = detach_pid_from_rooms(Pid, St0#st.calls, call, Users),
+    Subs = case {SubKeys, RtcHint} of
+        {unavailable, _} -> remove_from_all(Pid, St0#st.subs);
+        %% The registry monitor removes its ETS links before asking the hub to
+        %% clean up a hard-killed socket, so an empty exact lookup in that path
+        %% means "already removed from the registry", not "had no topics".
+        %% Connected sockets always own the system subscription; fall back to
+        %% the bounded legacy map scan so a dead PID cannot remain there.
+        
+{[], KnownMemberships} when is_list(KnownMemberships) -> remove_from_all(Pid, St0#st.subs);
+        _ -> remove_pid_from_keys(Pid, SubKeys, St0#st.subs)
+    end,
+    Voices = detach_pid_from_rooms(Pid, St0#st.voices, voice, Users, RtcMemberships),
+    Calls = detach_pid_from_rooms(Pid, St0#st.calls, call, Users, RtcMemberships),
     Rings = drop_caller_rings(Pid, St0#st.rings, St0#st.users),
-    OldWatches = maps:get(Pid, St0#st.watches, []),
-    Watchers = lists:foldl(fun(WatchedUid, Acc) -> update_set(WatchedUid, Pid, Acc) end, St0#st.watchers, OldWatches),
-    Watches = maps:remove(Pid, St0#st.watches),
-    St0#st{users = Users, pids = Pids, pid_statuses = PidStatuses, online = Online, subs = Subs, voices = Voices, calls = Calls, rings = Rings, watches = Watches, watchers = Watchers}.
+    St0#st{users = Users, pids = Pids, pid_statuses = PidStatuses, online = Online, subs = Subs, voices = Voices, calls = Calls, rings = Rings}.
 
 
 first_user_pid(Uid, Users) ->
@@ -746,20 +887,20 @@ effective_status(Uid, Users, PidStatuses) ->
             end
     end.
 
-update_presence(Uid, Prev, Effective, Watchers, Skip, Online0) ->
+update_presence(Uid, Prev, Effective, Skip, Online0) ->
     Visible = visible_status(Effective),
     case {Prev, Visible} of
         {undefined, false} -> Online0;
         {undefined, true} ->
-            send_presence_watchers(Watchers, Uid, #{type => presence_online, user_id => Uid, status => Effective}, Skip),
+            send_presence_watchers(Uid, #{type => presence_online, user_id => Uid, status => Effective}, Skip),
             maps:put(Uid, Effective, Online0);
         {_, false} ->
-            send_presence_watchers(Watchers, Uid, #{type => presence_offline, user_id => Uid, status => Effective}, Skip),
+            send_presence_watchers(Uid, #{type => presence_offline, user_id => Uid, status => Effective}, Skip),
             maps:remove(Uid, Online0);
         {Effective, true} ->
             Online0;
         {_, true} ->
-            send_presence_watchers(Watchers, Uid, #{type => presence_status, user_id => Uid, status => Effective}, Skip),
+            send_presence_watchers(Uid, #{type => presence_status, user_id => Uid, status => Effective}, Skip),
             maps:put(Uid, Effective, Online0)
     end.
 
@@ -780,38 +921,57 @@ drop_caller_rings(Pid, Rings, Users) ->
         end
     end, Rings, Rings).
 
-%% refresh gets a short grace window; an explicit leave does not.
-detach_pid_from_rooms(Pid, Rooms, Kind, Users) ->
-    maps:fold(fun(Key, Room0, Acc) ->
-        Audience = room_audience(Room0),
+%% refresh gets a short grace window; an explicit leave does not.  The hot
+%% disconnect path uses the registry's reverse RTC index, so a reconnect storm
+%% touches only rooms owned by this socket rather than folding every live room.
+detach_pid_from_rooms(Pid, Rooms, Kind, Users, unavailable) ->
+    detach_pid_from_rooms_scan(Pid, Rooms, Kind, Users);
+detach_pid_from_rooms(Pid, Rooms, Kind, Users, Memberships) when is_list(Memberships) ->
+    Entries = [{Id, Uid} || {Kind0, Id, Uid} <- Memberships, Kind0 =:= Kind],
+    lists:foldl(fun({Id, Uid}, Acc) -> detach_one_room(Pid, Acc, Kind, Id, Uid, Users) end, Rooms, Entries);
+detach_pid_from_rooms(Pid, Rooms, Kind, Users, _) ->
+    detach_pid_from_rooms_scan(Pid, Rooms, Kind, Users).
+
+detach_pid_from_rooms_scan(Pid, Rooms, Kind, Users) ->
+    maps:fold(fun({Kind0, Id}, Room0, Acc) when Kind0 =:= Kind ->
         Gone = [U || {U, Info} <- maps:to_list(Room0), maps:get(pid, Info, undefined) =:= Pid],
-        case Gone of
-            [] -> maps:put(Key, Room0, Acc);
-            [U | _] ->
-                IdKey = element(2, Key),
-                Room = lists:foldl(fun(GoneUid, R) ->
-                    Info0 = maps:get(GoneUid, R),
-                    cancel_member_reconnect(Info0),
-                    Token = make_ref(),
-                    Timer = erlang:send_after(reconnect_grace_ms(), self(),
-                        {room_reconnect_expired, Kind, IdKey, GoneUid, Token}),
-                    Info = Info0#{pid => undefined, screen => false, screen_audio => false,
-                        reconnecting => true, reconnect_token => Token,
-                        reconnect_timer => Timer},
-                    maps:put(GoneUid, Info, R)
-                end, Room0, Gone),
-                EventType = case Kind of voice -> voice_peer_left; call -> call_peer_left end,
-                IdName = case Kind of voice -> channel_id; call -> conversation_id end,
-                Pids = room_pids(Room),
-                send_many(Pids, #{type => EventType, IdName => IdKey, user_id => U}),
-                send_many(Pids, state_event(Kind, IdKey, Room)),
-                case Kind of
-                    call -> send_call_presence(IdKey, Room, Audience, Users);
-                    voice -> ok
-                end,
-                maps:put(Key, Room, Acc)
-        end
-    end, #{}, Rooms).
+        lists:foldl(fun(Uid, Acc0) -> detach_one_room(Pid, Acc0, Kind, Id, Uid, Users) end, Acc, Gone);
+       (_Key, _Room0, Acc) -> Acc
+    end, Rooms, Rooms).
+
+detach_one_room(Pid, Rooms, Kind, Id, Uid, Users) ->
+    Key = {Kind, Id},
+    case maps:get(Key, Rooms, undefined) of
+        Room0 when is_map(Room0) ->
+            case maps:get(Uid, Room0, undefined) of
+                Info0 when is_map(Info0) ->
+                    case maps:get(pid, Info0, undefined) =:= Pid of
+                        false -> Rooms;
+                        true ->
+                            Audience = room_audience(Room0),
+                            cancel_member_reconnect(Info0),
+                            Token = make_ref(),
+                            Timer = erlang:send_after(reconnect_grace_ms(), self(),
+                                {room_reconnect_expired, Kind, Id, Uid, Token}),
+                            Info = Info0#{pid => undefined, screen => false, screen_audio => false,
+                                reconnecting => true, reconnect_token => Token, reconnect_timer => Timer},
+                            Room = maps:put(Uid, Info, Room0),
+                            sync_room(Kind, Id, Room),
+                            EventType = case Kind of voice -> voice_peer_left; call -> call_peer_left end,
+                            IdName = case Kind of voice -> channel_id; call -> conversation_id end,
+                            Pids = room_pids(Room),
+                            send_many(Pids, #{type => EventType, IdName => Id, user_id => Uid}),
+                            send_many(Pids, state_event(Kind, Id, Room)),
+                            case Kind of
+                                call -> send_call_presence(Id, Room, Audience, Users);
+                                voice -> ok
+                            end,
+                            maps:put(Key, Room, Rooms)
+                    end;
+                _ -> Rooms
+            end;
+        _ -> Rooms
+    end.
 
 expire_reconnecting_member(Kind, Id, Uid, Token, St0) ->
     Key = {Kind, Id},
@@ -821,6 +981,7 @@ expire_reconnecting_member(Kind, Id, Uid, Token, St0) ->
         #{reconnecting := true, reconnect_token := Token} ->
             Audience = room_audience(Room0),
             Room = maps:remove(Uid, Room0),
+            sync_room(Kind, Id, Room),
             send_many(room_pids(Room), state_event(Kind, Id, Room)),
             case Kind of
                 call -> send_call_presence(Id, Room, Audience, St0#st.users);

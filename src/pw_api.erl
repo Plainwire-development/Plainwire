@@ -16,7 +16,21 @@ allowed(Req, Method, Path) ->
     pw_rate:allow({api, Ip, Method, route_bucket(Path)}, Limit, 60000).
 
 route_bucket([]) -> root;
-route_bucket([First | _]) -> First.
+route_bucket([First | _]) ->
+    %% The bucket becomes part of an ETS rate-limit key. Never let arbitrary 404
+    %% path components create unbounded attacker-controlled key cardinality.
+    case lists:member(First, [
+        <<"register">>, <<"login">>, <<"system">>, <<"webhooks">>, <<"bot">>,
+        <<"health">>, <<"version">>, <<"apps">>, <<"me">>, <<"rtc-config">>,
+        <<"voice-processing-config">>, <<"logout">>, <<"sessions">>, <<"password">>,
+        <<"account">>, <<"sync">>, <<"profile">>, <<"notifications">>, <<"forums">>,
+        <<"forum">>, <<"servers">>, <<"server">>, <<"channels">>, <<"messages">>,
+        <<"conversation">>, <<"search">>, <<"friends">>, <<"friend">>, <<"users">>,
+        <<"uploads">>, <<"files">>, <<"github">>, <<"klipy">>, <<"developer">>
+    ]) of
+        true -> First;
+        false -> other
+    end.
 
 api_path(Path) ->
     Segs = [S || S <- binary:split(Path, <<"/">>, [global]), S =/= <<>>],
@@ -70,6 +84,8 @@ handle(<<"POST">>, [<<"login">>], Req0, _) ->
                     {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
                     {error, database_busy} -> pw_util:err_json(Req, 503, <<"database_busy">>);
                     {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
+                    {error, {account_restricted, Restriction}} ->
+                        pw_util:json_reply(Req, 403, #{ok => false, error => <<"account_restricted">>, data => Restriction});
                     {error,E} -> pw_util:err_json(Req, 401, atom_to_binary(E, utf8))
                 end
         end
@@ -88,7 +104,30 @@ handle(<<"GET">>, [<<"version">>], Req0, _) ->
         asset_version => pw_client_config:asset_version(),
         api_version => 1
     }});
+handle(<<"GET">>, [<<"apps">>], Req0, _) ->
+    %% Public application directory. Only install-facing metadata is returned;
+    %% developer identity, credentials and connector configuration remain private.
+    result(Req0, pw_db:public_developer_apps(qs(Req0, <<"q">>), qs(Req0, <<"limit">>)));
+handle(<<"GET">>, [<<"apps">>, PublicId], Req0, _) ->
+    %% Public application cards contain only install-facing metadata. Secrets,
+    %% owner ids and raw upload/source references never cross this boundary.
+    result(Req0, pw_db:public_developer_app(PublicId));
 %% public gets alive/dead; signed-in users get the nerdy bits.
+handle(<<"POST">>, [<<"webhooks">>, WebhookId, Token], Req0, _) ->
+    Ip = pw_util:ip(Req0),
+    case pw_rate:allow_shared({incoming_webhook, WebhookId}, 300, 60000) andalso
+         pw_rate:allow_shared({incoming_webhook, WebhookId, Ip}, 60, 60000) of
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+        true -> with_json_public(Req0, fun(M, Req) ->
+            case pw_db:execute_incoming_webhook(WebhookId, Token, maps:get(<<"content">>, M, maps:get(<<"body">>, M, <<>>)), maps:get(<<"reply_to_id">>, M, undefined)) of
+                {ok, Data} -> pw_util:ok_json(Req, #{ok => true, data => Data});
+                {error, invalid_webhook_token} -> pw_util:err_json(Req, 404, <<"not_found">>);
+                Other -> result(Req, Other)
+            end
+        end)
+    end;
+handle(Method, [<<"bot">>, <<"v1">> | Rest], Req0, _) ->
+    handle_bot_v1(Method, Rest, Req0);
 handle(<<"GET">>, [<<"bot">>, <<"me">>], Req0, _) ->
     with_bot(Req0, fun(Bot, Req) -> pw_util:ok_json(Req, #{ok => true, data => Bot}) end);
 handle(<<"GET">>, [<<"bot">>, <<"server">>], Req0, _) ->
@@ -111,7 +150,7 @@ handle(<<"GET">>, [<<"bot">>, <<"channels">>], Req0, _) ->
     end);
 handle(<<"GET">>, [<<"bot">>, <<"channels">>, ChannelId, <<"messages">>], Req0, _) ->
     with_bot(Req0, fun(Bot, Req) ->
-        case pw_rate:allow_shared({bot_read, maps:get(id, Bot)}, 600, 60000) of
+        case bot_rate_allow(Bot, read) of
             false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>);
             true -> result(Req, pw_db:messages(maps:get(user_id, Bot), <<"channel">>, ChannelId, qs(Req, <<"before">>), qs(Req, <<"after">>)))
         end
@@ -119,7 +158,7 @@ handle(<<"GET">>, [<<"bot">>, <<"channels">>, ChannelId, <<"messages">>], Req0, 
 handle(<<"POST">>, [<<"bot">>, <<"channels">>, ChannelId, <<"messages">>], Req0, _) ->
     with_bot(Req0, fun(Bot, Req1) ->
         BotUid = maps:get(user_id, Bot),
-        case pw_rate:allow_shared({bot_message, maps:get(id, Bot)}, 120, 60000) of
+        case bot_rate_allow(Bot, message) of
             false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
             true -> with_json_public(Req1, fun(M, Req) ->
                 result(Req, pw_db:bot_post_channel_message(BotUid, ChannelId, maps:get(<<"body">>, M, <<>>), maps:get(<<"reply_to_id">>, M, undefined)))
@@ -128,14 +167,14 @@ handle(<<"POST">>, [<<"bot">>, <<"channels">>, ChannelId, <<"messages">>], Req0,
     end);
 handle(<<"POST">>, [<<"bot">>, <<"messages">>, MessageId, <<"delete">>], Req0, _) ->
     with_bot(Req0, fun(Bot, Req) ->
-        case pw_rate:allow_shared({bot_mutation, maps:get(id, Bot)}, 240, 60000) of
+        case bot_rate_allow(Bot, mutation) of
             false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>);
             true -> result(Req, pw_db:delete_message(maps:get(user_id, Bot), MessageId))
         end
     end);
 handle(<<"POST">>, [<<"bot">>, <<"messages">>, MessageId, <<"reaction">>], Req0, _) ->
     with_bot(Req0, fun(Bot, Req1) ->
-        case pw_rate:allow_shared({bot_mutation, maps:get(id, Bot)}, 240, 60000) of
+        case bot_rate_allow(Bot, mutation) of
             false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
             true -> with_json_public(Req1, fun(M, Req) ->
                 result(Req, pw_db:toggle_message_reaction(maps:get(user_id, Bot), MessageId, maps:get(<<"emoji">>, M, <<>>)))
@@ -153,6 +192,8 @@ handle(<<"GET">>, [<<"health">>], Req0, _) ->
                         processes => erlang:system_info(process_count),
                         process_limit => erlang:system_info(process_limit),
                         rate_limiter => pw_rate:stats(),
+                        realtime => realtime_health(),
+                        async_workers => pw_async_pool:stats(),
                         storage => Storage,
                         redis => maps:get(redis, Storage)};
                 _ ->
@@ -305,6 +346,54 @@ authed(<<"POST">>, [<<"server">>, Id, <<"member">>, UserId, <<"unban">>], Req, S
     result(Req, pw_db:unban_server_member(uid(Session), Id, UserId));
 authed(<<"GET">>, [<<"server">>, Id, <<"bans">>], Req, Session, _) ->
     result(Req, pw_db:server_bans(uid(Session), Id));
+authed(<<"GET">>, [<<"developer">>, <<"permissions">>], Req, _Session, _) ->
+    pw_util:ok_json(Req, #{ok => true, data => pw_permissions:catalog()});
+authed(<<"GET">>, [<<"developer">>, <<"apps">>], Req, Session, _) ->
+    result(Req, pw_db:developer_apps(uid(Session)));
+authed(<<"POST">>, [<<"developer">>, <<"apps">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_developer_app(uid(Session), maps:get(<<"name">>, M, <<>>))) end);
+authed(<<"GET">>, [<<"developer">>, <<"apps">>, AppId], Req, Session, _) ->
+    result(Req, pw_db:developer_app(uid(Session), AppId));
+authed(<<"POST">>, [<<"developer">>, <<"apps">>, AppId], Req0, Session, _) ->
+    with_json_large(Req0, fun(M, Req) -> result(Req, pw_db:update_developer_app(uid(Session), AppId, M)) end);
+authed(<<"POST">>, [<<"developer">>, <<"apps">>, AppId, <<"delete">>], Req, Session, _) ->
+    result(Req, pw_db:delete_developer_app(uid(Session), AppId));
+authed(<<"GET">>, [<<"developer">>, <<"apps">>, AppId, <<"installations">>], Req, Session, _) ->
+    result(Req, pw_db:developer_app_installations(uid(Session), AppId));
+authed(<<"POST">>, [<<"developer">>, <<"apps">>, AppId, <<"install">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:install_developer_app(uid(Session), AppId, maps:get(<<"server_id">>, M, undefined))) end);
+authed(<<"POST">>, [<<"developer">>, <<"apps">>, AppId, <<"installation">>, InstallationId, <<"rotate">>], Req, Session, _) ->
+    result(Req, pw_db:rotate_developer_app_installation(uid(Session), AppId, InstallationId));
+authed(<<"POST">>, [<<"developer">>, <<"apps">>, AppId, <<"installation">>, InstallationId, <<"uninstall">>], Req, Session, _) ->
+    result(Req, pw_db:uninstall_developer_app(uid(Session), AppId, InstallationId));
+authed(<<"GET">>, [<<"developer">>, <<"apps">>, AppId, <<"commands">>], Req, Session, _) ->
+    result(Req, pw_db:developer_app_commands(uid(Session), AppId));
+authed(<<"POST">>, [<<"developer">>, <<"apps">>, AppId, <<"commands">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) ->
+        result(Req, pw_db:upsert_developer_app_command(uid(Session), AppId,
+            maps:get(<<"name">>, M, <<>>), maps:get(<<"description">>, M, <<>>),
+            maps:get(<<"options">>, M, []), maps:get(<<"handler">>, M, <<"queue">>)))
+    end);
+authed(<<"DELETE">>, [<<"developer">>, <<"apps">>, AppId, <<"commands">>, CommandId], Req, Session, _) ->
+    result(Req, pw_db:delete_developer_app_command(uid(Session), AppId, CommandId));
+authed(<<"POST">>, [<<"developer">>, <<"apps">>, AppId, <<"interactions">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_developer_app_interactions(uid(Session), AppId, M)) end);
+authed(<<"POST">>, [<<"developer">>, <<"apps">>, AppId, <<"interactions">>, <<"rotate">>], Req, Session, _) ->
+    result(Req, pw_db:rotate_developer_app_interaction_secret(uid(Session), AppId));
+authed(<<"POST">>, [<<"developer">>, <<"apps">>, AppId, <<"ai">>], Req0, Session, _) ->
+    with_json_large(Req0, fun(M, Req) -> result(Req, pw_db:update_developer_app_ai(uid(Session), AppId, M)) end);
+authed(<<"GET">>, [<<"server">>, Id, <<"apps">>], Req, Session, _) ->
+    result(Req, pw_db:server_apps(uid(Session), Id));
+authed(<<"GET">>, [<<"server">>, Id, <<"app">>, InstallationId, <<"commands">>], Req, Session, _) ->
+    result(Req, pw_db:server_app_commands(uid(Session), Id, InstallationId));
+authed(<<"POST">>, [<<"server">>, Id, <<"app">>, InstallationId, <<"command">>, CommandId, <<"permissions">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) ->
+        result(Req, pw_db:set_server_command_permissions(uid(Session), Id, InstallationId, CommandId, maps:get(<<"permissions">>, M, [])))
+    end);
+authed(<<"POST">>, [<<"server">>, Id, <<"app">>, InstallationId, <<"uninstall">>], Req, Session, _) ->
+    result(Req, pw_db:uninstall_server_app(uid(Session), Id, InstallationId));
+authed(<<"POST">>, [<<"apps">>, PublicId, <<"install">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:install_public_developer_app(uid(Session), PublicId, maps:get(<<"server_id">>, M, undefined))) end);
 authed(<<"GET">>, [<<"server">>, Id, <<"webhooks">>], Req, Session, _) ->
     result(Req, pw_db:server_webhooks(uid(Session), Id));
 authed(<<"POST">>, [<<"server">>, Id, <<"webhooks">>], Req0, Session, _) ->
@@ -317,6 +406,18 @@ authed(<<"POST">>, [<<"server">>, Id, <<"webhook">>, WebhookId, <<"rotate">>], R
     result(Req, pw_db:rotate_server_webhook(uid(Session), Id, WebhookId));
 authed(<<"POST">>, [<<"server">>, Id, <<"webhook">>, WebhookId, <<"test">>], Req, Session, _) ->
     result(Req, pw_db:test_server_webhook(uid(Session), Id, WebhookId));
+authed(<<"GET">>, [<<"server">>, Id, <<"webhook">>, WebhookId, <<"deliveries">>], Req, Session, _) ->
+    result(Req, pw_db:server_webhook_deliveries(uid(Session), Id, WebhookId, qs(Req, <<"limit">>)));
+authed(<<"POST">>, [<<"server">>, Id, <<"webhook">>, WebhookId, <<"delivery">>, DeliveryId, <<"retry">>], Req, Session, _) ->
+    result(Req, pw_db:retry_server_webhook_delivery(uid(Session), Id, WebhookId, DeliveryId));
+authed(<<"GET">>, [<<"server">>, Id, <<"incoming-webhooks">>], Req, Session, _) ->
+    result(Req, pw_db:incoming_webhooks(uid(Session), Id));
+authed(<<"POST">>, [<<"server">>, Id, <<"incoming-webhooks">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_incoming_webhook(uid(Session), Id, maps:get(<<"channel_id">>,M,undefined), maps:get(<<"name">>,M,<<>>))) end);
+authed(<<"POST">>, [<<"server">>, Id, <<"incoming-webhook">>, WebhookId, <<"rotate">>], Req, Session, _) ->
+    result(Req, pw_db:rotate_incoming_webhook(uid(Session), Id, WebhookId));
+authed(<<"POST">>, [<<"server">>, Id, <<"incoming-webhook">>, WebhookId, <<"delete">>], Req, Session, _) ->
+    result(Req, pw_db:delete_incoming_webhook(uid(Session), Id, WebhookId));
 authed(<<"GET">>, [<<"server">>, Id, <<"bots">>], Req, Session, _) ->
     result(Req, pw_db:server_bots(uid(Session), Id));
 authed(<<"POST">>, [<<"server">>, Id, <<"bots">>], Req0, Session, _) ->
@@ -338,6 +439,7 @@ authed(<<"POST">>, [<<"server">>, Id, <<"category">>, CatId], Req0, Session, _) 
 authed(<<"POST">>, [<<"server">>, Id, <<"categories">>, <<"reorder">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:reorder_categories(uid(Session), Id, maps:get(<<"order">>,M,[]))) end);
 authed(<<"POST">>, [<<"server">>, Id, <<"category">>, CatId, <<"delete">>], Req, Session, _) -> result(Req, pw_db:delete_category(uid(Session), Id, CatId));
 authed(<<"POST">>, [<<"channel">>, ChannelId, <<"move">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:move_channel(uid(Session), ChannelId, maps:get(<<"category_id">>,M,undefined), maps:get(<<"position">>,M,undefined))) end);
+authed(<<"POST">>, [<<"channel">>, ChannelId, <<"settings">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_channel_settings(uid(Session), ChannelId, M)) end);
 authed(<<"GET">>, [<<"server">>, Id, <<"wires">>], Req, Session, _) -> result(Req, pw_db:list_invites(uid(Session), Id));
 authed(<<"DELETE">>, [<<"server">>, Id, <<"wires">>, Code], Req, Session, _) -> result(Req, pw_db:revoke_invite(uid(Session), Id, Code));
 authed(<<"POST">>, [<<"server">>, Id, <<"wires">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_invite(uid(Session), Id, maps:get(<<"channel_id">>,M,undefined), maps:get(<<"max_uses">>,M,0), maps:get(<<"expires_in">>,M,86400))) end);
@@ -402,6 +504,15 @@ authed(<<"POST">>, [<<"message">>, MsgId, <<"reactions">>], Req0, Session, _) ->
         true -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:toggle_message_reaction(uid(Session), MsgId, maps:get(<<"emoji">>, M, <<>>))) end);
         false -> pw_util:err_json(Req0, 429, <<"reaction_rate_limited">>)
     end;
+authed(<<"GET">>, [<<"message">>, MsgId, <<"context">>], Req, Session, _) ->
+    result(Req, pw_db:message_context(uid(Session), MsgId));
+authed(<<"GET">>, [<<"channel">>, ChannelId, <<"pins">>], Req, Session, _) ->
+    result(Req, pw_db:channel_pins(uid(Session), ChannelId));
+authed(<<"POST">>, [<<"message">>, MsgId, <<"pin">>], Req0, Session, _) ->
+    case pw_rate:allow_shared({message_pin, uid(Session)}, 120, 60000) of
+        false -> pw_util:err_json(Req0, 429, <<"pin_rate_limited">>);
+        true -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:set_message_pin(uid(Session), MsgId, maps:get(<<"pinned">>, M, true))) end)
+    end;
 authed(<<"GET">>, [<<"conversations">>], Req, Session, _) -> result(Req, pw_db:conversations(uid(Session)));
 authed(<<"POST">>, [<<"conversations">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) ->
     Name = maps:get(<<"name">>, M, <<>>),
@@ -431,10 +542,298 @@ authed(<<"POST">>, [<<"conversation">>, Id, <<"member">>, UserId, <<"kick">>], R
     result(Req, pw_db:kick_conversation_member(uid(Session), Id, UserId));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"request">>, <<"accept">>], Req, Session, _) -> result(Req, pw_db:accept_message_request(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"request">>, <<"deny">>], Req, Session, _) -> result(Req, pw_db:deny_message_request(uid(Session), Id));
+authed(<<"GET">>, [<<"search">>, <<"messages">>], Req, Session, _) ->
+    case pw_rate:allow_shared({message_search, uid(Session)}, 60, 60000) of
+        false -> pw_util:err_json(Req, 429, <<"search_rate_limited">>);
+        true -> result(Req, pw_db:search_messages(uid(Session), qs(Req, <<"q">>), qs(Req, <<"before">>), qs(Req, <<"limit">>)))
+    end;
+authed(<<"GET">>, [<<"commands">>], Req, Session, _) ->
+    result(Req, pw_db:commands_for_channel(uid(Session), qs(Req, <<"channel_id">>)));
+authed(<<"POST">>, [<<"commands">>, Name, <<"invoke">>], Req0, Session, _) ->
+    case pw_rate:allow_shared({command_invoke, uid(Session)}, 90, 60000) of
+        false -> pw_util:err_json(Req0, 429, <<"command_rate_limited">>);
+        true -> with_json(Req0, fun(M, Req) ->
+            result(Req, pw_db:invoke_bot_command(uid(Session), maps:get(<<"channel_id">>, M, undefined), Name, maps:get(<<"args">>, M, <<>>)))
+        end)
+    end;
 authed(<<"GET">>, [<<"notifications">>], Req, Session, _) -> result(Req, pw_db:notifications(uid(Session)));
 authed(<<"POST">>, [<<"notifications">>, <<"seen">>], Req, Session, _) -> result(Req, pw_db:mark_notifications_seen(uid(Session)));
 authed(<<"POST">>, [<<"friends">>, <<"unblock">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:friend_unblock(uid(Session), maps:get(<<"user_id">>,M,undefined))) end);
 authed(_, _, Req, _, _) -> pw_util:err_json(Req, 404, <<"not_found">>).
+
+
+handle_bot_v1(<<"GET">>, [], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        pw_util:ok_json(Req, #{ok => true, data => #{
+            api => <<"plainwire-bot">>, version => 1, bot => Bot,
+            authentication => <<"Authorization: Bot pwb_...">>, websocket => <<"/ws">>,
+            features => [<<"messages">>, <<"message_editing">>, <<"reactions">>, <<"pins">>, <<"message_context">>,
+                         <<"commands">>, <<"durable_command_claims">>, <<"realtime_events">>, <<"members">>,
+                         <<"roles">>, <<"moderation">>, <<"channel_management">>, <<"wires">>],
+            command_claim => #{lease_ms => bot_command_lease_ms(), max_batch => 50},
+            limits_per_minute => bot_limits()
+        }})
+    end);
+handle_bot_v1(<<"GET">>, [<<"me">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) -> pw_util:ok_json(Req, #{ok => true, data => Bot#{is_bot => true, api_version => 1}}) end);
+handle_bot_v1(<<"GET">>, [<<"server">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, read) of
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>);
+            true ->
+                case pw_db:server(maps:get(user_id, Bot), maps:get(server_id, Bot)) of
+                    {ok, Data} -> pw_util:ok_json(Req, #{ok => true, data => maps:with([server, channels, categories], Data)});
+                    {error, E} -> pw_util:err_json(Req, 403, pw_util:bin(E))
+                end
+        end
+    end);
+handle_bot_v1(<<"GET">>, [<<"channels">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, read) of
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>);
+            true ->
+                case pw_db:server(maps:get(user_id, Bot), maps:get(server_id, Bot)) of
+                    {ok, #{channels := Channels}} -> pw_util:ok_json(Req, #{ok => true, data => Channels});
+                    {error, E} -> pw_util:err_json(Req, 403, pw_util:bin(E))
+                end
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"channels">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, mutation) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:create_channel(maps:get(user_id, Bot), maps:get(server_id, Bot),
+                    maps:get(<<"name">>, M, <<>>), maps:get(<<"kind">>, M, <<"text">>), maps:get(<<"category_id">>, M, undefined)))
+            end)
+        end
+    end);
+handle_bot_v1(<<"GET">>, [<<"channels">>, ChannelId, <<"messages">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, read) of
+            true -> result(Req, pw_db:messages(maps:get(user_id, Bot), <<"channel">>, ChannelId, qs(Req, <<"before">>), qs(Req, <<"after">>)));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"channels">>, ChannelId, <<"messages">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, message) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:bot_post_channel_message(maps:get(user_id, Bot), ChannelId,
+                    maps:get(<<"body">>, M, <<>>), maps:get(<<"reply_to_id">>, M, undefined)))
+            end)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"messages">>, MessageId, <<"delete">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, mutation) of
+            true -> result(Req, pw_db:delete_message(maps:get(user_id, Bot), MessageId));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"messages">>, MessageId, <<"reaction">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, mutation) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:toggle_message_reaction(maps:get(user_id, Bot), MessageId, maps:get(<<"emoji">>, M, <<>>)))
+            end)
+        end
+    end);
+handle_bot_v1(<<"GET">>, [<<"channels">>, ChannelId, <<"pins">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, read) of
+            true -> result(Req, pw_db:channel_pins(maps:get(user_id, Bot), ChannelId));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"GET">>, [<<"messages">>, MessageId, <<"context">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, read) of
+            true -> result(Req, pw_db:message_context(maps:get(user_id, Bot), MessageId));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"messages">>, MessageId, <<"edit">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, message) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) -> result(Req, pw_db:edit_message(maps:get(user_id, Bot), MessageId, maps:get(<<"body">>, M, <<>>))) end)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"messages">>, MessageId, <<"pin">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, mutation) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) -> result(Req, pw_db:set_message_pin(maps:get(user_id, Bot), MessageId, maps:get(<<"pinned">>, M, true))) end)
+        end
+    end);
+handle_bot_v1(<<"GET">>, [<<"roles">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, read) of
+            true -> result(Req, pw_db:server_roles(maps:get(user_id, Bot), maps:get(server_id, Bot)));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"roles">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, mutation) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:create_server_role(maps:get(user_id, Bot), maps:get(server_id, Bot), maps:get(<<"name">>, M, <<>>), M))
+            end)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"roles">>, RoleId], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, mutation) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:update_server_role(maps:get(user_id, Bot), maps:get(server_id, Bot), RoleId, M))
+            end)
+        end
+    end);
+handle_bot_v1(<<"DELETE">>, [<<"roles">>, RoleId], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, mutation) of
+            true -> result(Req, pw_db:delete_server_role(maps:get(user_id, Bot), maps:get(server_id, Bot), RoleId));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"GET">>, [<<"members">>, UserId], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, read) of
+            true -> result(Req, pw_db:server_member_profile(maps:get(user_id, Bot), maps:get(server_id, Bot), UserId));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"members">>, UserId, <<"roles">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, mutation) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) -> result(Req, pw_db:set_server_member_roles(maps:get(user_id, Bot), maps:get(server_id, Bot), UserId, maps:get(<<"role_ids">>, M, []))) end)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"members">>, UserId, <<"kick">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, mutation) of
+            true -> result(Req, pw_db:kick_server_member(maps:get(user_id, Bot), maps:get(server_id, Bot), UserId));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"members">>, UserId, <<"ban">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, mutation) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) -> result(Req, pw_db:ban_server_member(maps:get(user_id, Bot), maps:get(server_id, Bot), UserId, maps:get(<<"reason">>, M, <<>>))) end)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"members">>, UserId, <<"unban">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, mutation) of
+            true -> result(Req, pw_db:unban_server_member(maps:get(user_id, Bot), maps:get(server_id, Bot), UserId));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"GET">>, [<<"bans">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, read) of
+            true -> result(Req, pw_db:server_bans(maps:get(user_id, Bot), maps:get(server_id, Bot)));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"channels">>, ChannelId, <<"settings">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, mutation) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) -> result(Req, pw_db:update_channel_settings(maps:get(user_id, Bot), ChannelId, M)) end)
+        end
+    end);
+handle_bot_v1(<<"GET">>, [<<"wires">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, read) of
+            true -> result(Req, pw_db:list_invites(maps:get(user_id, Bot), maps:get(server_id, Bot)));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"wires">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, mutation) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:create_invite(maps:get(user_id, Bot), maps:get(server_id, Bot), maps:get(<<"channel_id">>, M, undefined), maps:get(<<"max_uses">>, M, 0), maps:get(<<"expires_in">>, M, 86400)))
+            end)
+        end
+    end);
+handle_bot_v1(<<"GET">>, [<<"commands">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, read) of
+            true -> result(Req, pw_db:bot_commands(maps:get(id, Bot)));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"commands">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, mutation) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:bot_register_command(maps:get(id, Bot), maps:get(<<"name">>, M, <<>>),
+                    maps:get(<<"description">>, M, <<>>), maps:get(<<"options">>, M, [])))
+            end)
+        end
+    end);
+handle_bot_v1(<<"DELETE">>, [<<"commands">>, CommandId], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, mutation) of
+            true -> result(Req, pw_db:bot_delete_command(maps:get(id, Bot), CommandId));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"GET">>, [<<"commands">>, <<"claims">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, command_claim) of
+            true -> result(Req, pw_db:bot_claim_commands(maps:get(id, Bot), qs(Req, <<"limit">>)));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"commands">>, <<"claims">>, InvocationId, <<"respond">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, command_claim) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:bot_respond_command(maps:get(id, Bot), InvocationId,
+                    maps:get(<<"claim_token">>, M, <<>>), maps:get(<<"body">>, M, <<>>)))
+            end)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"commands">>, <<"claims">>, InvocationId, <<"fail">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, command_claim) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:bot_fail_command(maps:get(id, Bot), InvocationId,
+                    maps:get(<<"claim_token">>, M, <<>>), maps:get(<<"reason">>, M, <<"command failed">>)))
+            end)
+        end
+    end);
+handle_bot_v1(_, _, Req0) -> pw_util:err_json(Req0, 404, <<"not_found">>).
+
+bot_limits() -> #{
+    read => bot_limit("PLAINWIRE_BOT_READ_PER_MINUTE", 1200, 60, 10000),
+    message => bot_limit("PLAINWIRE_BOT_MESSAGE_PER_MINUTE", 300, 30, 3000),
+    mutation => bot_limit("PLAINWIRE_BOT_MUTATION_PER_MINUTE", 600, 30, 5000),
+    command_claim => bot_limit("PLAINWIRE_BOT_COMMAND_CLAIM_PER_MINUTE", 2400, 60, 20000)
+}.
+
+bot_limit(Name, Default, Min, Max) -> min(Max, max(Min, pw_util:env_int(Name, Default))).
+
+bot_rate_allow(Bot, Kind) ->
+    Limits = bot_limits(),
+    Limit = maps:get(Kind, Limits),
+    pw_rate:allow_shared({bot_api, Kind, maps:get(id, Bot)}, Limit, 60000).
+
+bot_command_lease_ms() -> min(120000, max(5000, pw_util:env_int("PLAINWIRE_BOT_COMMAND_LEASE_MS", 30000))).
 
 with_bot(Req0, Fun) ->
     case cowboy_req:header(<<"authorization">>, Req0) of
@@ -493,6 +892,28 @@ github_request(Req, Session, Fun) ->
             end
     end.
 
+realtime_health() ->
+    Registry = pw_realtime_registry:stats(),
+    HubQueue = case whereis(pw_hub) of
+        Pid when is_pid(Pid) ->
+            case process_info(Pid, [message_queue_len, memory, reductions]) of
+                Info when is_list(Info) -> maps:from_list(Info);
+                _ -> #{}
+            end;
+        _ -> #{}
+    end,
+    Registry#{hub => HubQueue,
+              listener => listener_health(plainwire_http),
+              cluster => pw_cluster:status()}.
+
+listener_health(Ref) ->
+    try ranch:info(Ref) of
+        Info when is_map(Info) ->
+            maps:with([status, active_connections, all_connections, max_connections, metrics], Info);
+        _ -> #{status => unavailable}
+    catch _:_ -> #{status => unavailable}
+    end.
+
 result(Req, {ok, Data}) -> pw_util:ok_json(Req, #{ok=>true,data=>Data});
 result(Req, ok) -> pw_util:ok_json(Req, #{ok=>true});
 result(Req, {error, database_unavailable}) -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
@@ -502,6 +923,7 @@ result(Req, {error, internal_error}) -> pw_util:err_json(Req, 500, <<"internal_e
 result(Req, {error, forbidden}) -> pw_util:err_json(Req, 403, <<"forbidden">>);
 result(Req, {error, username_changed_elsewhere}) -> pw_util:err_json(Req, 409, <<"username_changed_elsewhere">>);
 result(Req, {error, not_found}) -> pw_util:err_json(Req, 404, <<"not_found">>);
+result(Req, {error, {slowmode, Retry}}) -> pw_util:json_reply(Req, 429, #{ok => false, error => <<"slowmode">>, data => #{retry_after_seconds => Retry}});
 result(Req, {error, E}) when is_atom(E) -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8));
 result(Req, {error, E}) -> pw_util:err_json(Req, 400, pw_util:bin(E));
 result(Req, Other) -> pw_util:ok_json(Req, #{ok=>true,data=>Other}).

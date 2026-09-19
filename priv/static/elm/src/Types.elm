@@ -6,6 +6,7 @@ module Types exposing
     , CallPopup
     , CallUI
     , CallUser
+    , BotCommand
     , Category
     , Channel
     , ContextMenu
@@ -34,6 +35,7 @@ module Types exposing
     , User
     , VoiceState
     , VoiceUser
+    , decodeBotCommand
     , decodeCallUser
     , decodeCategory
     , decodeChannel
@@ -115,6 +117,7 @@ type alias User =
     , theme : String
     , lastSeen : Int
     , createdAt : Int
+    , isBot : Bool
     }
 
 
@@ -165,6 +168,8 @@ type alias Message =
     , deletedAt : Maybe Int
     , forwardedFrom : Maybe ForwardPreview
     , roleColor : String
+    , isBot : Bool
+    , pinned : Bool
     , reactions : List Reaction
     }
 
@@ -266,6 +271,19 @@ type alias Channel =
     , topic : String
     , createdAt : Int
     , categoryId : Maybe Int
+    , slowmodeSeconds : Int
+    }
+
+
+type alias BotCommand =
+    { id : Int
+    , name : String
+    , description : String
+    , botId : Int
+    , botUserId : Int
+    , botName : String
+    , botDisplayName : String
+    , botAvatarUrl : String
     }
 
 
@@ -473,11 +491,15 @@ type alias Model =
     , notifs : List Notification
     , searchUsers : List User
     , searchThreads : List ForumThread
+    , searchMessages : List Message
+    , availableCommands : List BotCommand
     , currentServer : Maybe ServerData
     , currentProfile : Maybe User
     , currentServerProfile : Maybe ServerProfile
     , invitePreview : Maybe InvitePreview
     , msg : List Message
+    , pinnedMessages : List Message
+    , messageContextMode : Bool
     , nextBefore : Maybe Int
     , loadingOlderMessages : Bool
     , hasOlderMessages : Bool
@@ -626,9 +648,14 @@ type Msg
     | GotTimeZone Time.Zone
     | ToggleTimestampMode
     | SetReplyTo Message
+    | JumpToMessage Int
+    | OpenPinnedMessages Int
+    | SetMessagePinned Message Bool
+    | ReturnToLatestMessages
     | CancelReply
     | ClearDrafts
     | AttachmentReady String String
+    | ToggleLastAttachmentSpoiler
     | InputText String
     | SendMessage
     | StartEditMessage Message
@@ -765,6 +792,7 @@ decodeUser =
         |> andMap (D.field "theme" D.string |> defaultValue "system")
         |> andMap (D.field "last_seen" D.int)
         |> andMap (D.field "created_at" D.int)
+        |> andMap (D.field "is_bot" D.bool |> defaultValue False)
 
 
 decodeConversation : D.Decoder Conversation
@@ -822,6 +850,8 @@ decodeMessage =
         |> andMap (D.field "deleted_at" (D.nullable D.int))
         |> andMap (D.field "forwarded_from" (D.nullable decodeForwardPreview) |> defaultValue Nothing)
         |> andMap (D.field "role_color" D.string |> defaultValue "")
+        |> andMap (D.field "is_bot" D.bool |> defaultValue False)
+        |> andMap (D.field "pinned" D.bool |> defaultValue False)
         |> andMap (D.field "reactions" (D.list decodeReaction) |> defaultValue [])
 
 
@@ -931,17 +961,33 @@ decodeServer =
         |> andMap (D.field "permissions" D.int |> defaultValue 0)
 
 
+decodeBotCommand : D.Decoder BotCommand
+decodeBotCommand =
+    D.map8 BotCommand
+        (D.field "id" D.int)
+        (D.field "name" D.string)
+        (D.field "description" D.string |> defaultValue "")
+        (D.at [ "bot", "id" ] D.int)
+        (D.at [ "bot", "user_id" ] D.int)
+        (D.at [ "bot", "name" ] D.string |> defaultValue "")
+        (D.at [ "bot", "display_name" ] D.string |> defaultValue "")
+        (D.at [ "bot", "avatar_url" ] D.string |> defaultValue "")
+
+
 decodeChannel : D.Decoder Channel
 decodeChannel =
-    D.map8 Channel
-        (D.field "id" D.int)
-        (D.field "server_id" D.int)
-        (D.field "name" D.string)
-        (D.field "kind" D.string)
-        (D.field "position" D.int)
-        (D.field "topic" D.string |> defaultValue "")
-        (D.field "created_at" D.int)
-        (D.field "category_id" (D.nullable D.int) |> defaultValue Nothing)
+    D.map2 (\partial slowmode -> partial slowmode)
+        (D.map8 Channel
+            (D.field "id" D.int)
+            (D.field "server_id" D.int)
+            (D.field "name" D.string)
+            (D.field "kind" D.string)
+            (D.field "position" D.int)
+            (D.field "topic" D.string |> defaultValue "")
+            (D.field "created_at" D.int)
+            (D.field "category_id" (D.nullable D.int) |> defaultValue Nothing)
+        )
+        (D.field "slowmode_seconds" D.int |> defaultValue 0)
 
 
 decodeCategory : D.Decoder Category
@@ -1012,7 +1058,7 @@ type alias SyncData r =
 
 defaultMsg : Message
 defaultMsg =
-    Message 0 "" 0 0 "" "" "" "" "text" Nothing Nothing 0 Nothing Nothing Nothing "" []
+    Message 0 "" 0 0 "" "" "" "" "text" Nothing Nothing 0 Nothing Nothing Nothing "" False False []
 
 
 

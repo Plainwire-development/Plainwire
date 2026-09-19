@@ -27,11 +27,11 @@ SOURCE_GENERATED = {
 def source_files():
     # Only project-owned roots are eligible: backups beside the checkout cannot
     # accidentally enter a release. Reject links instead of dereferencing them.
-    roots = ['src', 'priv', 'web', 'native', 'scripts', 'test', 'deploy', 'docs']
+    roots = ['src', 'priv', 'web', 'native', 'scripts', 'test', 'deploy', 'docs', 'sdk', '.github']
     files = [p for p in ROOT.iterdir() if p.name in {
         'Makefile', 'VERSION', 'LICENSE', 'README.md', 'BUILD_STATUS.md',
         'rebar.config', 'rebar.lock', 'package.json', 'package-lock.json',
-        '.gitignore', '.env.example', '.env.development.example'} or p.name.startswith('RELEASE_NOTES_') and p.suffix == '.md']
+        'compose.yaml', '.gitignore', '.env.example', '.env.development.example'} or p.name.startswith('RELEASE_NOTES_') and p.suffix == '.md']
     for folder in roots:
         for base, dirs, names in os.walk(ROOT / folder, followlinks=False):
             for name in dirs:

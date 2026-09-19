@@ -8,16 +8,28 @@
     sync/2, users/1, profile/2, profile_by_username/2,
     friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friend_unblock/2, friends/1,
     forums/1, create_forum/4, delete_forum/2, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, edit_thread/4, moderate_thread/4, delete_thread/2, reply_thread/3, edit_reply/4, delete_reply/3, vote_thread/3,
-    servers/1, create_server/3, update_server/3, delete_server/3, server/2, server_member_profile/3, create_channel/4, create_channel/5,
+    servers/1, create_server/3, update_server/3, delete_server/3, server/2, update_channel_settings/3, server_member_profile/3, create_channel/4, create_channel/5,
     server_roles/2, create_server_role/4, update_server_role/4, delete_server_role/3, set_server_member_roles/4,
     kick_server_member/3, ban_server_member/4, unban_server_member/3, server_bans/2, update_server_member_profile/4, server_permissions/2, update_server_default_permissions/3,
     server_webhooks/2, create_server_webhook/5, update_server_webhook/5, delete_server_webhook/3, rotate_server_webhook/3, test_server_webhook/3,
+    incoming_webhooks/2, create_incoming_webhook/4, rotate_incoming_webhook/3, delete_incoming_webhook/3, execute_incoming_webhook/4,
+    server_webhook_deliveries/4, retry_server_webhook_delivery/4,
     webhook_claim_due/1, webhook_finish/2, webhook_prune/0,
     storage_outbox_claim/1, storage_outbox_finish/2, storage_outbox_prune/0, storage_status/0, storage_migration_page/2, storage_migration_checkpoint/0, storage_migration_set_checkpoint/2, storage_reconcile_page/1,
     storage_pg_message_get/1, storage_pg_message_recent/3, storage_pg_message_before/4, storage_pg_message_after/4, storage_pg_message_bulk/1, storage_pg_message_edit/3, storage_pg_message_delete/2,
     server_bots/2, create_server_bot/3, rotate_server_bot/3, delete_server_bot/3, authenticate_bot/1, bot_post_channel_message/4,
+    developer_apps/1, developer_app/2, create_developer_app/2, update_developer_app/3, delete_developer_app/2,
+    developer_app_installations/2, install_developer_app/3, install_public_developer_app/3, rotate_developer_app_installation/3, uninstall_developer_app/3, public_developer_app/1, public_developer_apps/2, server_apps/2,
+    server_app_commands/3, set_server_command_permissions/5, uninstall_server_app/3,
+    developer_app_commands/2, upsert_developer_app_command/6, delete_developer_app_command/3,
+    update_developer_app_interactions/3, rotate_developer_app_interaction_secret/2, update_developer_app_ai/3,
+    app_interaction_claim_due/1, app_interaction_finish/2, ai_command_claim_due/1, ai_command_finish/2,
+    bot_commands/1, bot_register_command/4, bot_delete_command/2, bot_claim_commands/2, bot_respond_command/4, bot_fail_command/4,
+    commands_for_channel/2, invoke_bot_command/4,
+    search_messages/4, search_index_reconcile/1, search_index_status/0,
     create_invite/4, create_invite/5, list_invites/2, revoke_invite/3, invite_options/2, invite_preview/1, join_invite/2,
-    messages/5, post_channel_message/4, delete_message/2, edit_message/3, forward_message/4, toggle_message_reaction/3, record_missed_call/2,
+    messages/5, message_context/2, channel_pins/2, set_message_pin/3,
+    post_channel_message/4, delete_message/2, edit_message/3, forward_message/4, toggle_message_reaction/3, record_missed_call/2,
     conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4,
     set_conversation_member_role/4, kick_conversation_member/3,
     add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4,
@@ -33,6 +45,7 @@
     admin_create_enrollment/6, admin_redeem_enrollment/9, admin_rotate_key/5,
     admin_operators/1, admin_set_operator_role/3, admin_remove_operator/2,
     admin_overview/0, admin_users/3, admin_user/1, admin_servers/3, admin_server/1,
+    admin_user_moderation/2, admin_user_moderation_history/2, admin_apply_user_moderation/4,
     admin_audit/2, admin_record_audit/6,
     global_banners/0, invalidate_global_banners_cache/0, admin_banners/0, admin_create_banner/2, admin_update_banner/3, admin_delete_banner/3,
     instance_registration_mode/0, admin_set_registration_mode/2
@@ -71,17 +84,22 @@ message_id_renew_node(NodeId, Owner, LeaseUntil) -> call({message_id_renew_node,
 message_id_release_node(NodeId, Owner) -> call({message_id_release_node, NodeId, Owner}).
 
 health() ->
-    try
-        #pool{conns = Conns, size = Size} = persistent_term:get(?POOL_KEY),
-        Conn = pool_conn(1, Conns),
-        case rows(Conn, "SELECT 1", []) of
-            {ok, _} ->
+    %% Health probes must use the same reservation + per-connection serialization
+    %% path as every other query. Querying an epgsql connection directly here can
+    %% otherwise interleave with a transaction that currently owns that lane.
+    case call(health_probe) of
+        {ok, database_ok} ->
+            try
+                #pool{conns = Conns, size = Size} = persistent_term:get(?POOL_KEY),
                 Queues = [connection_load(I, pool_conn(I, Conns)) || I <- lists:seq(1, Size)],
-                {ok, #{database => ok, pool_size => Size, max_connection_queue => lists:max(Queues)}};
-            _ -> {error, database_unavailable}
-        end
-    catch
-        _:_ -> {error, database_unavailable}
+                {ok, #{database => ok, pool_size => Size,
+                       inflight => lists:sum([max(0, case ets:lookup(?POOL_LOAD, I) of [{I, N}] -> N; [] -> 0 end) || I <- lists:seq(1, Size)]),
+                       max_connection_queue => lists:max(Queues),
+                       queue_limit_per_connection => max(8, pw_util:env_int("PLAINWIRE_DB_MAX_QUEUE", 128))}}
+            catch
+                _:_ -> {error, database_unavailable}
+            end;
+        _ -> {error, database_unavailable}
     end.
 
 session_fast(Token) ->
@@ -113,75 +131,112 @@ call(Msg) ->
     end.
 
 call_with_pool(Msg, #pool{conns = Conns, size = Size, counter = Counter}) ->
-    case pick_connection(Conns, Size, Counter) of
+    %% Reserve capacity atomically before queuing work on a lane. Each lane is a
+    %% dedicated lightweight process that owns exactly one epgsql connection, so
+    %% whole routes/transactions are serialized without a global lock-manager hop.
+    case reserve_connection(Conns, Size, Counter) of
         overloaded ->
             logger:warning("[plainwire:db] pool_overloaded operation=~p", [operation_name(Msg)]),
             {error, database_busy};
-        {Idx, Conn, QueueLen} ->
+        {_Idx, Lane, QueueLen} ->
             Started = erlang:monotonic_time(millisecond),
-            _ = ets:update_counter(?POOL_LOAD, Idx, {2, 1}, {Idx, 0}),
-            try run_connection_locked(Idx, Msg, Conn, Started, QueueLen)
-            after ets:update_counter(?POOL_LOAD, Idx, {2, -1}, {Idx, 1}) end
+            %% The lane, not the caller, releases the reservation after the DB
+            %% operation actually finishes. If an HTTP/client caller times out,
+            %% the query may still be executing and must continue counting
+            %% against bounded admission until PostgreSQL returns.
+            run_connection_lane(Msg, Lane, Started, QueueLen)
     end.
 
 operation_name(Msg) when is_tuple(Msg), tuple_size(Msg) > 0 -> element(1, Msg);
 operation_name(Msg) -> Msg.
 
-run_connection_locked(Idx, Msg, Conn, Started, QueueLen) ->
-    %% epgsql locks queries, not whole transactions. lock the whole route.
-    LockId = {{?MODULE, connection, Idx}, self()},
-    try global:trans(LockId, fun() ->
-        CurrentConn = case ets:lookup(?POOL_CONNS, Idx) of [{Idx, C}] -> C; [] -> Conn end,
-        case route_with_reconnect(Msg, CurrentConn) of
-            {Reply, CurrentConn} -> Reply;
-            {Reply, Conn1} -> update_pool_conn(Idx, Conn1), Reply
-        end
-    end, [node()], infinity) of
-        aborted -> {error, database_busy};
-        Reply -> log_db_latency(Msg, Started, QueueLen), Reply
-    catch
-        exit:{timeout, _} -> {error, timeout};
-        exit:{noproc, _} -> {error, database_unavailable};
-        exit:{normal, _} -> {error, database_unavailable};
-        exit:Reason ->
-            error_logger:error_msg("DB call exit ~p for ~p~n", [Reason, safe_log_msg(Msg)]),
+run_connection_lane(Msg, Lane, Started, QueueLen) when is_pid(Lane) ->
+    %% OTP process aliases make late replies disappear after timeout instead of
+    %% accumulating unmatched {db_reply,...} messages in long-lived callers.
+    ReplyTo = erlang:alias([reply]),
+    Mon = erlang:monitor(process, Lane),
+    Lane ! {db_call, ReplyTo, Msg},
+    Timeout = min(120000, max(1000, pw_util:env_int_cached("PLAINWIRE_DB_CALL_TIMEOUT_MS", 60000))),
+    receive
+        {db_reply, ReplyTo, Reply} ->
+            erlang:demonitor(Mon, [flush]),
+            log_db_latency(Msg, Started, QueueLen),
+            Reply;
+        {'DOWN', Mon, process, Lane, Reason} ->
+            _ = erlang:unalias(ReplyTo),
+            error_logger:error_msg("DB lane exited ~p for ~p~n", [Reason, safe_log_msg(Msg)]),
             {error, database_unavailable}
-    end.
+    after Timeout ->
+        _ = erlang:unalias(ReplyTo),
+        erlang:demonitor(Mon, [flush]),
+        %% A reply can win the race immediately before unalias/1. Flush that one
+        %% message exactly once; later sends to the inactive alias are dropped.
+        receive
+            {db_reply, ReplyTo, Reply} ->
+                log_db_latency(Msg, Started, QueueLen),
+                Reply
+        after 0 ->
+            logger:warning("[plainwire:db] call_timeout operation=~p duration_ms=~p", [operation_name(Msg), Timeout]),
+            {error, timeout}
+        end
+    end;
+run_connection_lane(_, _, _, _) -> {error, database_unavailable}.
 
-%% two random choices keeps one connection from getting dogpiled.
-pick_connection(Conns, Size, Counter) ->
+%% Power-of-two choices keeps normal selection O(1). Reservations are atomic;
+%% if both sampled lanes race to full, do one bounded pool scan rather than
+%% returning database_busy while another lane still has room.
+reserve_connection(Conns, Size, Counter) ->
     A = atomics:add_get(Counter, 1, 1) rem Size + 1,
     B = case Size of 1 -> A; _ -> atomics:add_get(Counter, 1, 1) rem Size + 1 end,
-    ConnA = pool_conn(A, Conns),
-    ConnB = pool_conn(B, Conns),
-    QA = connection_load(A, ConnA),
-    QB = connection_load(B, ConnB),
-    {Idx, Conn, Q} = case QA =< QB of true -> {A, ConnA, QA}; false -> {B, ConnB, QB} end,
-    MaxQueue = max(10, pw_util:env_int("PLAINWIRE_DB_MAX_QUEUE", 250)),
-    case Q >= MaxQueue of true -> overloaded; false -> {Idx, Conn, Q} end.
+    Candidates0 = case A =:= B of true -> [A]; false -> [A, B] end,
+    Candidates = lists:sort(fun(I, J) ->
+        connection_load(I, pool_conn(I, Conns)) =< connection_load(J, pool_conn(J, Conns))
+    end, Candidates0),
+    MaxQueue = max(8, pw_util:env_int_cached("PLAINWIRE_DB_MAX_QUEUE", 128)),
+    case reserve_candidates(Candidates, Conns, MaxQueue) of
+        overloaded -> reserve_least_loaded(Conns, Size, MaxQueue, Candidates0);
+        Reserved -> Reserved
+    end.
 
-connection_queue_len(Pid) when is_pid(Pid) ->
-    case process_info(Pid, message_queue_len) of
-        {message_queue_len, N} -> N;
-        _ -> 1000000
-    end;
-connection_queue_len(_) -> 1000000.
+reserve_candidates([], _Conns, _MaxQueue) -> overloaded;
+reserve_candidates([Idx | Rest], Conns, MaxQueue) ->
+    Conn = pool_conn(Idx, Conns),
+    case is_pid(Conn) of
+        false -> reserve_candidates(Rest, Conns, MaxQueue);
+        true ->
+            NewLoad = ets:update_counter(?POOL_LOAD, Idx, {2, 1}, {Idx, 0}),
+            case NewLoad =< MaxQueue of
+                true -> {Idx, Conn, NewLoad - 1};
+                false ->
+                    ets:update_counter(?POOL_LOAD, Idx, {2, -1}, {Idx, 1}),
+                    reserve_candidates(Rest, Conns, MaxQueue)
+            end
+    end.
 
-connection_load(Idx, Conn) ->
-    Waiting = case ets:lookup(?POOL_LOAD, Idx) of [{Idx, N}] -> N; [] -> 0 end,
-    max(Waiting, connection_queue_len(Conn)).
+reserve_least_loaded(Conns, Size, MaxQueue, Skip) ->
+    Remaining = [I || I <- lists:seq(1, Size), not lists:member(I, Skip)],
+    case Remaining of
+        [] -> overloaded;
+        _ ->
+            Sorted = lists:sort(fun(I, J) ->
+                connection_load(I, pool_conn(I, Conns)) =< connection_load(J, pool_conn(J, Conns))
+            end, Remaining),
+            reserve_candidates(Sorted, Conns, MaxQueue)
+    end.
+
+connection_load(Idx, _Lane) ->
+    %% ?POOL_LOAD is an exact atomic admission counter for queued + executing
+    %% work, so probing another process mailbox on every pool choice adds cost
+    %% without improving the admission decision.
+    case ets:lookup(?POOL_LOAD, Idx) of [{Idx, N}] -> max(0, N); [] -> 0 end.
 
 log_db_latency(Msg, Started, QueueLen) ->
     Elapsed = erlang:monotonic_time(millisecond) - Started,
-    SlowMs = pw_util:env_int("PLAINWIRE_DB_SLOW_MS", 250),
+    SlowMs = pw_util:env_int_cached("PLAINWIRE_DB_SLOW_MS", 250),
     case Elapsed >= SlowMs of
         true -> logger:warning("[plainwire:db] slow operation=~p duration_ms=~p initial_queue=~p", [operation_name(Msg), Elapsed, QueueLen]);
         false -> ok
     end.
-
-update_pool_conn(Idx, NewConn) ->
-    ets:insert(?POOL_CONNS, {Idx, NewConn}),
-    ok.
 
 pool_conn(Idx, FallbackConns) ->
     case ets:lookup(?POOL_CONNS, Idx) of
@@ -238,6 +293,7 @@ create_server(Uid, Name, Desc) -> call({create_server, Uid, Name, Desc}).
 update_server(Uid, Sid, Patch) -> call({update_server, Uid, Sid, Patch}).
 delete_server(Uid, Sid, ConfirmName) -> call({delete_server, Uid, Sid, ConfirmName}).
 server(Uid, ServerId) -> call({server, Uid, ServerId}).
+update_channel_settings(Uid, ChannelId, Patch) -> call({update_channel_settings, Uid, ChannelId, Patch}).
 server_member_profile(Uid, ServerId, TargetUid) -> call({server_member_profile, Uid, ServerId, TargetUid}).
 create_channel(Uid, ServerId, Name, Kind) -> create_channel(Uid, ServerId, Name, Kind, undefined).
 create_channel(Uid, ServerId, Name, Kind, CategoryId) -> call({create_channel, Uid, ServerId, Name, Kind, CategoryId}).
@@ -259,6 +315,13 @@ update_server_webhook(Uid, ServerId, WebhookId, Patch, ExpectedUpdatedAt) -> cal
 delete_server_webhook(Uid, ServerId, WebhookId) -> call({delete_server_webhook, Uid, ServerId, WebhookId}).
 rotate_server_webhook(Uid, ServerId, WebhookId) -> call({rotate_server_webhook, Uid, ServerId, WebhookId}).
 test_server_webhook(Uid, ServerId, WebhookId) -> call({test_server_webhook, Uid, ServerId, WebhookId}).
+incoming_webhooks(Uid, ServerId) -> call({incoming_webhooks, Uid, ServerId}).
+create_incoming_webhook(Uid, ServerId, ChannelId, Name) -> call({create_incoming_webhook, Uid, ServerId, ChannelId, Name}).
+rotate_incoming_webhook(Uid, ServerId, WebhookId) -> call({rotate_incoming_webhook, Uid, ServerId, WebhookId}).
+delete_incoming_webhook(Uid, ServerId, WebhookId) -> call({delete_incoming_webhook, Uid, ServerId, WebhookId}).
+execute_incoming_webhook(WebhookId, Token, Body, ReplyTo) -> call({execute_incoming_webhook, WebhookId, Token, Body, ReplyTo}).
+server_webhook_deliveries(Uid, ServerId, WebhookId, Limit) -> call({server_webhook_deliveries, Uid, ServerId, WebhookId, Limit}).
+retry_server_webhook_delivery(Uid, ServerId, WebhookId, DeliveryId) -> call({retry_server_webhook_delivery, Uid, ServerId, WebhookId, DeliveryId}).
 webhook_claim_due(Limit) -> call({webhook_claim_due, Limit}).
 webhook_finish(Id, Result) -> call({webhook_finish, Id, Result}).
 webhook_prune() -> call(webhook_prune).
@@ -283,6 +346,46 @@ rotate_server_bot(Uid, ServerId, BotId) -> call({rotate_server_bot, Uid, ServerI
 delete_server_bot(Uid, ServerId, BotId) -> call({delete_server_bot, Uid, ServerId, BotId}).
 authenticate_bot(Token) -> call({authenticate_bot, Token}).
 bot_post_channel_message(BotUid, ChannelId, Body, ReplyTo) -> call({post_channel_message, BotUid, ChannelId, Body, ReplyTo}).
+developer_apps(Uid) -> call({developer_apps, Uid}).
+developer_app(Uid, AppId) -> call({developer_app, Uid, AppId}).
+create_developer_app(Uid, Name) -> call({create_developer_app, Uid, Name}).
+update_developer_app(Uid, AppId, Patch) -> call({update_developer_app, Uid, AppId, Patch}).
+delete_developer_app(Uid, AppId) -> call({delete_developer_app, Uid, AppId}).
+developer_app_installations(Uid, AppId) -> call({developer_app_installations, Uid, AppId}).
+install_developer_app(Uid, AppId, ServerId) -> call({install_developer_app, Uid, AppId, ServerId}).
+install_public_developer_app(Uid, PublicId, ServerId) -> call({install_public_developer_app, Uid, PublicId, ServerId}).
+server_apps(Uid, ServerId) -> call({server_apps, Uid, ServerId}).
+rotate_developer_app_installation(Uid, AppId, InstallationId) -> call({rotate_developer_app_installation, Uid, AppId, InstallationId}).
+uninstall_developer_app(Uid, AppId, InstallationId) -> call({uninstall_developer_app, Uid, AppId, InstallationId}).
+public_developer_app(PublicId) -> call({public_developer_app, PublicId}).
+public_developer_apps(Query, Limit) -> call({public_developer_apps, Query, Limit}).
+server_app_commands(Uid, ServerId, InstallationId) -> call({server_app_commands, Uid, ServerId, InstallationId}).
+set_server_command_permissions(Uid, ServerId, InstallationId, CommandId, Rules) -> call({set_server_command_permissions, Uid, ServerId, InstallationId, CommandId, Rules}).
+uninstall_server_app(Uid, ServerId, InstallationId) -> call({uninstall_server_app, Uid, ServerId, InstallationId}).
+developer_app_commands(Uid, AppId) -> call({developer_app_commands, Uid, AppId}).
+upsert_developer_app_command(Uid, AppId, Name, Description, Options, Handler) -> call({upsert_developer_app_command, Uid, AppId, Name, Description, Options, Handler}).
+delete_developer_app_command(Uid, AppId, CommandId) -> call({delete_developer_app_command, Uid, AppId, CommandId}).
+update_developer_app_interactions(Uid, AppId, Patch) -> call({update_developer_app_interactions, Uid, AppId, Patch}).
+rotate_developer_app_interaction_secret(Uid, AppId) -> call({rotate_developer_app_interaction_secret, Uid, AppId}).
+update_developer_app_ai(Uid, AppId, Patch) -> call({update_developer_app_ai, Uid, AppId, Patch}).
+app_interaction_claim_due(Limit) -> call({app_interaction_claim_due, Limit}).
+app_interaction_finish(Id, Result) -> call({app_interaction_finish, Id, Result}).
+ai_command_claim_due(Limit) -> call({ai_command_claim_due, Limit}).
+ai_command_finish(Id, Result) -> call({ai_command_finish, Id, Result}).
+bot_commands(BotId) -> call({bot_commands, BotId}).
+bot_register_command(BotId, Name, Description, Options) -> call({bot_register_command, BotId, Name, Description, Options}).
+bot_delete_command(BotId, CommandId) -> call({bot_delete_command, BotId, CommandId}).
+bot_claim_commands(BotId, Limit) -> call({bot_claim_commands, BotId, Limit}).
+bot_respond_command(BotId, InvocationId, ClaimToken, Body) -> call({bot_respond_command, BotId, InvocationId, ClaimToken, Body}).
+bot_fail_command(BotId, InvocationId, ClaimToken, Reason) -> call({bot_fail_command, BotId, InvocationId, ClaimToken, Reason}).
+commands_for_channel(Uid, ChannelId) -> call({commands_for_channel, Uid, ChannelId}).
+invoke_bot_command(Uid, ChannelId, Name, Args) -> call({invoke_bot_command, Uid, ChannelId, Name, Args}).
+search_messages(Uid, Query, Before, Limit) -> call({search_messages, Uid, Query, Before, Limit}).
+search_index_reconcile(Limit) -> call({search_index_reconcile, Limit}).
+search_index_status() -> call(search_index_status).
+message_context(Uid, MessageId) -> call({message_context, Uid, MessageId}).
+channel_pins(Uid, ChannelId) -> call({channel_pins, Uid, ChannelId}).
+set_message_pin(Uid, MessageId, Pinned) -> call({set_message_pin, Uid, MessageId, Pinned}).
 categories(Uid, ServerId) -> call({categories, Uid, ServerId}).
 create_category(Uid, ServerId, Name) -> call({create_category, Uid, ServerId, Name}).
 update_category(Uid, ServerId, CatId, Patch) -> call({update_category, Uid, ServerId, CatId, Patch}).
@@ -360,6 +463,9 @@ admin_remove_operator(ActorUid, TargetUid) -> call({admin_remove_operator, Actor
 admin_overview() -> call(admin_overview).
 admin_users(Query, Limit, Offset) -> call({admin_users, Query, Limit, Offset}).
 admin_user(Uid) -> call({admin_user, Uid}).
+admin_user_moderation(ActorUid, TargetUid) -> call({admin_user_moderation, ActorUid, TargetUid}).
+admin_user_moderation_history(ActorUid, TargetUid) -> call({admin_user_moderation_history, ActorUid, TargetUid}).
+admin_apply_user_moderation(ActorUid, TargetUid, Action, Patch) -> call({admin_apply_user_moderation, ActorUid, TargetUid, Action, Patch}).
 admin_servers(Query, Limit, Offset) -> call({admin_servers, Query, Limit, Offset}).
 admin_server(Sid) -> call({admin_server, Sid}).
 admin_audit(Limit, BeforeId) -> call({admin_audit, Limit, BeforeId}).
@@ -412,25 +518,31 @@ instance_registration_mode() -> call(instance_registration_mode).
 admin_set_registration_mode(ActorUid, Mode) -> call({admin_set_registration_mode, ActorUid, Mode}).
 
 init([]) ->
+    %% Database lanes are linked so shutdown remains simple, but isolate an
+    %% unexpected lane crash from the pool owner and replace only that lane.
+    process_flag(trap_exit, true),
     application:ensure_all_started(inets),
-    _ = ets:new(?SESSION_CACHE, [named_table, public, set, {read_concurrency, true}]),
-    _ = ets:new(?BANNER_CACHE, [named_table, public, set, {read_concurrency, true}, {write_concurrency, true}]),
-    _ = ets:new(?POOL_CONNS, [named_table, public, set, {read_concurrency, true}, {write_concurrency, true}]),
-    _ = ets:new(?POOL_LOAD, [named_table, public, set, {read_concurrency, true}, {write_concurrency, true}]),
+    _ = ets:new(?SESSION_CACHE, [named_table, public, set, {read_concurrency, true}, {write_concurrency, auto}, {decentralized_counters, true}]),
+    _ = ets:new(?BANNER_CACHE, [named_table, public, set, {read_concurrency, true}, {write_concurrency, auto}]),
+    _ = ets:new(?POOL_CONNS, [named_table, public, set, {read_concurrency, true}, {write_concurrency, auto}]),
+    _ = ets:new(?POOL_LOAD, [named_table, public, set, {read_concurrency, true}, {write_concurrency, auto}, {decentralized_counters, true}]),
     {ok, MigConn} = connect_with_retry(10, 500),
     ok = migrate(MigConn),
     try epgsql:close(MigConn) catch _:_ -> ok end,
-    %% clamp this before tuple math (and before opening 9000 connections).
-    PoolSize = min(128, max(1, pw_util:env_int("PLAINWIRE_DB_POOL_SIZE", 10))),
-    Conns = list_to_tuple([
+    %% Keep the zero-config pool proportional to the host without assuming an
+    %% enormous PostgreSQL max_connections setting. Explicit configuration wins.
+    Schedulers = erlang:system_info(schedulers_online),
+    DefaultPool = min(32, max(8, Schedulers * 2)),
+    PoolSize = min(128, max(1, pw_util:env_int("PLAINWIRE_DB_POOL_SIZE", DefaultPool))),
+    Lanes = list_to_tuple([
         begin
             {ok, C} = connect_with_retry(5, 500),
-            C
-        end || _ <- lists:seq(1, PoolSize)
+            spawn_link(fun() -> db_lane_loop(I, C) end)
+        end || I <- lists:seq(1, PoolSize)
     ]),
     Counter = atomics:new(1, [{signed, false}]),
-    [begin ets:insert(?POOL_CONNS, {I, element(I, Conns)}), ets:insert(?POOL_LOAD, {I, 0}) end || I <- lists:seq(1, PoolSize)],
-    persistent_term:put(?POOL_KEY, #pool{conns = Conns, size = PoolSize, counter = Counter}),
+    [begin ets:insert(?POOL_CONNS, {I, element(I, Lanes)}), ets:insert(?POOL_LOAD, {I, 0}) end || I <- lists:seq(1, PoolSize)],
+    persistent_term:put(?POOL_KEY, #pool{conns = Lanes, size = PoolSize, counter = Counter}),
     erlang:send_after(?SESSION_GC_MS, self(), session_gc),
     {ok, #st{}}.
 
@@ -445,15 +557,68 @@ handle_info(session_gc, St) ->
     _ = call({prune_sessions, Now}),
     erlang:send_after(?SESSION_GC_MS, self(), session_gc),
     {noreply, St};
+handle_info({'EXIT', Lane, Reason}, St) when is_pid(Lane) ->
+    case lane_index(Lane) of
+        undefined -> {noreply, St};
+        Idx ->
+            %% Queued callers monitor the failed lane and return immediately.
+            %% Reset its exact admission count and publish an unavailable sentinel
+            %% before reconnecting so new calls choose healthy lanes instead.
+            ets:insert(?POOL_CONNS, {Idx, unavailable}),
+            ets:insert(?POOL_LOAD, {Idx, 0}),
+            logger:warning("[plainwire:db] lane_crashed lane=~p reason=~p", [Idx, Reason]),
+            self() ! {restart_lane, Idx},
+            {noreply, St}
+    end;
+handle_info({restart_lane, Idx}, St) when is_integer(Idx), Idx > 0 ->
+    case ets:lookup(?POOL_CONNS, Idx) of
+        [{Idx, unavailable}] ->
+            case connect_with_retry(3, 250) of
+                {ok, Conn} ->
+                    NewLane = spawn_link(fun() -> db_lane_loop(Idx, Conn) end),
+                    ets:insert(?POOL_CONNS, {Idx, NewLane}),
+                    logger:notice("[plainwire:db] lane_recovered lane=~p", [Idx]),
+                    {noreply, St};
+                {error, Reason} ->
+                    logger:warning("[plainwire:db] lane_reconnect_failed lane=~p reason=~p", [Idx, Reason]),
+                    erlang:send_after(2000, self(), {restart_lane, Idx}),
+                    {noreply, St}
+            end;
+        _ -> {noreply, St}
+    end;
 handle_info(_, St) -> {noreply, St}.
 terminate(_, _) ->
     try
-        #pool{conns = Conns, size = Size} = persistent_term:get(?POOL_KEY),
-        [try epgsql:close(pool_conn(I, Conns)) catch _:_ -> ok end || I <- lists:seq(1, Size)],
+        #pool{conns = Lanes, size = Size} = persistent_term:get(?POOL_KEY),
+        
+[begin Lane = pool_conn(I, Lanes), try Lane ! stop catch _:_ -> ok end end || I <- lists:seq(1, Size)],
         persistent_term:erase(?POOL_KEY)
     catch _:_ -> ok end,
     ok.
 code_change(_, St, _) -> {ok, St}.
+
+lane_index(Lane) ->
+    case [Idx || {Idx, Pid} <- ets:tab2list(?POOL_CONNS), Pid =:= Lane] of
+        [Idx | _] -> Idx;
+        [] -> undefined
+    end.
+
+db_lane_loop(Idx, Conn) ->
+    process_flag(message_queue_data, off_heap),
+    receive
+        {db_call, ReplyTo, Msg} when is_reference(ReplyTo) ->
+            %% A reservation represents queued + executing work. Release it only
+            %% after the lane has actually completed, even when the original
+            %% caller has timed out and its reply alias has been deactivated.
+            {Reply, Conn1} = route_with_reconnect(Msg, Conn),
+            ReplyTo ! {db_reply, ReplyTo, Reply},
+            ets:update_counter(?POOL_LOAD, Idx, {2, -1, 0, 0}),
+            db_lane_loop(Idx, Conn1);
+        stop ->
+            try epgsql:close(Conn) catch _:_ -> ok end,
+            ok;
+        _ -> db_lane_loop(Idx, Conn)
+    end.
 
 route_with_reconnect(Msg, Conn) ->
     try route(Msg, Conn) of
@@ -542,6 +707,7 @@ read_msg({create_server, _, _, _}) -> false;
 read_msg({update_server, _, _, _}) -> false;
 read_msg({delete_server, _, _, _}) -> false;
 read_msg({create_channel, _, _, _, _, _}) -> false;
+read_msg({update_channel_settings, _, _, _}) -> false;
 read_msg({create_server_role, _, _, _, _}) -> false;
 read_msg({update_server_role, _, _, _, _}) -> false;
 read_msg({delete_server_role, _, _, _}) -> false;
@@ -556,6 +722,11 @@ read_msg({update_server_webhook, _, _, _, _, _}) -> false;
 read_msg({delete_server_webhook, _, _, _}) -> false;
 read_msg({rotate_server_webhook, _, _, _}) -> false;
 read_msg({test_server_webhook, _, _, _}) -> false;
+read_msg({create_incoming_webhook, _, _, _, _}) -> false;
+read_msg({rotate_incoming_webhook, _, _, _}) -> false;
+read_msg({delete_incoming_webhook, _, _, _}) -> false;
+read_msg({execute_incoming_webhook, _, _, _, _}) -> false;
+read_msg({retry_server_webhook_delivery, _, _, _, _}) -> false;
 read_msg({webhook_claim_due, _}) -> false;
 read_msg({webhook_finish, _, _}) -> false;
 read_msg(webhook_prune) -> false;
@@ -568,6 +739,32 @@ read_msg({storage_pg_message_delete, _, _}) -> false;
 read_msg({create_server_bot, _, _, _}) -> false;
 read_msg({rotate_server_bot, _, _, _}) -> false;
 read_msg({delete_server_bot, _, _, _}) -> false;
+read_msg({bot_register_command, _, _, _, _}) -> false;
+read_msg({create_developer_app, _, _}) -> false;
+read_msg({update_developer_app, _, _, _}) -> false;
+read_msg({delete_developer_app, _, _}) -> false;
+read_msg({install_developer_app, _, _, _}) -> false;
+read_msg({install_public_developer_app, _, _, _}) -> false;
+read_msg({rotate_developer_app_installation, _, _, _}) -> false;
+read_msg({uninstall_developer_app, _, _, _}) -> false;
+read_msg({upsert_developer_app_command, _, _, _, _, _, _}) -> false;
+read_msg({delete_developer_app_command, _, _, _}) -> false;
+read_msg({update_developer_app_interactions, _, _, _}) -> false;
+read_msg({rotate_developer_app_interaction_secret, _, _}) -> false;
+read_msg({update_developer_app_ai, _, _, _}) -> false;
+read_msg({set_server_command_permissions, _, _, _, _, _}) -> false;
+read_msg({uninstall_server_app, _, _, _}) -> false;
+read_msg({app_interaction_claim_due, _}) -> false;
+read_msg({app_interaction_finish, _, _}) -> false;
+read_msg({ai_command_claim_due, _}) -> false;
+read_msg({ai_command_finish, _, _}) -> false;
+read_msg({bot_delete_command, _, _}) -> false;
+read_msg({bot_claim_commands, _, _}) -> false;
+read_msg({bot_respond_command, _, _, _, _}) -> false;
+read_msg({bot_fail_command, _, _, _, _}) -> false;
+read_msg({invoke_bot_command, _, _, _, _}) -> false;
+read_msg({search_index_reconcile, _}) -> false;
+read_msg({set_message_pin, _, _, _}) -> false;
 read_msg({create_category, _, _, _}) -> false;
 read_msg({update_category, _, _, _, _}) -> false;
 read_msg({reorder_categories, _, _, _}) -> false;
@@ -629,6 +826,9 @@ read_msg({admin_create_banner, _, _}) -> false;
 read_msg({admin_update_banner, _, _, _}) -> false;
 read_msg({admin_delete_banner, _, _, _}) -> false;
 read_msg({admin_set_registration_mode, _, _}) -> false;
+read_msg({admin_user_moderation, _, _}) -> true;
+read_msg({admin_user_moderation_history, _, _}) -> true;
+read_msg({admin_apply_user_moderation, _, _, _, _}) -> false;
 read_msg(_) -> true.
 
 safe_log_msg({register, _, _, _}) -> {register, redacted};
@@ -682,6 +882,11 @@ connect() ->
     case epgsql:connect(Opts) of
         {ok, Conn} ->
             configure_connection(Conn),
+            %% epgsql connections may be linked to the process that opened
+            %% them. Lane workers deliberately own failure/reconnect handling;
+            %% an asynchronous socket exit must not cascade into pw_db itself.
+            
+try unlink(Conn) catch _:_ -> ok end,
             {ok, Conn};
         Err ->
             Err
@@ -714,6 +919,11 @@ connect_with_retry(Attempts, DelayMs) ->
         Error -> Error
     end.
 
+route(health_probe, Conn) ->
+    case rows(Conn, "SELECT 1", []) of
+        {ok, _} -> {ok, database_ok};
+        _ -> {error, database_unavailable}
+    end;
 route(admin_operator_count, Conn) ->
     %% No parameters, so rows/3 takes the simple-query path (epgsql:squery),
     %% which returns every column as text: count(*) arrives as <<"0">>, and
@@ -781,7 +991,7 @@ route({admin_login, U0, P0, VerificationHash0, SessionHash0, Csrf0, ExpiresAt, I
     with_tx(Conn, fun() ->
         case one(Conn,
             "SELECT u.id,u.username,u.display_name,u.password_hash,u.password_salt,a.role,a.verification_hash "
-            "FROM users u JOIN admin_operators a ON a.user_id=u.id WHERE u.username=$1 FOR UPDATE OF u,a", [U]) of
+            "FROM users u JOIN admin_operators a ON a.user_id=u.id WHERE u.username=$1 AND u.account_state='active' FOR UPDATE OF u,a", [U]) of
             {ok, [Uid, Username, DisplayName, PasswordHash, Salt, Role, StoredVerification]} ->
                 PasswordOk = pw_util:verify_password(P, Salt, PasswordHash),
                 KeyOk = pw_util:constant_time(VerificationHash, StoredVerification),
@@ -809,7 +1019,7 @@ route({admin_session, SessionHash0}, Conn) ->
     case one(Conn,
         "SELECT s.user_id,s.csrf,s.created_at,s.last_seen,s.expires_at,u.username,u.display_name,a.role "
         "FROM admin_sessions s JOIN users u ON u.id=s.user_id JOIN admin_operators a ON a.user_id=s.user_id "
-        "WHERE s.token_hash=$1 AND s.expires_at>$2", [SessionHash, Now]) of
+        "WHERE s.token_hash=$1 AND s.expires_at>$2 AND u.account_state='active'", [SessionHash, Now]) of
         {ok, [Uid, Csrf, Created, LastSeen, Expires, Username, DisplayName, Role]} ->
             Cutoff = Now - 60000,
             _ = exec(Conn, "UPDATE admin_sessions SET last_seen=$1 WHERE token_hash=$2 AND last_seen<$3", [Now, SessionHash, Cutoff]),
@@ -832,7 +1042,7 @@ route({admin_create_enrollment, ActorUid, TargetUsername0, RequestedRole0, Token
         ok = exec(Conn, "LOCK TABLE admin_operators IN SHARE ROW EXCLUSIVE MODE", []),
         case admin_actor_role(Conn, ActorUid) of
             <<"owner">> ->
-                case one(Conn, "SELECT id,username,display_name FROM users WHERE username=$1 FOR UPDATE", [TargetUsername]) of
+                case one(Conn, "SELECT id,username,display_name FROM users WHERE username=$1 AND account_state='active' FOR UPDATE", [TargetUsername]) of
                     {ok, [TargetUid, Username, DisplayName]} ->
                         ExistingRole = case one(Conn, "SELECT role FROM admin_operators WHERE user_id=$1", [TargetUid]) of
                             {ok, [ExistingRoleValue]} -> ExistingRoleValue;
@@ -865,9 +1075,9 @@ route({admin_redeem_enrollment, U0, P0, TokenHash0, VerificationHash0, SessionHa
     with_tx(Conn, fun() ->
         Now = pw_util:now_ms(),
         case one(Conn,
-            "SELECT e.user_id,e.role,u.username,u.display_name,u.password_hash,u.password_salt,e.expires_at,e.used_at "
+            "SELECT e.user_id,e.role,u.username,u.display_name,u.password_hash,u.password_salt,e.expires_at,e.used_at,u.account_state "
             "FROM admin_enrollments e JOIN users u ON u.id=e.user_id WHERE e.token_hash=$1 FOR UPDATE", [TokenHash]) of
-            {ok, [Uid, _EnrollmentRole, Username, DisplayName, PasswordHash, Salt, EnrollExpires, null]} when EnrollExpires > Now, Username =:= U ->
+            {ok, [Uid, _EnrollmentRole, Username, DisplayName, PasswordHash, Salt, EnrollExpires, null, <<"active">>]} when EnrollExpires > Now, Username =:= U ->
                 case pw_util:verify_password(P, Salt, PasswordHash) of
                     false -> {error, bad_login};
                     true ->
@@ -889,7 +1099,7 @@ route({admin_redeem_enrollment, U0, P0, TokenHash0, VerificationHash0, SessionHa
                         admin_audit_insert(Conn, Uid, <<"operator.enrollment_redeemed">>, <<"operator">>, integer_to_binary(Uid), <<>>, IpHash, Now),
                         {ok, #{user_id => Uid, username => Username, display_name => DisplayName, role => EffectiveRole, csrf => Csrf, expires_at => ExpiresAt}}
                 end;
-            {ok, [_Uid, _Role, _Username, _DisplayName, _PasswordHash, _Salt, _EnrollExpires, _UsedAt]} -> {error, invalid_enrollment};
+            {ok, [_Uid, _Role, _Username, _DisplayName, _PasswordHash, _Salt, _EnrollExpires, _UsedAt, _AccountState]} -> {error, invalid_enrollment};
             _ ->
                 _ = pw_util:pbkdf2(P, <<"plainwire-admin-enrollment-timing-pad">>),
                 {error, invalid_enrollment}
@@ -1058,7 +1268,8 @@ route({admin_users, Q0, Limit0, Offset0}, Conn) ->
         "(SELECT count(*) FROM server_members sm WHERE sm.user_id=u.id),"
         "(SELECT count(*) FROM direct_members dm WHERE dm.user_id=u.id),"
         "(SELECT count(*) FROM sessions s WHERE s.user_id=u.id AND s.expires_at>$4),"
-        "COALESCE((SELECT sum(size) FROM uploads up WHERE up.user_id=u.id AND up.status='ready'),0) "
+        "COALESCE((SELECT sum(size) FROM uploads up WHERE up.user_id=u.id AND up.status='ready'),0),"
+        "u.account_state,u.is_bot,u.moderation_expires_at "
         "FROM users u WHERE ($1='' OR u.username ILIKE $2 OR u.display_name ILIKE $2) "
         "ORDER BY u.last_seen DESC,u.id DESC LIMIT $3 OFFSET $5",
         [Q, Like, Limit, pw_util:now_ms(), Offset]),
@@ -1072,10 +1283,98 @@ route({admin_user, Uid}, Conn) ->
         "(SELECT count(*) FROM messages m WHERE m.user_id=u.id),"
         "(SELECT count(*) FROM uploads up WHERE up.user_id=u.id AND up.status='ready'),"
         "COALESCE((SELECT sum(size) FROM uploads up WHERE up.user_id=u.id AND up.status='ready'),0),"
-        "(SELECT count(*) FROM sessions s WHERE s.user_id=u.id AND s.expires_at>$2) "
+        "(SELECT count(*) FROM sessions s WHERE s.user_id=u.id AND s.expires_at>$2),"
+        "u.account_state,u.is_bot,u.moderation_title,u.moderation_reason,u.moderation_severity,u.moderation_expires_at,u.moderated_by,u.moderated_at "
         "FROM users u WHERE u.id=$1", [Uid, pw_util:now_ms()]) of
         {ok, Row} when is_list(Row) -> {ok, admin_user_detail(Row)};
         _ -> {error, not_found}
+    end;
+
+route({admin_user_moderation, ActorUid, TargetUid0}, Conn) ->
+    TargetUid = pw_util:int(TargetUid0),
+    case admin_can_inspect_user(Conn, ActorUid, TargetUid) of
+        false -> {error, forbidden};
+        true ->
+            case one(Conn,
+                "SELECT id,username,display_name,account_state,is_bot,moderation_title,moderation_reason,moderation_severity,moderation_expires_at,moderated_by,moderated_at "
+                "FROM users WHERE id=$1", [TargetUid]) of
+                {ok, [Uid, Username, Display, State, IsBot, Title, Reason, Severity, ExpiresAt, ModeratedBy, ModeratedAt]} ->
+                    {ok, #{id => Uid, username => Username, display_name => Display, account_state => State, is_bot => IsBot,
+                        moderation => moderation_public_map(State, Title, Reason, Severity, ExpiresAt, ModeratedBy, ModeratedAt)}};
+                _ -> {error, not_found}
+            end
+    end;
+route({admin_user_moderation_history, ActorUid, TargetUid0}, Conn) ->
+    TargetUid = pw_util:int(TargetUid0),
+    case admin_can_inspect_user(Conn, ActorUid, TargetUid) of
+        false -> {error, forbidden};
+        true ->
+            {ok, Rows} = rows(Conn,
+                "SELECT a.id,a.action,a.title,a.reason,a.severity,a.expires_at,a.created_at,a.actor_user_id,u.username "
+                "FROM instance_account_actions a LEFT JOIN users u ON u.id=a.actor_user_id WHERE a.user_id=$1 ORDER BY a.id DESC LIMIT 100",
+                [TargetUid]),
+            {ok, [#{id => Id, action => Action, title => Title, reason => Reason, severity => Severity,
+                    expires_at => ExpiresAt, created_at => CreatedAt, actor_user_id => Actor,
+                    actor_username => ActorUsername}
+                  || [Id, Action, Title, Reason, Severity, ExpiresAt, CreatedAt, Actor, ActorUsername] <- Rows]}
+    end;
+route({admin_apply_user_moderation, ActorUid, TargetUid0, Action0, Patch0}, Conn) ->
+    TargetUid = pw_util:int(TargetUid0), Action = normalize_instance_moderation_action(Action0),
+    Patch = normalize_instance_moderation_patch(Patch0, Action),
+    case {Action, Patch, TargetUid} of
+        {invalid, _, _} -> {error, invalid_action};
+        {_, {error, Reason}, _} -> {error, Reason};
+        {_, _, Uid} when not is_integer(Uid); Uid =< 0 -> {error, not_found};
+        {_, {ok, Moderation}, Uid} ->
+            Result = with_tx(Conn, fun() ->
+                %% Serialize operator-role checks with the action so demotion and
+                %% moderation cannot race each other across admin nodes.
+                ok = exec(Conn, "LOCK TABLE admin_operators IN SHARE MODE", []),
+                case moderation_actor_allowed(Conn, ActorUid, Uid) of
+                    {error, Reason} -> {error, Reason};
+                    ok ->
+                        case one(Conn, "SELECT id,account_state FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+                            {ok, [_Id, _OldState]} ->
+                                Now = pw_util:now_ms(),
+                                NewState = moderation_action_state(Action),
+                                Title = maps:get(title, Moderation), ReasonText = maps:get(reason, Moderation),
+                                Severity = maps:get(severity, Moderation), ExpiresAt = maps:get(expires_at, Moderation),
+                                case Action of
+                                    restore ->
+                                        ok = exec(Conn,
+                                            "UPDATE users SET account_state='active',moderation_title='',moderation_reason='',moderation_severity='warning',moderation_expires_at=0,moderated_by=$2,moderated_at=$3,updated_at=$3 WHERE id=$1",
+                                            [Uid, ActorUid, Now]);
+                                    _ ->
+                                        ok = exec(Conn,
+                                            "UPDATE users SET account_state=$2,moderation_title=$3,moderation_reason=$4,moderation_severity=$5,moderation_expires_at=$6,moderated_by=$7,moderated_at=$8,updated_at=$8 WHERE id=$1",
+                                            [Uid, NewState, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now])
+                                end,
+                                {ok, SessionRows} = rows(Conn, "DELETE FROM sessions WHERE user_id=$1 RETURNING token_hash", [Uid]),
+                                ok = exec(Conn, "DELETE FROM admin_sessions WHERE user_id=$1", [Uid]),
+                                ok = exec(Conn,
+                                    "INSERT INTO instance_account_actions(user_id,actor_user_id,action,title,reason,severity,expires_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+                                    [Uid, ActorUid, atom_to_binary(Action, utf8), Title, ReasonText, Severity, ExpiresAt, Now]),
+                                Detail = moderation_audit_detail(Action, Title, ReasonText, Severity, ExpiresAt),
+                                admin_audit_insert(Conn, ActorUid, <<"account.", (atom_to_binary(Action, utf8))/binary>>, <<"user">>, integer_to_binary(Uid), Detail, <<>>, Now),
+                                {ok, #{user_id => Uid, account_state => NewState,
+                                    moderation => moderation_public_map(NewState, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now),
+                                    session_hashes => [only_id(R) || R <- SessionRows]}};
+                            _ -> {error, not_found}
+                        end
+                end
+            end),
+            case Result of
+                {ok, #{session_hashes := Hashes, user_id := UserId} = Data} ->
+                    [ets:delete(?SESSION_CACHE, H) || H <- Hashes],
+                    invalidate_session_cache(UserId),
+                    pw_redis:presence_delete(UserId),
+                    pw_upload_gc:invalidate_user(UserId),
+                    Public = maps:remove(session_hashes, Data),
+                    EventType = case Action of restore -> account_restored; _ -> account_restricted end,
+                    pw_hub:notify_user(UserId, #{type => EventType, account_state => maps:get(account_state, Public), moderation => maps:get(moderation, Public)}),
+                    {ok, Public};
+                Other -> Other
+            end
     end;
 route({admin_servers, Q0, Limit0, Offset0}, Conn) ->
     Q = pw_util:clean_text(Q0, 100),
@@ -1280,18 +1579,35 @@ route({register, U0, D0, P0}, Conn) ->
 route({login, U0, P0}, Conn) ->
     U = pw_util:normalize_username(U0),
     P = pw_util:clean_text(P0, 256),
-    case one(Conn, "SELECT id, password_hash, password_salt, account_state FROM users WHERE username = $1", [U]) of
-        {ok, [Id, Hash, Salt, AccountState]} ->
+    case one(Conn,
+        "SELECT id,password_hash,password_salt,account_state,moderation_title,moderation_reason,moderation_severity,moderation_expires_at,moderated_at "
+        "FROM users WHERE username=$1", [U]) of
+        {ok, [Id, Hash, Salt, AccountState0, Title, Reason, Severity, ExpiresAt, ModeratedAt]} ->
             case pw_util:verify_password(P, Salt, Hash) of
                 true ->
                     maybe_upgrade_password_hash(Conn, Id, P, Hash),
-                    Reactivated = AccountState =:= <<"disabled">>,
-                    case Reactivated of
-                        true -> ok = exec(Conn, "UPDATE users SET account_state='active', disabled_at=0, updated_at=$2 WHERE id=$1", [Id, pw_util:now_ms()]);
-                        false -> ok
-                    end,
-                    Session = make_session(Conn, Id),
-                    {ok, case Reactivated of true -> Session#{reactivated => true}; false -> Session end};
+                    Now = pw_util:now_ms(),
+                    {AccountState, AutoRestored} = maybe_expire_account_restriction(Conn, Id, AccountState0, ExpiresAt, Now),
+                    case AccountState of
+                        <<"suspended">> ->
+                            {error, {account_restricted, moderation_public_map(AccountState, Title, Reason, Severity, ExpiresAt, null, ModeratedAt)}};
+                        <<"banned">> ->
+                            {error, {account_restricted, moderation_public_map(AccountState, Title, Reason, Severity, ExpiresAt, null, ModeratedAt)}};
+                        _ ->
+                            Reactivated = AccountState =:= <<"disabled">>,
+                            case Reactivated of
+                                true -> ok = exec(Conn,
+                                    "UPDATE users SET account_state='active',disabled_at=0,updated_at=$2 WHERE id=$1", [Id, Now]);
+                                false -> ok
+                            end,
+                            Session = make_session(Conn, Id),
+                            Extra = case {Reactivated, AutoRestored} of
+                                {true, _} -> #{reactivated => true};
+                                {false, true} -> #{restriction_expired => true};
+                                _ -> #{}
+                            end,
+                            {ok, maps:merge(Session, Extra)}
+                    end;
                 false -> {error, bad_login}
             end;
         _ ->
@@ -1573,9 +1889,10 @@ route({delete_account, Uid, Password0}, Conn) ->
     end;
 route({me, Uid}, Conn) ->
     case one(Conn,
-        "SELECT id, username, display_name, bio, avatar_url, banner_url, status, theme, created_at, last_seen "
+        "SELECT id, username, display_name, bio, avatar_url, banner_url, status, theme, created_at, last_seen, is_bot "
         "FROM users WHERE id = $1", [Uid]) of
-        {ok, Row} when is_list(Row) -> {ok, user_map_full(Row)};
+        {ok, [Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen, IsBot]} ->
+            {ok, (user_map_full([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen]))#{is_bot => IsBot =:= true}};
         _ -> {error, not_found}
     end;
 route({update_profile, Uid, Display0, Patch}, Conn) ->
@@ -1639,8 +1956,8 @@ route({users, Q0}, Conn) ->
         true ->
             Like = <<"%", Q/binary, "%">>,
             {ok, Rows} = rows(Conn,
-                "SELECT id, username, display_name, bio, avatar_url, banner_url, status, theme, created_at, last_seen "
-                "FROM users WHERE username ILIKE $1 OR display_name ILIKE $2 "
+                "SELECT id, username, display_name, bio, avatar_url, banner_url, status, theme, created_at, last_seen, is_bot "
+                "FROM users WHERE is_bot=false AND (username ILIKE $1 OR display_name ILIKE $2) "
                 "ORDER BY last_seen DESC LIMIT 40", [Like, Like]),
             {ok, map_rows_resilient(users, Rows, fun user_map/1)}
     end;
@@ -2253,6 +2570,8 @@ route({delete_server, Uid, Sid0, ConfirmName0}, Conn) ->
                 {ok, ChannelRows} = rows(Conn, "SELECT id FROM channels WHERE server_id = $1 ORDER BY id ASC FOR UPDATE", [Sid]),
                 MemberIds = [only_id(R) || R <- MemberRows],
                 ChannelIds = [only_id(R) || R <- ChannelRows],
+                {ok, BotRows} = rows(Conn, "SELECT bot_user_id FROM server_bots WHERE server_id=$1 UNION SELECT bot_user_id FROM incoming_webhooks WHERE server_id=$1", [Sid]),
+                AutomationUserIds = lists:usort([only_id(R) || R <- BotRows]),
                 %% Messages are polymorphic and intentionally have no channel FK.
                 %% Purge their dependent rows before the server/channel cascade so
                 %% a deleted server cannot leave invisible message/upload zombies.
@@ -2268,6 +2587,12 @@ route({delete_server, Uid, Sid0, ConfirmName0}, Conn) ->
                 ok = exec(Conn,
                     "DELETE FROM messages m WHERE m.scope='channel' AND EXISTS (SELECT 1 FROM channels c WHERE c.server_id=$1 AND c.id=m.scope_id)",
                     [Sid]),
+                %% Bot/webhook identities are owned by this server. Remove their
+                %% integration rows before their user rows so deleting a server
+                %% cannot accumulate globally orphaned automation accounts.
+                ok = exec(Conn, "DELETE FROM incoming_webhooks WHERE server_id=$1", [Sid]),
+                ok = exec(Conn, "DELETE FROM server_bots WHERE server_id=$1", [Sid]),
+                lists:foreach(fun(BotUid) -> ok = exec(Conn, "DELETE FROM users WHERE id=$1", [BotUid]) end, AutomationUserIds),
                 ok = exec(Conn, "DELETE FROM servers WHERE id = $1", [Sid]),
                 {ok, #{deleted => true, id => Sid, member_ids => MemberIds, channel_ids => ChannelIds}};
             {ok, [Uid, _]} -> {error, confirmation_mismatch};
@@ -2303,7 +2628,8 @@ route({server_member_profile, Uid, Sid0, Target0}, Conn) ->
                 "(r.permissions & 256) DESC,(r.permissions & 512) DESC,(r.permissions & 2) DESC,"
                 "(r.permissions & 1) DESC,r.position DESC,r.id ASC LIMIT 1),''),"
                 "COALESCE((SELECT string_agg(r.name, ', ' ORDER BY r.position DESC,r.id ASC) FROM server_member_roles mr "
-                "JOIN server_roles r ON r.id=mr.role_id WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id),'') "
+                "JOIN server_roles r ON r.id=mr.role_id WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id),''), "
+                "u.is_bot "
                 "FROM server_members sm JOIN users u ON u.id=sm.user_id WHERE sm.server_id=$1 AND sm.user_id=$2",
                 [Sid, Target]) of
                 {ok, MemberRow} when is_list(MemberRow) ->
@@ -2334,7 +2660,7 @@ route({server, Uid, ServerId0}, Conn) ->
             {ok, Permissions} = server_permissions0(Conn, Uid, Sid),
             CanViewChannels = pw_permissions:has(Permissions, pw_permissions:mask(<<"view_channels">>)),
             {ok, Ch} = case CanViewChannels of
-                true -> rows(Conn, "SELECT id, server_id, name, kind, position, topic, created_at, category_id FROM channels WHERE server_id = $1 ORDER BY position ASC, id ASC", [Sid]);
+                true -> rows(Conn, "SELECT id, server_id, name, kind, position, topic, created_at, category_id, slowmode_seconds FROM channels WHERE server_id = $1 ORDER BY position ASC, id ASC", [Sid]);
                 false -> {ok, []}
             end,
             {ok, Cats} = case CanViewChannels of
@@ -2347,7 +2673,8 @@ route({server, Uid, ServerId0}, Conn) ->
                 "COALESCE((SELECT r.color FROM server_member_roles mr JOIN server_roles r ON r.id=mr.role_id "
                 "WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id ORDER BY (r.permissions & 1073741824) DESC,(r.permissions & 16) DESC,(r.permissions & 32) DESC,(r.permissions & 8) DESC,(r.permissions & 4) DESC,(r.permissions & 64) DESC,(r.permissions & 128) DESC,(r.permissions & 2048) DESC,(r.permissions & 4096) DESC,(r.permissions & 256) DESC,(r.permissions & 512) DESC,(r.permissions & 2) DESC,(r.permissions & 1) DESC,r.position DESC,r.id ASC LIMIT 1),''), "
                 "COALESCE((SELECT string_agg(r.name, ', ' ORDER BY r.position DESC,r.id ASC) FROM server_member_roles mr "
-                "JOIN server_roles r ON r.id=mr.role_id WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id),'') "
+                "JOIN server_roles r ON r.id=mr.role_id WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id),''), "
+                "u.is_bot "
                 "FROM server_members sm JOIN users u ON u.id = sm.user_id WHERE sm.server_id = $1 "
                 "ORDER BY CASE sm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, u.display_name ASC",
                 [Sid]),
@@ -2395,7 +2722,7 @@ route({server_roles, Uid, Sid0}, Conn) ->
                 "FROM server_roles WHERE server_id = $1 ORDER BY position DESC,id ASC", [Sid]),
             {ok, MemberRows} = rows(Conn,
                 "SELECT u.id,u.username,u.display_name,u.bio,u.avatar_url,u.banner_url,u.status,u.theme,u.created_at,u.last_seen,"
-                "sm.role,sm.nickname,sm.avatar_url,sm.bio,sm.joined_at "
+                "sm.role,sm.nickname,sm.avatar_url,sm.bio,sm.joined_at,u.is_bot "
                 "FROM server_members sm JOIN users u ON u.id = sm.user_id WHERE sm.server_id = $1 "
                 "ORDER BY CASE sm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,u.display_name ASC", [Sid]),
             {ok, AssignmentRows} = rows(Conn,
@@ -2726,9 +3053,42 @@ route({create_channel, Uid, Sid0, Name0, Kind0, CategoryId0}, Conn) ->
             case Result of
                 {ok, #{id := Cid}} ->
                     publish_server_event(Conn, Sid, #{type => channel_created, server_id => Sid, channel_id => Cid}),
+                    enqueue_server_webhooks(Conn, Sid, <<"channel.created">>, #{channel_id => Cid, actor_id => Uid}),
                     Result;
                 _ -> Result
             end
+    end;
+route({update_channel_settings, Uid, ChannelId0, Patch0}, Conn) ->
+    ChannelId = pw_util:int(ChannelId0),
+    Patch = case is_map(Patch0) of true -> Patch0; false -> #{} end,
+    Result = with_tx(Conn, fun() ->
+        case one(Conn, "SELECT server_id,name,topic,slowmode_seconds,kind FROM channels WHERE id=$1 FOR UPDATE", [ChannelId]) of
+            {ok, [Sid, OldName, OldTopic, OldSlowmode, Kind]} ->
+                case has_server_permission(Conn, Uid, Sid, <<"manage_channels">>) of
+                    false -> {error, forbidden};
+                    true ->
+                        Name = case maps:is_key(<<"name">>, Patch) of true -> pw_util:clean_text(maps:get(<<"name">>, Patch), 40); false -> OldName end,
+                        Topic = case maps:is_key(<<"topic">>, Patch) of true -> pw_util:clean_text(maps:get(<<"topic">>, Patch), 1024); false -> OldTopic end,
+                        Slow0 = case maps:is_key(<<"slowmode_seconds">>, Patch) of true -> pw_util:int(maps:get(<<"slowmode_seconds">>, Patch)); false -> OldSlowmode end,
+                        Slow = case Slow0 of I when is_integer(I), I >= 0, I =< 21600 -> I; _ -> invalid end,
+                        case {byte_size(Name) >= 1, Slow, one(Conn, "SELECT id FROM channels WHERE server_id=$1 AND id<>$2 AND lower(name)=lower($3) LIMIT 1", [Sid,ChannelId,Name])} of
+                            {false, _, _} -> {error, invalid_channel_name};
+                            {_, invalid, _} -> {error, invalid_slowmode};
+                            {_, _, {ok, [_]}} -> {error, channel_exists};
+                            {true, S, _} ->
+                                ok = exec(Conn, "UPDATE channels SET name=$1,topic=$2,slowmode_seconds=$3 WHERE id=$4", [Name,Topic,S,ChannelId]),
+                                {ok, #{id => ChannelId, server_id => Sid, name => Name, topic => Topic, slowmode_seconds => S, kind => Kind}}
+                        end
+                end;
+            _ -> {error, not_found}
+        end
+    end),
+    case Result of
+        {ok, #{server_id := Sid} = Data} ->
+            publish_server_event(Conn, Sid, #{type => channel_updated, server_id => Sid, channel_id => ChannelId}),
+            enqueue_server_webhooks(Conn, Sid, <<"channel.updated">>, #{channel_id => ChannelId, actor_id => Uid}),
+            {ok, Data};
+        Other -> Other
     end;
 route({categories, Uid, Sid0}, Conn) ->
     Sid = pw_util:int(Sid0),
@@ -2912,7 +3272,7 @@ route({create_server_webhook, Uid, Sid0, Name0, Url0, Events0}, Conn) ->
                                 {ok, Id} = insert_returning(Conn,
                                     "INSERT INTO server_webhooks(server_id,name,url,secret,events,enabled,created_by,created_at,updated_at) "
                                     "VALUES($1,$2,$3,$4,$5,true,$6,$7,$7) RETURNING id",
-                                    [Sid, Name, Url, Secret, StoredEvents, Uid, Now]),
+                                    [Sid, Name, Url, store_message(Secret), StoredEvents, Uid, Now]),
                                 {ok, #{id => Id, server_id => Sid, name => Name, url => Url,
                                        events => Events, enabled => true, secret => Secret,
                                        created_at => Now, updated_at => Now}}
@@ -2972,7 +3332,7 @@ route({rotate_server_webhook, Uid, Sid0, WebhookId0}, Conn) ->
             Secret = pw_util:random_token(32), Now = pw_util:now_ms(),
             case one(Conn,
                 "UPDATE server_webhooks SET secret=$1,updated_at=$2 WHERE id=$3 AND server_id=$4 RETURNING id",
-                [Secret, Now, WebhookId, Sid]) of
+                [store_message(Secret), Now, WebhookId, Sid]) of
                 {ok, [_]} -> {ok, #{id => WebhookId, secret => Secret, updated_at => Now}};
                 _ -> {error, not_found}
             end
@@ -2990,11 +3350,144 @@ route({test_server_webhook, Uid, Sid0, WebhookId0}, Conn) ->
                     {ok, DeliveryId} = insert_returning(Conn,
                         "INSERT INTO webhook_deliveries(webhook_id,event,payload,subject_user_id,actor_user_id,status,attempts,next_attempt_at,created_at,updated_at) "
                         "VALUES($1,$2,$3,NULL,$4,'pending',0,$5,$5,$5) RETURNING id",
-                        [WebhookId, Event, Payload, Uid, Now]),
+                        [WebhookId, Event, store_message(Payload), Uid, Now]),
                     {ok, #{queued => true, delivery_id => DeliveryId}};
                 _ -> {error, not_found}
             end
     end;
+route({server_webhook_deliveries, Uid, Sid0, WebhookId0, Limit0}, Conn) ->
+    Sid = pw_util:int(Sid0), WebhookId = pw_util:int(WebhookId0),
+    Limit = min(100, max(1, int_or(pw_util:int(Limit0), 25))),
+    case {has_server_permission(Conn, Uid, Sid, <<"manage_webhooks">>),
+          one(Conn, "SELECT id FROM server_webhooks WHERE id=$1 AND server_id=$2", [WebhookId,Sid])} of
+        {false, _} -> {error, forbidden};
+        {true, {ok, [_]}} ->
+            {ok, Rows} = rows(Conn,
+                "SELECT id,event,status,attempts,next_attempt_at,response_code,last_error,created_at,updated_at FROM webhook_deliveries WHERE webhook_id=$1 ORDER BY id DESC LIMIT $2",
+                [WebhookId,Limit]),
+            {ok, [#{id => Id,event => Event,status => Status,attempts => Attempts,next_attempt_at => Next,
+                    response_code => Code,last_error => Err,created_at => Created,updated_at => Updated}
+                  || [Id,Event,Status,Attempts,Next,Code,Err,Created,Updated] <- Rows]};
+        {true, _} -> {error, not_found}
+    end;
+route({retry_server_webhook_delivery, Uid, Sid0, WebhookId0, DeliveryId0}, Conn) ->
+    Sid = pw_util:int(Sid0), WebhookId = pw_util:int(WebhookId0), DeliveryId = pw_util:int(DeliveryId0), Now = pw_util:now_ms(),
+    with_tx(Conn, fun() ->
+        case {has_server_permission(Conn, Uid, Sid, <<"manage_webhooks">>),
+              one(Conn, "SELECT d.status,octet_length(d.payload) FROM webhook_deliveries d JOIN server_webhooks w ON w.id=d.webhook_id WHERE d.id=$1 AND d.webhook_id=$2 AND w.server_id=$3 FOR UPDATE", [DeliveryId,WebhookId,Sid])} of
+            {false, _} -> {error, forbidden};
+            {true, {ok, [<<"failed">>, Size]}} when is_integer(Size), Size > 0 ->
+                ok = exec(Conn, "UPDATE webhook_deliveries SET status='pending',attempts=0,next_attempt_at=$1,locked_at=0,response_code=0,last_error='',updated_at=$1 WHERE id=$2", [Now,DeliveryId]),
+                {ok, #{queued => true, delivery_id => DeliveryId}};
+            {true, {ok, [<<"failed">>, _]}} -> {error, retry_payload_unavailable};
+            {true, {ok, [_Status, _]}} -> {error, delivery_not_failed};
+            {true, _} -> {error, not_found}
+        end
+    end);
+route({incoming_webhooks, Uid, Sid0}, Conn) ->
+    Sid = pw_util:int(Sid0),
+    case has_server_permission(Conn, Uid, Sid, <<"manage_webhooks">>) of
+        false -> {error, forbidden};
+        true ->
+            {ok, Rows} = rows(Conn,
+                "SELECT w.id,w.channel_id,w.bot_user_id,w.name,w.enabled,w.created_by,w.created_at,w.updated_at,w.last_used_at,c.name FROM incoming_webhooks w JOIN channels c ON c.id=w.channel_id WHERE w.server_id=$1 ORDER BY w.id ASC", [Sid]),
+            {ok, [#{id => Id,channel_id => Cid,bot_user_id => BotUid,name => Name,enabled => Enabled,
+                    created_by => CreatedBy,created_at => Created,updated_at => Updated,last_used_at => LastUsed,channel_name => ChannelName}
+                  || [Id,Cid,BotUid,Name,Enabled,CreatedBy,Created,Updated,LastUsed,ChannelName] <- Rows]}
+    end;
+route({create_incoming_webhook, Uid, Sid0, ChannelId0, Name0}, Conn) ->
+    Sid = pw_util:int(Sid0), ChannelId = pw_util:int(ChannelId0), Name = pw_util:clean_text(Name0, 80),
+    case byte_size(Name) >= 2 of
+        false -> {error, invalid_webhook_name};
+        true -> with_tx(Conn, fun() ->
+            _ = one(Conn, "SELECT id FROM servers WHERE id=$1 FOR UPDATE", [Sid]),
+            case {has_server_permission(Conn, Uid, Sid, <<"manage_webhooks">>),
+                  one(Conn, "SELECT id FROM channels WHERE id=$1 AND server_id=$2 AND kind='text'", [ChannelId,Sid])} of
+                {false, _} -> {error, forbidden};
+                {true, {ok, [_]}} ->
+                    {ok,[Count]} = one(Conn, "SELECT count(*) FROM incoming_webhooks WHERE server_id=$1", [Sid]),
+                    case Count >= 50 of
+                        true -> {error, webhook_limit};
+                        false ->
+                            Token = <<"pwi_", (pw_util:random_token(40))/binary>>, Hash = pw_util:sha256_hex(Token),
+                            Salt = pw_util:random_token(18), PasswordHash = pw_util:pbkdf2(pw_util:random_token(32), Salt), Now = pw_util:now_ms(),
+                            Username = unique_bot_username(Conn, Sid, <<Name/binary, "-hook">>),
+                            {ok,BotUid} = insert_returning(Conn,
+                                "INSERT INTO users(username,display_name,password_hash,password_salt,bio,avatar_url,banner_url,status,theme,created_at,updated_at,last_seen,account_state,disabled_at,is_bot) VALUES($1,$2,$3,$4,'','','','','system',$5,$5,$5,'active',0,true) RETURNING id",
+                                [Username,Name,PasswordHash,Salt,Now]),
+                            ok = exec(Conn, "INSERT INTO server_members(server_id,user_id,role,joined_at) VALUES($1,$2,'member',$3)", [Sid,BotUid,Now]),
+                            {ok,Id} = insert_returning(Conn,
+                                "INSERT INTO incoming_webhooks(server_id,channel_id,bot_user_id,name,token_hash,enabled,created_by,created_at,updated_at,last_used_at) VALUES($1,$2,$3,$4,$5,true,$6,$7,$7,0) RETURNING id",
+                                [Sid,ChannelId,BotUid,Name,Hash,Uid,Now]),
+                            {ok, #{id => Id,server_id => Sid,channel_id => ChannelId,bot_user_id => BotUid,name => Name,token => Token,
+                                   path => <<"/api/webhooks/",(integer_to_binary(Id))/binary,"/",Token/binary>>,created_at => Now}}
+                    end;
+                {true, _} -> {error, invalid_channel}
+            end
+        end)
+    end;
+route({rotate_incoming_webhook, Uid, Sid0, WebhookId0}, Conn) ->
+    Sid = pw_util:int(Sid0), WebhookId = pw_util:int(WebhookId0),
+    case has_server_permission(Conn, Uid, Sid, <<"manage_webhooks">>) of
+        false -> {error, forbidden};
+        true ->
+            Token = <<"pwi_", (pw_util:random_token(40))/binary>>, Hash = pw_util:sha256_hex(Token), Now = pw_util:now_ms(),
+            case one(Conn, "UPDATE incoming_webhooks SET token_hash=$1,updated_at=$2 WHERE id=$3 AND server_id=$4 RETURNING id", [Hash,Now,WebhookId,Sid]) of
+                {ok,[_]} -> {ok, #{id => WebhookId,token => Token,path => <<"/api/webhooks/",(integer_to_binary(WebhookId))/binary,"/",Token/binary>>,updated_at => Now}};
+                _ -> {error, not_found}
+            end
+    end;
+route({delete_incoming_webhook, Uid, Sid0, WebhookId0}, Conn) ->
+    Sid = pw_util:int(Sid0), WebhookId = pw_util:int(WebhookId0), Now = pw_util:now_ms(),
+    with_tx(Conn, fun() ->
+        case {has_server_permission(Conn, Uid, Sid, <<"manage_webhooks">>),
+              one(Conn, "SELECT bot_user_id FROM incoming_webhooks WHERE id=$1 AND server_id=$2 FOR UPDATE", [WebhookId,Sid])} of
+            {false,_} -> {error, forbidden};
+            {true,{ok,[BotUid]}} ->
+                ok = exec(Conn, "DELETE FROM incoming_webhooks WHERE id=$1", [WebhookId]),
+                ok = exec(Conn, "DELETE FROM server_members WHERE server_id=$1 AND user_id=$2", [Sid,BotUid]),
+                ok = exec(Conn, "UPDATE users SET account_state='disabled',disabled_at=$1,updated_at=$1 WHERE id=$2", [Now,BotUid]),
+                {ok, #{deleted => true,id => WebhookId}};
+            {true,_} -> {error, not_found}
+        end
+    end);
+route({execute_incoming_webhook, WebhookId0, Token0, Body0, ReplyTo0}, Conn) ->
+    WebhookId = pw_util:int(WebhookId0), Token = pw_util:clean_text(Token0, 256), Plain = pw_util:clean_text(Body0, ?MAX_MSG), ReplyTo = pw_util:int(ReplyTo0),
+    case message_body_valid(Plain) andalso extract_file_ids(Plain) =:= [] of
+        false -> {error, invalid_message};
+        true ->
+            Result = with_tx(Conn, fun() ->
+                case one(Conn,
+                    "SELECT w.server_id,w.channel_id,w.bot_user_id,w.token_hash FROM incoming_webhooks w JOIN users u ON u.id=w.bot_user_id JOIN channels c ON c.id=w.channel_id WHERE w.id=$1 AND w.enabled=true AND u.account_state='active' AND c.kind='text' FOR UPDATE",
+                    [WebhookId]) of
+                    {ok,[Sid,Cid,BotUid,ExpectedHash]} ->
+                        case secure_token_hash_match(Token, ExpectedHash) andalso valid_reply_to(Conn, <<"channel">>, Cid, ReplyTo) of
+                            false -> {error, invalid_webhook_token};
+                            true ->
+                                Now = pw_util:now_ms(), Mid = new_message_id(), Stored = store_message(Plain),
+                                ok = exec(Conn, "INSERT INTO messages(id,scope,scope_id,user_id,body,reply_to_id,created_at) VALUES($1,'channel',$2,$3,$4,$5,$6)", [Mid,Cid,BotUid,Stored,ReplyTo,Now]),
+                                ok = exec(Conn, "UPDATE incoming_webhooks SET last_used_at=$1 WHERE id=$2", [Now,WebhookId]),
+                                ok = storage_after_message_change(Conn, Mid, <<"message.created">>, BotUid),
+                                {ok,Row} = one(Conn, message_select() ++ " WHERE m.id=$1", [Mid]), Msg = message_map(Conn,Row),
+                                ok = maybe_enqueue_message_webhook(Conn, <<"channel">>, Cid, <<"message.created">>, #{message => Msg,actor_id => BotUid,source => <<"incoming_webhook">>,incoming_webhook_id => WebhookId}),
+                                {ok, #{message => Msg,server_id => Sid,channel_id => Cid,notify_at => Now}}
+                        end;
+                    _ -> {error, invalid_webhook_token}
+                end
+            end),
+            case Result of
+                {ok,#{message := Msg,server_id := Sid,channel_id := Cid,notify_at := Now}} ->
+                    invalidate_message_cache(<<"channel">>,Cid),
+                    pw_hub:broadcast({channel,Cid},#{type => message_created,scope => channel,scope_id => Cid,message => Msg}),
+                    best_effort_channel_notifications(Conn,Sid,maps:get(user_id,Msg),Cid,Msg,Now,false),
+                    %% Incoming webhooks are write-only credentials. Do not echo
+                    %% the serialized message because reply metadata can contain
+                    %% another user's message body.
+                    {ok,#{message_id => maps:get(id,Msg), channel_id => Cid, created_at => maps:get(created_at,Msg)}};
+                Other -> Other
+            end
+    end;
+
 route({storage_outbox_claim, Limit0}, Conn) ->
     Limit = min(100, max(1, case pw_util:int(Limit0) of undefined -> 25; I -> I end)),
     Now = pw_util:now_ms(),
@@ -3174,7 +3667,7 @@ route({webhook_claim_due, Limit0}, Conn) ->
             " FROM picked p,server_webhooks w WHERE d.id=p.id AND w.id=d.webhook_id"
             " RETURNING d.id,w.url,w.secret,d.payload,d.event,d.attempts",
             [Now, Limit]),
-        {ok, [#{id => Id, url => Url, secret => Secret, payload => Payload, event => Event, attempts => Attempts}
+        {ok, [#{id => Id, url => Url, secret => load_message(Secret), payload => load_message(Payload), event => Event, attempts => Attempts}
               || [Id, Url, Secret, Payload, Event, Attempts] <- Rows]}
     end);
 route({webhook_finish, DeliveryId0, Result0}, Conn) ->
@@ -3200,7 +3693,7 @@ route({webhook_finish, DeliveryId0, Result0}, Conn) ->
                         case Attempts >= 6 of
                             true ->
                                 ok = exec(Conn,
-                                    "UPDATE webhook_deliveries SET status='failed',payload=decode('','hex'),last_error=$1,locked_at=0,updated_at=$2 WHERE id=$3",
+                                    "UPDATE webhook_deliveries SET status='failed',last_error=$1,locked_at=0,updated_at=$2 WHERE id=$3",
                                     [Reason, Now, DeliveryId]),
                                 ok = maybe_queue_webhook_delivery_event(Conn, WebhookId, DeliveryId, Attempts, failed, 0, LatencyMs, Reason, Now),
                                 {ok, #{failed => true, retrying => false}};
@@ -3230,17 +3723,401 @@ route(webhook_prune, Conn) ->
     {ok, #{delivered_deleted => length(DeliveredRows), failed_deleted => length(FailedRows),
            delivered_retention_days => DeliveredDays, failed_retention_days => FailedDays}};
 
+route({developer_apps, Uid}, Conn) ->
+    {ok, Rows} = rows(Conn, developer_app_select() ++ " WHERE a.owner_user_id=$1 ORDER BY a.updated_at DESC,a.id DESC", [Uid]),
+    {ok, [developer_app_map(Row) || Row <- Rows]};
+route({developer_app, Uid, AppId0}, Conn) ->
+    AppId = pw_util:int(AppId0),
+    case developer_app_owned_row(Conn, Uid, AppId, false) of
+        {ok, Row} -> {ok, developer_app_map(Row)};
+        _ -> {error, not_found}
+    end;
+route({public_developer_apps, Query0, Limit0}, Conn) ->
+    Query = pw_util:clean_text(Query0, 80), Limit = clamp_int(Limit0, 1, 50, 20),
+    Pattern = <<"%", Query/binary, "%">>,
+    {ok, Rows} = rows(Conn,
+        "SELECT a.public_id,a.name,a.description,a.avatar_url,a.default_permissions,a.created_at,a.updated_at,count(di.id) "
+        "FROM developer_applications a LEFT JOIN developer_app_installations di ON di.app_id=a.id "
+        "WHERE a.public=true AND ($1='' OR a.name ILIKE $2 OR a.description ILIKE $2) "
+        "GROUP BY a.id ORDER BY count(di.id) DESC,a.name ASC,a.id ASC LIMIT $3",
+        [Query, Pattern, Limit]),
+    {ok, [#{public_id => PublicId, name => Name, description => Description,
+            avatar_url => pw_util:proxied_image(Avatar), default_permissions => pw_permissions:sanitize(Permissions),
+            created_at => CreatedAt, updated_at => UpdatedAt, installation_count => Count}
+          || [PublicId, Name, Description, Avatar, Permissions, CreatedAt, UpdatedAt, Count] <- Rows]};
+route({public_developer_app, PublicId0}, Conn) ->
+    PublicId = pw_util:clean_text(PublicId0, 96),
+    case one(Conn, developer_app_select() ++ " WHERE a.public_id=$1 AND a.public=true", [PublicId]) of
+        {ok, Row} ->
+            App = developer_app_map(Row),
+            {ok, Commands} = rows(Conn,
+                "SELECT name,description,options_json,handler FROM developer_app_commands WHERE app_id=$1 ORDER BY name ASC",
+                [maps:get(id, App)]),
+            {ok, 
+(maps:without([interaction, ai, avatar_source, owner_user_id], App))#{commands => [developer_public_command_map(C) || C <- Commands]}};
+        _ -> {error, not_found}
+    end;
+route({create_developer_app, Uid, Name0}, Conn) ->
+    Name = pw_util:clean_text(Name0, 48),
+    case byte_size(Name) >= 2 of
+        false -> {error, invalid_app_name};
+        true -> with_tx(Conn, fun() ->
+            Limit = min(100, max(1, pw_util:env_int("PLAINWIRE_DEVELOPER_APP_LIMIT", 25))),
+            {ok, [Count]} = one(Conn, "SELECT count(*) FROM developer_applications WHERE owner_user_id=$1", [Uid]),
+            case Count >= Limit of
+                true -> {error, app_limit};
+                false ->
+                    PublicId = unique_developer_public_id(Conn),
+                    Now = pw_util:now_ms(),
+                    {ok, AppId} = insert_returning(Conn,
+                        "INSERT INTO developer_applications(owner_user_id,public_id,name,created_at,updated_at) VALUES($1,$2,$3,$4,$4) RETURNING id",
+                        [Uid, PublicId, Name, Now]),
+                    {ok, Row} = developer_app_owned_row(Conn, Uid, AppId, false),
+                    {ok, developer_app_map(Row)}
+            end
+        end)
+    end;
+route({update_developer_app, Uid, AppId0, Patch}, Conn) ->
+    AppId = pw_util:int(AppId0),
+    with_tx(Conn, fun() ->
+        case developer_app_owned_row(Conn, Uid, AppId, true) of
+            {ok, Row0} ->
+                Current = developer_app_map(Row0),
+                Name = case maps:is_key(<<"name">>, Patch) of true -> pw_util:clean_text(maps:get(<<"name">>, Patch), 48); false -> maps:get(name, Current) end,
+                Description = case maps:is_key(<<"description">>, Patch) of true -> pw_util:clean_text(maps:get(<<"description">>, Patch), 500); false -> maps:get(description, Current) end,
+                Avatar = case maps:is_key(<<"avatar_url">>, Patch) of
+                    true -> developer_app_avatar(Conn, Uid, maps:get(<<"avatar_url">>, Patch, <<>>));
+                    false -> maps:get(avatar_source, Current, <<>>)
+                end,
+                Public = case maps:get(<<"public">>, Patch, maps:get(public, Current)) of true -> true; _ -> false end,
+                Permissions = case maps:is_key(<<"default_permissions">>, Patch) of
+                    true -> pw_permissions:sanitize(maps:get(<<"default_permissions">>, Patch, 0));
+                    false -> maps:get(default_permissions, Current, 0)
+                end,
+                case byte_size(Name) >= 2 of
+                    false -> {error, invalid_app_name};
+                    true ->
+                        Now = pw_util:now_ms(),
+                        ok = exec(Conn, "UPDATE developer_applications SET name=$1,description=$2,avatar_url=$3,public=$4,default_permissions=$5,updated_at=$6 WHERE id=$7 AND owner_user_id=$8",
+                                  [Name, Description, Avatar, Public, Permissions, Now, AppId, Uid]),
+                        %% Keep installed bot identity consistent with the app without
+                        %% changing server-scoped usernames or roles unexpectedly.
+                        ok = exec(Conn,
+                            "UPDATE users SET display_name=$1,bio=$2,avatar_url=$3,updated_at=$4 WHERE id IN (SELECT b.bot_user_id FROM developer_app_installations di JOIN server_bots b ON b.id=di.server_bot_id WHERE di.app_id=$5)",
+                            [Name, Description, Avatar, Now, AppId]),
+                        {ok, BotRows} = rows(Conn,
+                            "SELECT b.bot_user_id FROM developer_app_installations di JOIN server_bots b ON b.id=di.server_bot_id WHERE di.app_id=$1", [AppId]),
+                        [sync_profile_upload_refs(Conn, BotUid, Avatar, <<>>, Now) || [BotUid] <- BotRows],
+                        {ok, Row} = developer_app_owned_row(Conn, Uid, AppId, false),
+                        {ok, developer_app_map(Row)}
+                end;
+            _ -> {error, not_found}
+        end
+    end);
+route({delete_developer_app, Uid, AppId0}, Conn) ->
+    AppId = pw_util:int(AppId0),
+    with_tx(Conn, fun() ->
+        case developer_app_owned_row(Conn, Uid, AppId, true) of
+            {ok, _} ->
+                {ok, Installs} = rows(Conn,
+                    "SELECT id,server_id,server_bot_id,COALESCE(role_id,0) FROM developer_app_installations WHERE app_id=$1 ORDER BY id ASC FOR UPDATE", [AppId]),
+                lists:foreach(fun([InstallId, Sid, BotId, RoleId]) ->
+                    ok = uninstall_developer_app_internal(Conn, AppId, InstallId, Sid, BotId, RoleId, Uid)
+                end, Installs),
+                ok = exec(Conn, "DELETE FROM developer_applications WHERE id=$1 AND owner_user_id=$2", [AppId, Uid]),
+                {ok, #{deleted => true, id => AppId}};
+            _ -> {error, not_found}
+        end
+    end);
+route({developer_app_installations, Uid, AppId0}, Conn) ->
+    AppId = pw_util:int(AppId0),
+    case developer_app_owned_row(Conn, Uid, AppId, false) of
+        {ok, _} ->
+            {ok, Rows} = rows(Conn,
+                "SELECT di.id,di.server_id,s.name,di.server_bot_id,b.bot_user_id,u.username,u.display_name,u.avatar_url,COALESCE(di.role_id,0),di.installed_by,di.created_at "
+                "FROM developer_app_installations di JOIN servers s ON s.id=di.server_id JOIN server_bots b ON b.id=di.server_bot_id JOIN users u ON u.id=b.bot_user_id "
+                "WHERE di.app_id=$1 ORDER BY s.name ASC,di.id ASC", [AppId]),
+            {ok, [developer_installation_map(R) || R <- Rows]};
+        _ -> {error, not_found}
+    end;
+route({server_apps, Uid, Sid0}, Conn) ->
+    Sid = pw_util:int(Sid0),
+    case has_server_permission(Conn, Uid, Sid, <<"manage_bots">>) of
+        false -> {error, forbidden};
+        true ->
+            {ok, Rows} = rows(Conn,
+                "SELECT di.id,a.id,a.public_id,a.name,a.description,a.avatar_url,di.server_bot_id,b.bot_user_id,u.username,u.display_name,COALESCE(di.role_id,0),di.installed_by,di.created_at "
+                "FROM developer_app_installations di JOIN developer_applications a ON a.id=di.app_id JOIN server_bots b ON b.id=di.server_bot_id JOIN users u ON u.id=b.bot_user_id "
+                "WHERE di.server_id=$1 ORDER BY a.name ASC,di.id ASC", [Sid]),
+            {ok, [server_app_map(R) || R <- Rows]}
+    end;
+route({server_app_commands, Uid, Sid0, InstallId0}, Conn) ->
+    Sid = pw_util:int(Sid0), InstallId = pw_util:int(InstallId0),
+    case has_server_permission(Conn, Uid, Sid, <<"manage_bots">>) of
+        false -> {error, forbidden};
+        true ->
+            case one(Conn, "SELECT server_bot_id FROM developer_app_installations WHERE id=$1 AND server_id=$2", [InstallId, Sid]) of
+                {ok, [BotId]} ->
+                    {ok, CommandRows} = rows(Conn,
+                        "SELECT id,name,description,options_json,enabled,created_at,updated_at,handler FROM bot_commands WHERE bot_id=$1 AND server_id=$2 ORDER BY name ASC",
+                        [BotId, Sid]),
+                    {ok, [server_app_command_map(Row, bot_command_permission_rules(Conn, lists:nth(1, Row))) || Row <- CommandRows]};
+                _ -> {error, not_found}
+            end
+    end;
+route({set_server_command_permissions, Uid, Sid0, InstallId0, CommandId0, Rules0}, Conn) ->
+    Sid = pw_util:int(Sid0), InstallId = pw_util:int(InstallId0), CommandId = pw_util:int(CommandId0),
+    case normalize_command_permission_rules(Rules0) of
+        error -> {error, invalid_command_permissions};
+        {ok, Rules} -> with_tx(Conn, fun() ->
+            case has_server_permission(Conn, Uid, Sid, <<"manage_bots">>) of
+                false -> {error, forbidden};
+                true ->
+                    case one(Conn,
+                        "SELECT c.id FROM developer_app_installations di JOIN bot_commands c ON c.bot_id=di.server_bot_id "
+                        "WHERE di.id=$1 AND di.server_id=$2 AND c.id=$3 FOR UPDATE OF c", [InstallId, Sid, CommandId]) of
+                        {ok, [_]} ->
+                            case validate_command_permission_subjects(Conn, Sid, Rules) of
+                                false -> {error, invalid_command_permission_subject};
+                                true ->
+                                    Now = pw_util:now_ms(),
+                                    ok = exec(Conn, "DELETE FROM bot_command_permissions WHERE command_id=$1", [CommandId]),
+                                    lists:foreach(fun(#{type := Type, id := SubjectId, allow := Allow}) ->
+                                        ok = exec(Conn,
+                                            "INSERT INTO bot_command_permissions(command_id,subject_type,subject_id,allow,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$5)",
+                                            [CommandId, Type, SubjectId, Allow, Now])
+                                    end, Rules),
+                                    {ok, #{command_id => CommandId, permissions => bot_command_permission_rules(Conn, CommandId), updated_at => Now}}
+                            end;
+                        _ -> {error, not_found}
+                    end
+            end
+        end)
+    end;
+route({uninstall_server_app, Uid, Sid0, InstallId0}, Conn) ->
+    Sid = pw_util:int(Sid0), InstallId = pw_util:int(InstallId0),
+    with_tx(Conn, fun() ->
+        case has_server_permission(Conn, Uid, Sid, <<"manage_bots">>) of
+            false -> {error, forbidden};
+            true ->
+                _ = one(Conn, "SELECT id FROM servers WHERE id=$1 FOR UPDATE", [Sid]),
+                case one(Conn,
+                    "SELECT app_id,server_bot_id,COALESCE(role_id,0) FROM developer_app_installations WHERE id=$1 AND server_id=$2 FOR UPDATE",
+                    [InstallId, Sid]) of
+                    {ok, [AppId, BotId, RoleId]} ->
+                        ok = uninstall_developer_app_internal(Conn, AppId, InstallId, Sid, BotId, RoleId, Uid),
+                        {ok, #{deleted => true, installation_id => InstallId, server_id => Sid}};
+                    _ -> {error, not_found}
+                end
+        end
+    end);
+route({install_developer_app, Uid, AppId0, Sid0}, Conn) ->
+    AppId = pw_util:int(AppId0), Sid = pw_util:int(Sid0),
+    with_tx(Conn, fun() ->
+        case developer_app_owned_row(Conn, Uid, AppId, true) of
+            {ok, Row} -> install_developer_app_internal(Conn, Uid, developer_app_map(Row), Sid);
+            _ -> {error, not_found}
+        end
+    end);
+route({install_public_developer_app, Uid, PublicId0, Sid0}, Conn) ->
+    PublicId = pw_util:clean_text(PublicId0, 96), Sid = pw_util:int(Sid0),
+    with_tx(Conn, fun() ->
+        case one(Conn, developer_app_select() ++ " WHERE a.public_id=$1 AND a.public=true FOR UPDATE OF a", [PublicId]) of
+            {ok, Row} ->
+                App = developer_app_map(Row),
+                case install_developer_app_internal(Conn, Uid, App, Sid) of
+                    {ok, Data} ->
+                        case maps:get(owner_user_id, App) =:= Uid of
+                            true -> {ok, Data};
+                            false -> {ok, maps:remove(token, Data)}
+                        end;
+                    Other -> Other
+                end;
+            _ -> {error, not_found}
+        end
+    end);
+route({rotate_developer_app_installation, Uid, AppId0, InstallId0}, Conn) ->
+    AppId = pw_util:int(AppId0), InstallId = pw_util:int(InstallId0),
+    case developer_app_owned_row(Conn, Uid, AppId, false) of
+        {ok, _} ->
+            Token = <<"pwb_", (pw_util:random_token(36))/binary>>, Hash = pw_util:sha256_hex(Token), Now = pw_util:now_ms(),
+            case one(Conn,
+                "UPDATE server_bots b SET token_hash=$1,updated_at=$2 FROM developer_app_installations di WHERE di.id=$3 AND di.app_id=$4 AND b.id=di.server_bot_id RETURNING b.id,b.bot_user_id,di.server_id",
+                [Hash, Now, InstallId, AppId]) of
+                {ok, [BotId, BotUid, Sid]} -> {ok, #{installation_id => InstallId, bot_id => BotId, user_id => BotUid, server_id => Sid, token => Token, updated_at => Now}};
+                _ -> {error, not_found}
+            end;
+        _ -> {error, not_found}
+    end;
+route({uninstall_developer_app, Uid, AppId0, InstallId0}, Conn) ->
+    AppId = pw_util:int(AppId0), InstallId = pw_util:int(InstallId0),
+    with_tx(Conn, fun() ->
+        case developer_app_owned_row(Conn, Uid, AppId, true) of
+            {ok, _} ->
+                case one(Conn,
+                    "SELECT server_id,server_bot_id,COALESCE(role_id,0) FROM developer_app_installations WHERE id=$1 AND app_id=$2 FOR UPDATE",
+                    [InstallId, AppId]) of
+                    {ok, [Sid, BotId, RoleId]} ->
+                        ok = uninstall_developer_app_internal(Conn, AppId, InstallId, Sid, BotId, RoleId, Uid),
+                        {ok, #{deleted => true, installation_id => InstallId, server_id => Sid}};
+                    _ -> {error, not_found}
+                end;
+            _ -> {error, not_found}
+        end
+    end);
+route({developer_app_commands, Uid, AppId0}, Conn) ->
+    AppId = pw_util:int(AppId0),
+    case developer_app_owned_row(Conn, Uid, AppId, false) of
+        {ok, _} ->
+            {ok, Rows} = rows(Conn,
+                "SELECT id,name,description,options_json,handler,created_at,updated_at FROM developer_app_commands WHERE app_id=$1 ORDER BY name ASC", [AppId]),
+            {ok, [developer_command_map(R) || R <- Rows]};
+        _ -> {error, not_found}
+    end;
+route({upsert_developer_app_command, Uid, AppId0, Name0, Description0, Options0, Handler0}, Conn) ->
+    AppId = pw_util:int(AppId0), Name = normalize_command_name(Name0), Description = pw_util:clean_text(Description0, 160),
+    Handler = normalize_developer_handler(Handler0),
+    case {Name, normalize_command_options(Options0), Handler} of
+        {invalid, _, _} -> {error, invalid_command_name};
+        {_, error, _} -> {error, invalid_command_options};
+        {_, _, invalid} -> {error, invalid_command_handler};
+        {CommandName, {ok, Options}, HandlerName} -> with_tx(Conn, fun() ->
+            case developer_app_owned_row(Conn, Uid, AppId, true) of
+                {ok, AppRow} ->
+                    App = developer_app_map(AppRow),
+                    case developer_handler_available(App, HandlerName) of
+                        false -> {error, handler_not_configured};
+                        true ->
+                            case one(Conn,
+                                "SELECT di.server_id FROM developer_app_installations di JOIN bot_commands c ON c.server_id=di.server_id AND c.name=$2 WHERE di.app_id=$1 AND c.bot_id<>di.server_bot_id LIMIT 1",
+                                [AppId, CommandName]) of
+                                {ok, [ConflictSid]} -> {error, {command_name_conflict, ConflictSid}};
+                                _ ->
+                                    Now = pw_util:now_ms(), OptionsJson = pw_util:json(Options),
+                                    {ok, CmdRow} = one(Conn,
+                                        "INSERT INTO developer_app_commands(app_id,name,description,options_json,handler,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$6) "
+                                        "ON CONFLICT(app_id,name) DO UPDATE SET description=EXCLUDED.description,options_json=EXCLUDED.options_json,handler=EXCLUDED.handler,updated_at=EXCLUDED.updated_at "
+                                        "RETURNING id,name,description,options_json,handler,created_at,updated_at",
+                                        [AppId, CommandName, Description, OptionsJson, HandlerName, Now]),
+                                    [DevCmdId, _, _, _, _, _, _] = CmdRow,
+                                    {ok, Installs} = rows(Conn, "SELECT server_bot_id,server_id FROM developer_app_installations WHERE app_id=$1 ORDER BY id ASC", [AppId]),
+                                    lists:foreach(fun([BotId, Sid]) ->
+                                        case one(Conn,
+                                            "INSERT INTO bot_commands(bot_id,server_id,name,description,options_json,enabled,developer_command_id,handler,created_at,updated_at) "
+                                            "VALUES($1,$2,$3,$4,$5,true,$6,$7,$8,$8) ON CONFLICT(server_id,name) DO UPDATE SET description=EXCLUDED.description,options_json=EXCLUDED.options_json,enabled=true,developer_command_id=EXCLUDED.developer_command_id,handler=EXCLUDED.handler,updated_at=EXCLUDED.updated_at WHERE bot_commands.bot_id=EXCLUDED.bot_id RETURNING id",
+                                            [BotId, Sid, CommandName, Description, OptionsJson, DevCmdId, HandlerName, Now]) of
+                                            {ok, [_]} -> ok;
+                                            _ -> throw({plainwire_error, command_name_taken})
+                                        end
+                                    end, Installs),
+                                    {ok, developer_command_map(CmdRow)}
+                            end
+                    end;
+                _ -> {error, not_found}
+            end
+        end)
+    end;
+route({delete_developer_app_command, Uid, AppId0, CommandId0}, Conn) ->
+    AppId = pw_util:int(AppId0), CommandId = pw_util:int(CommandId0),
+    case developer_app_owned_row(Conn, Uid, AppId, false) of
+        {ok, _} ->
+            case one(Conn, "DELETE FROM developer_app_commands WHERE id=$1 AND app_id=$2 RETURNING id", [CommandId, AppId]) of
+                {ok, [_]} -> {ok, #{deleted => true, id => CommandId}};
+                _ -> {error, not_found}
+            end;
+        _ -> {error, not_found}
+    end;
+route({update_developer_app_interactions, Uid, AppId0, Patch}, Conn) ->
+    AppId = pw_util:int(AppId0),
+    with_tx(Conn, fun() ->
+        case developer_app_owned_row(Conn, Uid, AppId, true) of
+            {ok, Row0} ->
+                App0 = developer_app_map(Row0),
+                Url = pw_util:clean_text(maps:get(<<"url">>, Patch, maps:get(url, maps:get(interaction, App0), <<>>)), 2048),
+                case developer_endpoint_valid(Url) of
+                    false -> {error, invalid_interaction_url};
+                    true ->
+                        {ok, [StoredSecret]} = one(Conn, "SELECT interaction_secret FROM developer_applications WHERE id=$1", [AppId]),
+                        {SecretPlain, SecretStored, Reveal} = case {Url =/= <<>>, pw_util:bin(StoredSecret)} of
+                            {true, <<>>} ->
+                                Generated = <<"pwi_", (pw_util:random_token(36))/binary>>,
+                                {Generated, pw_crypto:encrypt(Generated), true};
+                            _ -> {<<>>, StoredSecret, false}
+                        end,
+                        Now = pw_util:now_ms(),
+                        ok = exec(Conn, "UPDATE developer_applications SET interaction_url=$1,interaction_secret=$2,updated_at=$3 WHERE id=$4 AND owner_user_id=$5", [Url, SecretStored, Now, AppId, Uid]),
+                        Base = #{url => Url, configured => Url =/= <<>> andalso pw_util:bin(SecretStored) =/= <<>>, updated_at => Now},
+                        case Reveal of true -> {ok, Base#{secret => SecretPlain}}; false -> {ok, Base} end
+                end;
+            _ -> {error, not_found}
+        end
+    end);
+route({rotate_developer_app_interaction_secret, Uid, AppId0}, Conn) ->
+    AppId = pw_util:int(AppId0),
+    case developer_app_owned_row(Conn, Uid, AppId, false) of
+        {ok, Row} ->
+            App = developer_app_map(Row),
+            case maps:get(url, maps:get(interaction, App), <<>>) of
+                <<>> -> {error, interaction_not_configured};
+                _ ->
+                    Secret = <<"pwi_", (pw_util:random_token(36))/binary>>, Now = pw_util:now_ms(),
+                    ok = exec(Conn, "UPDATE developer_applications SET interaction_secret=$1,updated_at=$2 WHERE id=$3 AND owner_user_id=$4", [pw_crypto:encrypt(Secret), Now, AppId, Uid]),
+                    {ok, #{secret => Secret, updated_at => Now}}
+            end;
+        _ -> {error, not_found}
+    end;
+route({update_developer_app_ai, Uid, AppId0, Patch}, Conn) ->
+    AppId = pw_util:int(AppId0),
+    with_tx(Conn, fun() ->
+        case developer_app_owned_row(Conn, Uid, AppId, true) of
+            {ok, Row0} ->
+                App0 = developer_app_map(Row0), Ai0 = maps:get(ai, App0),
+                Enabled = maps:get(<<"enabled">>, Patch, maps:get(enabled, Ai0, false)) =:= true,
+                Endpoint = pw_util:clean_text(maps:get(<<"endpoint">>, Patch, maps:get(endpoint, Ai0, <<>>)), 2048),
+                Model = pw_util:clean_text(maps:get(<<"model">>, Patch, maps:get(model, Ai0, <<>>)), 160),
+                SystemPrompt = pw_util:clean_text(maps:get(<<"system_prompt">>, Patch, maps:get(system_prompt, Ai0, <<>>)), 8000),
+                {ok, [StoredKey0]} = one(Conn, "SELECT ai_api_key FROM developer_applications WHERE id=$1", [AppId]),
+                NewKey0 = pw_util:clean_text(maps:get(<<"api_key">>, Patch, <<>>), 1024),
+                StoredKey = case NewKey0 of <<>> -> StoredKey0; _ -> pw_crypto:encrypt(NewKey0) end,
+                ConfigOk = (not Enabled) orelse (developer_endpoint_valid(Endpoint) andalso Model =/= <<>> andalso pw_util:bin(StoredKey) =/= <<>>),
+                case ConfigOk of
+                    false -> {error, invalid_ai_configuration};
+                    true ->
+                        Now = pw_util:now_ms(),
+                        ok = exec(Conn,
+                            "UPDATE developer_applications SET ai_enabled=$1,ai_endpoint=$2,ai_model=$3,ai_api_key=$4,ai_system_prompt=$5,updated_at=$6 WHERE id=$7 AND owner_user_id=$8",
+                            [Enabled, Endpoint, Model, StoredKey, pw_crypto:encrypt(SystemPrompt), Now, AppId, Uid]),
+                        {ok, Row} = developer_app_owned_row(Conn, Uid, AppId, false),
+                        {ok, maps:get(ai, developer_app_map(Row))}
+                end;
+            _ -> {error, not_found}
+        end
+    end);
+
+route({app_interaction_claim_due, Limit0}, Conn) ->
+    internal_app_claim_route(Conn, <<"webhook">>, Limit0);
+route({ai_command_claim_due, Limit0}, Conn) ->
+    internal_app_claim_route(Conn, <<"ai">>, Limit0);
+route({app_interaction_finish, InvocationId0, Result0}, Conn) ->
+    internal_app_finish_route(Conn, <<"webhook">>, InvocationId0, Result0);
+route({ai_command_finish, InvocationId0, Result0}, Conn) ->
+    internal_app_finish_route(Conn, <<"ai">>, InvocationId0, Result0);
+
 route({server_bots, Uid, Sid0}, Conn) ->
     Sid = pw_util:int(Sid0),
     case has_server_permission(Conn, Uid, Sid, <<"manage_bots">>) of
         false -> {error, forbidden};
         true ->
             {ok, Rows} = rows(Conn,
-                "SELECT b.id,b.bot_user_id,b.name,u.username,u.display_name,u.avatar_url,b.created_by,b.created_at,b.updated_at "
-                "FROM server_bots b JOIN users u ON u.id=b.bot_user_id WHERE b.server_id=$1 ORDER BY b.id ASC", [Sid]),
-            {ok, [#{id => Id, user_id => BotUid, name => Name, username => Username, display_name => Display, avatar_url => Avatar,
-                    created_by => CreatedBy, created_at => CreatedAt, updated_at => UpdatedAt}
-                  || [Id, BotUid, Name, Username, Display, Avatar, CreatedBy, CreatedAt, UpdatedAt] <- Rows]}
+                "SELECT b.id,b.bot_user_id,b.name,u.username,u.display_name,u.avatar_url,b.created_by,b.created_at,b.updated_at,"
+                "COALESCE(di.app_id,0),COALESCE(a.public_id,''),COALESCE(a.name,'') "
+                "FROM server_bots b JOIN users u ON u.id=b.bot_user_id "
+                "LEFT JOIN developer_app_installations di ON di.server_bot_id=b.id LEFT JOIN developer_applications a ON a.id=di.app_id "
+                "WHERE b.server_id=$1 ORDER BY b.id ASC", [Sid]),
+            {ok, [#{id => Id, user_id => BotUid, name => Name, username => Username, display_name => Display, avatar_url => pw_util:proxied_image(Avatar),
+                    created_by => CreatedBy, created_at => CreatedAt, updated_at => UpdatedAt,
+                    application_id => AppId, application_public_id => AppPublicId, application_name => AppName}
+                  || [Id, BotUid, Name, Username, Display, Avatar, CreatedBy, CreatedAt, UpdatedAt, AppId, AppPublicId, AppName] <- Rows]}
     end;
 route({create_server_bot, Uid, Sid0, Name0}, Conn) ->
     Sid = pw_util:int(Sid0),
@@ -3271,6 +4148,7 @@ route({create_server_bot, Uid, Sid0, Name0}, Conn) ->
                                 "INSERT INTO server_bots(server_id,bot_user_id,name,token_hash,created_by,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$6) RETURNING id",
                                 [Sid, BotUid, Name, TokenHash, Uid, Now]),
                             publish_server_event(Conn, Sid, #{type => bot_added, server_id => Sid, bot_user_id => BotUid}),
+                            enqueue_server_webhooks(Conn, Sid, <<"bot.added">>, #{bot_user_id => BotUid, bot_id => BotId, actor_id => Uid}),
                             {ok, #{id => BotId, user_id => BotUid, name => Name, username => Username, token => Token, created_at => Now}}
                     end
             end
@@ -3295,14 +4173,23 @@ route({delete_server_bot, Uid, Sid0, BotId0}, Conn) ->
               one(Conn, "SELECT bot_user_id FROM server_bots WHERE id=$1 AND server_id=$2 FOR UPDATE", [BotId, Sid])} of
             {false, _} -> {error, forbidden};
             {true, {ok, [BotUid]}} ->
-                %% Messages intentionally cascade through explicit deletion because the
-                %% historical message FK predates ON DELETE CASCADE.
-                ok = enqueue_scylla_hard_deletes_for_user(Conn, BotUid),
-                ok = exec(Conn, "UPDATE messages SET reply_to_id=NULL WHERE reply_to_id IN (SELECT id FROM messages WHERE user_id=$1)", [BotUid]),
-                ok = exec(Conn, "DELETE FROM messages WHERE user_id=$1", [BotUid]),
-                ok = exec(Conn, "DELETE FROM users WHERE id=$1", [BotUid]),
-                publish_server_event(Conn, Sid, #{type => bot_removed, server_id => Sid, bot_user_id => BotUid}),
-                {ok, #{deleted => true, id => BotId, user_id => BotUid}};
+                case one(Conn, "SELECT id,app_id,COALESCE(role_id,0) FROM developer_app_installations WHERE server_bot_id=$1 FOR UPDATE", [BotId]) of
+                    {ok, [InstallId, AppId, RoleId]} ->
+                        %% User-owned applications preserve historical bot messages when
+                        %% removed from a server, matching normal chat expectations.
+                        ok = uninstall_developer_app_internal(Conn, AppId, InstallId, Sid, BotId, RoleId, Uid),
+                        {ok, #{deleted => true, id => BotId, user_id => BotUid, application_id => AppId}};
+                    _ ->
+                        %% Legacy server-scoped bot deletion keeps the established 2.0
+                        %% behavior for compatibility with existing self-hosted servers.
+                        ok = enqueue_scylla_hard_deletes_for_user(Conn, BotUid),
+                        ok = exec(Conn, "UPDATE messages SET reply_to_id=NULL WHERE reply_to_id IN (SELECT id FROM messages WHERE user_id=$1)", [BotUid]),
+                        ok = exec(Conn, "DELETE FROM messages WHERE user_id=$1", [BotUid]),
+                        ok = exec(Conn, "DELETE FROM users WHERE id=$1", [BotUid]),
+                        publish_server_event(Conn, Sid, #{type => bot_removed, server_id => Sid, bot_user_id => BotUid}),
+                        enqueue_server_webhooks(Conn, Sid, <<"bot.removed">>, #{bot_user_id => BotUid, bot_id => BotId, actor_id => Uid}),
+                        {ok, #{deleted => true, id => BotId, user_id => BotUid}}
+                end;
             {true, _} -> {error, not_found}
         end
     end);
@@ -3319,6 +4206,247 @@ route({authenticate_bot, Token0}, Conn) ->
                 _ -> {error, invalid_bot_token}
             end;
         _ -> {error, invalid_bot_token}
+    end;
+
+
+route({bot_commands, BotId0}, Conn) ->
+    BotId = pw_util:int(BotId0),
+    case bot_identity(Conn, BotId) of
+        {ok, _BotUid, _Sid} ->
+            {ok, Rows} = rows(Conn,
+                "SELECT id,name,description,options_json,enabled,created_at,updated_at FROM bot_commands WHERE bot_id=$1 ORDER BY name ASC", [BotId]),
+            {ok, [bot_command_map(Row) || Row <- Rows]};
+        _ -> {error, forbidden}
+    end;
+route({bot_register_command, BotId0, Name0, Description0, Options0}, Conn) ->
+    BotId = pw_util:int(BotId0),
+    Name = normalize_command_name(Name0),
+    Description = pw_util:clean_text(Description0, 160),
+    case {Name, normalize_command_options(Options0), bot_identity(Conn, BotId)} of
+        {invalid, _, _} -> {error, invalid_command_name};
+        {_, error, _} -> {error, invalid_command_options};
+        {_, _, {error, _}} -> {error, forbidden};
+        {CommandName, {ok, Options}, {ok, _BotUid, Sid}} ->
+            Now = pw_util:now_ms(),
+            OptionsJson = pw_util:json(Options),
+            case one(Conn,
+                "INSERT INTO bot_commands(bot_id,server_id,name,description,options_json,enabled,created_at,updated_at) "
+                "VALUES($1,$2,$3,$4,$5,true,$6,$6) "
+                "ON CONFLICT(server_id,name) DO UPDATE SET description=EXCLUDED.description,options_json=EXCLUDED.options_json,enabled=true,updated_at=EXCLUDED.updated_at "
+                "WHERE bot_commands.bot_id=EXCLUDED.bot_id RETURNING id,name,description,options_json,enabled,created_at,updated_at",
+                [BotId, Sid, CommandName, Description, OptionsJson, Now]) of
+                {ok, Row} -> {ok, bot_command_map(Row)};
+                _ -> {error, command_name_taken}
+            end
+    end;
+route({bot_delete_command, BotId0, CommandId0}, Conn) ->
+    BotId = pw_util:int(BotId0), CommandId = pw_util:int(CommandId0),
+    case one(Conn, "DELETE FROM bot_commands WHERE id=$1 AND bot_id=$2 RETURNING id", [CommandId, BotId]) of
+        {ok, [_]} -> {ok, #{deleted => true, id => CommandId}};
+        _ -> {error, not_found}
+    end;
+route({commands_for_channel, Uid, ChannelId0}, Conn) ->
+    ChannelId = pw_util:int(ChannelId0),
+    case channel_message_access(Conn, Uid, ChannelId) of
+        {ok, Sid} ->
+            {ok, Rows} = rows(Conn,
+                "SELECT c.id,c.name,c.description,c.options_json,c.enabled,c.created_at,c.updated_at,b.id,b.name,u.id,u.username,u.display_name,u.avatar_url,c.handler "
+                "FROM bot_commands c JOIN server_bots b ON b.id=c.bot_id JOIN users u ON u.id=b.bot_user_id "
+                "WHERE c.server_id=$1 AND c.enabled=true AND u.account_state='active' ORDER BY c.name ASC", [Sid]),
+            %% Do not advertise commands whose bot cannot actually read/send in
+            %% this channel. Handler configuration is checked dynamically as well,
+            %% so disabling an app interaction/AI connector immediately removes
+            %% commands that can no longer be serviced.
+            Visible = [R || R <- Rows,
+                            bot_command_channel_access(Conn, ChannelId, R),
+                            bot_command_handler_available(Conn, lists:nth(8, R), lists:nth(14, R)),
+                            bot_command_permission_allowed(Conn, Uid, Sid, ChannelId, lists:nth(1, R))],
+            {ok, [bot_public_command_map(R) || R <- Visible]};
+        _ -> {error, forbidden}
+    end;
+route({invoke_bot_command, Uid, ChannelId0, Name0, Args0}, Conn) ->
+    ChannelId = pw_util:int(ChannelId0),
+    Name = normalize_command_name(Name0),
+    case Name of
+        invalid -> {error, invalid_command_name};
+        _ ->
+            Result = with_tx(Conn, fun() ->
+                case channel_message_access(Conn, Uid, ChannelId) of
+                    {ok, Sid} ->
+                        case one(Conn,
+                            "SELECT c.id,c.bot_id,b.bot_user_id,c.options_json,c.handler FROM bot_commands c "
+                            "JOIN server_bots b ON b.id=c.bot_id JOIN users u ON u.id=b.bot_user_id "
+                            "WHERE c.server_id=$1 AND c.name=$2 AND c.enabled=true AND u.account_state='active' FOR UPDATE OF c",
+                            [Sid, Name]) of
+                            {ok, [CommandId, BotId, BotUid, OptionsJson, Handler]} ->
+                                %% Discovery is only a convenience. Re-check both
+                                %% channel authorization and handler availability in
+                                %% the same transaction so stale/hand-crafted clients
+                                %% cannot enqueue arguments for a revoked bot or a
+                                %% disabled interaction/AI connector.
+                                case channel_message_access(Conn, BotUid, ChannelId) of
+                                    {ok, Sid} ->
+                                        case {bot_command_handler_available(Conn, BotId, Handler),
+                                              bot_command_permission_allowed(Conn, Uid, Sid, ChannelId, CommandId)} of
+                                            {false, _} -> {error, command_unavailable};
+                                            {_, false} -> {error, command_forbidden};
+                                            {true, true} -> case normalize_command_arguments(Args0, decode_json_value(OptionsJson, [])) of
+                                            {error, _} = Error -> Error;
+                                            {ok, Args} ->
+                                                Now = pw_util:now_ms(),
+                                                Display = command_display(Name, Args),
+                                                Mid = new_message_id(),
+                                                ok = exec(Conn,
+                                                    "INSERT INTO messages(id,scope,scope_id,user_id,body,reply_to_id,created_at) VALUES($1,'channel',$2,$3,$4,NULL,$5)",
+                                                    [Mid, ChannelId, Uid, store_message(Display), Now]),
+                                                ok = storage_after_message_change(Conn, Mid, <<"message.created">>, Uid),
+                                                Cipher = encode_command_args(Args),
+                                                {ok, InvocationId} = insert_returning(Conn,
+                                                    "INSERT INTO bot_command_invocations(command_id,bot_id,server_id,channel_id,user_id,request_message_id,args_cipher,status,created_at,updated_at) "
+                                                    "VALUES($1,$2,$3,$4,$5,$6,$7,'pending',$8,$8) RETURNING id",
+                                                    [CommandId, BotId, Sid, ChannelId, Uid, Mid, Cipher, Now]),
+                                                {ok, Row} = one(Conn, message_select() ++ " WHERE m.id=$1", [Mid]),
+                                                Msg = message_map(Conn, Row),
+                                                {ok, #{invocation_id => InvocationId, bot_id => BotId, bot_user_id => BotUid,
+                                                       command => Name, handler => Handler, message => Msg, server_id => Sid, channel_id => ChannelId}}
+                                        end
+                                        end;
+                                    _ -> {error, command_unavailable}
+                                end;
+                            _ -> {error, command_not_found}
+                        end;
+                    _ -> {error, forbidden}
+                end
+            end),
+            case Result of
+                {ok, #{message := Msg, server_id := Sid, bot_user_id := BotUid, invocation_id := InvocationId, command := CommandName, handler := Handler} = Data} ->
+                    invalidate_message_cache(<<"channel">>, ChannelId),
+                    pw_hub:broadcast({channel, ChannelId}, #{type => message_created, scope => channel, scope_id => ChannelId, message => Msg}),
+                    case Handler of
+                        <<"queue">> -> pw_hub:notify_user(BotUid, #{type => bot_command_available, invocation_id => InvocationId, command => CommandName, server_id => Sid, channel_id => ChannelId});
+                        
+<<"webhook">> -> try pw_app_interaction_dispatcher:poke() catch _:_ -> ok end;
+                        
+<<"ai">> -> try pw_ai_bot_dispatcher:poke() catch _:_ -> ok end;
+                        _ -> ok
+                    end,
+                    {ok, maps:without([server_id, bot_user_id], Data)};
+                Other -> Other
+            end
+    end;
+route({bot_claim_commands, BotId0, Limit0}, Conn) ->
+    BotId = pw_util:int(BotId0), Limit = clamp_int(Limit0, 1, 50, 10), Now = pw_util:now_ms(),
+    LeaseMs = clamp_int(pw_util:env_int("PLAINWIRE_BOT_COMMAND_LEASE_MS", 30000), 5000, 120000, 30000),
+    MaxAttempts = clamp_int(pw_util:env_int("PLAINWIRE_BOT_COMMAND_MAX_ATTEMPTS", 8), 1, 25, 8),
+    case bot_identity(Conn, BotId) of
+        {ok, BotUid, _Sid} ->
+            Result = with_tx(Conn, fun() ->
+                %% A worker that repeatedly disappears must not poison the queue forever.
+                _ = exec(Conn,
+                    "UPDATE bot_command_invocations SET status='failed',fail_reason='delivery attempts exhausted',claim_token_hash='',lease_until=0,completed_at=$1,updated_at=$1 "
+                    "WHERE bot_id=$2 AND status='claimed' AND lease_until<$1 AND attempts >= $3",
+                    [Now, BotId, MaxAttempts]),
+                %% Reclaim only expired work. SKIP LOCKED allows several workers for
+                %% one bot without duplicate live claims. Channel authorization is
+                %% rechecked at claim time so queued arguments are never disclosed
+                %% after a bot's role/channel access has been revoked.
+                {ok, Rows0} = rows(Conn,
+                    "SELECT i.id,i.command_id,c.name,i.server_id,i.channel_id,i.user_id,i.request_message_id,i.args_cipher,i.attempts,i.created_at "
+                    "FROM bot_command_invocations i JOIN bot_commands c ON c.id=i.command_id "
+                    "WHERE i.bot_id=$1 AND c.handler='queue' AND (i.status='pending' OR (i.status='claimed' AND i.lease_until<$2)) "
+                    "ORDER BY i.id ASC LIMIT $3 FOR UPDATE OF i SKIP LOCKED", [BotId, Now, Limit]),
+                {Claims, Failed} = claim_authorized_bot_invocations(Conn, BotId, BotUid, Rows0, Now, LeaseMs, [], []),
+                {ok, #{claims => lists:reverse(Claims), failed => lists:reverse(Failed)}}
+            end),
+            case Result of
+                {ok, #{claims := Claims, failed := Failed}} ->
+                    [pw_hub:notify_user(UserId, #{type => bot_command_failed, invocation_id => InvocationId,
+                        channel_id => ChannelId, reason => <<"Bot no longer has access to this channel">>})
+                     || #{user_id := UserId, id := InvocationId, channel_id := ChannelId} <- Failed, is_integer(UserId)],
+                    {ok, Claims};
+                Other -> Other
+            end;
+        _ -> {error, forbidden}
+    end;
+route({bot_respond_command, BotId0, InvocationId0, ClaimToken0, Body0}, Conn) ->
+    BotId = pw_util:int(BotId0), InvocationId = pw_util:int(InvocationId0),
+    ClaimToken = pw_util:clean_text(ClaimToken0, 256), Plain = pw_util:clean_text(Body0, ?MAX_MSG),
+    case message_body_valid(Plain) of
+        false -> {error, invalid_message};
+        true ->
+            Result = with_tx(Conn, fun() ->
+                Now = pw_util:now_ms(),
+                case one(Conn,
+                    "SELECT i.channel_id,i.request_message_id,b.bot_user_id,i.status,i.claim_token_hash,i.lease_until,i.response_message_id "
+                    "FROM bot_command_invocations i JOIN server_bots b ON b.id=i.bot_id WHERE i.id=$1 AND i.bot_id=$2 FOR UPDATE OF i",
+                    [InvocationId, BotId]) of
+                    {ok, [_Cid, _RequestMid, _BotUid, <<"completed">>, _Hash, _Lease, ExistingMid]} ->
+                        {ok, #{completed => true, message_id => db_null(ExistingMid), duplicate => true}};
+                    {ok, [Cid, RequestMid, BotUid, <<"claimed">>, Hash, LeaseUntil, _]} when LeaseUntil >= Now ->
+                        case secure_token_hash_match(ClaimToken, Hash) of
+                            false -> {error, invalid_claim};
+                            true ->
+                                case channel_message_access(Conn, BotUid, Cid) of
+                                    {ok, Sid} ->
+                                        Mid = new_message_id(),
+                                        ok = exec(Conn,
+                                            "INSERT INTO messages(id,scope,scope_id,user_id,body,reply_to_id,created_at) VALUES($1,'channel',$2,$3,$4,$5,$6)",
+                                            [Mid, Cid, BotUid, store_message(Plain), RequestMid, Now]),
+                                        ok = storage_after_message_change(Conn, Mid, <<"message.created">>, BotUid),
+                                        ok = exec(Conn,
+                                            "UPDATE bot_command_invocations SET status='completed',response_message_id=$1,claim_token_hash='',lease_until=0,completed_at=$2,updated_at=$2 WHERE id=$3",
+                                            [Mid, Now, InvocationId]),
+                                        {ok, Row} = one(Conn, message_select() ++ " WHERE m.id=$1", [Mid]),
+                                        Msg = message_map(Conn, Row),
+                                        {ok, #{completed => true, message_id => Mid, message => Msg, channel_id => Cid, server_id => Sid}};
+                                    _ -> {error, forbidden}
+                                end
+                        end;
+                    {ok, [_Cid, _RequestMid, _BotUid, <<"claimed">>, _Hash, _Lease, _]} -> {error, claim_expired};
+                    {ok, [_Cid, _RequestMid, _BotUid, <<"failed">>, _, _, _]} -> {error, invocation_failed};
+                    _ -> {error, invalid_claim}
+                end
+            end),
+            case Result of
+                {ok, #{message := Msg, channel_id := Cid, server_id := Sid} = Data} ->
+                    invalidate_message_cache(<<"channel">>, Cid),
+                    pw_hub:broadcast({channel, Cid}, #{type => message_created, scope => channel, scope_id => Cid, message => Msg}),
+                    best_effort_channel_notifications(Conn, Sid, maps:get(user_id, Msg), Cid, Msg, pw_util:now_ms(), false),
+                    {ok, maps:without([message, channel_id, server_id], Data)};
+                Other -> Other
+            end
+    end;
+route({bot_fail_command, BotId0, InvocationId0, ClaimToken0, Reason0}, Conn) ->
+    BotId = pw_util:int(BotId0), InvocationId = pw_util:int(InvocationId0),
+    ClaimToken = pw_util:clean_text(ClaimToken0, 256), Reason = pw_util:clean_text(Reason0, 240), Now = pw_util:now_ms(),
+    Result = with_tx(Conn, fun() ->
+        case one(Conn,
+            "SELECT status,claim_token_hash,lease_until,user_id,channel_id FROM bot_command_invocations "
+            "WHERE id=$1 AND bot_id=$2 FOR UPDATE",
+            [InvocationId, BotId]) of
+            {ok, [<<"claimed">>, Hash, LeaseUntil, UserId, ChannelId]} when LeaseUntil >= Now ->
+                case secure_token_hash_match(ClaimToken, Hash) of
+                    true ->
+                        ok = exec(Conn,
+                            "UPDATE bot_command_invocations SET status='failed',fail_reason=$1,claim_token_hash='',lease_until=0,completed_at=$2,updated_at=$2 WHERE id=$3",
+                            [Reason, Now, InvocationId]),
+                        {ok, #{failed => true, id => InvocationId, user_id => UserId, channel_id => ChannelId}};
+                    false -> {error, invalid_claim}
+                end;
+            {ok, [<<"claimed">>, _Hash, _LeaseUntil, _UserId, _ChannelId]} -> {error, claim_expired};
+            {ok, [<<"failed">>, _Hash, _LeaseUntil, _UserId, _ChannelId]} -> {ok, #{failed => true, id => InvocationId, duplicate => true}};
+            _ -> {error, invalid_claim}
+        end
+    end),
+    case Result of
+        {ok, #{duplicate := true} = Data} -> {ok, Data};
+        {ok, #{user_id := UserId, channel_id := ChannelId} = Data} ->
+            case UserId of
+                I when is_integer(I) -> pw_hub:notify_user(I, #{type => bot_command_failed, invocation_id => InvocationId, channel_id => ChannelId, reason => Reason});
+                _ -> ok
+            end,
+            {ok, maps:without([user_id, channel_id], Data)};
+        Other -> Other
     end;
 
 route({create_invite, Uid, Sid0, ChannelId0, MaxUses0, ExpiresIn0}, Conn) ->
@@ -3423,6 +4551,108 @@ route({messages, Uid, Scope0, ScopeId0, Before0, After0}, Conn) ->
             end;
         false ->
             {error, forbidden}
+    end;
+route({message_context, Uid, Mid0}, Conn) ->
+    Mid = pw_util:int(Mid0),
+    case Mid of
+        I when is_integer(I), I > 0 ->
+            case one(Conn, "SELECT scope,scope_id FROM messages WHERE id=$1 AND deleted_at IS NULL", [I]) of
+                {ok, [Scope, ScopeId]} ->
+                    case can_read_messages(Conn, Uid, Scope, ScopeId) of
+                        false -> {error, forbidden};
+                        true ->
+                            %% Reply jumps must stay bounded even when the target is
+                            %% years old. Load a small window around the target and let
+                            %% the client return to the live tail with its normal route.
+                            {ok, BeforeDesc} = rows(Conn,
+                                message_select() ++
+                                " WHERE m.scope=$1 AND m.scope_id=$2 AND m.deleted_at IS NULL AND m.id<$3"
+                                " ORDER BY m.id DESC LIMIT 24", [Scope, ScopeId, I]),
+                            {ok, AfterRows} = rows(Conn,
+                                message_select() ++
+                                " WHERE m.scope=$1 AND m.scope_id=$2 AND m.deleted_at IS NULL AND m.id>=$3"
+                                " ORDER BY m.id ASC LIMIT 37", [Scope, ScopeId, I]),
+                            ContextRows = lists:reverse(BeforeDesc) ++ AfterRows,
+                            ReplyIds = [R || [_,_,_,_,_,_,_,_,R|_] <- ContextRows, R =/= null, is_integer(R)],
+                            ReplyMap = batch_replied_messages(Conn, ReplyIds, Scope, ScopeId),
+                            ReactionMap = batch_message_reactions(Conn, ContextRows, Uid, Scope, ScopeId),
+                            Messages = [message_map_with_replies_and_reactions(R, ReplyMap, ReactionMap) || R <- ContextRows],
+                            case lists:any(fun(M) -> maps:get(id, M, 0) =:= I end, Messages) of
+                                true -> {ok, #{target_id => I, scope => Scope, scope_id => ScopeId, messages => Messages}};
+                                false -> {error, not_found}
+                            end
+                    end;
+                _ -> {error, not_found}
+            end;
+        _ -> {error, not_found}
+    end;
+route({channel_pins, Uid, ChannelId0}, Conn) ->
+    ChannelId = pw_util:int(ChannelId0),
+    case can_read_messages(Conn, Uid, <<"channel">>, ChannelId) of
+        false -> {error, forbidden};
+        true ->
+            {ok, Rows} = rows(Conn,
+                message_select() ++
+                " WHERE m.scope='channel' AND m.scope_id=$1 AND m.deleted_at IS NULL"
+                " AND EXISTS (SELECT 1 FROM message_pins pin WHERE pin.channel_id=$1 AND pin.message_id=m.id)"
+                " ORDER BY (SELECT pin.pinned_at FROM message_pins pin WHERE pin.channel_id=$1 AND pin.message_id=m.id) DESC"
+                " LIMIT 50", [ChannelId]),
+            ReplyIds = [R || [_,_,_,_,_,_,_,_,R|_] <- Rows, R =/= null, is_integer(R)],
+            ReplyMap = batch_replied_messages(Conn, ReplyIds, <<"channel">>, ChannelId),
+            ReactionMap = batch_message_reactions(Conn, Rows, Uid, <<"channel">>, ChannelId),
+            {ok, [message_map_with_replies_and_reactions(R, ReplyMap, ReactionMap) || R <- Rows]}
+    end;
+route({set_message_pin, Uid, Mid0, Pinned0}, Conn) ->
+    Mid = pw_util:int(Mid0),
+    Pinned = case Pinned0 of true -> true; false -> false; _ -> invalid end,
+    case {Mid, Pinned} of
+        {I, P} when is_integer(I), I > 0, is_boolean(P) ->
+            Result = with_tx(Conn, fun() ->
+                case one(Conn,
+                    "SELECT m.scope,m.scope_id,c.server_id FROM messages m"
+                    " LEFT JOIN channels c ON m.scope='channel' AND c.id=m.scope_id"
+                    " WHERE m.id=$1 AND m.deleted_at IS NULL AND m.kind='text' FOR UPDATE OF m", [I]) of
+                    {ok, [<<"channel">>, ChannelId, Sid]} when is_integer(Sid) ->
+                        case has_server_permission(Conn, Uid, Sid, <<"manage_messages">>) of
+                            false -> {error, forbidden};
+                            true ->
+                                case P of
+                                    true ->
+                                        case one(Conn, "SELECT pinned_at FROM message_pins WHERE message_id=$1 AND channel_id=$2", [I, ChannelId]) of
+                                            {ok, [PinnedAt]} -> {ok, #{message_id => I, channel_id => ChannelId, server_id => Sid, pinned => true, pinned_at => PinnedAt}};
+                                            _ ->
+                                                {ok, [Count]} = one(Conn, "SELECT count(*) FROM message_pins WHERE channel_id=$1", [ChannelId]),
+                                                case Count >= 50 of
+                                                    true -> {error, pin_limit};
+                                                    false ->
+                                                        Now = pw_util:now_ms(),
+                                                        ok = exec(Conn,
+                                                            "INSERT INTO message_pins(channel_id,message_id,pinned_by,pinned_at) VALUES($1,$2,$3,$4) ON CONFLICT(message_id) DO NOTHING",
+                                                            [ChannelId, I, Uid, Now]),
+                                                        {ok, #{message_id => I, channel_id => ChannelId, server_id => Sid, pinned => true, pinned_at => Now}}
+                                                end
+                                        end;
+                                    false ->
+                                        _ = exec(Conn, "DELETE FROM message_pins WHERE message_id=$1 AND channel_id=$2", [I, ChannelId]),
+                                        {ok, #{message_id => I, channel_id => ChannelId, server_id => Sid, pinned => false, pinned_at => 0}}
+                                end
+                        end;
+                    {ok, _} -> {error, pins_channel_only};
+                    _ -> {error, not_found}
+                end
+            end),
+            case Result of
+                {ok, #{channel_id := ChannelId, server_id := Sid, pinned := IsPinned} = Data0} ->
+                    invalidate_message_cache(<<"channel">>, ChannelId),
+                    Event = #{type => message_pin_changed, message_id => I, channel_id => ChannelId,
+                              pinned => IsPinned, actor_id => Uid},
+                    pw_hub:broadcast({channel, ChannelId}, Event),
+                    WebhookEvent = case IsPinned of true -> <<"message.pinned">>; false -> <<"message.unpinned">> end,
+                    enqueue_server_webhooks(Conn, Sid, WebhookEvent, #{message_id => I, channel_id => ChannelId, actor_id => Uid}),
+                    {ok, maps:without([server_id], Data0)};
+                Other -> Other
+            end;
+        _ -> {error, invalid_pin_state}
     end;
 route({delete_message, Uid, Mid0}, Conn) ->
     Mid = pw_util:int(Mid0),
@@ -3579,6 +4809,10 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
             Result = with_tx(Conn, fun() ->
                 case channel_message_access(Conn, Uid, Cid) of
                     {ok, Sid} ->
+                        case enforce_channel_slowmode(Conn, Uid, Cid, Sid) of
+                            {error, SlowReason} -> throw({plainwire_error, SlowReason});
+                            ok -> ok
+                        end,
                         VoiceNoteAllowed = case is_voice_note_body(Plain) of
                             true -> has_server_permission(Conn, Uid, Sid, <<"send_voice_notes">>);
                             false -> true
@@ -4223,6 +5457,77 @@ route({upload_delete_finish, Path0, Result}, Conn) ->
             end
     end;
 %% public-to-members, yes. imaginary ids, no; they bloat hub subscriptions.
+route(search_index_status, Conn) ->
+    case one(Conn, "SELECT key_fingerprint,last_message_id,complete,updated_at FROM message_search_state WHERE id=1", []) of
+        {ok, [Fingerprint, LastId, Complete, UpdatedAt]} ->
+            {ok, #{key_fingerprint => Fingerprint, last_message_id => LastId, complete => Complete, updated_at => UpdatedAt}};
+        _ -> {ok, #{key_fingerprint => <<>>, last_message_id => 0, complete => false, updated_at => 0}}
+    end;
+route({search_index_reconcile, Limit0}, Conn) ->
+    Limit = min(250, max(10, case pw_util:int(Limit0) of undefined -> 100; L -> L end)),
+    case pw_crypto:search_enabled() of
+        false -> {ok, #{enabled => false, indexed => 0, complete => false}};
+        true ->
+            Fingerprint = pw_crypto:search_key_fingerprint(),
+            with_tx(Conn, fun() ->
+                {ok, State} = one(Conn,
+                    "SELECT key_fingerprint,last_message_id,complete FROM message_search_state WHERE id=1 FOR UPDATE", []),
+                {OldFingerprint, Last0, Complete0} = case State of
+                    [F, L0, C0] -> {F, L0, C0};
+                    _ -> {<<>>, 0, false}
+                end,
+                Last = case OldFingerprint =:= Fingerprint of
+                    true -> Last0;
+                    false ->
+                        ok = exec(Conn, "DELETE FROM message_search_tokens", []),
+                        ok = exec(Conn,
+                            "UPDATE message_search_state SET key_fingerprint=$1,last_message_id=0,complete=false,updated_at=$2 WHERE id=1",
+                            [Fingerprint, pw_util:now_ms()]),
+                        0
+                end,
+                case Complete0 andalso OldFingerprint =:= Fingerprint of
+                    true -> {ok, #{enabled => true, indexed => 0, complete => true, last_message_id => Last}};
+                    false ->
+                        {ok, Rows0} = rows(Conn,
+                            "SELECT id,body,COALESCE(deleted_at,0),kind FROM messages WHERE id>$1 ORDER BY id ASC LIMIT $2",
+                            [Last, Limit]),
+                        [sync_search_row(Conn, Row) || Row <- Rows0],
+                        NewLast = case lists:reverse(Rows0) of [[Id|_] | _] -> Id; [] -> Last end,
+                        Complete = length(Rows0) < Limit,
+                        Now = pw_util:now_ms(),
+                        ok = exec(Conn,
+                            "UPDATE message_search_state SET key_fingerprint=$1,last_message_id=$2,complete=$3,updated_at=$4 WHERE id=1",
+                            [Fingerprint, NewLast, Complete, Now]),
+                        {ok, #{enabled => true, indexed => length(Rows0), complete => Complete, last_message_id => NewLast}}
+                end
+            end)
+    end;
+route({search_messages, Uid, Query0, Before0, Limit0}, Conn) ->
+    Query = pw_util:clean_text(Query0, 500),
+    Hashes = pw_crypto:search_hashes(Query),
+    Limit = min(50, max(1, case pw_util:int(Limit0) of undefined -> 30; L -> L end)),
+    Before = case pw_util:int(Before0) of B when is_integer(B), B > 0 -> B; _ -> 9223372036854775807 end,
+    case Hashes of
+        [] -> {error, invalid_search};
+        _ ->
+            %% Search tokens are intentionally global blind indexes.  Scan in
+            %% bounded pages and re-check the caller's ACL for every candidate
+            %% so unrelated private matches cannot crowd older authorized
+            %% results out of the first page.  The scan ceiling also bounds DB
+            %% work for very common terms without leaking global match counts.
+            CandidateBatch = min(250, max(100, Limit * 6)),
+            ScanBudget = min(2000, max(500, Limit * 30)),
+            Messages = search_authorized_batches(Conn, Uid, Hashes, Before, Limit, CandidateBatch, ScanBudget, []),
+            %% Client search needs to know only whether backfill is complete. Do
+            %% not disclose instance-wide indexing cursors, key fingerprints, or
+            %% timestamps to ordinary users.
+            PublicIndex = case route(search_index_status, Conn) of
+                {ok, S0} -> #{complete => maps:get(complete, S0, false)};
+                _ -> #{complete => false}
+            end,
+            {ok, #{messages => Messages, query => Query, index => PublicIndex}}
+    end;
+
 route({subscribable, thread, Id}, Conn) ->
     case one(Conn, "SELECT id FROM threads WHERE id = $1", [Id]) of
         {ok, [_]} -> true;
@@ -4296,6 +5601,79 @@ route({conversation_peer_ids, Uid, Cid0}, Conn) ->
             {ok, [only_id(R) || R <- Rows]};
         false ->
             {error, forbidden}
+    end.
+
+sync_message_search_index(Conn, Msg) ->
+    Mid = maps:get(id, Msg),
+    Deleted = maps:get(deleted_at, Msg, undefined),
+    Kind = maps:get(kind, Msg, <<"text">>),
+    Body = maps:get(body, Msg, <<>>),
+    case Deleted =:= undefined andalso Kind =:= <<"text">> of
+        true -> replace_message_search_tokens(Conn, Mid, load_message(Body));
+        false -> exec(Conn, "DELETE FROM message_search_tokens WHERE message_id=$1", [Mid])
+    end.
+
+sync_search_row(Conn, [Mid, Body, DeletedAt, Kind]) ->
+    case DeletedAt =:= 0 andalso Kind =:= <<"text">> of
+        true -> replace_message_search_tokens(Conn, Mid, load_message(Body));
+        false -> exec(Conn, "DELETE FROM message_search_tokens WHERE message_id=$1", [Mid])
+    end;
+sync_search_row(_Conn, _) -> ok.
+
+replace_message_search_tokens(Conn, Mid, Plain) ->
+    Hashes = pw_crypto:search_hashes(Plain),
+    ok = exec(Conn, "DELETE FROM message_search_tokens WHERE message_id=$1", [Mid]),
+    [ok = exec(Conn,
+        "INSERT INTO message_search_tokens(message_id,token) VALUES($1,$2) ON CONFLICT DO NOTHING",
+        [Mid, Hash]) || Hash <- Hashes],
+    ok.
+
+search_candidate_rows(Conn, Hashes, Before, Limit) ->
+    N = length(Hashes),
+    TokenPlaceholders = string:join(["$" ++ integer_to_list(I) || I <- lists:seq(2, N + 1)], ","),
+    CountParam = N + 2,
+    LimitParam = N + 3,
+    %% Carry scope metadata in the blind-index query so unauthorized candidates
+    %% can be rejected without an extra point SELECT per result. The query still
+    %% returns no message plaintext; bodies are loaded only after the normal ACL.
+    Sql = "SELECT m.id,m.scope,m.scope_id FROM messages m JOIN message_search_tokens st ON st.message_id=m.id "
+          "WHERE m.id<$1 AND m.deleted_at IS NULL AND m.kind='text' AND st.token IN (" ++ TokenPlaceholders ++ ") "
+          "GROUP BY m.id,m.scope,m.scope_id HAVING count(DISTINCT st.token)=$" ++ integer_to_list(CountParam) ++
+          " ORDER BY m.id DESC LIMIT $" ++ integer_to_list(LimitParam),
+    Params = [Before] ++ Hashes ++ [N, Limit],
+    case rows(Conn, Sql, Params) of
+        {ok, Rs} -> Rs;
+        _ -> []
+    end.
+
+search_authorized_batches(_Conn, _Uid, _Hashes, _Before, Limit, _Batch, _Budget, Acc) when length(Acc) >= Limit ->
+    lists:reverse(Acc);
+search_authorized_batches(_Conn, _Uid, _Hashes, _Before, _Limit, _Batch, Budget, Acc) when Budget =< 0 ->
+    lists:reverse(Acc);
+search_authorized_batches(Conn, Uid, Hashes, Before, Limit, Batch, Budget, Acc) ->
+    Fetch = min(Batch, Budget),
+    Candidates = search_candidate_rows(Conn, Hashes, Before, Fetch),
+    {Acc1, Used} = collect_authorized_search_batch(Conn, Uid, Candidates, Limit, Acc, 0),
+    case {length(Acc1) >= Limit, Candidates, length(Candidates) < Fetch} of
+        {true, _, _} -> lists:reverse(Acc1);
+        {false, [], _} -> lists:reverse(Acc1);
+        {false, _, true} -> lists:reverse(Acc1);
+        {false, _, false} ->
+            [NextBefore | _] = lists:last(Candidates),
+            search_authorized_batches(Conn, Uid, Hashes, NextBefore, Limit, Batch, Budget - Used, Acc1)
+    end.
+
+collect_authorized_search_batch(_Conn, _Uid, _Candidates, Limit, Acc, Used) when length(Acc) >= Limit -> {Acc, Used};
+collect_authorized_search_batch(_Conn, _Uid, [], _Limit, Acc, Used) -> {Acc, Used};
+collect_authorized_search_batch(Conn, Uid, [[Mid, Scope, ScopeId] | Rest], Limit, Acc, Used0) ->
+    Used = Used0 + 1,
+    case can_read_messages(Conn, Uid, Scope, ScopeId) of
+        true ->
+            case one(Conn, message_select() ++ " WHERE m.id=$1 AND m.deleted_at IS NULL", [Mid]) of
+                {ok, Row} -> collect_authorized_search_batch(Conn, Uid, Rest, Limit, [message_map(Conn, Row) | Acc], Used);
+                _ -> collect_authorized_search_batch(Conn, Uid, Rest, Limit, Acc, Used)
+            end;
+        false -> collect_authorized_search_batch(Conn, Uid, Rest, Limit, Acc, Used)
     end.
 
 map_rows_resilient(Name, Rows, Fun) ->
@@ -4860,7 +6238,719 @@ migrations() -> [
         "ALTER TABLE storage_outbox DROP CONSTRAINT IF EXISTS storage_outbox_entity_created_at_check",
         "ALTER TABLE storage_outbox ADD CONSTRAINT storage_outbox_entity_created_at_check CHECK(entity_created_at >= 0)"
     ]}
+
+    ,{40, [
+        %% Search never stores plaintext message terms. Tokens are keyed HMACs
+        %% derived in Erlang and are useless without the instance search key.
+        "CREATE TABLE IF NOT EXISTS message_search_tokens(message_id bigint NOT NULL REFERENCES messages(id) ON DELETE CASCADE, token text NOT NULL, PRIMARY KEY(message_id,token))",
+        "CREATE INDEX IF NOT EXISTS idx_message_search_token ON message_search_tokens(token,message_id DESC)",
+        "CREATE TABLE IF NOT EXISTS message_search_state(id smallint PRIMARY KEY CHECK(id=1), key_fingerprint text NOT NULL DEFAULT '', last_message_id bigint NOT NULL DEFAULT 0, complete boolean NOT NULL DEFAULT false, updated_at bigint NOT NULL DEFAULT 0)",
+        "INSERT INTO message_search_state(id,key_fingerprint,last_message_id,complete,updated_at) VALUES(1,'',0,false,0) ON CONFLICT(id) DO NOTHING"
+    ]}
+    ,{41, [
+        %% Bot commands are a durable, language-neutral queue. Command arguments
+        %% are encrypted before storage; claim tokens are stored only as hashes.
+        "CREATE TABLE IF NOT EXISTS bot_commands(id bigserial PRIMARY KEY,bot_id bigint NOT NULL REFERENCES server_bots(id) ON DELETE CASCADE,server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE,name text NOT NULL,description text NOT NULL DEFAULT '',options_json text NOT NULL DEFAULT '[]',enabled boolean NOT NULL DEFAULT true,created_at bigint NOT NULL,updated_at bigint NOT NULL,UNIQUE(server_id,name))",
+        "CREATE INDEX IF NOT EXISTS idx_bot_commands_bot ON bot_commands(bot_id,id)",
+        "CREATE TABLE IF NOT EXISTS bot_command_invocations(id bigserial PRIMARY KEY,command_id bigint NOT NULL REFERENCES bot_commands(id) ON DELETE CASCADE,bot_id bigint NOT NULL REFERENCES server_bots(id) ON DELETE CASCADE,server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE,channel_id integer NOT NULL REFERENCES channels(id) ON DELETE CASCADE,user_id integer REFERENCES users(id) ON DELETE SET NULL,request_message_id bigint REFERENCES messages(id) ON DELETE SET NULL,args_cipher text NOT NULL,status text NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','claimed','completed','failed')),claim_token_hash text NOT NULL DEFAULT '',lease_until bigint NOT NULL DEFAULT 0,attempts integer NOT NULL DEFAULT 0,response_message_id bigint,fail_reason text NOT NULL DEFAULT '',created_at bigint NOT NULL,updated_at bigint NOT NULL,completed_at bigint NOT NULL DEFAULT 0)",
+        "CREATE INDEX IF NOT EXISTS idx_bot_command_invocations_claim ON bot_command_invocations(bot_id,status,lease_until,id)",
+        "CREATE INDEX IF NOT EXISTS idx_bot_command_invocations_user ON bot_command_invocations(user_id,id DESC) WHERE user_id IS NOT NULL"
+    ]}
+    ,{42, [
+        %% Host moderation changes account access only. It never grants the
+        %% control plane access to messages or private attachment contents.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderation_title text NOT NULL DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderation_reason text NOT NULL DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderation_severity text NOT NULL DEFAULT 'warning'",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderation_expires_at bigint NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderated_by integer REFERENCES users(id) ON DELETE SET NULL",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderated_at bigint NOT NULL DEFAULT 0",
+        "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_state_check",
+        "ALTER TABLE users ADD CONSTRAINT users_account_state_check CHECK(account_state IN ('active','disabled','suspended','banned'))",
+        "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_moderation_severity_check",
+        "ALTER TABLE users ADD CONSTRAINT users_moderation_severity_check CHECK(moderation_severity IN ('info','warning','critical'))",
+        "CREATE TABLE IF NOT EXISTS instance_account_actions(id bigserial PRIMARY KEY,user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,actor_user_id integer REFERENCES users(id) ON DELETE SET NULL,action text NOT NULL CHECK(action IN ('suspend','ban','restore')),title text NOT NULL DEFAULT '',reason text NOT NULL DEFAULT '',severity text NOT NULL DEFAULT 'warning',expires_at bigint NOT NULL DEFAULT 0,created_at bigint NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_instance_account_actions_user ON instance_account_actions(user_id,id DESC)"
+    ]}
+    ,{43, [
+        %% Channel pins are deliberately separate from message rows so pin
+        %% history can be changed without rewriting encrypted message bodies.
+        "CREATE TABLE IF NOT EXISTS message_pins(channel_id integer NOT NULL REFERENCES channels(id) ON DELETE CASCADE,message_id bigint PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,pinned_by integer REFERENCES users(id) ON DELETE SET NULL,pinned_at bigint NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_message_pins_channel ON message_pins(channel_id,pinned_at DESC,message_id DESC)"
+    ]}
+    ,{44, [
+        %% Slowmode is channel configuration. Enforcement is serialized per
+        %% user/channel at send time so concurrent API nodes cannot bypass it.
+        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS slowmode_seconds integer NOT NULL DEFAULT 0",
+        "ALTER TABLE channels DROP CONSTRAINT IF EXISTS channels_slowmode_seconds_check",
+        "ALTER TABLE channels ADD CONSTRAINT channels_slowmode_seconds_check CHECK(slowmode_seconds BETWEEN 0 AND 21600)"
+    ]}
+    ,{45, [
+        %% Incoming channel webhooks have dedicated bot identities. Tokens are
+        %% stored only as hashes; deleting a webhook disables its identity while
+        %% preserving authorship of historical messages.
+        "CREATE TABLE IF NOT EXISTS incoming_webhooks(id bigserial PRIMARY KEY,server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE,channel_id integer NOT NULL REFERENCES channels(id) ON DELETE CASCADE,bot_user_id integer NOT NULL UNIQUE REFERENCES users(id),name text NOT NULL,token_hash text NOT NULL UNIQUE,enabled boolean NOT NULL DEFAULT true,created_by integer REFERENCES users(id) ON DELETE SET NULL,created_at bigint NOT NULL,updated_at bigint NOT NULL,last_used_at bigint NOT NULL DEFAULT 0)",
+        "CREATE INDEX IF NOT EXISTS idx_incoming_webhooks_server ON incoming_webhooks(server_id,id)",
+        "CREATE INDEX IF NOT EXISTS idx_incoming_webhooks_channel ON incoming_webhooks(channel_id,id)"
+    ]}
+    ,{46, [
+        %% User-owned developer applications are templates above server-scoped
+        %% bot installations. Existing server_bots remain fully compatible.
+        "CREATE TABLE IF NOT EXISTS developer_applications(id bigserial PRIMARY KEY,owner_user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,public_id text NOT NULL UNIQUE,name text NOT NULL,description text NOT NULL DEFAULT '',avatar_url text NOT NULL DEFAULT '',public boolean NOT NULL DEFAULT false,default_permissions bigint NOT NULL DEFAULT 0,interaction_url text NOT NULL DEFAULT '',interaction_secret text NOT NULL DEFAULT '',ai_enabled boolean NOT NULL DEFAULT false,ai_endpoint text NOT NULL DEFAULT '',ai_model text NOT NULL DEFAULT '',ai_api_key text NOT NULL DEFAULT '',ai_system_prompt text NOT NULL DEFAULT '',created_at bigint NOT NULL,updated_at bigint NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_developer_applications_owner ON developer_applications(owner_user_id,id DESC)",
+        "CREATE TABLE IF NOT EXISTS developer_app_installations(id bigserial PRIMARY KEY,app_id bigint NOT NULL REFERENCES developer_applications(id) ON DELETE CASCADE,server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE,server_bot_id bigint NOT NULL UNIQUE REFERENCES server_bots(id) ON DELETE CASCADE,role_id bigint REFERENCES server_roles(id) ON DELETE SET NULL,installed_by integer REFERENCES users(id) ON DELETE SET NULL,created_at bigint NOT NULL,UNIQUE(app_id,server_id))",
+        "CREATE INDEX IF NOT EXISTS idx_developer_app_installations_app ON developer_app_installations(app_id,id)",
+        "CREATE INDEX IF NOT EXISTS idx_developer_app_installations_server ON developer_app_installations(server_id,id)",
+        "CREATE TABLE IF NOT EXISTS developer_app_commands(id bigserial PRIMARY KEY,app_id bigint NOT NULL REFERENCES developer_applications(id) ON DELETE CASCADE,name text NOT NULL,description text NOT NULL DEFAULT '',options_json text NOT NULL DEFAULT '[]',handler text NOT NULL DEFAULT 'queue' CHECK(handler IN ('queue','webhook','ai')),created_at bigint NOT NULL,updated_at bigint NOT NULL,UNIQUE(app_id,name))",
+        "CREATE INDEX IF NOT EXISTS idx_developer_app_commands_app ON developer_app_commands(app_id,id)",
+        "ALTER TABLE bot_commands ADD COLUMN IF NOT EXISTS developer_command_id bigint REFERENCES developer_app_commands(id) ON DELETE CASCADE",
+        "ALTER TABLE bot_commands ADD COLUMN IF NOT EXISTS handler text NOT NULL DEFAULT 'queue'",
+        "ALTER TABLE bot_commands DROP CONSTRAINT IF EXISTS bot_commands_handler_check",
+        "ALTER TABLE bot_commands ADD CONSTRAINT bot_commands_handler_check CHECK(handler IN ('queue','webhook','ai'))",
+        "CREATE INDEX IF NOT EXISTS idx_bot_commands_handler ON bot_commands(handler,bot_id,id)",
+        "CREATE INDEX IF NOT EXISTS idx_bot_commands_developer_command ON bot_commands(developer_command_id) WHERE developer_command_id IS NOT NULL"
+    ]}
+    ,{47, [
+        %% Server managers can narrow app-command usage by channel, role or
+        %% member. Rules are evaluated at discovery and invocation time.
+        "CREATE TABLE IF NOT EXISTS bot_command_permissions(command_id bigint NOT NULL REFERENCES bot_commands(id) ON DELETE CASCADE,subject_type text NOT NULL CHECK(subject_type IN ('channel','role','user')),subject_id bigint NOT NULL,allow boolean NOT NULL,created_at bigint NOT NULL,updated_at bigint NOT NULL,PRIMARY KEY(command_id,subject_type,subject_id))",
+        "CREATE INDEX IF NOT EXISTS idx_bot_command_permissions_command ON bot_command_permissions(command_id,subject_type,subject_id)"
+    ]}
+    ,{48, [
+        %% Internal webhook/AI workers claim across all installed bots. Keep the
+        %% hot queue tiny even when completed invocation history becomes large;
+        %% completed/failed rows deliberately do not occupy this partial index.
+        "CREATE INDEX IF NOT EXISTS idx_bot_command_invocations_active ON bot_command_invocations(id,lease_until) WHERE status IN ('pending','claimed')"
+    ]}
+    ,{49, [
+        %% Slowmode is evaluated on every channel message send. This partial
+        %% index serves the exact channel+author live-message lookup without
+        %% adding write amplification to deleted/direct/profile message rows.
+        "CREATE INDEX IF NOT EXISTS idx_messages_channel_author_recent ON messages(scope_id,user_id,created_at DESC) WHERE scope='channel' AND deleted_at IS NULL"
+    ]}
 ].
+
+
+
+developer_app_select() ->
+    "SELECT a.id,a.owner_user_id,a.public_id,a.name,a.description,a.avatar_url,a.public,a.default_permissions,"
+    "a.interaction_url,a.interaction_secret,a.ai_enabled,a.ai_endpoint,a.ai_model,a.ai_api_key,a.ai_system_prompt,a.created_at,a.updated_at FROM developer_applications a".
+
+developer_app_owned_row(Conn, Uid, AppId, Lock) when is_integer(AppId), AppId > 0 ->
+    Suffix = case Lock of true -> " FOR UPDATE OF a"; false -> "" end,
+    one(Conn, developer_app_select() ++ " WHERE a.id=$1 AND a.owner_user_id=$2" ++ Suffix, [AppId, Uid]);
+developer_app_owned_row(_Conn, _Uid, _AppId, _Lock) -> {error, not_found}.
+
+developer_app_map([Id, Owner, PublicId, Name, Description, Avatar, Public, DefaultPermissions,
+                   InteractionUrl, InteractionSecret, AiEnabled, AiEndpoint, AiModel, AiApiKey, AiSystemPrompt,
+                   CreatedAt, UpdatedAt]) ->
+    #{id => Id, owner_user_id => Owner, public_id => PublicId, name => Name, description => Description,
+      avatar_source => pw_util:bin(Avatar), avatar_url => pw_util:proxied_image(Avatar), public => Public =:= true,
+      default_permissions => pw_permissions:sanitize(DefaultPermissions),
+      interaction => #{url => pw_util:bin(InteractionUrl), configured => pw_util:bin(InteractionUrl) =/= <<>> andalso pw_util:bin(InteractionSecret) =/= <<>>},
+      ai => #{enabled => AiEnabled =:= true, endpoint => pw_util:bin(AiEndpoint), model => pw_util:bin(AiModel),
+              has_api_key => pw_util:bin(AiApiKey) =/= <<>>, system_prompt => load_message(AiSystemPrompt),
+              configured => AiEnabled =:= true andalso pw_util:bin(AiEndpoint) =/= <<>> andalso pw_util:bin(AiModel) =/= <<>> andalso pw_util:bin(AiApiKey) =/= <<>>},
+      created_at => CreatedAt, updated_at => UpdatedAt}.
+
+developer_installation_map([Id, Sid, ServerName, BotId, BotUid, Username, Display, Avatar, RoleId, InstalledBy, CreatedAt]) ->
+    #{id => Id, server_id => Sid, server_name => ServerName, bot_id => BotId, bot_user_id => BotUid,
+      username => Username, display_name => Display, avatar_url => pw_util:proxied_image(Avatar), role_id => int_or(pw_util:int(RoleId), 0),
+      installed_by => db_null(InstalledBy), created_at => CreatedAt}.
+
+server_app_map([InstallId, AppId, PublicId, Name, Description, Avatar, BotId, BotUid, Username, Display, RoleId, InstalledBy, CreatedAt]) ->
+    #{installation_id => InstallId, app_id => AppId, public_id => PublicId, name => Name, description => Description,
+      avatar_url => pw_util:proxied_image(Avatar), bot_id => BotId, bot_user_id => BotUid, username => Username,
+      display_name => Display, role_id => int_or(pw_util:int(RoleId), 0), installed_by => db_null(InstalledBy), created_at => CreatedAt}.
+
+developer_command_map([Id, Name, Description, OptionsJson, Handler, CreatedAt, UpdatedAt]) ->
+    #{id => Id, name => Name, description => Description, options => decode_json_value(OptionsJson, []), handler => Handler,
+      created_at => CreatedAt, updated_at => UpdatedAt}.
+
+developer_public_command_map([Name, Description, OptionsJson, Handler]) ->
+    #{name => Name, description => Description, options => decode_json_value(OptionsJson, []), handler => Handler}.
+
+normalize_developer_handler(Value0) ->
+    case string:lowercase(pw_util:bin(Value0)) of
+        <<"queue">> -> <<"queue">>;
+        <<"webhook">> -> <<"webhook">>;
+        <<"ai">> -> <<"ai">>;
+        _ -> invalid
+    end.
+
+developer_handler_available(_App, <<"queue">>) -> true;
+developer_handler_available(App, <<"webhook">>) -> maps:get(configured, maps:get(interaction, App), false);
+developer_handler_available(App, <<"ai">>) -> maps:get(configured, maps:get(ai, App), false);
+developer_handler_available(_, _) -> false.
+
+developer_endpoint_valid(<<>>) -> true;
+developer_endpoint_valid(Url) when is_binary(Url) ->
+    case pw_outbound_url:resolve_allowed(Url) of {ok, _} -> true; _ -> false end;
+developer_endpoint_valid(_) -> false.
+
+unique_developer_public_id(Conn) ->
+    Candidate = <<"app_", (pw_util:random_token(18))/binary>>,
+    case one(Conn, "SELECT id FROM developer_applications WHERE public_id=$1", [Candidate]) of
+        {ok, [_]} -> unique_developer_public_id(Conn);
+        _ -> Candidate
+    end.
+
+developer_app_avatar(Conn, Uid, Value0) ->
+    Value = pw_util:clean_text(Value0, 17825792),
+    case Value of
+        <<>> -> <<>>;
+        <<"/api/files/", Id/binary>> ->
+            case profile_upload_allowed(Conn, Uid, Id) of true -> Value; false -> <<>> end;
+        _ -> store_image_url(Value)
+    end.
+
+install_developer_app_internal(Conn, Uid, App, Sid) when is_integer(Sid), Sid > 0 ->
+    
+AppId = maps:get(id, App),
+    case has_server_permission(Conn, Uid, Sid, <<"manage_bots">>) of
+        false -> {error, forbidden};
+        true ->
+            _ = one(Conn, "SELECT id FROM servers WHERE id=$1 FOR UPDATE", [Sid]),
+            case one(Conn, "SELECT id FROM developer_app_installations WHERE app_id=$1 AND server_id=$2", [AppId, Sid]) of
+                {ok, [_]} -> {error, already_installed};
+                _ ->
+                    {ok, [Count]} = one(Conn, "SELECT count(*) FROM server_bots WHERE server_id=$1", [Sid]),
+                    case Count >= 50 of
+                        true -> {error, bot_limit};
+                        false ->
+                            case one(Conn,
+                                "SELECT c.name FROM developer_app_commands dc JOIN bot_commands c ON c.server_id=$2 AND c.name=dc.name WHERE dc.app_id=$1 LIMIT 1",
+                                [AppId, Sid]) of
+                                {ok, [Conflict]} -> {error, {command_name_conflict, Conflict}};
+                                _ -> create_developer_installation_rows(Conn, Uid, App, Sid)
+                            end
+                    end
+            end
+    end;
+install_developer_app_internal(_Conn, _Uid, _App, _Sid) -> {error, invalid_server}.
+
+create_developer_installation_rows(Conn, Uid, App, Sid) ->
+    
+
+AppId = maps:get(id, App), Name = maps:get(name, App), Description = maps:get(description, App, <<>>),
+    Avatar = maps:get(avatar_source, App, <<>>), Now = pw_util:now_ms(),
+    Token = <<"pwb_", (pw_util:random_token(36))/binary>>, TokenHash = pw_util:sha256_hex(Token),
+    Salt = pw_util:random_token(18), PasswordHash = pw_util:pbkdf2(pw_util:random_token(32), Salt),
+    Username = unique_bot_username(Conn, Sid, Name),
+    {ok, BotUid} = insert_returning(Conn,
+        "INSERT INTO users(username,display_name,password_hash,password_salt,bio,avatar_url,banner_url,status,theme,created_at,updated_at,last_seen,account_state,disabled_at,is_bot) "
+        "VALUES($1,$2,$3,$4,$5,$6,'','','system',$7,$7,$7,'active',0,true) RETURNING id",
+        [Username, Name, PasswordHash, Salt, Description, Avatar, Now]),
+    ok = exec(Conn, "INSERT INTO server_members(server_id,user_id,role,joined_at) VALUES($1,$2,'member',$3)", [Sid, BotUid, Now]),
+    Requested = pw_permissions:sanitize(maps:get(default_permissions, App, 0)),
+    Permissions = grantable_role_permissions(Conn, Uid, Sid, Requested),
+    RoleId = case Permissions of
+        0 -> 0;
+        _ ->
+            {ok, Rid} = insert_returning(Conn,
+                "INSERT INTO server_roles(server_id,name,color,permissions,position,hoist,mentionable,created_at,updated_at) VALUES($1,$2,'',$3,0,false,false,$4,$4) RETURNING id",
+                [Sid, Name, Permissions, Now]),
+            ok = exec(Conn, "INSERT INTO server_member_roles(server_id,user_id,role_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", [Sid, BotUid, Rid]),
+            Rid
+    end,
+    {ok, BotId} = insert_returning(Conn,
+        "INSERT INTO server_bots(server_id,bot_user_id,name,token_hash,created_by,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$6) RETURNING id",
+        [Sid, BotUid, Name, TokenHash, Uid, Now]),
+    RoleDb = case RoleId of 0 -> null; _ -> RoleId end,
+    {ok, InstallId} = insert_returning(Conn,
+        "INSERT INTO developer_app_installations(app_id,server_id,server_bot_id,role_id,installed_by,created_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
+        [AppId, Sid, BotId, RoleDb, Uid, Now]),
+    ok = sync_developer_commands_to_installation(Conn, AppId, BotId, Sid, Now),
+    ok = sync_profile_upload_refs(Conn, BotUid, Avatar, <<>>, Now),
+    publish_server_event(Conn, Sid, #{type => bot_added, server_id => Sid, bot_user_id => BotUid, application_id => AppId}),
+    enqueue_server_webhooks(Conn, Sid, <<"bot.added">>, #{bot_user_id => BotUid, bot_id => BotId, application_id => AppId, actor_id => Uid}),
+    {ok, #{installation_id => InstallId, app_id => AppId, server_id => Sid, bot_id => BotId, bot_user_id => BotUid,
+           username => Username, token => Token, permissions => Permissions, role_id => RoleId, created_at => Now}}.
+
+sync_developer_commands_to_installation(Conn, AppId, BotId, Sid, Now) ->
+    {ok, Commands} = rows(Conn,
+        "SELECT id,name,description,options_json,handler FROM developer_app_commands WHERE app_id=$1 ORDER BY id ASC", [AppId]),
+    lists:foreach(fun([DevCmdId, Name, Description, OptionsJson, Handler]) ->
+        case one(Conn,
+            "INSERT INTO bot_commands(bot_id,server_id,name,description,options_json,enabled,developer_command_id,handler,created_at,updated_at) "
+            "VALUES($1,$2,$3,$4,$5,true,$6,$7,$8,$8) ON CONFLICT(server_id,name) DO UPDATE SET description=EXCLUDED.description,options_json=EXCLUDED.options_json,enabled=true,developer_command_id=EXCLUDED.developer_command_id,handler=EXCLUDED.handler,updated_at=EXCLUDED.updated_at WHERE bot_commands.bot_id=EXCLUDED.bot_id RETURNING id",
+            [BotId, Sid, Name, Description, OptionsJson, DevCmdId, Handler, Now]) of
+            {ok, [_]} -> ok;
+            _ -> throw({plainwire_error, command_name_taken})
+        end
+    end, Commands),
+    ok.
+
+uninstall_developer_app_internal(Conn, AppId, InstallId, Sid, BotId, RoleId, ActorUid) ->
+    case one(Conn,
+        "SELECT b.bot_user_id FROM developer_app_installations di JOIN server_bots b ON b.id=di.server_bot_id WHERE di.id=$1 AND di.app_id=$2 AND di.server_id=$3 AND di.server_bot_id=$4 FOR UPDATE OF di,b",
+        [InstallId, AppId, Sid, BotId]) of
+        {ok, [BotUid]} ->
+            Now = pw_util:now_ms(),
+            ok = exec(Conn, "DELETE FROM server_member_roles WHERE server_id=$1 AND user_id=$2", [Sid, BotUid]),
+            ok = exec(Conn, "DELETE FROM server_members WHERE server_id=$1 AND user_id=$2", [Sid, BotUid]),
+            ok = exec(Conn, "DELETE FROM server_bots WHERE id=$1 AND server_id=$2", [BotId, Sid]),
+            case pw_util:int(RoleId) of
+                Rid when is_integer(Rid), Rid > 0 -> ok = exec(Conn, "DELETE FROM server_roles WHERE id=$1 AND server_id=$2", [Rid, Sid]);
+                _ -> ok
+            end,
+            %% Preserve historical authorship while making the detached bot identity
+            %% permanently non-authenticating and undiscoverable as an active account.
+            ok = exec(Conn, "UPDATE users SET account_state='disabled',disabled_at=$1,updated_at=$1 WHERE id=$2 AND is_bot=true", [Now, BotUid]),
+            publish_server_event(Conn, Sid, #{type => bot_removed, server_id => Sid, bot_user_id => BotUid, application_id => AppId}),
+            enqueue_server_webhooks(Conn, Sid, <<"bot.removed">>, #{bot_user_id => BotUid, bot_id => BotId, application_id => AppId, actor_id => ActorUid}),
+            ok;
+        _ -> throw({plainwire_error, not_found})
+    end.
+
+
+internal_app_claim_route(Conn, Handler, Limit0) ->
+    Limit = clamp_int(Limit0, 1, 32, 8),
+    Now = pw_util:now_ms(),
+    LeaseMs = clamp_int(pw_util:env_int("PLAINWIRE_APP_COMMAND_LEASE_MS", 45000), 10000, 120000, 45000),
+    MaxAttempts = clamp_int(pw_util:env_int("PLAINWIRE_APP_COMMAND_MAX_ATTEMPTS", 6), 1, 20, 6),
+    Result = with_tx(Conn, fun() ->
+        %% Internal workers use lease_until as both the in-flight lease and the
+        %% retry clock. Exhausted jobs are terminal so a bad endpoint cannot
+        %% permanently occupy the head of the queue.
+        ok = exec(Conn,
+            "UPDATE bot_command_invocations i SET status='failed',fail_reason='delivery attempts exhausted',claim_token_hash='',lease_until=0,completed_at=$1,updated_at=$1 "
+            "FROM bot_commands c WHERE c.id=i.command_id AND c.handler=$2 AND i.status='claimed' AND i.lease_until<$1 AND i.attempts >= $3",
+            [Now, Handler, MaxAttempts]),
+        {ok, Rows0} = rows(Conn,
+            "SELECT i.id,c.name,c.id,i.server_id,i.channel_id,i.user_id,i.request_message_id,i.args_cipher,i.attempts,i.created_at,"
+            "b.bot_user_id,a.id,a.public_id,a.name,a.interaction_url,a.interaction_secret,a.ai_enabled,a.ai_endpoint,a.ai_model,a.ai_api_key,a.ai_system_prompt "
+            "FROM bot_command_invocations i JOIN bot_commands c ON c.id=i.command_id "
+            "JOIN server_bots b ON b.id=i.bot_id JOIN users bu ON bu.id=b.bot_user_id "
+            "JOIN developer_app_installations di ON di.server_bot_id=b.id "
+            "JOIN developer_applications a ON a.id=di.app_id "
+            "WHERE c.handler=$1 AND bu.account_state='active' AND (i.status='pending' OR (i.status='claimed' AND i.lease_until<$2)) "
+            "ORDER BY i.id ASC LIMIT $3 FOR UPDATE OF i SKIP LOCKED",
+            [Handler, Now, Limit]),
+        {Jobs, Failed} = claim_internal_app_rows(Conn, Handler, Rows0, Now, LeaseMs, [], []),
+        {ok, #{jobs => lists:reverse(Jobs), failed => lists:reverse(Failed)}}
+    end),
+    case Result of
+        {ok, #{jobs := Jobs, failed := Failed}} ->
+            [pw_hub:notify_user(UserId, #{type => bot_command_failed, invocation_id => InvocationId,
+                channel_id => ChannelId, reason => Reason})
+             || #{user_id := UserId, id := InvocationId, channel_id := ChannelId, reason := Reason} <- Failed,
+                is_integer(UserId)],
+            {ok, Jobs};
+        Other -> Other
+    end.
+
+claim_internal_app_rows(_Conn, _Handler, [], _Now, _LeaseMs, Jobs, Failed) -> {Jobs, Failed};
+claim_internal_app_rows(Conn, Handler,
+        [[Id, Command, CommandId, Sid, Cid, UserId, RequestMid, ArgsCipher, Attempts0, CreatedAt,
+          BotUid, AppId, PublicId, AppName, InteractionUrl, InteractionSecret,
+          AiEnabled, AiEndpoint, AiModel, AiApiKey, AiSystemPrompt] | Rest],
+        Now, LeaseMs, Jobs, Failed) ->
+    Available = case Handler of
+        <<"webhook">> -> pw_util:bin(InteractionUrl) =/= <<>> andalso pw_util:bin(InteractionSecret) =/= <<>>;
+        <<"ai">> -> AiEnabled =:= true andalso pw_util:bin(AiEndpoint) =/= <<>> andalso
+                    pw_util:bin(AiModel) =/= <<>> andalso pw_util:bin(AiApiKey) =/= <<>>;
+        _ -> false
+    end,
+    Authorization = case Available of
+        true -> command_claim_authorization(Conn, UserId, Sid, Cid, CommandId, BotUid);
+        false -> {error, <<"Command handler is no longer configured">>}
+    end,
+    case Authorization of
+        ok ->
+            Attempts = int_or(pw_util:int(Attempts0), 0) + 1,
+            ok = exec(Conn,
+                "UPDATE bot_command_invocations SET status='claimed',claim_token_hash='',lease_until=$1,attempts=$2,updated_at=$3 WHERE id=$4",
+                [Now + LeaseMs, Attempts, Now, Id]),
+            Base = #{id => Id, command => Command, server_id => Sid, channel_id => Cid,
+                     user_id => db_null(UserId), request_message_id => db_null(RequestMid),
+                     args => decode_command_args(ArgsCipher), attempts => Attempts, created_at => CreatedAt,
+                     bot_user_id => BotUid, app_id => AppId, app_public_id => PublicId, app_name => AppName},
+            Job = case Handler of
+                <<"webhook">> -> Base#{url => pw_util:bin(InteractionUrl), secret => pw_crypto:decrypt(pw_util:bin(InteractionSecret))};
+                <<"ai">> -> Base#{endpoint => pw_util:bin(AiEndpoint), model => pw_util:bin(AiModel),
+                    api_key => pw_crypto:decrypt(pw_util:bin(AiApiKey)), system_prompt => pw_crypto:decrypt(pw_util:bin(AiSystemPrompt))}
+            end,
+            claim_internal_app_rows(Conn, Handler, Rest, Now, LeaseMs, [Job | Jobs], Failed);
+        {error, Reason} ->
+            ok = exec(Conn,
+                "UPDATE bot_command_invocations SET status='failed',fail_reason=$1,claim_token_hash='',lease_until=0,completed_at=$2,updated_at=$2 WHERE id=$3",
+                [Reason, Now, Id]),
+            Failure = #{id => Id, user_id => db_null(UserId), channel_id => Cid, reason => Reason},
+            claim_internal_app_rows(Conn, Handler, Rest, Now, LeaseMs, Jobs, [Failure | Failed])
+    end.
+
+internal_app_finish_route(Conn, Handler, InvocationId0, Result0) ->
+    InvocationId = pw_util:int(InvocationId0),
+    Now = pw_util:now_ms(),
+    MaxAttempts = clamp_int(pw_util:env_int("PLAINWIRE_APP_COMMAND_MAX_ATTEMPTS", 6), 1, 20, 6),
+    Result = with_tx(Conn, fun() ->
+        case one(Conn,
+            "SELECT i.channel_id,i.request_message_id,b.bot_user_id,i.status,i.lease_until,i.attempts,i.user_id,i.response_message_id "
+            "FROM bot_command_invocations i JOIN bot_commands c ON c.id=i.command_id JOIN server_bots b ON b.id=i.bot_id "
+            "WHERE i.id=$1 AND c.handler=$2 FOR UPDATE OF i", [InvocationId, Handler]) of
+            {ok, [_Cid, _RequestMid, _BotUid, <<"completed">>, _Lease, _Attempts, _UserId, ExistingMid]} ->
+                {ok, #{completed => true, message_id => db_null(ExistingMid), duplicate => true}};
+            {ok, [Cid, RequestMid, BotUid, <<"claimed">>, LeaseUntil, Attempts0, UserId, _]} when LeaseUntil >= Now ->
+                Attempts = int_or(pw_util:int(Attempts0), 0),
+                finish_internal_app_claim(Conn, InvocationId, Cid, RequestMid, BotUid, UserId, Attempts, MaxAttempts, Result0, Now);
+            {ok, [_Cid, _RequestMid, _BotUid, <<"claimed">>, _Lease, _Attempts, _UserId, _]} -> {error, claim_expired};
+            {ok, [_Cid, _RequestMid, _BotUid, <<"failed">>, _Lease, _Attempts, _UserId, _]} -> {ok, #{failed => true, duplicate => true}};
+            _ -> {error, not_found}
+        end
+    end),
+    case Result of
+        {ok, #{message := Msg, channel_id := Cid, server_id := Sid} = Data} ->
+            invalidate_message_cache(<<"channel">>, Cid),
+            pw_hub:broadcast({channel, Cid}, #{type => message_created, scope => channel, scope_id => Cid, message => Msg}),
+            best_effort_channel_notifications(Conn, Sid, maps:get(user_id, Msg), Cid, Msg, pw_util:now_ms(), false),
+            {ok, maps:without([message, channel_id, server_id, user_id], Data)};
+        {ok, #{terminal_failed := true, user_id := UserId, channel_id := Cid} = Data} ->
+            case is_integer(UserId) of true -> pw_hub:notify_user(UserId, #{type => bot_command_failed, invocation_id => InvocationId, channel_id => Cid, reason => maps:get(reason, Data, <<"Command failed">>)}); false -> ok end,
+            {ok, maps:without([terminal_failed, user_id, channel_id], Data)};
+        Other -> Other
+    end.
+
+finish_internal_app_claim(Conn, InvocationId, Cid, RequestMid, BotUid, UserId, _Attempts, _MaxAttempts, {ok, Body0}, Now) ->
+    Body = pw_util:clean_text(Body0, ?MAX_MSG),
+    case Body of
+        <<>> ->
+            ok = exec(Conn, "UPDATE bot_command_invocations SET status='completed',claim_token_hash='',lease_until=0,completed_at=$1,updated_at=$1 WHERE id=$2", [Now, InvocationId]),
+            {ok, #{completed => true, message_id => null}};
+        _ ->
+            case {message_body_valid(Body), channel_message_access(Conn, BotUid, Cid)} of
+                {true, {ok, Sid}} ->
+                    Mid = new_message_id(),
+                    ok = exec(Conn,
+                        "INSERT INTO messages(id,scope,scope_id,user_id,body,reply_to_id,created_at) VALUES($1,'channel',$2,$3,$4,$5,$6)",
+                        [Mid, Cid, BotUid, store_message(Body), RequestMid, Now]),
+                    ok = storage_after_message_change(Conn, Mid, <<"message.created">>, BotUid),
+                    ok = exec(Conn,
+                        "UPDATE bot_command_invocations SET status='completed',response_message_id=$1,claim_token_hash='',lease_until=0,completed_at=$2,updated_at=$2 WHERE id=$3",
+                        [Mid, Now, InvocationId]),
+                    {ok, Row} = one(Conn, message_select() ++ " WHERE m.id=$1", [Mid]),
+                    {ok, #{completed => true, message_id => Mid, message => message_map(Conn, Row), channel_id => Cid, server_id => Sid}};
+                _ ->
+                    Reason = <<"Bot no longer has access to this channel">>,
+                    ok = exec(Conn, "UPDATE bot_command_invocations SET status='failed',fail_reason=$1,claim_token_hash='',lease_until=0,completed_at=$2,updated_at=$2 WHERE id=$3", [Reason, Now, InvocationId]),
+                    {ok, #{failed => true, terminal_failed => true, reason => Reason, user_id => db_null(UserId), channel_id => Cid}}
+            end
+    end;
+finish_internal_app_claim(Conn, InvocationId, Cid, _RequestMid, _BotUid, UserId, Attempts, MaxAttempts, {error, Reason0}, Now) ->
+    Reason = pw_util:clean_text(Reason0, 500),
+    case Attempts >= MaxAttempts of
+        true ->
+            ok = exec(Conn, "UPDATE bot_command_invocations SET status='failed',fail_reason=$1,claim_token_hash='',lease_until=0,completed_at=$2,updated_at=$2 WHERE id=$3", [Reason, Now, InvocationId]),
+            {ok, #{failed => true, terminal_failed => true, reason => Reason, user_id => db_null(UserId), channel_id => Cid}};
+        false ->
+            Delay = internal_app_retry_delay_ms(Attempts),
+            ok = exec(Conn, "UPDATE bot_command_invocations SET status='claimed',fail_reason=$1,claim_token_hash='',lease_until=$2,updated_at=$3 WHERE id=$4", [Reason, Now + Delay, Now, InvocationId]),
+            {ok, #{retrying => true, retry_in_ms => Delay, attempts => Attempts}}
+    end;
+finish_internal_app_claim(Conn, InvocationId, Cid, RequestMid, BotUid, UserId, Attempts, MaxAttempts, Other, Now) ->
+    finish_internal_app_claim(Conn, InvocationId, Cid, RequestMid, BotUid, UserId, Attempts, MaxAttempts,
+        {error, pw_util:clean_text(io_lib:format("invalid dispatcher result: ~p", [Other]), 500)}, Now).
+
+internal_app_retry_delay_ms(Attempts0) ->
+    Attempts = max(1, min(10, int_or(pw_util:int(Attempts0), 1))),
+    min(60000, 1000 bsl min(6, Attempts - 1)).
+
+bot_command_handler_available(_Conn, _BotId, <<"queue">>) -> true;
+bot_command_handler_available(Conn, BotId, <<"webhook">>) ->
+    case one(Conn,
+        "SELECT a.interaction_url,a.interaction_secret FROM developer_app_installations di "
+        "JOIN developer_applications a ON a.id=di.app_id WHERE di.server_bot_id=$1", [BotId]) of
+        {ok, [Url, Secret]} -> pw_util:bin(Url) =/= <<>> andalso pw_util:bin(Secret) =/= <<>>;
+        _ -> false
+    end;
+bot_command_handler_available(Conn, BotId, <<"ai">>) ->
+    case one(Conn,
+        "SELECT a.ai_enabled,a.ai_endpoint,a.ai_model,a.ai_api_key FROM developer_app_installations di "
+        "JOIN developer_applications a ON a.id=di.app_id WHERE di.server_bot_id=$1", [BotId]) of
+        {ok, [true, Endpoint, Model, ApiKey]} -> pw_util:bin(Endpoint) =/= <<>> andalso pw_util:bin(Model) =/= <<>> andalso pw_util:bin(ApiKey) =/= <<>>;
+        _ -> false
+    end;
+bot_command_handler_available(_Conn, _BotId, _) -> false.
+
+server_app_command_map([Id, Name, Description, OptionsJson, Enabled, CreatedAt, UpdatedAt, Handler], Rules) ->
+    #{id => Id, name => Name, description => Description,
+      options => decode_json_value(OptionsJson, []), enabled => Enabled, handler => Handler,
+      permissions => Rules, created_at => CreatedAt, updated_at => UpdatedAt}.
+
+bot_command_permission_rules(Conn, CommandId) ->
+    case rows(Conn,
+        "SELECT subject_type,subject_id,allow FROM bot_command_permissions WHERE command_id=$1 ORDER BY subject_type ASC,subject_id ASC",
+        [CommandId]) of
+        {ok, RuleRows} -> [#{type => Type, id => SubjectId, allow => Allow} || [Type, SubjectId, Allow] <- RuleRows];
+        _ -> []
+    end.
+
+normalize_command_permission_rules(Rules) when is_list(Rules), length(Rules) =< 100 ->
+    try
+        {NormalizedRev, Keys} = lists:foldl(fun(Rule0, {Acc, Seen}) when is_map(Rule0) ->
+            Type0 = maps:get(<<"type">>, Rule0, maps:get(type, Rule0, undefined)),
+            Id0 = maps:get(<<"id">>, Rule0, maps:get(id, Rule0, undefined)),
+            Allow0 = maps:get(<<"allow">>, Rule0, maps:get(allow, Rule0, undefined)),
+            Type = case pw_util:bin(Type0) of
+                <<"channel">> -> <<"channel">>;
+                <<"role">> -> <<"role">>;
+                <<"user">> -> <<"user">>;
+                _ -> throw(invalid_command_permissions)
+            end,
+            SubjectId = pw_util:int(Id0),
+            Allow = case Allow0 of true -> true; false -> false; _ -> throw(invalid_command_permissions) end,
+            case is_integer(SubjectId) andalso SubjectId > 0 of
+                false -> throw(invalid_command_permissions);
+                true -> ok
+            end,
+            Key = {Type, SubjectId},
+            case maps:is_key(Key, Seen) of
+                true -> throw(invalid_command_permissions);
+                false -> {[#{type => Type, id => SubjectId, allow => Allow} | Acc], Seen#{Key => true}}
+            end;
+        (_, _) -> throw(invalid_command_permissions)
+        end, {[], #{}}, Rules),
+        _ = Keys,
+        {ok, lists:reverse(NormalizedRev)}
+    catch
+        throw:invalid_command_permissions -> error
+    end;
+normalize_command_permission_rules(_) -> error.
+
+validate_command_permission_subjects(Conn, Sid, Rules) ->
+    lists:all(fun
+        (#{type := <<"channel">>, id := SubjectId}) ->
+            case one(Conn, "SELECT id FROM channels WHERE id=$1 AND server_id=$2", [SubjectId, Sid]) of {ok, [_]} -> true; _ -> false end;
+        (#{type := <<"role">>, id := SubjectId}) ->
+            case one(Conn, "SELECT id FROM server_roles WHERE id=$1 AND server_id=$2", [SubjectId, Sid]) of {ok, [_]} -> true; _ -> false end;
+        (#{type := <<"user">>, id := SubjectId}) ->
+            case one(Conn, "SELECT user_id FROM server_members WHERE server_id=$1 AND user_id=$2", [Sid, SubjectId]) of {ok, [_]} -> true; _ -> false end;
+        (_) -> false
+    end, Rules).
+
+bot_command_permission_allowed(Conn, Uid, Sid, ChannelId, CommandId) ->
+    %% Discord-style precedence for Plainwire: an explicit member rule wins,
+    %% then the current channel rule, then role rules. Any matching role deny
+    %% wins over role allows. With no matching overwrite the command remains
+    %% available, preserving legacy command behavior.
+    case one(Conn,
+        "SELECT allow FROM bot_command_permissions WHERE command_id=$1 AND subject_type='user' AND subject_id=$2",
+        [CommandId, Uid]) of
+        {ok, [Allow]} when Allow =:= true; Allow =:= false -> Allow;
+        _ ->
+            case one(Conn,
+                "SELECT allow FROM bot_command_permissions WHERE command_id=$1 AND subject_type='channel' AND subject_id=$2",
+                [CommandId, ChannelId]) of
+                {ok, [Allow]} when Allow =:= true; Allow =:= false -> Allow;
+                _ ->
+                    case rows(Conn,
+                        "SELECT p.allow FROM bot_command_permissions p JOIN server_member_roles mr ON mr.role_id=p.subject_id "
+                        "WHERE p.command_id=$1 AND p.subject_type='role' AND mr.server_id=$2 AND mr.user_id=$3",
+                        [CommandId, Sid, Uid]) of
+                        {ok, RoleRows} ->
+                            Values = [V || [V] <- RoleRows, V =:= true orelse V =:= false],
+                            case {lists:member(false, Values), lists:member(true, Values)} of
+                                {true, _} -> false;
+                                {false, true} -> true;
+                                _ -> true
+                            end;
+                        _ -> true
+                    end
+            end
+    end.
+
+bot_identity(Conn, BotId) when is_integer(BotId), BotId > 0 ->
+    case one(Conn,
+        "SELECT b.bot_user_id,b.server_id FROM server_bots b JOIN users u ON u.id=b.bot_user_id "
+        "WHERE b.id=$1 AND u.account_state='active'", [BotId]) of
+        {ok, [BotUid, Sid]} -> {ok, BotUid, Sid};
+        _ -> {error, forbidden}
+    end;
+bot_identity(_Conn, _BotId) -> {error, forbidden}.
+
+normalize_command_name(Value0) ->
+    Value = pw_util:clean_text(Value0, 40),
+    Lower = try unicode:characters_to_binary(string:lowercase(unicode:characters_to_list(Value))) catch _:_ -> <<>> end,
+    case byte_size(Lower) >= 1 andalso byte_size(Lower) =< 32 andalso
+         re:run(Lower, <<"^[a-z][a-z0-9_-]{0,31}$">>, [{capture, none}]) =:= match of
+        true -> Lower;
+        false -> invalid
+    end.
+
+normalize_command_options(Options) when is_list(Options), length(Options) =< 25 ->
+    normalize_command_options(Options, [], []);
+normalize_command_options(_) -> error.
+
+normalize_command_options([], Acc, _Names) -> {ok, lists:reverse(Acc)};
+normalize_command_options([Opt | Rest], Acc, Names) when is_map(Opt) ->
+    Name = normalize_command_name(maps:get(<<"name">>, Opt, maps:get(name, Opt, <<>>))),
+    Type0 = pw_util:clean_text(maps:get(<<"type">>, Opt, maps:get(type, Opt, <<"string">>)), 24),
+    Type = case Type0 of
+        <<"string">> -> <<"string">>; <<"integer">> -> <<"integer">>; <<"number">> -> <<"number">>;
+        <<"boolean">> -> <<"boolean">>; <<"user">> -> <<"user">>; <<"channel">> -> <<"channel">>;
+        _ -> invalid
+    end,
+    Required = maps:get(<<"required">>, Opt, maps:get(required, Opt, false)) =:= true,
+    Desc = pw_util:clean_text(maps:get(<<"description">>, Opt, maps:get(description, Opt, <<>>)), 120),
+    case Name =/= invalid andalso Type =/= invalid andalso not lists:member(Name, Names) of
+        true -> normalize_command_options(Rest,
+            [#{name => Name, type => Type, required => Required, description => Desc} | Acc], [Name | Names]);
+        false -> error
+    end;
+normalize_command_options(_, _, _) -> error.
+
+normalize_command_arguments(Args0, _Options) when is_binary(Args0); is_list(Args0) ->
+    Raw = pw_util:clean_text(Args0, 2000),
+    {ok, #{<<"raw">> => Raw}};
+normalize_command_arguments(Args0, Options) when is_map(Args0), map_size(Args0) =< 32 ->
+    try
+        Pairs = maps:to_list(Args0),
+        Clean = lists:foldl(fun({K0, V0}, Acc) ->
+            K = normalize_command_name(K0),
+            case {K, clean_command_arg(V0)} of
+                {invalid, _} -> throw(invalid_command_arguments);
+                {_, invalid} -> throw(invalid_command_arguments);
+                {_, V} -> Acc#{K => V}
+            end
+        end, #{}, Pairs),
+        case validate_command_argument_schema(Clean, Options) of
+            ok ->
+                Encoded = pw_util:json(Clean),
+                case byte_size(Encoded) =< 4096 of true -> {ok, Clean}; false -> {error, command_arguments_too_large} end;
+            error -> {error, invalid_command_arguments}
+        end
+    catch
+        throw:invalid_command_arguments -> {error, invalid_command_arguments}
+    end;
+normalize_command_arguments(_, _) -> {error, invalid_command_arguments}.
+
+clean_command_arg(V) when is_binary(V); is_list(V) -> pw_util:clean_text(V, 1000);
+clean_command_arg(V) when is_integer(V) -> V;
+clean_command_arg(V) when is_float(V) -> V;
+clean_command_arg(true) -> true;
+clean_command_arg(false) -> false;
+clean_command_arg(null) -> null;
+clean_command_arg(_) -> invalid.
+
+validate_command_argument_schema(Args, Options) when is_map(Args), is_list(Options) ->
+    Declared = lists:foldl(fun(Opt, Acc) when is_map(Opt) ->
+        Name = maps:get(<<"name">>, Opt, maps:get(name, Opt, invalid)),
+        Type = maps:get(<<"type">>, Opt, maps:get(type, Opt, invalid)),
+        Required = maps:get(<<"required">>, Opt, maps:get(required, Opt, false)) =:= true,
+        case Name of
+            N when is_binary(N) -> Acc#{N => {Type, Required}};
+            _ -> Acc
+        end;
+        (_, Acc) -> Acc
+    end, #{}, Options),
+    ArgNames = maps:keys(Args),
+    NoUnknown = lists:all(fun(Name) -> maps:is_key(Name, Declared) end, ArgNames),
+    RequiredPresent = maps:fold(fun(Name, {_Type, Required}, Ok) ->
+        Ok andalso (not Required orelse maps:is_key(Name, Args))
+    end, true, Declared),
+    TypesValid = maps:fold(fun(Name, Value, Ok) ->
+        case maps:get(Name, Declared, undefined) of
+            {Type, _} -> Ok andalso command_argument_type_valid(Type, Value);
+            _ -> false
+        end
+    end, true, Args),
+    case NoUnknown andalso RequiredPresent andalso TypesValid of true -> ok; false -> error end;
+validate_command_argument_schema(_, _) -> error.
+
+command_argument_type_valid(<<"string">>, V) -> is_binary(V);
+command_argument_type_valid(<<"integer">>, V) -> is_integer(V);
+command_argument_type_valid(<<"number">>, V) -> is_integer(V) orelse is_float(V);
+command_argument_type_valid(<<"boolean">>, V) -> V =:= true orelse V =:= false;
+command_argument_type_valid(<<"user">>, V) -> is_integer(V) andalso V > 0;
+command_argument_type_valid(<<"channel">>, V) -> is_integer(V) andalso V > 0;
+command_argument_type_valid(_, _) -> false.
+
+command_display(Name, Args) ->
+    Raw = case maps:get(<<"raw">>, Args, <<>>) of
+        B when is_binary(B) -> B;
+        _ -> <<>>
+    end,
+    case Raw of
+        <<>> -> <<"/", Name/binary>>;
+        _ -> <<"/", Name/binary, " ", Raw/binary>>
+    end.
+
+encode_command_args(Args) -> pw_crypto:encrypt(pw_util:json(Args)).
+
+decode_command_args(Value) ->
+    Plain = pw_crypto:decrypt(pw_util:bin(Value)),
+    decode_json_value(Plain, #{}).
+
+decode_json_value(Value, Default) when is_binary(Value) ->
+    try jsx:decode(Value, [return_maps]) catch _:_ -> Default end;
+decode_json_value(_, Default) -> Default.
+
+bot_command_map([Id, Name, Description, OptionsJson, Enabled, CreatedAt, UpdatedAt]) ->
+    #{id => Id, name => Name, description => Description, options => decode_json_value(OptionsJson, []),
+      enabled => Enabled, created_at => CreatedAt, updated_at => UpdatedAt}.
+
+bot_command_channel_access(Conn, ChannelId,
+        [_Id, _Name, _Description, _OptionsJson, _Enabled, _CreatedAt, _UpdatedAt,
+         _BotId, _BotName, BotUid, _Username, _Display, _Avatar | _Rest]) ->
+    channel_message_access(Conn, BotUid, ChannelId) =/= {error, forbidden};
+bot_command_channel_access(_Conn, _ChannelId, _) -> false.
+
+bot_public_command_map([Id, Name, Description, OptionsJson, Enabled, CreatedAt, UpdatedAt,
+                        BotId, BotName, BotUid, Username, Display, Avatar | Rest]) ->
+    Handler = case Rest of [H | _] -> H; _ -> <<"queue">> end,
+    #{id => Id, name => Name, description => Description, options => decode_json_value(OptionsJson, []),
+      enabled => Enabled, handler => Handler, created_at => CreatedAt, updated_at => UpdatedAt,
+      bot => #{id => BotId, user_id => BotUid, name => BotName, username => Username,
+               display_name => Display, avatar_url => pw_util:proxied_image(Avatar), is_bot => true}}.
+
+claim_authorized_bot_invocations(_Conn, _BotId, _BotUid, [], _Now, _LeaseMs, Claims, Failed) ->
+    {Claims, Failed};
+claim_authorized_bot_invocations(Conn, BotId, BotUid,
+        [Row=[Id, CommandId, _Name, Sid, Cid, UserId, _RequestMid, _ArgsCipher, _Attempts0, _CreatedAt] | Rest],
+        Now, LeaseMs, Claims, Failed) ->
+    case command_claim_authorization(Conn, UserId, Sid, Cid, CommandId, BotUid) of
+        ok ->
+            Claim = claim_bot_invocation(Conn, BotId, Row, Now, LeaseMs),
+            claim_authorized_bot_invocations(Conn, BotId, BotUid, Rest, Now, LeaseMs, [Claim | Claims], Failed);
+        {error, Reason} ->
+            ok = exec(Conn,
+                "UPDATE bot_command_invocations SET status='failed',fail_reason=$1,claim_token_hash='',lease_until=0,completed_at=$2,updated_at=$2 WHERE id=$3 AND bot_id=$4",
+                [Reason, Now, Id, BotId]),
+            Failure = #{id => Id, user_id => UserId, channel_id => Cid},
+            claim_authorized_bot_invocations(Conn, BotId, BotUid, Rest, Now, LeaseMs, Claims, [Failure | Failed])
+    end.
+
+command_claim_authorization(Conn, UserId, Sid, Cid, CommandId, BotUid) ->
+    case channel_message_access(Conn, BotUid, Cid) of
+        {ok, Sid} ->
+            case channel_message_access(Conn, UserId, Cid) of
+                {ok, Sid} ->
+                    case bot_command_permission_allowed(Conn, UserId, Sid, Cid, CommandId) of
+                        true -> ok;
+                        false -> {error, <<"Command permission revoked before delivery">>}
+                    end;
+                _ -> {error, <<"Invoking user no longer has access to this channel">>}
+            end;
+        _ -> {error, <<"Bot no longer has access to this channel">>}
+    end.
+
+claim_bot_invocation(Conn, BotId,
+    [Id, CommandId, Name, Sid, Cid, UserId, RequestMid, ArgsCipher, Attempts0, CreatedAt], Now, LeaseMs) ->
+    Token = <<"pwc_", (pw_util:random_token(32))/binary>>,
+    Hash = pw_util:sha256_hex(Token), LeaseUntil = Now + LeaseMs, Attempts = Attempts0 + 1,
+    ok = exec(Conn,
+        "UPDATE bot_command_invocations SET status='claimed',claim_token_hash=$1,lease_until=$2,attempts=$3,updated_at=$4 WHERE id=$5 AND bot_id=$6",
+        [Hash, LeaseUntil, Attempts, Now, Id, BotId]),
+    #{id => Id, command_id => CommandId, command => Name, server_id => Sid, channel_id => Cid,
+      user_id => db_null(UserId), request_message_id => db_null(RequestMid), args => decode_command_args(ArgsCipher),
+      claim_token => Token, lease_until => LeaseUntil, attempt => Attempts, created_at => CreatedAt}.
+
+secure_token_hash_match(Token, ExpectedHash) ->
+    pw_util:constant_time(pw_util:sha256_hex(Token), ExpectedHash).
+
+clamp_int(Value0, Min, Max, Default) ->
+    Value = pw_util:int(Value0),
+    case Value of I when is_integer(I) -> min(Max, max(Min, I)); _ -> Default end.
 
 unique_bot_username(Conn, Sid, Name0) ->
     Base0 = pw_util:normalize_username(Name0),
@@ -4887,7 +6977,9 @@ webhook_public_map([Id, Name, Url, Events, Enabled, CreatedBy, CreatedAt, Update
 
 webhook_event_catalog() ->
     [<<"message.created">>, <<"message.updated">>, <<"message.deleted">>, <<"message.reaction">>,
-     <<"member.joined">>, <<"member.removed">>, <<"member.banned">>, <<"member.unbanned">>, <<"server.updated">>].
+     <<"message.pinned">>, <<"message.unpinned">>,
+     <<"member.joined">>, <<"member.removed">>, <<"member.banned">>, <<"member.unbanned">>,
+     <<"channel.created">>, <<"channel.updated">>, <<"bot.added">>, <<"bot.removed">>, <<"server.updated">>].
 
 normalize_webhook_events(Events0) when is_list(Events0) ->
     Events = lists:usort([pw_util:clean_text(E, 64) || E <- Events0]),
@@ -4925,7 +7017,7 @@ enqueue_server_webhooks(Conn, Sid, Event, Data) when is_integer(Sid), Sid > 0 ->
                         _ = exec(Conn,
                             "INSERT INTO webhook_deliveries(webhook_id,event,payload,subject_user_id,actor_user_id,status,attempts,next_attempt_at,created_at,updated_at) "
                             "VALUES($1,$2,$3,$4,$5,'pending',0,$6,$6,$6)",
-                            [WebhookId, Event, Payload, SubjectUid, ActorUid, Now])
+                            [WebhookId, Event, store_message(Payload), SubjectUid, ActorUid, Now])
                     end, WebhookRows),
                     ok;
                 _ -> ok
@@ -5006,7 +7098,7 @@ best_effort_identity_changed(Conn, Uid, Username) ->
         {ok, FriendRows} -> lists:usort([PeerUid || [PeerUid] <- FriendRows, PeerUid =/= Uid]);
         _ -> []
     end,
-    _ = spawn(fun() ->
+    Fanout = fun() ->
         try
             [pw_hub:broadcast({server, Sid}, Event) || Sid <- ServerIds],
             [pw_hub:broadcast({direct, Cid}, Event) || Cid <- DirectIds],
@@ -5017,7 +7109,11 @@ best_effort_identity_changed(Conn, Uid, Username) ->
             logger:warning("[plainwire:identity] realtime fanout failed uid=~p class=~p reason=~p", [Uid, C, R]),
             ok
         end
-    end),
+    end,
+    case pw_async_pool:submit(Fanout) of
+        {error, overloaded} -> logger:warning("[plainwire:identity] realtime fanout shed uid=~p", [Uid]);
+        _ -> ok
+    end,
     ok.
 
 safe_exec(Conn, Sql) ->
@@ -5668,10 +7764,12 @@ only_id([I]) -> I;
 only_id(I) -> I.
 
 user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen]) ->
+    user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen, false]);
+user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen, IsBot]) ->
     #{id => Id, username => U, display_name => D, bio => Bio,
       avatar_url => pw_util:proxied_image(Avatar),
       banner_url => pw_util:proxied_image(Banner),
-      status => Status, theme => Theme, created_at => Created, last_seen => LastSeen}.
+      status => Status, theme => Theme, created_at => Created, last_seen => LastSeen, is_bot => IsBot =:= true}.
 
 user_map_full([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen]) ->
     (user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen])) #{
@@ -5770,10 +7868,12 @@ derived_media_url(<<"/api/media/", _/binary>>) -> true;
 derived_media_url(_) -> false.
 
 channel_map([Id, Sid, Name, Kind, Pos, Topic, Created]) ->
-    channel_map([Id, Sid, Name, Kind, Pos, Topic, Created, undefined]);
+    channel_map([Id, Sid, Name, Kind, Pos, Topic, Created, undefined, 0]);
 channel_map([Id, Sid, Name, Kind, Pos, Topic, Created, CatId]) ->
+    channel_map([Id, Sid, Name, Kind, Pos, Topic, Created, CatId, 0]);
+channel_map([Id, Sid, Name, Kind, Pos, Topic, Created, CatId, Slowmode]) ->
     #{id => Id, server_id => Sid, name => Name, kind => Kind, position => Pos, topic => Topic,
-      created_at => Created, category_id => db_null(CatId)}.
+      created_at => Created, category_id => db_null(CatId), slowmode_seconds => int_or(pw_util:int(Slowmode), 0)}.
 
 category_map([Id, Sid, Name, Pos, Created]) ->
     #{id => Id, server_id => Sid, name => Name, position => Pos, created_at => Created}.
@@ -5784,7 +7884,9 @@ member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, Role, M
 member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, Role, Muted, Joined, Nick, ServerAvatar, ServerBio]) ->
     member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, Role, Muted, Joined, Nick, ServerAvatar, ServerBio, <<>>, <<>>]);
 member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, Role, Muted, Joined, Nick, ServerAvatar, ServerBio, RoleColor, RoleNames]) ->
-    #{user => user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last]),
+    member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, Role, Muted, Joined, Nick, ServerAvatar, ServerBio, RoleColor, RoleNames, false]);
+member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, Role, Muted, Joined, Nick, ServerAvatar, ServerBio, RoleColor, RoleNames, IsBot]) ->
+    #{user => user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, IsBot]),
       role => Role, muted => Muted, joined_at => Joined,
       nickname => Nick, server_avatar_url => pw_util:proxied_image(ServerAvatar), server_bio => ServerBio,
       role_color => RoleColor, role_names => RoleNames,
@@ -5801,7 +7903,9 @@ role_assignment_map(Rows) ->
     end, #{}, Rows).
 
 server_admin_member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, LegacyRole, Nick, ServerAvatar, ServerBio, Joined], RoleIds) ->
-    #{user => user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last]),
+    server_admin_member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, LegacyRole, Nick, ServerAvatar, ServerBio, Joined, false], RoleIds);
+server_admin_member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, LegacyRole, Nick, ServerAvatar, ServerBio, Joined, IsBot], RoleIds) ->
+    #{user => user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, IsBot]),
       legacy_role => LegacyRole, nickname => Nick, server_avatar_url => pw_util:proxied_image(ServerAvatar),
       server_bio => ServerBio, joined_at => Joined, role_ids => lists:reverse(RoleIds)}.
 
@@ -5853,11 +7957,15 @@ grantable_role_permissions(Conn, Uid, Sid, Requested0) ->
             end
     end.
 
-message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, _ForwardBody, RoleColor]) ->
+message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, ForwardBody, RoleColor]) ->
+    message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, ForwardBody, RoleColor, false, false]);
+message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, ForwardBody, RoleColor, IsBot]) ->
+    message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, ForwardBody, RoleColor, IsBot, false]);
+message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, _ForwardBody, RoleColor, IsBot, Pinned]) ->
     Base = #{id => Id, scope => Scope, scope_id => ScopeId, user_id => Uid, username => U, display_name => D,
       avatar_url => pw_util:proxied_image(Avatar), body => load_message(Body), reply_to_id => db_null(ReplyTo),
       created_at => Created, edited_at => db_null(Edited), deleted_at => db_null(Deleted), kind => Kind,
-      role_color => RoleColor, reactions => []},
+      role_color => RoleColor, is_bot => IsBot =:= true, pinned => Pinned =:= true, reactions => []},
     case ForwardId of
         null -> Base;
         %% A forward is an immutable snapshot. Never expose the *current* body
@@ -6019,7 +8127,8 @@ message_select() ->
     "(r.permissions & 8) DESC,(r.permissions & 4) DESC,(r.permissions & 64) DESC,"
     "(r.permissions & 128) DESC,(r.permissions & 2048) DESC,(r.permissions & 4096) DESC,"
     "(r.permissions & 256) DESC,(r.permissions & 512) DESC,(r.permissions & 2) DESC,"
-    "(r.permissions & 1) DESC,r.position DESC,r.id ASC LIMIT 1),'') "
+    "(r.permissions & 1) DESC,r.position DESC,r.id ASC LIMIT 1),''), u.is_bot, "
+    "EXISTS(SELECT 1 FROM message_pins pin WHERE pin.message_id=m.id) "
     "FROM messages m JOIN users u ON u.id = m.user_id "
     "LEFT JOIN channels mc ON m.scope='channel' AND mc.id=m.scope_id "
     "LEFT JOIN server_members sm ON sm.server_id=mc.server_id AND sm.user_id=m.user_id "
@@ -6132,11 +8241,11 @@ hydrate_scylla_rows(Conn, CoreRows) ->
         Error -> Error
     end.
 
-overlay_scylla_row([Id, _Scope, _ScopeId, _Uid, U, D, Avatar, _Body, _Reply, _Created, _Edited, _Deleted, _Kind, _ForwardId, ForwardUid, ForwardName, ForwardBody, RoleColor], Core) ->
+overlay_scylla_row([Id, _Scope, _ScopeId, _Uid, U, D, Avatar, _Body, _Reply, _Created, _Edited, _Deleted, _Kind, _ForwardId, ForwardUid, ForwardName, ForwardBody, RoleColor, IsBot], Core) ->
     [Id, maps:get(scope, Core), maps:get(scope_id, Core), maps:get(user_id, Core), U, D, Avatar, maps:get(body, Core),
      db_value(maps:get(reply_to_id, Core, undefined)), maps:get(created_at, Core),
      db_value(maps:get(edited_at, Core, undefined)), db_value(maps:get(deleted_at, Core, undefined)), maps:get(kind, Core, <<"text">>),
-     db_value(maps:get(forwarded_from_id, Core, undefined)), ForwardUid, ForwardName, ForwardBody, RoleColor].
+     db_value(maps:get(forwarded_from_id, Core, undefined)), ForwardUid, ForwardName, ForwardBody, RoleColor, IsBot].
 
 db_value(undefined) -> null;
 db_value(V) -> V.
@@ -6304,6 +8413,31 @@ can_read_messages(Conn, Uid, <<"channel">>, Id) ->
 can_read_messages(Conn, Uid, <<"direct">>, Id) ->
     is_conversation_member(Conn, Uid, Id) andalso not is_blocked_in_conversation(Conn, Uid, Id);
 can_read_messages(_, _, _, _) -> false.
+
+enforce_channel_slowmode(Conn, Uid, Cid, Sid) ->
+    case one(Conn, "SELECT COALESCE(slowmode_seconds,0) FROM channels WHERE id=$1 AND server_id=$2 AND kind='text'", [Cid,Sid]) of
+        {ok, [Slow]} when is_integer(Slow), Slow > 0 ->
+            %% Bots and moderators are automation/moderation actors and bypass
+            %% user slowmode, matching the normal Manage Messages expectation.
+            IsBot = case one(Conn, "SELECT is_bot FROM users WHERE id=$1", [Uid]) of {ok,[true]} -> true; _ -> false end,
+            Bypass = IsBot orelse has_server_permission(Conn, Uid, Sid, <<"manage_messages">>),
+            case Bypass of
+                true -> ok;
+                false ->
+                    %% Two-key advisory lock is scoped to this transaction and
+                    %% prevents concurrent sends on separate app nodes from both
+                    %% observing the same previous-message timestamp.
+                    _ = one(Conn, "SELECT pg_advisory_xact_lock($1,$2)", [Uid,Cid]),
+                    Now = pw_util:now_ms(),
+                    case one(Conn, "SELECT COALESCE(max(created_at),0) FROM messages WHERE scope='channel' AND scope_id=$1 AND user_id=$2 AND deleted_at IS NULL", [Cid,Uid]) of
+                        {ok, [Last]} when is_integer(Last), Last > 0 ->
+                            Remaining = Slow * 1000 - (Now - Last),
+                            case Remaining > 0 of true -> {error, {slowmode, (Remaining + 999) div 1000}}; false -> ok end;
+                        _ -> ok
+                    end
+            end;
+        _ -> ok
+    end.
 
 %% Editing/deleting is an ownership operation, but ownership alone must not let a
 %% departed member keep mutating history in a scope they can no longer access.
@@ -6714,9 +8848,20 @@ seed_forums(Conn) ->
             ok
     end.
 
+maybe_expire_account_restriction(Conn, Uid, State, ExpiresAt, Now)
+  when (State =:= <<"suspended">> orelse State =:= <<"banned">>), is_integer(ExpiresAt), ExpiresAt > 0, ExpiresAt =< Now ->
+    ok = exec(Conn,
+        "UPDATE users SET account_state='active',moderation_title='',moderation_reason='',moderation_severity='warning',moderation_expires_at=0,moderated_by=NULL,moderated_at=$2,updated_at=$2 WHERE id=$1",
+        [Uid, Now]),
+    ok = exec(Conn,
+        "INSERT INTO instance_account_actions(user_id,actor_user_id,action,title,reason,severity,expires_at,created_at) VALUES($1,NULL,'restore','Automatic restoration','Restriction expired','info',0,$2)",
+        [Uid, Now]),
+    {<<"active">>, true};
+maybe_expire_account_restriction(_Conn, _Uid, State, _ExpiresAt, _Now) -> {State, false}.
+
 verify_admin_user(Conn, Username, Password) ->
     case one(Conn,
-        "SELECT id,username,display_name,password_hash,password_salt FROM users WHERE username=$1 FOR UPDATE",
+        "SELECT id,username,display_name,password_hash,password_salt FROM users WHERE username=$1 AND account_state='active' FOR UPDATE",
         [Username]) of
         {ok, [Uid, StoredUsername, DisplayName, PasswordHash, Salt]} ->
             case pw_util:verify_password(Password, Salt, PasswordHash) of
@@ -6766,6 +8911,7 @@ new_message_id() ->
 storage_after_message_change(Conn, Mid, EventType, ActorId) ->
     case message_core(Conn, Mid) of
         {ok, Msg} ->
+            ok = sync_message_search_index(Conn, Msg),
             EventId = required_storage_event_id(),
             Event = #{event_id => EventId, type => EventType, scope => maps:get(scope, Msg),
                       scope_id => maps:get(scope_id, Msg), actor_id => ActorId, entity_id => Mid,
@@ -6993,16 +9139,20 @@ clamp_offset(Value) ->
         N -> min(1000000, max(0, N))
     end.
 
-admin_user_summary([Uid, Username, DisplayName, CreatedAt, LastSeen, Servers, Conversations, ActiveSessions, UploadBytes]) ->
+admin_user_summary([Uid, Username, DisplayName, CreatedAt, LastSeen, Servers, Conversations, ActiveSessions, UploadBytes,
+                    AccountState, IsBot, ModerationExpiresAt]) ->
     #{id => Uid, username => Username, display_name => DisplayName, created_at => CreatedAt, last_seen => LastSeen,
-      server_count => Servers, conversation_count => Conversations, active_sessions => ActiveSessions, upload_bytes => UploadBytes}.
+      server_count => Servers, conversation_count => Conversations, active_sessions => ActiveSessions, upload_bytes => UploadBytes,
+      account_state => AccountState, is_bot => IsBot, moderation_expires_at => ModerationExpiresAt}.
 
 admin_user_detail([Uid, Username, DisplayName, CreatedAt, UpdatedAt, LastSeen, Servers, OwnedServers,
-                   Conversations, Messages, Uploads, UploadBytes, ActiveSessions]) ->
+                   Conversations, Messages, Uploads, UploadBytes, ActiveSessions, AccountState, IsBot,
+                   Title, Reason, Severity, ExpiresAt, ModeratedBy, ModeratedAt]) ->
     #{id => Uid, username => Username, display_name => DisplayName, created_at => CreatedAt, updated_at => UpdatedAt,
       last_seen => LastSeen, server_count => Servers, owned_server_count => OwnedServers,
       conversation_count => Conversations, message_count => Messages, upload_count => Uploads,
-      upload_bytes => UploadBytes, active_sessions => ActiveSessions}.
+      upload_bytes => UploadBytes, active_sessions => ActiveSessions, account_state => AccountState, is_bot => IsBot,
+      moderation => moderation_public_map(AccountState, Title, Reason, Severity, ExpiresAt, ModeratedBy, ModeratedAt)}.
 
 admin_server_summary([Sid, Name, CreatedAt, UpdatedAt, OwnerId, OwnerUsername, OwnerDisplayName, Members, Channels]) ->
     #{id => Sid, name => Name, created_at => CreatedAt, updated_at => UpdatedAt,
@@ -7015,6 +9165,75 @@ admin_server_detail([Sid, Name, CreatedAt, UpdatedAt, OwnerId, OwnerUsername, Ow
       owner => #{id => OwnerId, username => OwnerUsername, display_name => OwnerDisplayName},
       member_count => Members, channel_count => Channels, role_count => Roles,
       active_invite_count => Invites, message_count => Messages, last_message_at => LastMessageAt}.
+
+
+admin_can_inspect_user(Conn, ActorUid, TargetUid) ->
+    is_integer(TargetUid) andalso TargetUid > 0 andalso
+    case admin_actor_role(Conn, ActorUid) of
+        <<"owner">> -> true;
+        <<"operator">> -> true;
+        <<"viewer">> -> true;
+        _ -> false
+    end.
+
+moderation_actor_allowed(_Conn, ActorUid, TargetUid) when ActorUid =:= TargetUid -> {error, cannot_moderate_self};
+moderation_actor_allowed(Conn, ActorUid, TargetUid) ->
+    ActorRole = admin_actor_role(Conn, ActorUid),
+    TargetRole = admin_actor_role(Conn, TargetUid),
+    case {ActorRole, TargetRole} of
+        {<<"owner">>, <<"owner">>} -> {error, owner_protected};
+        {<<"owner">>, _} -> ok;
+        {<<"operator">>, undefined} -> ok;
+        {<<"operator">>, _} -> {error, operator_protected};
+        _ -> {error, forbidden}
+    end.
+
+normalize_instance_moderation_action(<<"suspend">>) -> suspend;
+normalize_instance_moderation_action(<<"ban">>) -> ban;
+normalize_instance_moderation_action(<<"restore">>) -> restore;
+normalize_instance_moderation_action(suspend) -> suspend;
+normalize_instance_moderation_action(ban) -> ban;
+normalize_instance_moderation_action(restore) -> restore;
+normalize_instance_moderation_action(_) -> invalid.
+
+moderation_action_state(suspend) -> <<"suspended">>;
+moderation_action_state(ban) -> <<"banned">>;
+moderation_action_state(restore) -> <<"active">>.
+
+normalize_instance_moderation_patch(_Patch0, restore) ->
+    {ok, #{title => <<>>, reason => <<>>, severity => <<"warning">>, expires_at => 0}};
+normalize_instance_moderation_patch(Patch0, Action) when is_map(Patch0) ->
+    Patch = normalize_patch_keys(Patch0), Now = pw_util:now_ms(),
+    DefaultTitle = case Action of suspend -> <<"Account suspended">>; ban -> <<"Account banned">> end,
+    Title0 = pw_util:clean_text(maps:get(<<"title">>, Patch, DefaultTitle), 100),
+    Title = case Title0 of <<>> -> DefaultTitle; _ -> Title0 end,
+    Reason = pw_util:clean_text(maps:get(<<"reason">>, Patch, <<>>), 1000),
+    Severity0 = pw_util:clean_text(maps:get(<<"severity">>, Patch, case Action of ban -> <<"critical">>; _ -> <<"warning">> end), 16),
+    Severity = case Severity0 of <<"info">> -> <<"info">>; <<"warning">> -> <<"warning">>; <<"critical">> -> <<"critical">>; _ -> invalid end,
+    Expires0 = pw_util:int(maps:get(<<"expires_at">>, Patch, 0)),
+    ExpiresAt = case Expires0 of
+        undefined -> 0;
+        I when is_integer(I), I =:= 0 -> 0;
+        I when is_integer(I), I > Now, I =< Now + 315360000000 -> I;
+        _ -> invalid
+    end,
+    case {Severity, ExpiresAt, byte_size(Reason)} of
+        {invalid, _, _} -> {error, invalid_severity};
+        {_, invalid, _} -> {error, invalid_expiry};
+        {_, _, 0} -> {error, moderation_reason_required};
+        _ -> {ok, #{title => Title, reason => Reason, severity => Severity, expires_at => ExpiresAt}}
+    end;
+normalize_instance_moderation_patch(_, _) -> {error, invalid_moderation}.
+
+moderation_public_map(State, Title, Reason, Severity, ExpiresAt, ModeratedBy, ModeratedAt) ->
+    #{state => State, title => Title, reason => Reason, severity => Severity,
+      expires_at => ExpiresAt, moderated_by => db_null(ModeratedBy), moderated_at => ModeratedAt}.
+
+moderation_audit_detail(Action, Title, Reason, Severity, ExpiresAt) ->
+    %% Audit detail is bounded operational metadata. It intentionally contains
+    %% the moderation reason entered by the operator, never private user content.
+    pw_util:clean_text(pw_util:json(#{action => atom_to_binary(Action, utf8), title => Title,
+        reason => Reason, severity => Severity, expires_at => ExpiresAt}), 240).
 
 admin_can_operate(Conn, ActorUid) ->
     case admin_actor_role(Conn, ActorUid) of

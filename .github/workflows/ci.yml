@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: OTP 27 / Node 22 / Gleam 1.18
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1.24.1
+        with:
+          otp-version: '27'
+          rebar3-version: '3.25'
+          gleam-version: '1.18.1'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: tools/load/requirements.txt
+      - name: Install native Erlang dependency toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            libssl-dev \
+            libuv1-dev \
+            zlib1g-dev
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Verify source contracts
+        run: ./scripts/verify-source.sh
+      - name: Build frontend
+        run: npm run build
+      - name: Compile Erlang and run EUnit
+        run: rebar3 compile && rebar3 eunit
+      - name: Realtime scalability smoke
+        run: make load USERS=250 DURATION=2 RATE=2000
+      - name: Validate live load harness
+        run: |
+          python -m pip install -r tools/load/requirements.txt
+          make load-live-selftest PYTHON=python
+      - name: Check Gleam scalability model
+        run: |
+          cd tools/load/gleam
+          gleam deps download
+          gleam format --check src
+          gleam check
+      - name: Browser regression suite
+        run: npm run test:browser
+      - name: WebRTC regression suite
+        run: npm run test:rtc
+      - name: Verify source archive construction
+        run: python3 scripts/archive.py source && tar -tzf dist/Plainwire-$(cat VERSION).tar.gz >/dev/null

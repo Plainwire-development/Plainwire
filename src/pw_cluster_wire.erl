@@ -40,8 +40,7 @@ allowed({topic, {Kind, Id}}, #{type := Type}) when is_integer(Id), Id > 0 ->
                           user_identity_updated, thread_updated, thread_reply_updated, thread_reply_deleted]);
 allowed({control, revoke_server_access}, #{uid := Uid, server_id := ServerId, channel_ids := ChannelIds}) ->
     is_integer(Uid) andalso Uid > 0 andalso is_integer(ServerId) andalso ServerId > 0 andalso
-        is_list(ChannelIds) andalso length(ChannelIds) =< 512 andalso
-        lists:all(fun(Id) -> is_integer(Id) andalso Id > 0 end, ChannelIds);
+        valid_id_list(ChannelIds, 512);
 allowed({control, revoke_conversation_access}, #{uid := Uid, conversation_id := ConversationId}) ->
     is_integer(Uid) andalso Uid > 0 andalso is_integer(ConversationId) andalso ConversationId > 0;
 allowed(_, _) -> false.
@@ -51,6 +50,17 @@ safe_term(T, _) when is_integer(T); is_float(T); is_atom(T) -> true;
 safe_term(T, _) when is_binary(T) -> byte_size(T) =< ?MAX_BYTES;
 safe_term(T, D) when is_map(T), map_size(T) =< 128 ->
     lists:all(fun({K, V}) -> safe_term(K, D + 1) andalso safe_term(V, D + 1) end, maps:to_list(T));
-safe_term(T, D) when is_list(T), length(T) =< 2048 ->
-    lists:all(fun(V) -> safe_term(V, D + 1) end, T);
+safe_term(T, D) when is_list(T) ->
+    safe_list(T, D, 0, 2048);
 safe_term(_, _) -> false.
+
+safe_list([], _D, _N, _Max) -> true;
+safe_list([V | Rest], D, N, Max) when N < Max ->
+    safe_term(V, D + 1) andalso safe_list(Rest, D, N + 1, Max);
+safe_list(_, _, _, _) -> false.
+
+valid_id_list(List, Max) -> valid_id_list(List, Max, 0).
+valid_id_list([], _Max, _N) -> true;
+valid_id_list([Id | Rest], Max, N) when is_integer(Id), Id > 0, N < Max ->
+    valid_id_list(Rest, Max, N + 1);
+valid_id_list(_, _, _) -> false.

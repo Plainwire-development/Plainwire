@@ -1,0 +1,309 @@
+openapi: 3.1.0
+info:
+  title: Plainwire Bot API
+  version: 1.0.0
+  description: >-
+    Language-neutral HTTPS/JSON API for Plainwire server bots. Bot tokens are
+    server-scoped credentials. Use TLS for non-loopback deployments and send
+    tokens only in the Authorization header.
+servers:
+  - url: https://plainwire.example
+security:
+  - BotToken: []
+paths:
+  /api/bot/v1:
+    get:
+      operationId: getBotCapabilities
+      summary: Discover Bot API capabilities and effective limits
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/me:
+    get:
+      operationId: getBotIdentity
+      summary: Return the authenticated bot identity
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/server:
+    get:
+      operationId: getBotServer
+      summary: Return the bot's server and visible channel metadata
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/channels:
+    get:
+      operationId: listBotChannels
+      summary: List channels visible to the bot
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/channels/{channelId}/messages:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    get:
+      operationId: listChannelMessages
+      summary: Read message history the bot is allowed to view
+      parameters:
+        - name: before
+          in: query
+          schema: { type: integer, format: int64, minimum: 1 }
+        - name: after
+          in: query
+          schema: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: sendChannelMessage
+      summary: Send a channel message as the bot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMessageRequest'
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/messages/{messageId}/delete:
+    parameters:
+      - $ref: '#/components/parameters/MessageId'
+    post:
+      operationId: deleteMessage
+      summary: Delete a message when the bot's normal Plainwire permissions allow it
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/messages/{messageId}/reaction:
+    parameters:
+      - $ref: '#/components/parameters/MessageId'
+    post:
+      operationId: toggleReaction
+      summary: Toggle a reaction as the bot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [emoji]
+              properties:
+                emoji: { type: string, minLength: 1, maxLength: 64 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/commands:
+    get:
+      operationId: listCommands
+      summary: List commands owned by the authenticated bot
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: registerCommand
+      summary: Register or update a command owned by this bot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterCommandRequest'
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/commands/{commandId}:
+    parameters:
+      - name: commandId
+        in: path
+        required: true
+        schema: { type: integer, format: int64, minimum: 1 }
+    delete:
+      operationId: deleteCommand
+      summary: Delete a command owned by this bot
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/commands/claims:
+    get:
+      operationId: claimCommands
+      summary: Claim pending command invocations for bounded processing leases
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+      responses:
+        '200':
+          description: Claimed invocations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, data]
+                properties:
+                  ok: { const: true }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/CommandClaim' }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/commands/claims/{invocationId}/respond:
+    parameters:
+      - $ref: '#/components/parameters/InvocationId'
+    post:
+      operationId: respondToCommand
+      summary: Complete a claimed invocation with a channel reply
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [claim_token, body]
+              properties:
+                claim_token: { type: string, minLength: 1, maxLength: 256 }
+                body: { type: string, minLength: 1, maxLength: 5000 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/commands/claims/{invocationId}/fail:
+    parameters:
+      - $ref: '#/components/parameters/InvocationId'
+    post:
+      operationId: failCommand
+      summary: Permanently fail a claimed invocation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [claim_token]
+              properties:
+                claim_token: { type: string, minLength: 1, maxLength: 256 }
+                reason: { type: string, maxLength: 240 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+components:
+  securitySchemes:
+    BotToken:
+      type: http
+      scheme: bearer
+      bearerFormat: "Plainwire bot token, sent with the Bot authorization scheme"
+      description: >-
+        Plainwire uses the literal `Bot` authorization scheme instead of
+        `Bearer`. OpenAPI's http bearer shape is used here for client-generator
+        compatibility; generated clients should override the prefix to `Bot`.
+  parameters:
+    ChannelId:
+      name: channelId
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+    MessageId:
+      name: messageId
+      in: path
+      required: true
+      schema: { type: integer, format: int64, minimum: 1 }
+    InvocationId:
+      name: invocationId
+      in: path
+      required: true
+      schema: { type: integer, format: int64, minimum: 1 }
+  schemas:
+    SendMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [body]
+      properties:
+        body: { type: string, minLength: 1, maxLength: 5000 }
+        reply_to_id: { type: integer, format: int64, minimum: 1 }
+    CommandOption:
+      type: object
+      additionalProperties: false
+      required: [name, type]
+      properties:
+        name:
+          type: string
+          pattern: '^[a-z][a-z0-9_-]{0,31}$'
+        type:
+          type: string
+          enum: [string, integer, number, boolean, user, channel]
+        required: { type: boolean, default: false }
+        description: { type: string, maxLength: 120 }
+    RegisterCommandRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: '^[a-z][a-z0-9_-]{0,31}$'
+        description: { type: string, maxLength: 160 }
+        options:
+          type: array
+          maxItems: 25
+          items: { $ref: '#/components/schemas/CommandOption' }
+    CommandClaim:
+      type: object
+      required: [id, command_id, command, server_id, channel_id, args, claim_token, lease_until, attempt, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        command_id: { type: integer, format: int64 }
+        command: { type: string }
+        server_id: { type: integer }
+        channel_id: { type: integer }
+        user_id: { type: [integer, 'null'] }
+        request_message_id: { type: [integer, 'null'], format: int64 }
+        args: { type: object, additionalProperties: true }
+        claim_token: { type: string, description: "One-lease credential. Never log or persist it." }
+        lease_until: { type: integer, format: int64 }
+        attempt: { type: integer, minimum: 1 }
+        created_at: { type: integer, format: int64 }
+  responses:
+    Success:
+      description: Successful Plainwire API envelope
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ok]
+            properties:
+              ok: { const: true }
+              data: {}
+    Error:
+      description: Plainwire API error envelope
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ok, error]
+            properties:
+              ok: { const: false }
+              error: { type: string }

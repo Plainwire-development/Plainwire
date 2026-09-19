@@ -10,6 +10,9 @@ PYTHON ?= python3
 REBAR3 ?= rebar3
 PROFILE ?= default
 NATIVE ?= 0
+USERS ?= 1000
+DURATION ?= 60
+RATE ?= 0
 # GNU Make otherwise supplies the historical f77 default.
 ifeq ($(origin FC),default)
 FC := gfortran
@@ -38,7 +41,7 @@ FRONTEND_OUTPUTS := priv/static/index.html priv/static/app.css priv/static/app.j
 NATIVE_TARGET := $(if $(filter 1,$(NATIVE)),native)
 NATIVE_TEST := $(if $(filter 1,$(NATIVE)),test-native)
 
-.PHONY: help doctor deps frontend backend native build verify test-health test-rtc-contract test-ui-contract test-release-contract test-browser test-native test-backend test check release source package run clean browsers
+.PHONY: help doctor deps frontend backend native build verify test-health test-rtc-contract test-ui-contract test-admin-contract test-integrations-contract test-storage-contract test-storage-tools test-v21-contract test-scalability-contract test-release-contract test-sdks test-browser test-native test-backend test check release source package run clean browsers load load-soak load-live load-live-selftest load-doctor load-gleam-check
 # Rebar invocations and test servers are sequenced even with make -j.
 .NOTPARALLEL: check test test-browser test-backend
 
@@ -54,6 +57,12 @@ help:
 	  '  make release NATIVE=1  Check and assemble an Erlang runtime release' \
 	  '  make package NATIVE=1  Check, release, and archive with SHA-256' \
 	  '  make source           Compile frontend/backend and archive portable source only' \
+	  '  make load USERS=10000 Stress realtime fanout with fake users (DURATION=60 RATE=auto)' \
+	  '  make load-10000       Convenience alias for USERS=10000' \
+	  '  make load-soak        Ten-minute sustained fake-user stress run' \
+	  '  make load-live        Authenticated HTTP/WebSocket staging load test' \
+	  '  make load-live-selftest Validate the live load generator on loopback' \
+	  '  make load-doctor      Check host limits for USERS before a large run' \
 	  '  make run              Start the development server (requires PostgreSQL)' \
 	  '  make clean            Remove build/test output; preserve data and secrets' \
 	  'Options: PROFILE=default|cluster NATIVE=0|1 CC=cc FC=gfortran' \
@@ -63,7 +72,7 @@ doctor:
 	@missing=0; for tool in "$(NODE)" "$(NPM)" "$(PYTHON)" erl "$(REBAR3)" $(if $(filter 1,$(NATIVE)),"$(CC)" "$(FC)"); do \
 	  if command -v "$$tool" >/dev/null; then printf 'Found: %s\n' "$$tool"; else printf 'Missing: %s\n' "$$tool"; missing=1; fi; done; \
 	  if command -v erl >/dev/null 2>&1; then otp=$$(erl -noshell -eval 'io:format("~s",[erlang:system_info(otp_release)]),halt().' 2>/dev/null); major=$${otp%%.*}; \
-	    if [ -n "$$major" ] && [ "$$major" -ge 27 ] 2>/dev/null; then printf 'Erlang/OTP: %s (supported)\n' "$$otp"; else printf 'Unsupported Erlang/OTP: %s (Plainwire 2.0 requires OTP 27+)\n' "$$otp"; missing=1; fi; fi; \
+	    if [ -n "$$major" ] && [ "$$major" -ge 27 ] 2>/dev/null; then printf 'Erlang/OTP: %s (supported)\n' "$$otp"; else printf 'Unsupported Erlang/OTP: %s (Plainwire requires OTP 27+)\n' "$$otp"; missing=1; fi; fi; \
 	  printf 'Tests also need Chromium; make browsers installs it. Production needs PostgreSQL and HTTPS.\n'; exit $$missing
 
 node_modules/.plainwire-deps: package.json package-lock.json
@@ -101,10 +110,31 @@ test-rtc-contract:
 test-ui-contract:
 	$(NPM) run test:ui-contract
 
+test-admin-contract:
+	$(NPM) run test:admin-contract
+
+test-integrations-contract:
+	$(NPM) run test:integrations-contract
+
+test-storage-contract:
+	$(NPM) run test:storage-contract
+
+test-storage-tools:
+	$(NPM) run test:storage-tools
+
+test-v21-contract:
+	$(NPM) run test:v21-contract
+
+test-scalability-contract:
+	$(NPM) run test:scalability-contract
+
+test-sdks:
+	./scripts/test-bot-sdks.sh
+
 test-release-contract:
 	$(NPM) run test:release-contract
 
-test-browser: frontend test-rtc-contract test-ui-contract test-release-contract
+test-browser: frontend test-rtc-contract test-ui-contract test-admin-contract test-integrations-contract test-storage-contract test-storage-tools test-v21-contract test-scalability-contract test-release-contract
 	$(NPM) run test:browser
 	$(NPM) run test:rtc
 
@@ -140,6 +170,33 @@ browsers: deps
 
 run: build
 	./scripts/start.sh
+
+load: backend
+	@[[ "$(USERS)" =~ ^[0-9]+$$ ]] && [ "$(USERS)" -ge 10 ] || { echo 'USERS must be an integer >= 10'; exit 2; }
+	@[[ "$(DURATION)" =~ ^[0-9]+$$ ]] && [ "$(DURATION)" -ge 1 ] || { echo 'DURATION must be an integer >= 1 second'; exit 2; }
+	@[[ "$(RATE)" =~ ^[0-9]+$$ ]] || { echo 'RATE must be a non-negative integer (0 = automatic)'; exit 2; }
+	mkdir -p _build/load
+	erlc -Werror -o _build/load tools/load/pw_load_sim.erl
+	erl -noshell -pa _build/load _build/$(PROFILE)/lib/*/ebin -eval 'case pw_load_sim:run($(USERS), $(DURATION), $(RATE)) of {ok, _} -> halt(0); {error, _} -> halt(1) end.'
+
+load-%:
+	@$(MAKE) --no-print-directory load USERS=$* DURATION=$(DURATION) RATE=$(RATE) PROFILE=$(PROFILE)
+
+load-soak:
+	@$(MAKE) --no-print-directory load USERS=$(USERS) DURATION=600 RATE=$(RATE) PROFILE=$(PROFILE)
+
+load-live:
+	$(PYTHON) tools/load/live_load.py --users "$(USERS)" --duration "$(DURATION)" --rate "$(RATE)"
+
+load-live-selftest:
+	./scripts/test-live-load-harness.sh
+
+load-doctor:
+	./scripts/load-doctor.sh "$(USERS)"
+
+load-gleam-check:
+	@command -v gleam >/dev/null || { echo 'gleam is required for the typed load-model check'; exit 2; }
+	cd tools/load/gleam && gleam check
 
 clean:
 	rm -rf -- _build test-results priv/static/elm/elm-stuff

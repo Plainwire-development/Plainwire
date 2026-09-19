@@ -23,7 +23,7 @@ async function api(path,opts={}){
   if(!res.ok||!payload.ok){const code=payload.error||`HTTP ${res.status}`,err=new Error(errorText(code));err.code=code;throw err;}
   return payload.data;
 }
-function errorText(code){const known={bad_login:'Username, password, or verification key was not accepted.',bad_bootstrap:'That startup bootstrap token is not valid.',bootstrap_unavailable:'First-owner bootstrap is no longer available.',bad_recovery:'That local recovery token is not valid.',recovery_unavailable:'Host-local recovery is not active for this startup.',invalid_enrollment:'That enrollment/recovery code is invalid or expired.',last_owner:'The final service owner cannot be demoted or removed.',forbidden:'Your operator role does not allow that action.',rate_limited:'Too many attempts. Try again shortly.',database_busy:'The database is busy. Try again.',database_unavailable:'The database is temporarily unavailable.',invalid_role:'That operator role is invalid.',user_not_found:'That Plainwire account does not exist.',invalid_banner:'Banner text and severity are required.',invalid_banner_window:'The banner end time must be after its start time.',invalid_banner_link:'Banner links must be HTTPS or a local Plainwire path.',banner_conflict:'This banner changed in another operator session. The latest version has been reloaded.',invalid_registration_mode:'That registration mode is not valid.'};return known[code]||titleCase(code||'Request failed');}
+function errorText(code){const known={bad_login:'Username, password, or verification key was not accepted.',bad_bootstrap:'That startup bootstrap token is not valid.',bootstrap_unavailable:'First-owner bootstrap is no longer available.',bad_recovery:'That local recovery token is not valid.',recovery_unavailable:'Host-local recovery is not active for this startup.',invalid_enrollment:'That enrollment/recovery code is invalid or expired.',last_owner:'The final service owner cannot be demoted or removed.',forbidden:'Your operator role does not allow that action.',rate_limited:'Too many attempts. Try again shortly.',database_busy:'The database is busy. Try again.',database_unavailable:'The database is temporarily unavailable.',invalid_role:'That operator role is invalid.',user_not_found:'That Plainwire account does not exist.',invalid_banner:'Banner text and severity are required.',invalid_banner_window:'The banner end time must be after its start time.',invalid_banner_link:'Banner links must be HTTPS or a local Plainwire path.',banner_conflict:'This banner changed in another operator session. The latest version has been reloaded.',invalid_registration_mode:'That registration mode is not valid.',invalid_action:'That moderation action is not valid.',invalid_moderation:'That moderation request is not valid.',invalid_severity:'Choose a valid moderation severity.',invalid_expiry:'The moderation expiry is invalid.',moderation_reason_required:'A reason is required for bans and suspensions.',cannot_moderate_self:'You cannot restrict your own account.',owner_protected:'Service owners are protected from instance moderation.',operator_protected:'Your operator role cannot restrict that service operator.'};return known[code]||titleCase(code||'Request failed');}
 function toast(msg,error=false){const n=el('div',`toast${error?' error':''}`,msg);$('#toast-region').append(n);setTimeout(()=>n.remove(),4200);}
 function showLoading(){clear(content);content.append(el('div','loading','Loading service data…'));}
 
@@ -75,8 +75,72 @@ function td(text,cls=''){return el('td',cls,text);}
 function tdNode(node,cls=''){const c=el('td',cls);c.append(node);return c;}
 function clickableRow(body,cells,onClick){const tr=el('tr');tr.dataset.clickable='true';cells.forEach(c=>tr.append(c));tr.addEventListener('click',onClick);body.append(tr);}
 
-async function renderUsers(){const q=encodeURIComponent(state.usersQuery),d=await api(`/users?q=${q}&limit=50&offset=${state.usersOffset}`);clear(content);content.append(panelTitle('Accounts','Content-free account metadata; click a row for details.'));content.append(toolbar(state.usersQuery,'Search username or display name…',v=>{state.usersQuery=v;state.usersOffset=0;renderUsers().catch(e=>toast(e.message,true));}));const t=table(['User','Status','Last seen','Servers','DMs','Sessions','Uploads']);d.forEach(u=>{const active=Number(u.active_sessions||0)>0;clickableRow(t.body,[identityCell(u.display_name||u.username,`@${u.username} · #${u.id}`),tdNode(el('span',`pill ${active?'active':'inactive'}`,active?'Active':'Inactive')),td(fmtTime(u.last_seen)),td(fmtNum(u.server_count)),td(fmtNum(u.conversation_count)),td(fmtNum(u.active_sessions)),td(fmtBytes(u.upload_bytes))],()=>showUser(u.id));});if(!d.length){const tr=el('tr');const c=td('No matching users.','empty');c.colSpan=7;tr.append(c);t.body.append(tr);}content.append(t.wrap,pager('users',d.length));}
-async function showUser(id){const u=await api(`/users/${id}`);const body=el('div','kv-grid');[['Account',`${u.display_name} (@${u.username})`],['User ID',u.id],['Status',Number(u.active_sessions||0)>0?'Active now':'Inactive'],['Created',fmtTime(u.created_at)],['Last seen',fmtTime(u.last_seen)],['Servers',fmtNum(u.server_count)],['Owned servers',fmtNum(u.owned_server_count)],['DM threads',fmtNum(u.conversation_count)],['Messages sent',fmtNum(u.message_count)],['Stored uploads',`${fmtNum(u.upload_count)} · ${fmtBytes(u.upload_bytes)}`],['Active sessions',fmtNum(u.active_sessions)]].forEach(([k,v])=>body.append(kv(k,v)));showModal('Account metadata','Private messages and profile text are not exposed here.',body,[]);}
+async function renderUsers(){
+  const q=encodeURIComponent(state.usersQuery),d=await api(`/users?q=${q}&limit=50&offset=${state.usersOffset}`);
+  clear(content);
+  content.append(panelTitle('Accounts','Content-free account metadata and instance moderation. Plainwire messages and attachment contents are not exposed here.'));
+  content.append(toolbar(state.usersQuery,'Search username or display name…',v=>{state.usersQuery=v;state.usersOffset=0;renderUsers().catch(e=>toast(e.message,true));}));
+  const t=table(['User','Account state','Last seen','Servers','DMs','Sessions','Uploads']);
+  d.forEach(u=>{
+    const accountState=String(u.account_state||'active');
+    const stateLabel=accountState==='active'&&Number(u.active_sessions||0)>0?'Online':titleCase(accountState);
+    const ident=identityCell(u.display_name||u.username,`@${u.username} · #${u.id}${u.is_bot?' · bot':''}`);
+    clickableRow(t.body,[ident,tdNode(el('span',`pill account-state ${accountState}`,stateLabel)),td(fmtTime(u.last_seen)),td(fmtNum(u.server_count)),td(fmtNum(u.conversation_count)),td(fmtNum(u.active_sessions)),td(fmtBytes(u.upload_bytes))],()=>showUser(u.id));
+  });
+  if(!d.length){const tr=el('tr');const c=td('No matching users.','empty');c.colSpan=7;tr.append(c);t.body.append(tr);}
+  content.append(t.wrap,pager('users',d.length));
+}
+
+async function showUser(id){
+  const [u,m,h]=await Promise.all([api(`/users/${id}`),api(`/users/${id}/moderation`),api(`/users/${id}/moderation/history`)]);
+  const wrap=el('div','account-detail-stack');
+  const body=el('div','kv-grid');
+  [['Account',`${u.display_name} (@${u.username})${u.is_bot?' · BOT':''}`],['User ID',u.id],['Account state',titleCase(u.account_state||'active')],['Created',fmtTime(u.created_at)],['Last seen',fmtTime(u.last_seen)],['Servers',fmtNum(u.server_count)],['Owned servers',fmtNum(u.owned_server_count)],['DM threads',fmtNum(u.conversation_count)],['Messages sent',fmtNum(u.message_count)],['Stored uploads',`${fmtNum(u.upload_count)} · ${fmtBytes(u.upload_bytes)}`],['Active sessions',fmtNum(u.active_sessions)]].forEach(([k,v])=>body.append(kv(k,v)));
+  wrap.append(body);
+
+  const mod=el('section','moderation-card');
+  const mh=el('div','moderation-card-head');mh.append(el('div','',null));mh.firstChild.append(el('h3','', 'Instance moderation'),el('p','muted','Account access only. This control plane cannot read private messages or attachment contents.'));
+  const statePill=el('span',`pill account-state ${m.account_state||'active'}`,titleCase(m.account_state||'active'));mh.append(statePill);mod.append(mh);
+  if(m.account_state==='suspended'||m.account_state==='banned'){
+    const notice=el('div',`moderation-preview ${m.moderation?.severity||'warning'}`);
+    notice.append(el('strong','',m.moderation?.title||titleCase(m.account_state)),el('p','',m.moderation?.reason||'No user-facing reason set.'));
+    if(Number(m.moderation?.expires_at||0)>0)notice.append(el('small','muted',`Expires ${fmtTime(m.moderation.expires_at)}`));
+    mod.append(notice);
+  }
+  if(canOperate()){
+    const actions=el('div','moderation-actions');
+    const suspend=el('button','secondary','Suspend'),ban=el('button','danger','Ban'),restore=el('button','secondary','Restore access');
+    suspend.disabled=m.account_state==='suspended';ban.disabled=m.account_state==='banned';restore.disabled=m.account_state==='active';
+    suspend.addEventListener('click',()=>showModerationAction(u,m,'suspend'));
+    ban.addEventListener('click',()=>showModerationAction(u,m,'ban'));
+    restore.addEventListener('click',()=>showModerationAction(u,m,'restore'));
+    actions.append(suspend,ban,restore);mod.append(actions);
+  }
+  wrap.append(mod);
+
+  const history=el('section','moderation-history');history.append(el('h3','', 'Moderation history'));
+  const list=el('div','audit-list');
+  h.forEach(a=>{const item=el('div','audit-item');item.append(el('time','',fmtTime(a.created_at)));const copy=el('div');copy.append(el('strong','',`${titleCase(a.action)} · ${a.title||'Account action'}`),el('p','',a.reason||'No reason'));item.append(copy,el('small','',a.actor_username?`@${a.actor_username}`:'system'));list.append(item);});
+  if(!h.length)list.append(el('div','empty','No instance moderation actions for this account.'));
+  history.append(list);wrap.append(history);
+  showModal('Account moderation',`@${u.username} · user ${u.id}`,wrap,[]);
+}
+
+function showModerationAction(user,current,action){
+  if(action==='restore'){
+    confirmAction('Restore account access?',`${user.display_name||user.username} will be able to sign in again. This is recorded in the operator audit trail.`,'Restore access').then(async ok=>{if(!ok)return;try{await api(`/users/${user.id}/moderation`,{method:'POST',body:{action:'restore'}});toast('Account access restored.');await showUser(user.id);}catch(e){toast(e.message,true);}});return;
+  }
+  const form=el('form','auth-form moderation-form');
+  const titleField=field('User-facing title','title','text'),reasonField=field('Reason shown to this user','reason','text'),severity=fieldSelect('Notice style','severity',['warning','critical','info']),expiry=field('Expires at (optional)','expires_at','datetime-local');
+  titleField.querySelector('input').value=action==='ban'?'Access revoked':'Account suspended';
+  reasonField.querySelector('input').maxLength=1000;
+  severity.querySelector('select').value=action==='ban'?'critical':'warning';
+  form.append(titleField,reasonField,severity,expiry,el('p','form-help','The action revokes normal and control-plane sessions immediately. Leave expiry blank for an indefinite restriction.'));
+  const cancel=el('button','secondary','Cancel'),apply=el('button',action==='ban'?'danger':'primary',action==='ban'?'Ban account':'Suspend account');
+  cancel.type='button';apply.type='submit';cancel.addEventListener('click',()=>showUser(user.id).catch(e=>toast(e.message,true)));
+  form.addEventListener('submit',async e=>{e.preventDefault();apply.disabled=true;const rawExpiry=expiry.querySelector('input').value;const expiresAt=rawExpiry?new Date(rawExpiry).getTime():0;try{await api(`/users/${user.id}/moderation`,{method:'POST',body:{action,title:titleField.querySelector('input').value,reason:reasonField.querySelector('input').value,severity:severity.querySelector('select').value,expires_at:Number.isFinite(expiresAt)?expiresAt:0}});toast(action==='ban'?'Account banned.':'Account suspended.');await showUser(user.id);}catch(err){toast(err.message,true);apply.disabled=false;}});
+  showModal(action==='ban'?'Ban Plainwire account':'Suspend Plainwire account',`This affects the entire hosted Plainwire instance, not one server.`,form,[cancel,apply]);
+}
 
 async function renderServers(){const q=encodeURIComponent(state.serversQuery),d=await api(`/servers?q=${q}&limit=50&offset=${state.serversOffset}`);clear(content);content.append(panelTitle('Hosted servers','Ownership and aggregate service metadata; no channel message contents.'));content.append(toolbar(state.serversQuery,'Search server or owner…',v=>{state.serversQuery=v;state.serversOffset=0;renderServers().catch(e=>toast(e.message,true));}));const t=table(['Server','Owner','Members','Channels','Updated']);d.forEach(s=>clickableRow(t.body,[identityCell(s.name,`#${s.id}`),identityCell(s.owner.display_name||s.owner.username,`@${s.owner.username}`),td(fmtNum(s.member_count)),td(fmtNum(s.channel_count)),td(fmtTime(s.updated_at))],()=>showServer(s.id)));if(!d.length){const tr=el('tr');const c=td('No matching servers.','empty');c.colSpan=5;tr.append(c);t.body.append(tr);}content.append(t.wrap,pager('servers',d.length));}
 async function showServer(id){const s=await api(`/servers/${id}`);const body=el('div','kv-grid');[['Server',s.name],['Server ID',s.id],['Owner',`${s.owner.display_name} (@${s.owner.username})`],['Created',fmtTime(s.created_at)],['Updated',fmtTime(s.updated_at)],['Members',fmtNum(s.member_count)],['Channels',fmtNum(s.channel_count)],['Roles',fmtNum(s.role_count)],['Active invites',fmtNum(s.active_invite_count)],['Messages',fmtNum(s.message_count)],['Last message time',fmtTime(s.last_message_at)]].forEach(([k,v])=>body.append(kv(k,v)));showModal('Server metadata','Operational metadata only; channel contents are not available to this panel.',body,[]);}

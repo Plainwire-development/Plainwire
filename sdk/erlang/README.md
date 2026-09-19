@@ -1,8 +1,6 @@
 # Plainwire Bot SDK for Erlang
 
-A small Erlang SDK for Plainwire 2.0 bots. It uses Gun for the HTTP API and a separate Gun WebSocket connection for realtime events.
-
-Bots authenticate with the one-time `pwb_...` token shown when a server bot is created. Keep it outside source control.
+First-party OTP client for Plainwire Bot API v1. It uses Gun for bounded HTTP requests and a separate WebSocket connection for realtime events. Remote instances require verified HTTPS. Plain HTTP is accepted only on loopback.
 
 ```erlang
 {ok, Bot} = plainwire_bot:start_link(#{
@@ -11,14 +9,16 @@ Bots authenticate with the one-time `pwb_...` token shown when a server bot is c
 }),
 
 {ok, Me} = plainwire_bot:me(Bot),
+{ok, Caps} = plainwire_bot:capabilities(Bot),
 ok = plainwire_bot:subscribe(Bot, <<"channel:42">>),
 {ok, Message} = plainwire_bot:send_message(Bot, 42, <<"hello from Erlang">>).
 ```
 
-Realtime events are delivered to the owner process as:
+Commands are durable. Register a command once, then let one or more workers claim invocations. Each claim has a short-lived one-time token and lease. Responding completes the invocation; `fail_command/4` permanently rejects it.
 
 ```erlang
-{plainwire_bot, BotPid, {event, EventMap}}
+{ok, _} = plainwire_bot:register_command(Bot, <<"hello">>, <<"Say hello">>, []),
+{ok, Claims} = plainwire_bot:claim_commands(Bot, 10).
 ```
 
-The SDK reconnects the realtime socket with bounded backoff and restores subscriptions. HTTP and WebSocket traffic intentionally use separate Gun connections because an upgraded HTTP/1.1 connection is dedicated to WebSocket traffic.
+Realtime events arrive at the owner process as `{plainwire_bot, BotPid, {event, EventMap}}`. The SDK reconnects with bounded backoff and restores subscriptions.

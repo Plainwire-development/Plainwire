@@ -2,13 +2,24 @@
 -include_lib("eunit/include/eunit.hrl").
 
 local_without_manager_test() ->
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
+    Parent = self(),
+    Socket = spawn(fun() -> cluster_socket_loop(Parent) end),
     try
-        pw_hub:subscribe(self(), {direct, 17}),
+        pw_hub:connect(17017, Socket, <<"online">>),
+        gen_server:call(pw_hub, sync),
+        pw_hub:subscribe(Socket, {direct, 17}),
         gen_server:call(pw_hub, sync),
         ok = pw_cluster:broadcast({direct, 17}, event()),
-        receive {hub_text, _, message_created} -> ok after 500 -> ?assert(false) end
-    after gen_server:stop(Hub) end.
+        receive
+            {cluster_message_created, Socket, _Payload} -> ok
+        after 500 ->
+            ?assert(false)
+        end
+    after
+        Socket ! stop,
+        stop_test_hub(Hub)
+    end.
 
 wire_validation_test() ->
     Now = erlang:system_time(millisecond),
@@ -27,6 +38,12 @@ wire_validation_test() ->
     ?assertEqual(true, pw_cluster_wire:allowed({topic, {system, global}}, #{type => service_settings_changed})),
     ?assertEqual(true, pw_cluster_wire:allowed({topic, {system, global}}, #{type => realtime_resync})),
     ?assertEqual(false, pw_cluster_wire:allowed({topic, {system, global}}, #{type => arbitrary_admin_event})),
+    ?assertEqual(true, pw_cluster_wire:allowed({control, revoke_server_access},
+        #{uid => 1, server_id => 2, channel_ids => lists:seq(1, 512)})),
+    ?assertEqual(false, pw_cluster_wire:allowed({control, revoke_server_access},
+        #{uid => 1, server_id => 2, channel_ids => lists:seq(1, 513)})),
+    ?assertEqual(false, pw_cluster_wire:allowed({control, revoke_server_access},
+        #{uid => 1, server_id => 2, channel_ids => [3 | malformed_tail]})),
     Huge = pw_cluster_wire:encode(api, Boot, 3, Now, {user, 1}, #{type => direct_message, data => binary:copy(<<0>>, 140000)}),
     ?assertMatch({error, _}, pw_cluster_wire:decode(Huge, [api], Now)).
 
@@ -45,19 +62,35 @@ secure_configuration_test() ->
 duplicate_expiry_and_rejoin_test() ->
     C = owner_config(),
     application:set_env(plainwire_relay, cluster, C),
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
+    Parent = self(),
+    Socket = spawn(fun() -> cluster_socket_loop(Parent) end),
     {ok, Cluster} = pw_cluster:start_link(C, pw_cluster_test_transport),
     try
-        pw_hub:subscribe(self(), {direct, 17}),
+        pw_hub:connect(17017, Socket, <<"online">>),
+        gen_server:call(pw_hub, sync),
+        pw_hub:subscribe(Socket, {direct, 17}),
         gen_server:call(pw_hub, sync),
         Now = erlang:system_time(millisecond),
         E = pw_cluster_wire:encode(api, <<1:128>>, 1, Now, {topic, {direct, 17}}, event()),
         Cluster ! E, Cluster ! E,
-        receive {hub_text, _, message_created} -> ok after 500 -> ?assert(false) end,
-        receive {hub_text, _, message_created} -> ?assert(false) after 30 -> ok end,
+        receive
+            {cluster_message_created, Socket, _} -> ok
+        after 500 ->
+            ?assert(false)
+        end,
+        receive
+            {cluster_message_created, Socket, _DuplicatePayload} -> ?assert(false)
+        after 30 ->
+            ok
+        end,
         %% A restarted peer may begin its sequence at 1 with a new boot ID.
         Cluster ! pw_cluster_wire:encode(api, <<2:128>>, 1, Now, {topic, {direct, 17}}, event()),
-        receive {hub_text, _, message_created} -> ok after 500 -> ?assert(false) end,
+        receive
+            {cluster_message_created, Socket, _} -> ok
+        after 500 ->
+            ?assert(false)
+        end,
         ?assertEqual(2, maps:get(received, pw_cluster:status())),
         ?assertEqual(1, maps:get(dropped, pw_cluster:status())),
         %% Node leases expire, without changing hub presence or local call state.
@@ -65,24 +98,48 @@ duplicate_expiry_and_rejoin_test() ->
         Cluster ! tick,
         _ = pw_cluster:status(),
         ?assertEqual(#{}, maps:get(peers, sys:get_state(Cluster)))
-    after gen_server:stop(Cluster), gen_server:stop(Hub), application:unset_env(plainwire_relay, cluster) end.
+    after
+        Socket ! stop,
+        gen_server:stop(Cluster),
+        stop_test_hub(Hub),
+        application:unset_env(plainwire_relay, cluster)
+    end.
 
 outbound_and_failure_test() ->
     C = (owner_config())#{name => api, realtime_node => owner, peers => [#{name => owner, ip => {127,0,0,1}, port => 9911}]},
     application:set_env(plainwire_relay, cluster, C),
     application:set_env(plainwire_relay, test_transport_sink, self()),
-    {ok, Hub} = pw_hub:start_link(),
+    os:putenv("PLAINWIRE_CLUSTER_OUTBOX_LIMIT", "256"),
+    {ok, Hub} = start_test_hub(),
     {ok, Cluster} = pw_cluster:start_link(C, pw_cluster_test_transport),
     try
         _ = pw_cluster:status(),
         ?assertEqual(false, pw_cluster_config:websocket_owner()),
         ok = pw_cluster:broadcast({direct, 17}, event()),
         receive {transport_sent, owner, events, {pw_cluster_v1, api, _, _, _, _, _}} -> ok after 500 -> ?assert(false) end,
+
+        %% A transport rejection retains the bounded head event and retries the
+        %% exact same signed/deduplicated envelope instead of silently losing a
+        %% security-control or durable-state notification.
         application:set_env(plainwire_relay, test_transport_result, {error, disconnected}),
         ok = pw_cluster:broadcast({direct, 17}, event()),
-        receive {transport_sent, owner, events, _} -> ok after 500 -> ?assert(false) end,
-        ?assertEqual(1, maps:get(dropped, pw_cluster:status())),
-        ?assert(is_process_alive(Hub)),
+        FailedEnvelope = receive
+            {transport_sent, owner, events, E1} -> E1
+        after 500 -> ?assert(false)
+        end,
+        timer:sleep(50),
+        ?assertEqual(1, maps:get(queue, pw_cluster:status())),
+        ?assert(maps:get(send_failures, pw_cluster:status()) >= 1),
+        ?assertEqual(0, maps:get(dropped, pw_cluster:status())),
+        application:set_env(plainwire_relay, test_transport_result, ok),
+        RetriedEnvelope = receive
+            {transport_sent, owner, events, E2} -> E2
+        after 1500 -> ?assert(false)
+        end,
+        ?assertEqual(FailedEnvelope, RetriedEnvelope),
+        timer:sleep(20),
+        ?assertEqual(0, maps:get(queue, pw_cluster:status())),
+
         %% Bound queued work even if the transport process stops consuming it.
         sys:suspend(Cluster),
         [pw_cluster:broadcast({direct, 17}, event()) || _ <- lists:seq(1, 256)],
@@ -92,10 +149,43 @@ outbound_and_failure_test() ->
     after
         try sys:resume(Cluster) catch _:_ -> ok end,
         try gen_server:stop(Cluster) catch _:_ -> ok end,
-        try gen_server:stop(Hub) catch _:_ -> ok end,
+        try stop_test_hub(Hub) catch _:_ -> ok end,
+        os:unsetenv("PLAINWIRE_CLUSTER_OUTBOX_LIMIT"),
         [application:unset_env(plainwire_relay, K) || K <- [cluster, test_transport_sink, test_transport_result]]
     end.
 
 owner_config() -> #{backend => partisan, name => owner, realtime_node => owner,
     peers => [#{name => api, ip => {127,0,0,1}, port => 9912}] }.
 event() -> #{type => message_created, scope => direct, scope_id => 17, message => #{id => 3, body => <<"hello">>}}.
+
+cluster_socket_loop(Parent) ->
+    receive
+        {hub_text, Payload, message_created} ->
+            Parent ! {cluster_message_created, self(), Payload},
+            cluster_socket_loop(Parent);
+        stop ->
+            ok;
+        _Other ->
+            cluster_socket_loop(Parent)
+    end.
+
+start_test_hub() ->
+    stop_named(pw_hub),
+    stop_named(pw_realtime_registry),
+    {ok, _Registry} = pw_realtime_registry:start_link(),
+    pw_hub:start_link().
+
+stop_test_hub(Hub) ->
+    case is_process_alive(Hub) of
+        true -> gen_server:stop(Hub);
+        false -> ok
+    end,
+    stop_named(pw_realtime_registry).
+
+stop_named(Name) ->
+    case whereis(Name) of
+        undefined -> ok;
+        Pid when is_pid(Pid) ->
+            try gen_server:stop(Pid, normal, 1000)
+            catch exit:_ -> exit(Pid, kill), ok end
+    end.

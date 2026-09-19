@@ -14,12 +14,35 @@ init(Req0, _State) ->
     end.
 
 init_owner(Req0) ->
-    %% Bot credentials are explicit Authorization headers, not ambient browser
-    %% credentials, so they do not rely on an Origin header. Cookie sessions keep
-    %% the stricter browser-origin contract below.
-    case bot_authorization(Req0) of
-        {ok, BotToken} -> init_bot_socket(Req0, BotToken);
-        error -> init_user_socket(Req0)
+    case websocket_admission(Req0) of
+        ok ->
+            %% Bot credentials are explicit Authorization headers, not ambient browser
+            %% credentials, so they do not rely on an Origin header. Cookie sessions keep
+            %% the stricter browser-origin contract below.
+            case bot_authorization(Req0) of
+                {ok, BotToken} -> init_bot_socket(Req0, BotToken);
+                error -> init_user_socket(Req0)
+            end;
+        {error, rate_limited} ->
+            {ok, cowboy_req:reply(429, #{<<"retry-after">> => <<"2">>}, <<"too many websocket upgrades">>, Req0), #{}};
+        {error, overloaded} ->
+            {ok, cowboy_req:reply(503, #{<<"retry-after">> => <<"3">>}, <<"realtime capacity temporarily full">>, Req0), #{}}
+    end.
+
+websocket_admission(Req) ->
+    MaxConnections = max(100, pw_util:env_int("PLAINWIRE_WS_MAX_CONNECTIONS", 100000)),
+    PerIpPerMinute = max(30, pw_util:env_int("PLAINWIRE_WS_UPGRADES_PER_IP_MIN", 1200)),
+    GlobalPerMinute = max(1000, pw_util:env_int("PLAINWIRE_WS_UPGRADES_GLOBAL_MIN", 60000)),
+    Ip = pw_util:ip(Req),
+    case pw_rate:allow({ws_upgrade, global}, GlobalPerMinute, 60000)
+         andalso pw_rate:allow({ws_upgrade, ip, Ip}, PerIpPerMinute, 60000) of
+        false -> {error, rate_limited};
+        true ->
+            case pw_realtime_registry:stats() of
+                #{available := true, websocket_connections := N} when N >= MaxConnections -> {error, overloaded};
+                #{available := true} -> ok;
+                _ -> {error, overloaded}
+            end
     end.
 
 init_user_socket(Req0) ->
@@ -63,7 +86,8 @@ init_bot_socket(Req0, Token) ->
 
 websocket_accept(Req0, Session0, Token, Uid, Status, AuthKind) ->
     Session = strip_session_urls(Session0),
-    WsOpts = #{idle_timeout => 300000, max_frame_size => 65536, compress => true},
+    WsCompress = pw_util:env_bool("PLAINWIRE_WS_COMPRESS", true),
+    WsOpts = #{idle_timeout => 300000, max_frame_size => 65536, compress => WsCompress},
     {cowboy_websocket, Req0, #{session=>Session, token=>Token, auth_kind=>AuthKind,
         last_auth_check=>erlang:monotonic_time(millisecond), uid=>Uid, subs=>[], voice=>undefined,
         voice_profile=>undefined, call=>undefined, status=>Status}, WsOpts}.
@@ -98,7 +122,7 @@ websocket_handle({text, Data}, State0=#{uid:=Uid}) ->
                                 true ->
                                     case message_allowed(Uid, M) of
                                         true ->
-                                            debug(debug_level(M), "received", #{uid => Uid, type => event_type(M), bytes => byte_size(Data), room => room_summary(State)}),
+                                            trace("received", Uid, event_type(M), State, #{bytes => byte_size(Data)}),
                                             handle_msg(M, State);
                                         false ->
                                             reply_error(State, rate_limited)
@@ -159,7 +183,8 @@ handle_msg(#{<<"type">> := <<"unsubscribe_all">>}, State) ->
     pw_hub:unsubscribe_all(self()),
     {ok, State#{subs=>[]}};
 handle_msg(#{<<"type">> := <<"presence_watch">>, <<"user_ids">> := Uids0}, State) when is_list(Uids0) ->
-    Uids = lists:sublist(lists:usort([U || U0 <- Uids0, U <- [pw_util:int(U0)], is_integer(U), U > 0]), 2000),
+    Limit = min(10000, max(100, pw_util:env_int_cached("PLAINWIRE_PRESENCE_WATCH_MAX", 2000))),
+    Uids = lists:sublist(lists:usort([U || U0 <- Uids0, U <- [pw_util:int(U0)], is_integer(U), U > 0]), Limit),
     pw_hub:watch_presence(self(), Uids),
     {ok, State};
 handle_msg(#{<<"type">> := <<"typing">>, <<"scope">> := Scope0, <<"scope_id">> := ScopeId0} = Msg,
@@ -296,8 +321,8 @@ handle_msg(#{<<"type">> := <<"voice_activity">>, <<"active">> := Active0}=Msg, S
         true -> relay_activity(State, Uid, Active);
         false -> ok
     end,
-    debug(debug, case Active of true -> "voice_detected"; false -> "voice_stopped" end,
-        #{uid => Uid, active => Active, level_db => Level, room => room_summary(State)}),
+    trace(case Active of true -> "voice_detected"; false -> "voice_stopped" end,
+          Uid, voice_activity, State, #{active => Active, level_db => Level}),
     {ok, State};
 handle_msg(#{<<"type">> := <<"presence_update">>, <<"status">> := Status0}, #{uid:=Uid}=State) ->
     Status = clean_status(Status0),
@@ -307,6 +332,25 @@ handle_msg(_, State) -> {ok, State}.
 
 websocket_info({quality_result, Request, Peer, Result}, State) ->
     quality_reply(Request, Peer, Result, State);
+websocket_info(cluster_revalidate_access, State) ->
+    case maps:get(cluster_revalidate_pending, State, false) of
+        true -> {ok, State};
+        false ->
+            MaxJitter = max(0, min(30000, pw_util:env_int_cached(
+                "PLAINWIRE_CLUSTER_REVALIDATE_JITTER_MS", 10000))),
+            Delay = case MaxJitter of
+                0 -> 0;
+                _ -> erlang:phash2({self(), maps:get(uid, State)}, MaxJitter + 1)
+            end,
+            erlang:send_after(Delay, self(), cluster_revalidate_access_now),
+            {ok, State#{cluster_revalidate_pending => true}}
+    end;
+websocket_info(cluster_revalidate_access_now, State0) ->
+    State1 = maps:remove(cluster_revalidate_pending, State0),
+    case force_revalidate_session(State1) of
+        {ok, State} -> {ok, State};
+        {error, expired} -> {stop, State1}
+    end;
 websocket_info(revalidate_auth, State0) ->
     case revalidate_session(State0) of
         {ok, State} ->
@@ -322,9 +366,20 @@ websocket_info({hub_json, Event=#{type := user_identity_updated, user_id := Even
                State=#{uid:=Uid}) when EventUid =:= Uid ->
     State1 = apply_self_identity_update(State, Username),
     deliver_hub_payload(pw_util:json(Event), user_identity_updated, Uid, State1);
+websocket_info({hub_json, Event=#{type := account_restricted}}, State=#{uid:=Uid, auth_kind:=user}) ->
+    %% The moderation transaction has already revoked every durable session.
+    %% Deliver the operator-supplied restriction details first so the client can
+    %% render the dedicated account-state screen, then tear the socket down on
+    %% the next mailbox turn. This removes the normal 60s revalidation window
+    %% without racing the UI event off the wire.
+    self() ! close_restricted_session,
+    deliver_hub_payload(pw_util:json(Event), account_restricted, Uid, State#{last_auth_check => 0});
+websocket_info(close_restricted_session, State) ->
+    {stop, State};
 websocket_info({hub_json, Event}, State=#{uid:=Uid}) ->
     deliver_hub_payload(pw_util:json(Event), event_type(Event), Uid, State);
 websocket_info({hub_text, Payload, Type}, State=#{uid:=Uid}) ->
+    _ = pw_realtime_registry:ack_delivery(self()),
     deliver_hub_payload(Payload, Type, Uid, State);
 websocket_info(_, State) -> {ok, State}.
 
@@ -333,31 +388,34 @@ quality_reply(Request, Peer, Result, State) ->
                                 peer_id => Peer, result => Result})}, State}.
 
 deliver_hub_payload(Payload, Type, Uid, State) ->
-    QueueLen = case process_info(self(), message_queue_len) of {message_queue_len, N} -> N; _ -> 0 end,
-    Soft = max(10, pw_util:env_int("PLAINWIRE_WS_SOFT_QUEUE", 500)),
-    Hard = max(Soft + 1, pw_util:env_int("PLAINWIRE_WS_HARD_QUEUE", 2000)),
-    case QueueLen >= Hard of
-        true ->
-            logger:warning("[plainwire:ws] slow_client_disconnected uid=~p queue=~p", [Uid, QueueLen]),
-            {stop, State};
-        false when QueueLen >= Soft ->
-            case droppable_event(Type) of
-                true -> {ok, State};
-                false -> {reply, {text, Payload}, State}
-            end;
-        false ->
-            logger:debug("[plainwire:ws] sent ~p", [#{uid => Uid, type => Type, room => room_summary(State)}]),
-            {reply, {text, Payload}, State}
-    end.
+    %% Sender-side atomic delivery reservations enforce the queue budget before
+    %% a hub_text enters this mailbox. Avoid another process_info/2 syscall on
+    %% every frame; local hub_json messages are bounded control-plane events.
+    trace("sent", Uid, Type, State, #{}),
+    {reply, {text, Payload}, State}.
 
 terminate(Reason, _, State=#{uid:=Uid}) ->
     debug(info, "disconnected", #{uid => Uid, reason => Reason, room => room_summary(State)}),
-    %% refresh isn't hangup. let the replacement socket reclaim the room.
-    pw_hub:disconnect(self()), ok;
+    %% refresh isn't hangup. let the replacement socket reclaim the room. Pass
+    %% the socket's own RTC ownership as a disconnect hint so cleanup remains
+    %% exact even if the registry monitor observes process death first.
+    pw_hub:disconnect(self(), rtc_disconnect_hint(State)), ok;
 %% Rejected handshakes (bad origin, no session, database down) never reach
 %% websocket_init, so cowboy terminates them with the state init/2 returned
 %% and there is no hub registration to drop.
 terminate(_, _, _) -> ok.
+
+rtc_disconnect_hint(#{uid := Uid} = State) when is_integer(Uid) ->
+    Voice = case maps:get(voice, State, undefined) of
+        Cid when is_integer(Cid), Cid > 0 -> [{voice, Cid, Uid}];
+        _ -> []
+    end,
+    Call = case maps:get(call, State, undefined) of
+        Cid2 when is_integer(Cid2), Cid2 > 0 -> [{call, Cid2, Uid}];
+        _ -> []
+    end,
+    Voice ++ Call;
+rtc_disconnect_hint(_) -> [].
 
 parse_key(Bin) when is_binary(Bin) ->
     case binary:split(Bin, <<":">>, [global]) of
@@ -432,38 +490,40 @@ production_env() ->
     lists:member(os:getenv("PLAINWIRE_ENV"), ["prod", "production"]) orelse
         lists:member(os:getenv("NODE_ENV"), ["prod", "production"]).
 
-revalidate_session(State=#{auth_kind := bot, last_auth_check := Last, token := Token, uid := Uid}) ->
+revalidate_session(State=#{last_auth_check := Last}) ->
     Now = erlang:monotonic_time(millisecond),
     case Now - Last < 60000 of
         true -> {ok, State};
-        false ->
-            case pw_db:authenticate_bot(Token) of
-                {ok, #{user_id := Uid}} -> {ok, revalidate_subscriptions(State#{last_auth_check=>Now})};
-                _ -> {error, expired}
-            end
+        false -> force_revalidate_session(State)
+    end.
+
+force_revalidate_session(State=#{auth_kind := bot, token := Token, uid := Uid}) ->
+    Now = erlang:monotonic_time(millisecond),
+    case pw_db:authenticate_bot(Token) of
+        {ok, #{user_id := Uid}} ->
+            {ok, revalidate_subscriptions(State#{last_auth_check=>Now})};
+        _ -> {error, expired}
     end;
-revalidate_session(State=#{last_auth_check := Last, token := Token, uid := Uid}) ->
+force_revalidate_session(State=#{token := Token, uid := Uid}) ->
     Now = erlang:monotonic_time(millisecond),
-    case Now - Last < 60000 of
-        true -> {ok, State};
-        false ->
-            case pw_db:session_fast(Token) of
-                {ok, Session} ->
-                    User = maps:get(user, Session),
-                    case maps:get(id, User) of
-                        Uid -> {ok, revalidate_subscriptions(revalidate_rooms(State#{session=>strip_session_urls(Session), last_auth_check=>Now}))};
+    case pw_db:session_fast(Token) of
+        {ok, Session} ->
+            User = maps:get(user, Session),
+            case maps:get(id, User) of
+                Uid -> {ok, revalidate_subscriptions(revalidate_rooms(
+                    State#{session=>strip_session_urls(Session), last_auth_check=>Now}))};
+                _ -> {error, expired}
+            end;
+        _ ->
+            case pw_db:session(Token) of
+                {ok, Session2} ->
+                    User2 = maps:get(user, Session2),
+                    case maps:get(id, User2) of
+                        Uid -> {ok, revalidate_subscriptions(revalidate_rooms(
+                            State#{session=>strip_session_urls(Session2), last_auth_check=>Now}))};
                         _ -> {error, expired}
                     end;
-                _ ->
-                    case pw_db:session(Token) of
-                        {ok, Session2} ->
-                            User2 = maps:get(user, Session2),
-                            case maps:get(id, User2) of
-                                Uid -> {ok, revalidate_subscriptions(revalidate_rooms(State#{session=>strip_session_urls(Session2), last_auth_check=>Now}))};
-                                _ -> {error, expired}
-                            end;
-                        _ -> {error, expired}
-                    end
+                _ -> {error, expired}
             end
     end.
 
@@ -555,13 +615,11 @@ maybe_leave_rtc(State) ->
 
 event_type(Map) -> maps:get(<<"type">>, Map, maps:get(type, Map, unknown)).
 
-debug_level(Map) ->
-    case event_type(Map) of
-        <<"voice_signal">> -> debug;
-        <<"call_signal">> -> debug;
-        voice_signal -> debug;
-        call_signal -> debug;
-        _ -> debug
+trace(Event, Uid, Type, State, Extra) ->
+    case pw_util:env_bool_cached("PLAINWIRE_WS_TRACE", false) of
+        true ->
+            logger:debug("[plainwire:ws] ~s ~p", [Event, Extra#{uid => Uid, type => Type, room => room_summary(State)}]);
+        false -> ok
     end.
 
 droppable_event(presence_state) -> true;

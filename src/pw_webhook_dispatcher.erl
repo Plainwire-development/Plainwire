@@ -130,7 +130,7 @@ deliver_gun(#{host := Host, address := Address, port := Port, scheme := Scheme, 
                         Headers = [
                             {<<"host">>, host_header(Host, Scheme, Port)},
                             {<<"content-type">>, <<"application/json">>},
-                            {<<"user-agent">>, <<"Plainwire-Webhook/2.0">>},
+                            {<<"user-agent">>, <<"Plainwire-Webhook/2.1">>},
                             {<<"x-plainwire-event">>, Event},
                             {<<"x-plainwire-delivery">>, integer_to_binary(Id)},
                             {<<"x-plainwire-signature">>, Signature}

@@ -34,6 +34,7 @@ view key placeholderText model =
             , onComposerKeyDown model.chatEnterSends
             ]
             []
+        , commandSuggestions model
         , Html.node "pw-mention-picker"
             [ attribute "data-scope" key
             , attribute "data-members" (mentionCandidatesJson model)
@@ -55,6 +56,16 @@ view key placeholderText model =
                 ]
                 [ span [ class "ui-icon ui-icon-attach", attribute "aria-hidden" "true" ] []
                 , span [ class "composer-action-label" ] [ text "Attach" ]
+                ]
+            , button
+                [ class "btn secondary composer-action spoiler-action"
+                , type_ "button"
+                , title "Hide or reveal the latest attachment as a spoiler"
+                , attribute "aria-label" "Toggle spoiler on latest attachment"
+                , onClick ToggleLastAttachmentSpoiler
+                ]
+                [ span [ class "composer-action-spoiler", attribute "aria-hidden" "true" ] [ text "◐" ]
+                , span [ class "composer-action-label" ] [ text "Spoiler" ]
                 ]
             , button
                 [ class "btn secondary composer-action voice-note-action"
@@ -132,6 +143,57 @@ view key placeholderText model =
                 ]
             ]
         ]
+
+
+commandSuggestions : Model -> Html Msg
+commandSuggestions model =
+    let
+        trimmed =
+            String.trimLeft model.inputText
+
+        prefix =
+            if String.startsWith "/" trimmed && not (String.contains " " trimmed) then
+                String.toLower (String.dropLeft 1 trimmed)
+
+            else
+                ""
+
+        matches =
+            if String.isEmpty prefix && trimmed /= "/" then
+                []
+
+            else
+                model.availableCommands
+                    |> List.filter (\command -> String.startsWith prefix (String.toLower command.name))
+                    |> List.take 8
+    in
+    if List.isEmpty matches then
+        text ""
+
+    else
+        div [ class "command-suggestions", attribute "role" "listbox", attribute "aria-label" "Available bot commands" ]
+            (List.map
+                (\command ->
+                    button
+                        [ type_ "button"
+                        , class "command-suggestion"
+                        , onClick (InsertComposerText ("/" ++ command.name ++ " "))
+                        ]
+                        [ span [ class "command-suggestion-name" ] [ text ("/" ++ command.name) ]
+                        , span [ class "command-suggestion-description" ]
+                            [ text
+                                (if String.isEmpty command.description then
+                                    "Bot command"
+
+                                 else
+                                    command.description
+                                )
+                            ]
+                        , span [ class "pill bot-badge" ] [ text "BOT" ]
+                        ]
+                )
+                matches
+            )
 
 
 onComposerKeyDown : Bool -> Attribute Msg

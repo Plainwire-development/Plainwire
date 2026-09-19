@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plainwire-bot"
+version = "2.1.0"
+description = "Dependency-free Python client for the Plainwire Bot API v1"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "PlainSimple License" }
+authors = [{ name = "Plainwire" }]
+keywords = ["plainwire", "bot", "chat"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Communications :: Chat",
+]
+
+[tool.setuptools]
+py-modules = ["plainwire_bot"]

@@ -100,6 +100,9 @@ bridgeDecoder =
                     "load_more_messages" ->
                         D.succeed LoadMoreMessages
 
+                    "message_jump_missing" ->
+                        D.map JumpToMessage (D.field "data" D.int)
+
                     "rtc_peer_connected" ->
                         D.map4 SetCallPeerConnected
                             (D.field "room_kind" D.string)
@@ -275,11 +278,15 @@ init flags url _ =
       , notifs = []
       , searchUsers = []
       , searchThreads = []
+      , searchMessages = []
+      , availableCommands = []
       , currentServer = Nothing
       , currentProfile = Nothing
       , currentServerProfile = Nothing
       , invitePreview = Nothing
       , msg = []
+      , pinnedMessages = []
+      , messageContextMode = False
       , nextBefore = Nothing
       , loadingOlderMessages = False
       , hasOlderMessages = True
@@ -466,6 +473,18 @@ update msg model =
 
                     else
                         model.replyTo
+                , pinnedMessages =
+                    if clearMessages then
+                        []
+
+                    else
+                        model.pinnedMessages
+                , messageContextMode =
+                    if clearMessages then
+                        False
+
+                    else
+                        model.messageContextMode
                 , sidebarOpen = False
                 , serversSheetOpen = False
                 , invitePreview = clearedInvite
@@ -479,6 +498,17 @@ update msg model =
                     else
                         model.hasOlderMessages
                 , pendingConversationId = pendingId
+                , availableCommands =
+                    case active of
+                        ChannelView _ ->
+                            if clearMessages then
+                                []
+
+                            else
+                                model.availableCommands
+
+                        _ ->
+                            []
                 , mentionHints =
                     case active of
                         DmView id ->
@@ -660,6 +690,89 @@ update msg model =
                     else if String.startsWith "/message/" tag && String.endsWith "/reactions" tag && method == "POST" then
                         handleReactionChange val model
 
+                    else if String.startsWith "/message/" tag && String.endsWith "/context" tag && method == "GET" then
+                        case D.decodeValue
+                            (D.map4 (\targetId scope scopeId messages -> { targetId = targetId, scope = scope, scopeId = scopeId, messages = messages })
+                                (D.field "target_id" D.int)
+                                (D.field "scope" D.string)
+                                (D.field "scope_id" D.int)
+                                (D.field "messages" (D.list decodeMessage))
+                            )
+                            val of
+                            Ok { targetId, scope, scopeId, messages } ->
+                                let
+                                    applies =
+                                        case model.active of
+                                            ChannelView id ->
+                                                scope == "channel" && scopeId == id
+
+                                            DmView id ->
+                                                scope == "direct" && scopeId == id
+
+                                            _ ->
+                                                False
+                                in
+                                if applies then
+                                    ( { model
+                                        | msg = messages
+                                        , messageContextMode = True
+                                        , loadingOlderMessages = False
+                                        , hasOlderMessages = True
+                                      }
+                                    , bridgeSend (E.object [ ( "tag", E.string "jump_to_message" ), ( "data", E.int targetId ) ])
+                                    )
+
+                                else
+                                    ( model, Cmd.none )
+
+                            Err _ ->
+                                ( { model | toast = Just "That replied-to message could not be loaded." }, Cmd.none )
+
+                    else if String.startsWith "/channel/" tag && String.endsWith "/pins" tag && method == "GET" then
+                        case D.decodeValue (D.list decodeMessage) val of
+                            Ok items ->
+                                ( { model | pinnedMessages = items }, Cmd.none )
+
+                            Err _ ->
+                                ( { model | pinnedMessages = [], toast = Just "Pinned messages could not be loaded." }, Cmd.none )
+
+                    else if String.startsWith "/message/" tag && String.endsWith "/pin" tag && method == "POST" then
+                        case D.decodeValue (D.map2 Tuple.pair (D.field "message_id" D.int) (D.field "pinned" D.bool)) val of
+                            Ok ( messageId, pinned ) ->
+                                let
+                                    updatePinned message =
+                                        if message.id == messageId then
+                                            { message | pinned = pinned }
+
+                                        else
+                                            message
+
+                                    maybeMessage =
+                                        findMessage messageId model.msg |> Maybe.map updatePinned
+
+                                    nextPins =
+                                        if pinned then
+                                            case maybeMessage of
+                                                Just message ->
+                                                    message :: List.filter (\item -> item.id /= messageId) model.pinnedMessages
+
+                                                Nothing ->
+                                                    model.pinnedMessages
+
+                                        else
+                                            List.filter (\item -> item.id /= messageId) model.pinnedMessages
+                                in
+                                ( { model
+                                    | msg = List.map updatePinned model.msg
+                                    , pinnedMessages = nextPins
+                                    , toast = Just (if pinned then "Message pinned" else "Message unpinned")
+                                  }
+                                , Cmd.none
+                                )
+
+                            Err _ ->
+                                ( model, Cmd.none )
+
                     else if String.startsWith "/server/" tag && method == "POST" && String.contains "/categor" tag then
                         ( { model
                             | toast =
@@ -726,6 +839,20 @@ update msg model =
 
                     else if String.startsWith "/threads?q=" tag then
                         handleList (D.list decodeThread) (\items m -> { m | searchThreads = items }) val model
+
+                    else if String.startsWith "/search/messages?q=" tag then
+                        case D.decodeValue (D.field "messages" (D.list decodeMessage)) val of
+                            Ok items ->
+                                ( { model | searchMessages = items }, Cmd.none )
+
+                            Err _ ->
+                                ( { model | searchMessages = [], toast = Just "Message search could not be loaded." }, Cmd.none )
+
+                    else if String.startsWith "/commands?channel_id=" tag then
+                        handleList (D.list decodeBotCommand) (\items m -> { m | availableCommands = items }) val model
+
+                    else if String.startsWith "/commands/" tag && String.endsWith "/invoke" tag then
+                        handleMessageSent Nothing (fromApiField "message" val) { model | inputText = "", replyTo = Nothing, drafts = Dict.remove (draftKeyFor model.active) model.drafts }
 
                     else if String.startsWith "/server/" tag && String.endsWith "/channels" tag then
                         ( { model | toast = Just "Channel created" }, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), routeCmd model.active ] )
@@ -857,6 +984,14 @@ update msg model =
             in
             ( { model | drafts = Dict.insert key draft model.drafts, toast = Just "Upload added to the original conversation's draft." }, Cmd.none )
 
+        ToggleLastAttachmentSpoiler ->
+            case toggleLastAttachmentSpoiler model.inputText of
+                Just next ->
+                    ( { model | inputText = next, drafts = Dict.insert (draftKeyFor model.active) next model.drafts }, Cmd.none )
+
+                Nothing ->
+                    ( { model | toast = Just "Attach a file first, then mark it as a spoiler." }, Cmd.none )
+
         InputText s ->
             ( { model | inputText = s, drafts = Dict.insert (draftKeyFor model.active) s model.drafts }, Cmd.none )
 
@@ -940,6 +1075,54 @@ update msg model =
                         }
               }
             , Cmd.none
+            )
+
+        JumpToMessage mid ->
+            if mid <= 0 then
+                ( model, Cmd.none )
+
+            else
+                case findMessage mid model.msg of
+                    Just _ ->
+                        ( { model | modal = Nothing, ctxMenu = Nothing }
+                        , bridgeSend (E.object [ ( "tag", E.string "jump_to_message" ), ( "data", E.int mid ) ])
+                        )
+
+                    Nothing ->
+                        ( { model | modal = Nothing, ctxMenu = Nothing }
+                        , apiSend (encodeApiRequest (ApiGet ("/message/" ++ String.fromInt mid ++ "/context")))
+                        )
+
+        OpenPinnedMessages channelId ->
+            if channelId <= 0 then
+                ( model, Cmd.none )
+
+            else
+                ( { model | modal = Just ("pinned_messages:" ++ String.fromInt channelId), pinnedMessages = [] }
+                , apiSend (encodeApiRequest (ApiGet ("/channel/" ++ String.fromInt channelId ++ "/pins")))
+                )
+
+        SetMessagePinned message pinned ->
+            if message.id <= 0 || message.scope /= "channel" then
+                ( model, Cmd.none )
+
+            else
+                ( { model | ctxMenu = Nothing }
+                , apiSend
+                    (encodeApiRequest
+                        (ApiPost ("/message/" ++ String.fromInt message.id ++ "/pin")
+                            (Just (E.object [ ( "pinned", E.bool pinned ) ]))
+                        )
+                    )
+                )
+
+        ReturnToLatestMessages ->
+            ( { model
+                | messageContextMode = False
+                , msg = Dict.values model.outbox |> List.filter (messageApplies model.active) |> List.sortBy .createdAt
+                , hasOlderMessages = True
+              }
+            , routeCmd model.active
             )
 
         CancelReply ->
@@ -3014,7 +3197,10 @@ routeCmd active =
                 ]
 
         ChannelView id ->
-            apiSend (encodeApiRequest (ApiGet ("/messages?scope=channel&scope_id=" ++ String.fromInt id)))
+            Cmd.batch
+                [ apiSend (encodeApiRequest (ApiGet ("/messages?scope=channel&scope_id=" ++ String.fromInt id)))
+                , apiSend (encodeApiRequest (ApiGet ("/commands?channel_id=" ++ String.fromInt id)))
+                ]
 
         ServerView id ->
             apiSend (encodeApiRequest (ApiGet ("/server/" ++ String.fromInt id)))
@@ -3030,9 +3216,14 @@ routeCmd active =
                 Cmd.none
 
         SearchView q ->
+            let
+                encoded =
+                    Url.percentEncode q
+            in
             Cmd.batch
-                [ apiSend (encodeApiRequest (ApiGet ("/users?q=" ++ q)))
-                , apiSend (encodeApiRequest (ApiGet ("/threads?q=" ++ q)))
+                [ apiSend (encodeApiRequest (ApiGet ("/users?q=" ++ encoded)))
+                , apiSend (encodeApiRequest (ApiGet ("/threads?q=" ++ encoded)))
+                , apiSend (encodeApiRequest (ApiGet ("/search/messages?q=" ++ encoded ++ "&limit=30")))
                 ]
 
         _ ->
@@ -3294,6 +3485,45 @@ toggleDeafen voice =
         { voice | deafened = True, mutedBeforeDeafen = voice.muted, muted = True }
 
 
+matchingCommand : String -> List BotCommand -> Maybe ( BotCommand, String )
+matchingCommand body commands =
+    let
+        trimmed =
+            String.trim body
+
+        pieces =
+            String.words trimmed
+
+        commandName =
+            case pieces of
+                first :: _ ->
+                    if String.startsWith "/" first then
+                        String.toLower (String.dropLeft 1 first)
+
+                    else
+                        ""
+
+                [] ->
+                    ""
+
+        args =
+            case pieces of
+                _ :: rest ->
+                    String.join " " rest
+
+                [] ->
+                    ""
+    in
+    if String.isEmpty commandName then
+        Nothing
+
+    else
+        commands
+            |> List.filter (\command -> String.toLower command.name == commandName)
+            |> List.head
+            |> Maybe.map (\command -> ( command, args ))
+
+
 sendMessage : Model -> ( Model, Cmd Msg )
 sendMessage model =
     let
@@ -3335,30 +3565,83 @@ sendMessage model =
                 )
 
             ChannelView id ->
-                let
-                    path =
-                        "/channels/" ++ String.fromInt id ++ "/messages"
+                case matchingCommand body model.availableCommands of
+                    Just ( command, args ) ->
+                        let
+                            commandPayload =
+                                E.object
+                                    [ ( "channel_id", E.int id )
+                                    , ( "args", E.string args )
+                                    ]
+                        in
+                        -- Keep the draft until the server acknowledges the invocation. If
+                        -- the request fails or times out, the user should never lose what
+                        -- they typed. The response handler clears it on success.
+                        ( model
+                        , apiSend (encodeApiRequest (ApiPost ("/commands/" ++ command.name ++ "/invoke") (Just commandPayload)))
+                        )
 
-                    model2 =
-                        appendOptimisticMessage "channel" id body model
+                    Nothing ->
+                        let
+                            path =
+                                "/channels/" ++ String.fromInt id ++ "/messages"
 
-                    lastMsgId =
-                        case List.reverse model2.msg of
-                            m :: _ ->
-                                m.id
+                            model2 =
+                                appendOptimisticMessage "channel" id body model
 
-                            [] ->
-                                -1
-                in
-                ( { model2 | pendingMessages = Dict.insert lastMsgId path model.pendingMessages, failedMsgIds = Set.remove lastMsgId model.failedMsgIds }
-                , Cmd.batch [ apiSend (messageRequest lastMsgId path payload), scrollToBottom ]
-                )
+                            lastMsgId =
+                                case List.reverse model2.msg of
+                                    m :: _ ->
+                                        m.id
+
+                                    [] ->
+                                        -1
+                        in
+                        ( { model2 | pendingMessages = Dict.insert lastMsgId path model.pendingMessages, failedMsgIds = Set.remove lastMsgId model.failedMsgIds }
+                        , Cmd.batch [ apiSend (messageRequest lastMsgId path payload), scrollToBottom ]
+                        )
 
             ThreadView id ->
                 ( model, apiSend (encodeApiRequest (ApiPost ("/thread/" ++ String.fromInt id ++ "/replies") (Just (E.object [ ( "body", E.string body ) ])))) )
 
             _ ->
                 ( model, Cmd.none )
+
+
+toggleLastAttachmentSpoiler : String -> Maybe String
+toggleLastAttachmentSpoiler source =
+    let
+        toggleLine line =
+            let
+                trimmed =
+                    String.trim line
+
+                isAttachment =
+                    String.contains "](/api/files/" trimmed || String.contains "](/api/media/" trimmed
+            in
+            if not isAttachment then
+                Nothing
+
+            else if String.startsWith "||" trimmed && String.endsWith "||" trimmed && String.length trimmed > 4 then
+                Just (String.dropRight 2 (String.dropLeft 2 trimmed))
+
+            else
+                Just ("||" ++ trimmed ++ "||")
+
+        walk reversed prefix =
+            case reversed of
+                [] ->
+                    Nothing
+
+                line :: rest ->
+                    case toggleLine line of
+                        Just changed ->
+                            Just (String.join "\n" (List.reverse (prefix ++ (changed :: rest))))
+
+                        Nothing ->
+                            walk rest (prefix ++ [ line ])
+    in
+    walk (List.reverse (String.lines source)) []
 
 
 appendOptimisticMessage : String -> Int -> String -> Model -> Model
@@ -3389,6 +3672,8 @@ appendOptimisticMessage scope scopeId body model =
                         Nothing
                         Nothing
                         ""
+                        user.isBot
+                        False
                         []
             in
             { model | msg = model.msg ++ [ optimistic ], inputText = "", replyTo = Nothing, drafts = Dict.remove (draftKeyFor model.active) model.drafts, outbox = Dict.insert optimistic.id optimistic model.outbox, nextMessageId = model.nextMessageId - 1 }
@@ -3425,6 +3710,9 @@ handleWsEvent val model =
 
         Ok ( "message_reaction_changed", ev ) ->
             handleReactionChange ev model
+
+        Ok ( "message_pin_changed", ev ) ->
+            handleMessagePinChanged ev model
 
         Ok ( "direct_message", _ ) ->
             handleNotifiedMessage val model
@@ -3484,6 +3772,9 @@ handleWsEvent val model =
             handleServerStructureEvent ev model
 
         Ok ( "channel_created", ev ) ->
+            handleServerStructureEvent ev model
+
+        Ok ( "channel_updated", ev ) ->
             handleServerStructureEvent ev model
 
         Ok ( "member_joined", ev ) ->
@@ -3998,6 +4289,39 @@ handleServerStructureEvent ev model =
             ( model, Cmd.none )
 
 
+handleMessagePinChanged : E.Value -> Model -> ( Model, Cmd Msg )
+handleMessagePinChanged ev model =
+    case D.decodeValue (D.map2 Tuple.pair (D.field "message_id" D.int) (D.field "pinned" D.bool)) ev of
+        Ok ( messageId, pinned ) ->
+            let
+                updatePinned message =
+                    if message.id == messageId then
+                        { message | pinned = pinned }
+
+                    else
+                        message
+
+                maybeMessage =
+                    findMessage messageId model.msg |> Maybe.map updatePinned
+
+                nextPins =
+                    if pinned then
+                        case maybeMessage of
+                            Just message ->
+                                message :: List.filter (\item -> item.id /= messageId) model.pinnedMessages
+
+                            Nothing ->
+                                model.pinnedMessages
+
+                    else
+                        List.filter (\item -> item.id /= messageId) model.pinnedMessages
+            in
+            ( { model | msg = List.map updatePinned model.msg, pinnedMessages = nextPins }, Cmd.none )
+
+        Err _ ->
+            ( model, Cmd.none )
+
+
 handleConversationStructureEvent : E.Value -> Model -> ( Model, Cmd Msg )
 handleConversationStructureEvent ev model =
     case D.decodeValue (D.field "conversation_id" D.int) ev of
@@ -4255,6 +4579,19 @@ handleMessageCreated ev model =
             if alreadyPresent then
                 ( model, Cmd.none )
 
+            else if messageApplies model.active message && model.messageContextMode then
+                ( { model
+                    | convs = List.map (updateConversationPreview message) model.convs
+                    , toast =
+                        if fromMe then
+                            model.toast
+
+                        else
+                            Just "New messages are available. Return to Latest to see them."
+                  }
+                , notification
+                )
+
             else if messageApplies model.active message then
                 ( { model
                     | msg = List.filter (\m -> m.id /= message.id) model.msg ++ [ message ]
@@ -4283,6 +4620,14 @@ handleNotifiedMessage ev model =
             in
             if alreadyPresent then
                 ( model, Cmd.none )
+
+            else if messageApplies model.active message && model.messageContextMode then
+                ( { model
+                    | convs = List.map (updateConversationPreview message) model.convs
+                    , toast = Just "New messages are available. Return to Latest to see them."
+                  }
+                , playNotification model.soundEnabled
+                )
 
             else if messageApplies model.active message then
                 ( { model
@@ -4664,6 +5009,7 @@ handleMessageDeleted ev model =
             in
             ( { model
                 | msg = List.filter (\m -> m.id /= messageId) model.msg
+                , pinnedMessages = List.filter (\m -> m.id /= messageId) model.pinnedMessages
                 , editingMessageId = nextEditingId
                 , editingMessageText = if nextEditingId == Nothing then "" else model.editingMessageText
               }
@@ -4937,6 +5283,51 @@ modalContent kind model =
             [ div [ class "emoji-picker-grid reaction-picker-grid", attribute "role" "listbox", attribute "aria-label" "Message reactions" ]
                 (List.map (emojiReactionPickerButton messageId) emojiPickerItems)
             ]
+        ]
+
+    else if String.startsWith "pinned_messages:" kind then
+        let
+            canManage =
+                model.currentServer
+                    |> Maybe.map (\data -> serverHasPermission 4 data.server)
+                    |> Maybe.withDefault False
+
+            pinRow message =
+                div [ class "pinned-message-row" ]
+                    [ button
+                        [ class "pinned-message-open"
+                        , type_ "button"
+                        , onClick (JumpToMessage message.id)
+                        , attribute "aria-label" ("Jump to message from " ++ message.displayName)
+                        ]
+                        [ div [ class "pinned-message-meta" ]
+                            [ b [] [ text message.displayName ]
+                            , small [ class "muted" ] [ text (relativeTime model.serverTime message.createdAt) ]
+                            ]
+                        , div [ class "pinned-message-body" ] [ Markdown.preview message.body ]
+                        ]
+                    , if canManage then
+                        button
+                            [ class "btn secondary pinned-message-unpin"
+                            , type_ "button"
+                            , onClick (SetMessagePinned message False)
+                            , title "Unpin message"
+                            ]
+                            [ text "Unpin" ]
+
+                      else
+                        text ""
+                    ]
+        in
+        [ modalHead "Pinned messages" "Important messages saved for this channel."
+        , div [ class "modal-body pinned-messages-modal" ]
+            [ if List.isEmpty model.pinnedMessages then
+                div [ class "empty compact-empty" ] [ text "No pinned messages in this channel." ]
+
+              else
+                div [ class "pinned-message-list" ] (List.map pinRow model.pinnedMessages)
+            ]
+        , div [ class "modal-actions" ] [ button [ class "btn secondary", type_ "button", onClick CloseModal ] [ text "Close" ] ]
         ]
 
     else if String.startsWith "delete_server:" kind then
@@ -5570,7 +5961,10 @@ serverProfileModal model profile =
         [ div [ class "server-profile-identity" ]
             [ presenceAvatar model.userStatuses user.id avatarUrl displayName "big"
             , div [ class "server-profile-copy" ]
-                [ h2 [ style "color" (if String.isEmpty member.roleColor then "var(--text1)" else member.roleColor) ] [ text displayName ]
+                [ div [ class "profile-name-line" ]
+                    [ h2 [ style "color" (if String.isEmpty member.roleColor then "var(--text1)" else member.roleColor) ] [ text displayName ]
+                    , botBadge user.isBot
+                    ]
                 , p [ class "muted" ] [ text ("@" ++ user.username ++ " · " ++ profile.serverName) ]
                 ]
             ]
@@ -6007,6 +6401,24 @@ messageContext model message x y =
                 , { label = "More reactions…", icon = Just "+", danger = False, sep = False, msg = OpenReactionPicker message.id }
                 ]
 
+        pinItems =
+            case ( message.scope, model.currentServer ) of
+                ( "channel", Just data ) ->
+                    if message.id > 0 && serverHasPermission 4 data.server then
+                        [ { label = if message.pinned then "Unpin message" else "Pin message"
+                          , icon = Just "📌"
+                          , danger = False
+                          , sep = True
+                          , msg = SetMessagePinned message (not message.pinned)
+                          }
+                        ]
+
+                    else
+                        []
+
+                _ ->
+                    []
+
         authorItems =
             if mine then
                 []
@@ -6038,7 +6450,7 @@ messageContext model message x y =
             else
                 []
     in
-    { items = base ++ reactionItems ++ authorItems ++ mineItems, x = x, y = y }
+    { items = base ++ reactionItems ++ pinItems ++ authorItems ++ mineItems, x = x, y = y }
 
 
 conversationContext : Model -> Conversation -> Int -> Int -> ContextMenu
@@ -6916,7 +7328,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "2.0.3", attribute "data-ui-revision" "interface-5" ]
+    div [ class "layout", attribute "data-ui-version" "2.1.0", attribute "data-ui-revision" "interface-5" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -9197,6 +9609,15 @@ managedChannelRow canManage categories channel =
         ]
 
 
+botBadge : Bool -> Html Msg
+botBadge isBot =
+    if isBot then
+        span [ class "pill bot-badge", title "Automated account" ] [ text "BOT" ]
+
+    else
+        text ""
+
+
 memberRow : Dict String String -> Int -> ServerMember -> Html Msg
 memberRow userStatuses serverId m =
     let
@@ -9241,6 +9662,7 @@ memberRow userStatuses serverId m =
                     [ style "color" m.roleColor ]
                 )
                 [ text displayName ]
+            , botBadge m.user.isBot
             , small [ class "muted" ] [ text ("@" ++ m.user.username ++ " · "), span roleAttrs [ text roleText ] ]
             ]
         ]
@@ -9599,7 +10021,7 @@ renderProfilePage model =
                     , div [ class "profile-copy" ]
                         [ div [ class "profile-title-row" ]
                             [ div []
-                                [ h1 [] [ text u.displayName ]
+                                [ div [ class "profile-name-line" ] [ h1 [] [ text u.displayName ], botBadge u.isBot ]
                                 , p [ class "muted profile-identity" ] [ text ("@" ++ u.username) ]
                                 ]
                             , span [ class ("presence-pill profile-presence " ++ presence) ]
@@ -9666,6 +10088,7 @@ renderSettingsPage model =
                     , settingsMobileTab model.settingsTab "sound" "Alerts"
                     , settingsMobileTab model.settingsTab "privacy" "Privacy"
                     , settingsMobileTab model.settingsTab "account" "Account"
+                    , settingsMobileTab model.settingsTab "developer" "Developer"
                     ]
                 , aside [ class "settings-sidebar" ]
                     [ div [ class "settings-nav-label" ] [ text "User settings" ]
@@ -9677,6 +10100,7 @@ renderSettingsPage model =
                     , settingsDesktopTab model.settingsTab "privacy" "ui-icon ui-icon-profile" "Privacy & Safety" "Local data controls"
                     , div [ class "settings-nav-separator" ] []
                     , settingsDesktopTab model.settingsTab "account" "ui-icon ui-icon-settings" "Account" "Security and sessions"
+                    , settingsDesktopTab model.settingsTab "developer" "ui-icon ui-icon-settings" "Developer" "Apps, bots and commands"
                     , div [ class "settings-nav-footer" ]
                         [ span [ class "settings-saved-dot", attribute "aria-hidden" "true" ] []
                         , div [] [ b [] [ text "Saved on this device" ], small [] [ text "Most changes apply immediately" ] ]
@@ -9722,6 +10146,9 @@ renderSettingsPage model =
 
                             "account" ->
                                 renderAccountSettings u model
+
+                            "developer" ->
+                                node "pw-developer-portal" [] []
 
                             _ ->
                                 renderProfileSettings u model
@@ -9865,6 +10292,9 @@ settingsTitle tab =
         "account" ->
             "Account"
 
+        "developer" ->
+            "Developer Portal"
+
         _ ->
             "My Profile"
 
@@ -9889,6 +10319,9 @@ settingsSubtitle tab =
 
         "account" ->
             "Manage your sign-in, active sessions, and connection diagnostics."
+
+        "developer" ->
+            "Build applications, install bots, register commands, and connect external services or AI models."
 
         _ ->
             "Update the name, photo, banner, and bio people see across Plainwire."
@@ -10852,6 +11285,11 @@ renderChatHeader model =
 
                           else
                             text ""
+                        , if model.messageContextMode then
+                            button [ class "btn secondary chat-history-action", type_ "button", onClick ReturnToLatestMessages, title "Return to the newest messages" ] [ text "Latest" ]
+
+                          else
+                            text ""
                         , chatConnectionBadge model
                         , if joinedCall then
                             button [ class "btn call-decline chat-call-action", onClick EndCall ] [ span [ class "ui-icon ui-icon-call-end", attribute "aria-hidden" "true" ] [], span [ class "chat-call-label" ] [ text "Leave" ] ]
@@ -11083,17 +11521,46 @@ channelChatHeader channelId model =
 
         channelTopic =
             channel |> Maybe.map .topic |> Maybe.withDefault ""
+
+        slowmodeSeconds =
+            channel |> Maybe.map .slowmodeSeconds |> Maybe.withDefault 0
+
+        channelMeta =
+            let
+                base =
+                    if String.isEmpty (String.trim channelTopic) then
+                        "Text channel"
+
+                    else
+                        channelTopic
+            in
+            if slowmodeSeconds > 0 then
+                base ++ " · Slowmode " ++ String.fromInt slowmodeSeconds ++ "s"
+
+            else
+                base
     in
     div [ class "chat-header channel-chat-header" ]
         [ button [ class "chat-mobile-menu", type_ "button", onClick ToggleSidebar, attribute "aria-label" "Open navigation" ] [ span [ class "ui-icon ui-icon-menu", attribute "aria-hidden" "true" ] [] ]
         , span [ class "channel-header-mark", attribute "aria-hidden" "true" ] [ text "#" ]
         , div [ class "grow" ]
             [ h2 [] [ text channelName ]
-            , if String.isEmpty (String.trim channelTopic) then
-                small [ class "muted" ] [ text "Text channel" ]
+            , small [ class "muted" ] [ text channelMeta ]
+            ]
+        , if model.messageContextMode then
+            button [ class "btn secondary chat-history-action", type_ "button", onClick ReturnToLatestMessages, title "Return to the newest messages" ] [ text "Latest" ]
 
-              else
-                small [ class "muted" ] [ text channelTopic ]
+          else
+            text ""
+        , button
+            [ class "btn secondary chat-history-action"
+            , type_ "button"
+            , onClick (OpenPinnedMessages channelId)
+            , title "Pinned messages"
+            , attribute "aria-label" "Open pinned messages"
+            ]
+            [ span [ class "channel-pin-symbol", attribute "aria-hidden" "true" ] [ text "📌" ]
+            , span [ class "chat-history-label" ] [ text "Pins" ]
             ]
         , chatConnectionBadge model
         ]
@@ -11320,6 +11787,7 @@ textMessageView model grouped m =
                                )
                         )
                         [ text m.displayName ]
+                    , botBadge m.isBot
                     , timestampButton model "msg-time" m
                     , if mine then
                         span [ class "pill self-pill" ] [ text "you" ]
@@ -11329,10 +11797,28 @@ textMessageView model grouped m =
                     ]
             , case m.replyTo of
                 Just r ->
-                    div [ class "reply-preview" ] [ span [ class "reply-line" ] [], span [ class "reply-author" ] [ text r.displayName ], span [] [ text r.body ] ]
+                    button
+                        [ class "reply-preview"
+                        , type_ "button"
+                        , onClick (JumpToMessage r.id)
+                        , title "Jump to replied-to message"
+                        , attribute "aria-label" ("Jump to message from " ++ r.displayName)
+                        ]
+                        [ span [ class "reply-line", attribute "aria-hidden" "true" ] []
+                        , span [ class "reply-author" ] [ text r.displayName ]
+                        , span [ class "reply-preview-body" ] [ text r.body ]
+                        ]
 
                 Nothing ->
                     text ""
+            , if m.pinned then
+                span [ class "message-pinned-indicator", title "Pinned message" ]
+                    [ span [ attribute "aria-hidden" "true" ] [ text "📌" ]
+                    , text " Pinned"
+                    ]
+
+              else
+                text ""
             , case m.forwardedFrom of
                 Just forwarded ->
                     button
@@ -11570,13 +12056,25 @@ renderSearchPage q model =
 
         threadCount =
             List.length model.searchThreads
+
+        messageCount =
+            List.length model.searchMessages
     in
     div [ class "search-page page-stack" ]
         [ div [ class "page-heading" ]
             [ div []
                 [ span [ class "eyebrow" ] [ text "Search" ]
                 , h1 [] [ text ("Results for “" ++ q ++ "”") ]
-                , p [ class "muted" ] [ text (String.fromInt userCount ++ " people and " ++ String.fromInt threadCount ++ " discussions") ]
+                , p [ class "muted" ]
+                    [ text
+                        (String.fromInt userCount
+                            ++ " people, "
+                            ++ String.fromInt threadCount
+                            ++ " discussions, and "
+                            ++ String.fromInt messageCount
+                            ++ " messages"
+                        )
+                    ]
                 ]
             ]
         , div [ class "search-result-grid" ]
@@ -11600,6 +12098,46 @@ renderSearchPage q model =
                         List.map searchThreadView model.searchThreads
                     )
                 ]
+            , section [ class "card search-result-section search-message-results" ]
+                [ div [ class "search-result-head" ] [ h2 [] [ text "Messages" ], span [ class "pill" ] [ text (String.fromInt messageCount) ] ]
+                , div []
+                    (if List.isEmpty model.searchMessages then
+                        [ div [ class "empty" ] [ text "No readable messages matched this search." ] ]
+
+                     else
+                        List.map searchMessageView model.searchMessages
+                    )
+                ]
+            ]
+        ]
+
+
+searchMessageView : Message -> Html Msg
+searchMessageView m =
+    let
+        target =
+            if m.scope == "channel" then
+                "#channel/" ++ String.fromInt m.scopeId
+
+            else
+                "#dm/" ++ String.fromInt m.scopeId
+
+        preview =
+            if String.length m.body > 220 then
+                String.left 217 m.body ++ "..."
+
+            else
+                m.body
+    in
+    button [ class "row search-message-row", type_ "button", onClick (Go target) ]
+        [ avatarImg m.avatarUrl m.displayName "small"
+        , div [ class "grow search-message-copy" ]
+            [ div [ class "search-message-author" ]
+                [ b [] [ text m.displayName ]
+                , botBadge m.isBot
+                , small [ class "muted" ] [ text ("@" ++ m.username) ]
+                ]
+            , p [] [ text preview ]
             ]
         ]
 
@@ -11779,6 +12317,15 @@ fmtErr err =
 
         "rate_limited" ->
             "Too many attempts. Wait a moment and try again."
+
+        "slowmode" ->
+            "Slowmode is active in this channel. Wait a little before sending another message."
+
+        "pin_limit" ->
+            "This channel already has 50 pinned messages. Unpin one before adding another."
+
+        "pins_channel_only" ->
+            "Only server channel messages can be pinned."
 
         "reaction_rate_limited" ->
             "You’re reacting too quickly. Wait a moment and try again."

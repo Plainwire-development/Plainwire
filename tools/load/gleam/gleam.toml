@@ -1,0 +1,6 @@
+name = "plainwire_load_model"
+version = "1.0.0"
+target = "erlang"
+
+[dependencies]
+gleam_stdlib = ">= 1.0.0 and < 2.0.0"

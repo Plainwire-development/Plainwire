@@ -34,7 +34,7 @@ const deliveryStore = read('src/pw_delivery_store.erl');
 const pinnedGitDeps = {
   cowboy: '79e3fb02b31d47af6e69e8f3ba18fba291a3072a',
   cowlib: 'c768a804565ff5b8178ed968a5921e469d6bd7b2',
-  ranch: '10b51304b26062e0dbfd5e74824324e9a911e269',
+  ranch: '70ae2ff5d5f5740a60b3d68a5898be3edf4e4802',
   gun: '9d40b0ff2de1546e5c613205c4f25aaefffc2569',
   erlcass: 'a3f752e1a9de007b806f160a6798fb1945dc075b',
 };

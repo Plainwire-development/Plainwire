@@ -14,10 +14,17 @@ allow(Key, Limit, WindowMs) when Limit > 0, WindowMs > 0 ->
     Bucket = Now div WindowMs,
     CounterKey = {Key, WindowMs, Bucket},
     Expires = (Bucket + 1) * WindowMs + WindowMs,
-    try ets:update_counter(?TABLE, CounterKey, {2, 1}, {CounterKey, 0, Expires}) of
-        Count -> Count =< Limit
-    catch
-        error:badarg -> false
+    %% High-cardinality attacker input must not turn the rate limiter itself
+    %% into an unbounded memory sink. Existing counters continue to update;
+    %% novel keys fail closed once the soft global table budget is reached.
+    case counter_admitted(CounterKey) of
+        false -> false;
+        true ->
+            try ets:update_counter(?TABLE, CounterKey, {2, 1}, {CounterKey, 0, Expires}) of
+                Count -> Count =< Limit
+            catch
+                error:badarg -> false
+            end
     end;
 allow(_, _, _) -> false.
 
@@ -38,6 +45,16 @@ stats() ->
     try #{entries => ets:info(?TABLE, size), memory_words => ets:info(?TABLE, memory)}
     catch _:_ -> #{entries => 0, memory_words => 0}
     end.
+
+counter_admitted(CounterKey) ->
+    try
+        ets:member(?TABLE, CounterKey) orelse
+            ets:info(?TABLE, size) < rate_max_entries()
+    catch error:badarg -> false
+    end.
+
+rate_max_entries() ->
+    min(5000000, max(10000, pw_util:env_int_cached("PLAINWIRE_RATE_MAX_ENTRIES", 500000))).
 
 init([]) ->
     _ = ets:new(?TABLE, [named_table, public, set,

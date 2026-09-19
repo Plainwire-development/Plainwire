@@ -56,8 +56,17 @@ renderRichChunks remaining pending fence rendered =
                     else
                         fence
             in
-            if fence == Nothing && attachmentMarkup line /= Nothing then
-                renderRichChunks rest [] nextFence (renderAttachment line :: flush)
+            if fence == Nothing then
+                case spoilerAttachmentLine line of
+                    Just inner ->
+                        renderRichChunks rest [] nextFence (renderSpoilerAttachment inner :: flush)
+
+                    Nothing ->
+                        if attachmentMarkup line /= Nothing then
+                            renderRichChunks rest [] nextFence (renderAttachment line :: flush)
+
+                        else
+                            renderRichChunks rest (line :: pending) nextFence rendered
 
             else
                 renderRichChunks rest (line :: pending) nextFence rendered
@@ -66,6 +75,38 @@ renderRichChunks remaining pending fence rendered =
 markdown : String -> Html msg
 markdown source =
     Html.node "pw-markdown" [ attribute "source" source ] []
+
+
+spoilerAttachmentLine : String -> Maybe String
+spoilerAttachmentLine line =
+    let
+        trimmed =
+            String.trim line
+    in
+    if String.startsWith "||" trimmed && String.endsWith "||" trimmed && String.length trimmed > 4 then
+        let
+            inner =
+                String.dropRight 2 (String.dropLeft 2 trimmed)
+        in
+        if attachmentMarkup inner /= Nothing then
+            Just inner
+
+        else
+            Nothing
+
+    else
+        Nothing
+
+
+renderSpoilerAttachment : String -> Html msg
+renderSpoilerAttachment inner =
+    Html.details [ class "spoiler-attachment" ]
+        [ Html.summary [ class "spoiler-attachment-summary" ]
+            [ span [ class "spoiler-attachment-icon", attribute "aria-hidden" "true" ] [ text "◐" ]
+            , text "Spoiler attachment"
+            ]
+        , div [ class "spoiler-attachment-content" ] [ renderAttachment inner ]
+        ]
 
 
 renderAttachment : String -> Html msg

@@ -1,5 +1,5 @@
 -module(pw_outbound_url).
--export([allowed/1, resolve_allowed/1, public_ip/1]).
+-export([allowed/1, resolve_allowed/1, resolve_app_allowed/1, public_ip/1]).
 
 %% Resolve and validate an outbound URL in one operation. Callers that perform
 %% the network request must connect to the returned address instead of resolving
@@ -24,29 +24,65 @@ resolve_allowed(Url0) ->
         _ -> {error, invalid_url}
     catch _:_ -> {error, invalid_url} end.
 
+%% Developer application interactions and hosted-AI connectors have a stricter
+%% transport policy than legacy outbound webhooks. Remote destinations are
+%% always HTTPS. Explicit loopback HTTP exists only for local development and
+%% is limited to exact numeric/localhost loopback names so DNS cannot turn a
+%% development exception into remote plaintext token delivery.
+resolve_app_allowed(Url0) ->
+    Url = pw_util:clean_text(Url0, 2048),
+    try uri_string:parse(Url) of
+        #{scheme := Scheme0, host := Host0} = Parts ->
+            Scheme = string:lowercase(pw_util:bin(Scheme0)),
+            Host = string:lowercase(pw_util:bin(Host0)),
+            case Scheme of
+                <<"https">> -> resolve_parts(Scheme, Host, Parts);
+                <<"http">> -> resolve_app_loopback(Host, Parts);
+                _ -> {error, blocked_scheme}
+            end;
+        _ -> {error, invalid_url}
+    catch _:_ -> {error, invalid_url} end.
+
+resolve_app_loopback(Host, Parts) ->
+    case pw_util:env_bool("PLAINWIRE_APP_ALLOW_LOOPBACK_HTTP", false) of
+        false -> {error, blocked_scheme};
+        true ->
+            case loopback_address(Host) of
+                {ok, Address} -> target_for_address(<<"http">>, Host, Parts, Address);
+                error -> {error, blocked_address}
+            end
+    end.
+
+loopback_address(<<"localhost">>) -> {ok, {127,0,0,1}};
+loopback_address(<<"127.0.0.1">>) -> {ok, {127,0,0,1}};
+loopback_address(<<"::1">>) -> {ok, {0,0,0,0,0,0,0,1}};
+loopback_address(_) -> error.
+
 resolve_parts(_Scheme, <<>>, _Parts) -> {error, invalid_host};
 resolve_parts(_Scheme, <<"localhost">>, _Parts) -> {error, blocked_host};
 resolve_parts(Scheme, Host, Parts) ->
+    case resolve_public(Host) of
+        {ok, Address} -> target_for_address(Scheme, Host, Parts, Address);
+        Error -> Error
+    end.
+
+target_for_address(Scheme, Host, Parts, Address) ->
     DefaultPort = case Scheme of <<"https">> -> 443; <<"http">> -> 80 end,
     Port = maps:get(port, Parts, DefaultPort),
     case is_integer(Port) andalso Port > 0 andalso Port =< 65535 of
         false -> {error, invalid_port};
         true ->
-            case resolve_public(Host) of
-                {ok, Address} ->
-                    RawPath = case maps:get(path, Parts, <<>>) of
-                        <<>> -> <<"/">>;
-                        P -> pw_util:bin(P)
-                    end,
-                    Path = case maps:get(query, Parts, undefined) of
-                        undefined -> RawPath;
-                        <<>> -> RawPath;
-                        Q -> <<RawPath/binary, "?", (pw_util:bin(Q))/binary>>
-                    end,
-                    {ok, #{scheme => Scheme, host => Host, port => Port,
-                           path => Path, address => Address}};
-                Error -> Error
-            end
+            RawPath = case maps:get(path, Parts, <<>>) of
+                <<>> -> <<"/">>;
+                P -> pw_util:bin(P)
+            end,
+            Path = case maps:get(query, Parts, undefined) of
+                undefined -> RawPath;
+                <<>> -> RawPath;
+                Q -> <<RawPath/binary, "?", (pw_util:bin(Q))/binary>>
+            end,
+            {ok, #{scheme => Scheme, host => Host, port => Port,
+                   path => Path, address => Address}}
     end.
 
 scheme_allowed(<<"https">>) -> true;

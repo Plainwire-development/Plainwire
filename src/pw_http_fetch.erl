@@ -159,8 +159,8 @@ get(Url, MaxBytes, Opts) when is_binary(Url), is_integer(MaxBytes), MaxBytes > 0
 
 
 tls_options(<<"https://", _/binary>>) ->
-    %% OTP 25 still defaulted httpc TLS verification to verify_none. Plainwire
-    %% supports OTP 25+, so make certificate + HTTPS hostname verification
+    %% Keep certificate and HTTPS hostname verification explicit even on the
+    %% OTP 27+ baseline so future runtime defaults cannot silently weaken it
     %% explicit instead of relying on the runtime's changing defaults.
     try
         [{ssl, [

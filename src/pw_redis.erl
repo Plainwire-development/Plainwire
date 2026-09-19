@@ -2,7 +2,7 @@
 -behaviour(gen_server).
 
 -export([start_link/0, enabled/0, command/1, command/2, cast_command/1,
-         rate_allow/3, presence_set/3, presence_get/1, presence_delete/1, cache_put/3, cache_get/1,
+         rate_allow/3, presence_set/3, presence_set_many/2, presence_get/1, presence_delete/1, cache_put/3, cache_get/1,
          cache_delete/1, cache_version/1, cache_bump_version/1,
          cache_get_at_version/2, cache_put_at_version/4, stats/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -27,18 +27,25 @@ enabled() ->
 
 command(Args) -> command(Args, timeout_ms()).
 command(Args, Timeout) when is_list(Args), is_integer(Timeout), Timeout > 0 ->
-    case whereis(?MODULE) of
-        undefined -> {error, unavailable};
-        _ ->
-            try gen_server:call(?MODULE, {command, Args, Timeout}, Timeout + 100)
-            catch exit:_ -> {error, unavailable} end
+    case choose_worker(Args) of
+        {manager, Pid} when is_pid(Pid) ->
+            try gen_server:call(Pid, {command, Args, Timeout}, Timeout + 100)
+            catch exit:_ -> {error, unavailable} end;
+        {worker, Pid} when is_pid(Pid) -> worker_call(Pid, Args, Timeout);
+        _ -> {error, unavailable}
     end.
 
 cast_command(Args) when is_list(Args) ->
-    case whereis(?MODULE) of
-        undefined -> ok;
-        _ -> gen_server:cast(?MODULE, {command, Args}), ok
-    end.
+    send_async(choose_worker(Args), {redis_cast, Args}).
+
+cast_pipeline([]) -> ok;
+cast_pipeline(Commands) when is_list(Commands) ->
+    Groups = lists:foldl(fun(Command, Acc) ->
+        Entry = choose_worker(Command),
+        maps:update_with(Entry, fun(L) -> [Command | L] end, [Command], Acc)
+    end, #{}, Commands),
+    maps:foreach(fun(Entry, Reversed) -> send_pipeline(Entry, lists:reverse(Reversed)) end, Groups),
+    ok.
 
 %% Shared limiter is deliberately a second gate behind pw_rate's ETS limiter.
 %% If Redis is absent or unhealthy we fail open to the already-enforced local
@@ -56,44 +63,79 @@ rate_allow(_, _, _) -> false.
 
 presence_set(Uid, Status0, TtlMs) when is_integer(Uid), Uid > 0, TtlMs >= 1000 ->
     Status = safe_status(Status0),
-    Key = redis_key(<<"presence">>, integer_to_binary(Uid)),
     Owner = presence_owner(),
     Now = pw_util:now_ms(),
+    cast_command(presence_set_command(Uid, Status, TtlMs, Owner, Now));
+presence_set(_, _, _) -> ok.
+
+%% Refreshing thousands of online users one TCP round-trip at a time creates a
+%% burst every presence TTL interval and can bury the Redis worker mailbox.
+%% Pipeline single-key Lua commands so this remains compatible with Redis
+%% Cluster hash-slot rules while collapsing the network round trips.
+presence_set_many(Pairs0, TtlMs) when is_list(Pairs0), TtlMs >= 1000 ->
+    Pairs = [{Uid, safe_status(Status)} || {Uid, Status} <- Pairs0,
+        is_integer(Uid), Uid > 0],
+    Owner = presence_owner(),
+    Now = pw_util:now_ms(),
+    Commands = [presence_set_command(Uid, Status, TtlMs, Owner, Now) || {Uid, Status} <- Pairs],
+    lists:foreach(fun(Batch) -> cast_pipeline(Batch) end, chunk_list(Commands, 256)),
+    ok;
+presence_set_many(_, _) -> ok.
+
+presence_set_command(Uid, Status, TtlMs, Owner, Now) ->
+    Key = redis_key(<<"presence">>, integer_to_binary(Uid)),
     %% Presence is stored per Plainwire node, not as one user-wide scalar. That
     %% prevents one websocket node from overwriting another node that still has
     %% an active session for the same account. Each field carries its own expiry
     %% deadline; readers prune stale fields atomically. Invisible means this node
     %% has no visible session and therefore removes only its own field.
-    Script = <<"local owner=ARGV[1]; local status=ARGV[2]; local now=tonumber(ARGV[3]); local ttl=tonumber(ARGV[4]); "
-               "if status=='invisible' then redis.call('HDEL',KEYS[1],owner); if redis.call('HLEN',KEYS[1])==0 then redis.call('DEL',KEYS[1]) end; return 1 end; "
+    Script = <<"local owner=ARGV[1]; local now=tonumber(ARGV[2]); local ttl=tonumber(ARGV[3]); "
+               "local status=ARGV[4]; if status=='invisible' then redis.call('HDEL',KEYS[1],owner); "
+               "if redis.call('HLEN',KEYS[1])==0 then redis.call('DEL',KEYS[1]) end; return 1 end; "
                "redis.call('HSET',KEYS[1],owner,status..'|'..tostring(now+ttl)); redis.call('PEXPIRE',KEYS[1],ttl*2); return 1">>,
-    cast_command([<<"EVAL">>, Script, <<"1">>, Key, Owner, Status, integer_to_binary(Now), integer_to_binary(TtlMs)]);
-presence_set(_, _, _) -> ok.
+    [<<"EVAL">>, Script, <<"1">>, Key, Owner, integer_to_binary(Now), integer_to_binary(TtlMs), Status].
 
 presence_get(Uids0) when is_list(Uids0) ->
     Uids = lists:usort([U || U <- Uids0, is_integer(U), U > 0]),
     case Uids of
         [] -> #{};
         _ ->
-            Keys = [redis_key(<<"presence">>, integer_to_binary(U)) || U <- Uids],
-            %% One Lua call keeps a large presence-watch request to one network
-            %% round trip. Stale node fields are removed while reading. Status
-            %% precedence matches pw_hub: effective_status/3.
-            Script = <<"local now=tonumber(ARGV[1]); local out={}; "
-                       "for k=1,#KEYS do local vals=redis.call('HGETALL',KEYS[k]); local best=false; local rank=0; "
-                       "for i=1,#vals,2 do local v=vals[i+1]; local sep=string.find(v,'|',1,true); "
-                       "if sep then local st=string.sub(v,1,sep-1); local exp=tonumber(string.sub(v,sep+1)) or 0; "
-                       "if exp<=now then redis.call('HDEL',KEYS[k],vals[i]); else local r=(st=='busy' and 3) or (st=='online' and 2) or (st=='away' and 1) or 0; if r>rank then rank=r; best=st end end end end; "
-                       "if redis.call('HLEN',KEYS[k])==0 then redis.call('DEL',KEYS[k]) end; out[k]=best; end; return out">>,
-            case command([<<"EVAL">>, Script, integer_to_binary(length(Keys)) | Keys] ++ [integer_to_binary(pw_util:now_ms())]) of
-                {ok, Values} when is_list(Values), length(Values) =:= length(Uids) ->
-                    maps:from_list([{U, normalize_presence(V)} || {U, V} <- lists:zip(Uids, Values), is_binary(V)]);
-                _ -> #{}
-            end
+            %% Keep every presence read single-key. Besides avoiding one giant
+            %% Lua invocation for a 2k-member watch list, this preserves Redis
+            %% Cluster/proxy compatibility because no command spans hash slots.
+            %% Commands are synchronously pipelined across the local Redis worker
+            %% pool, so the caller pays roughly one round trip per worker/batch,
+            %% not one round trip per watched account.
+            Now = integer_to_binary(pw_util:now_ms()),
+            Pairs = [{U, presence_get_command(U, Now)} || U <- Uids],
+            Results = lists:append([
+                presence_get_batch(Batch) || Batch <- chunk_list(Pairs, 256)
+            ]),
+            maps:from_list([{U, normalize_presence(V)} || {U, {ok, V}} <- Results, is_binary(V)])
     end.
 
+presence_get_command(Uid, Now) ->
+    Key = redis_key(<<"presence">>, integer_to_binary(Uid)),
+    Script = <<"local now=tonumber(ARGV[1]); local vals=redis.call('HGETALL',KEYS[1]); "
+               "local best=false; local rank=0; for i=1,#vals,2 do local v=vals[i+1]; "
+               "local sep=string.find(v,'|',1,true); if sep then local st=string.sub(v,1,sep-1); "
+               "local exp=tonumber(string.sub(v,sep+1)) or 0; if exp<=now then redis.call('HDEL',KEYS[1],vals[i]); "
+               "else local r=(st=='busy' and 3) or (st=='online' and 2) or (st=='away' and 1) or 0; "
+               "if r>rank then rank=r; best=st end end end; if redis.call('HLEN',KEYS[1])==0 then redis.call('DEL',KEYS[1]) end; return best">>,
+    [<<"EVAL">>, Script, <<"1">>, Key, Now].
+
+presence_get_batch(Pairs) ->
+    Commands = [Command || {_Uid, Command} <- Pairs],
+    Values = pipeline_commands(Commands, timeout_ms()),
+    lists:zipwith(fun({Uid, _}, Value) -> {Uid, Value} end, Pairs, Values).
+
 presence_delete(Uid) when is_integer(Uid), Uid > 0 ->
-    cast_command([<<"DEL">>, redis_key(<<"presence">>, integer_to_binary(Uid))]);
+    %% Presence is node-scoped. Disconnecting from this gateway must never wipe
+    %% a session for the same account that is still alive on another gateway.
+    Owner = presence_owner(),
+    Key = redis_key(<<"presence">>, integer_to_binary(Uid)),
+    Script = <<"redis.call('HDEL',KEYS[1],ARGV[1]); if redis.call('HLEN',KEYS[1])==0 then redis.call('DEL',KEYS[1]) end; return 1">>,
+    cast_command([<<"EVAL">>, Script, <<"1">>, Key, Owner]);
 presence_delete(_) -> ok.
 
 presence_owner() ->
@@ -169,7 +211,7 @@ stats() ->
 init([]) ->
     process_flag(trap_exit, true),
     Enabled = configured(),
-    State = #{enabled => Enabled, socket => undefined, transport => tcp,
+    BaseState = #{enabled => Enabled, socket => undefined, transport => tcp,
               host => os:getenv("PLAINWIRE_REDIS_HOST", "127.0.0.1"),
               port => env_range("PLAINWIRE_REDIS_PORT", ?DEFAULT_PORT, 1, 65535),
               tls => env_bool("PLAINWIRE_REDIS_TLS", false),
@@ -179,16 +221,27 @@ init([]) ->
               database => env_range("PLAINWIRE_REDIS_DB", 0, 0, 15),
               timeout => timeout_ms(),
               commands => 0, failures => 0, connects => 0, last_error => undefined},
-    case Enabled of
-        true -> self() ! warm_connect;
-        false -> ok
+    PoolSize = case Enabled of
+        true -> env_range("PLAINWIRE_REDIS_POOL_SIZE", min(8, max(2, erlang:system_info(schedulers_online))), 1, 32);
+        false -> 1
     end,
-    {ok, State}.
+    %% Keep the gen_server as a pure control plane. Redis I/O happens only in
+    %% dedicated workers so a slow socket can never delay worker supervision,
+    %% stats, or pool repair. Workers connect lazily and reconnect independently.
+    Workers = case Enabled of
+        true -> [spawn_link(fun() -> redis_worker_start(BaseState) end) || _ <- lists:seq(1, PoolSize)];
+        false -> []
+    end,
+    Entries = [{worker, Pid} || Pid <- Workers],
+    %% slot 1 = round-robin cursor; slot 2 = shed async accelerator writes.
+    Counter = atomics:new(2, [{signed, false}]),
+    persistent_term:put({?MODULE, pool}, {Entries, Counter}),
+    {ok, BaseState#{workers => Workers, pool_size => length(Workers)}}.
 
 handle_call(enabled, _, State) -> {reply, maps:get(enabled, State), State};
 handle_call(stats, _, State) ->
-    Reply = maps:with([enabled, commands, failures, connects, last_error], State),
-    {reply, Reply#{connected => maps:get(socket, State) =/= undefined}, State};
+    Reply = aggregate_stats(State),
+    {reply, Reply, State};
 handle_call({command, _Args, _Timeout}, _, State=#{enabled := false}) ->
     {reply, {error, disabled}, State};
 handle_call({command, Args, Timeout}, _, State0) ->
@@ -197,8 +250,12 @@ handle_call({command, Args, Timeout}, _, State0) ->
 handle_call(_, _, State) -> {reply, {error, unsupported}, State}.
 
 handle_cast({command, _Args}, State=#{enabled := false}) -> {noreply, State};
+handle_cast({pipeline, _Commands}, State=#{enabled := false}) -> {noreply, State};
 handle_cast({command, Args}, State0) ->
     {_Reply, State} = execute(Args, maps:get(timeout, State0), State0, false),
+    {noreply, State};
+handle_cast({pipeline, Commands}, State0) ->
+    {_Reply, State} = execute_pipeline(Commands, maps:get(timeout, State0), State0, true),
     {noreply, State};
 handle_cast(_, State) -> {noreply, State}.
 
@@ -211,10 +268,276 @@ handle_info({tcp_closed, _}, State) -> {noreply, close_socket(State)};
 handle_info({ssl_closed, _}, State) -> {noreply, close_socket(State)};
 handle_info({tcp_error, _, Reason}, State) -> {noreply, failed(Reason, close_socket(State))};
 handle_info({ssl_error, _, Reason}, State) -> {noreply, failed(Reason, close_socket(State))};
+handle_info({'EXIT', Pid, Reason}, State=#{workers := Workers}) ->
+    case lists:member(Pid, Workers) of
+        false -> {noreply, State};
+        true ->
+            logger:warning("[plainwire:redis] pool worker restarted reason=~p", [Reason]),
+            Base = worker_base_state(State),
+            Replacement = spawn_link(fun() -> redis_worker_start(Base) end),
+            Workers1 = [case W =:= Pid of true -> Replacement; false -> W end || W <- Workers],
+            update_pool(Workers1),
+            {noreply, State#{workers => Workers1}}
+    end;
 handle_info(_, State) -> {noreply, State}.
 
-terminate(_, State) -> _ = close_socket(State), ok.
+terminate(_, State) ->
+    persistent_term:erase({?MODULE, pool}),
+    persistent_term:erase({?MODULE, async_queue_limit}),
+    persistent_term:erase({?MODULE, sync_queue_limit}),
+    [Pid ! stop || Pid <- maps:get(workers, State, [])],
+    _ = close_socket(State),
+    ok.
 code_change(_, State, _) -> {ok, State}.
+
+choose_worker(Args) ->
+    case persistent_term:get({?MODULE, pool}, undefined) of
+        {Entries, Counter} when is_list(Entries), Entries =/= [] ->
+            Index = case command_route_key(Args) of
+                undefined ->
+                    N = atomics:add_get(Counter, 1, 1),
+                    1 + ((N - 1) rem length(Entries));
+                Key -> 1 + erlang:phash2(Key, length(Entries))
+            end,
+            lists:nth(Index, Entries);
+        _ -> unavailable
+    end.
+
+send_async({worker, Pid}, Message) when is_pid(Pid) ->
+    case queue_len(Pid) >= redis_async_queue_limit() of
+        true -> record_async_drop(), ok;
+        false -> Pid ! Message, ok
+    end;
+send_async(_, _) -> ok.
+
+send_pipeline({worker, Pid}, Commands) when is_pid(Pid) ->
+    send_async({worker, Pid}, {redis_pipeline, Commands});
+send_pipeline(_, _) -> ok.
+
+redis_async_queue_limit() ->
+    case persistent_term:get({?MODULE, async_queue_limit}, undefined) of
+        Limit when is_integer(Limit) -> Limit;
+        undefined ->
+            Limit = env_range("PLAINWIRE_REDIS_ASYNC_QUEUE", 4096, 128, 65536),
+            persistent_term:put({?MODULE, async_queue_limit}, Limit),
+            Limit
+    end.
+
+record_async_drop() ->
+    case persistent_term:get({?MODULE, pool}, undefined) of
+        {_Entries, Counter} -> atomics:add(Counter, 2, 1);
+        _ -> ok
+    end.
+
+%% Hash commands by their Redis key so asynchronous mutations for the same
+%% logical record remain ordered even with multiple TCP connections.
+command_route_key([Command, Key | _]) when Command =:= <<"GET">>; Command =:= <<"SET">>;
+                                                Command =:= <<"DEL">>; Command =:= <<"INCR">>;
+                                                Command =:= <<"HGETALL">>; Command =:= <<"HSET">>;
+                                                Command =:= <<"HDEL">> -> Key;
+command_route_key([<<"EVAL">>, _Script, NumKeys, Key | _]) ->
+    case NumKeys of <<"1">> -> Key; 1 -> Key; _ -> undefined end;
+command_route_key(_) -> undefined.
+
+worker_call(Pid, Args, Timeout) ->
+    case queue_len(Pid) >= redis_sync_queue_limit() of
+        true -> {error, overloaded};
+        false ->
+            Ref = make_ref(),
+            Mon = erlang:monitor(process, Pid),
+            Pid ! {redis_command, self(), Ref, Args, Timeout},
+            receive
+                {redis_reply, Ref, Reply} -> erlang:demonitor(Mon, [flush]), Reply;
+                {'DOWN', Mon, process, Pid, _} -> {error, unavailable}
+            after Timeout + 100 ->
+                erlang:demonitor(Mon, [flush]),
+                {error, timeout}
+            end
+    end.
+
+redis_sync_queue_limit() ->
+    case persistent_term:get({?MODULE, sync_queue_limit}, undefined) of
+        Limit when is_integer(Limit) -> Limit;
+        undefined ->
+            Limit = env_range("PLAINWIRE_REDIS_SYNC_QUEUE", 2048, 64, 32768),
+            persistent_term:put({?MODULE, sync_queue_limit}, Limit),
+            Limit
+    end.
+
+%% Return one {ok, Value}/{error, Reason} entry per input command while running
+%% independent worker pipelines concurrently. This is used for bounded bulk
+%% reads such as presence snapshots; it never turns them into a cross-slot Redis
+%% command and it keeps result ordering stable for callers.
+pipeline_commands([], _Timeout) -> [];
+pipeline_commands(Commands, Timeout) ->
+    Indexed = lists:zip(lists:seq(1, length(Commands)), Commands),
+    Groups = lists:foldl(fun({Index, Command}, Acc) ->
+        Entry = choose_worker(Command),
+        maps:update_with(Entry, fun(L) -> [{Index, Command} | L] end,
+                         [{Index, Command}], Acc)
+    end, #{}, Indexed),
+    {Pending, Results0} = maps:fold(fun(Entry, Reversed, {PendingAcc, ResultAcc}) ->
+        Items = lists:reverse(Reversed),
+        case Entry of
+            {worker, Pid} when is_pid(Pid) ->
+                case queue_len(Pid) >= redis_sync_queue_limit() of
+                    true ->
+                        {PendingAcc, add_pipeline_errors(Items, overloaded, ResultAcc)};
+                    false ->
+                        Ref = make_ref(),
+                        Mon = erlang:monitor(process, Pid),
+                        Pid ! {redis_pipeline_call, self(), Ref,
+                               [Command || {_Index, Command} <- Items], Timeout},
+                        {[{Ref, Mon, Pid, Items} | PendingAcc], ResultAcc}
+                end;
+            _ -> {PendingAcc, add_pipeline_errors(Items, unavailable, ResultAcc)}
+        end
+    end, {[], #{}}, Groups),
+    Deadline = erlang:monotonic_time(millisecond) + Timeout + 100,
+    Results = collect_pipeline_replies(Pending, Deadline, Results0),
+    [maps:get(I, Results, {error, timeout}) || I <- lists:seq(1, length(Commands))].
+
+add_pipeline_errors(Items, Reason, Acc) ->
+    lists:foldl(fun({Index, _}, A) -> maps:put(Index, {error, Reason}, A) end, Acc, Items).
+
+collect_pipeline_replies([], _Deadline, Results) -> Results;
+collect_pipeline_replies(Pending, Deadline, Results0) ->
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    case Remaining of
+        0 ->
+            lists:foreach(fun({_Ref, Mon, _Pid, _Items}) -> erlang:demonitor(Mon, [flush]) end, Pending),
+            lists:foldl(fun({_Ref, _Mon, _Pid, Items}, Acc) ->
+                add_pipeline_errors(Items, timeout, Acc)
+            end, Results0, Pending);
+        _ ->
+            receive
+                {redis_pipeline_reply, Ref, Reply} ->
+                    case lists:keytake(Ref, 1, Pending) of
+                        {value, {Ref, Mon, _Pid, Items}, Rest} ->
+                            erlang:demonitor(Mon, [flush]),
+                            Results1 = add_pipeline_reply(Items, Reply, Results0),
+                            collect_pipeline_replies(Rest, Deadline, Results1);
+                        false -> collect_pipeline_replies(Pending, Deadline, Results0)
+                    end;
+                {'DOWN', Mon, process, Pid, _Reason} ->
+                    case take_pipeline_monitor(Mon, Pid, Pending) of
+                        {ok, Items, Rest} ->
+                            collect_pipeline_replies(Rest, Deadline,
+                                add_pipeline_errors(Items, unavailable, Results0));
+                        error -> collect_pipeline_replies(Pending, Deadline, Results0)
+                    end
+            after Remaining ->
+                collect_pipeline_replies(Pending, Deadline, Results0)
+            end
+    end.
+
+add_pipeline_reply(Items, {ok, Values}, Results) when is_list(Values), length(Values) =:= length(Items) ->
+    lists:foldl(fun({{Index, _}, Value}, Acc) -> maps:put(Index, {ok, Value}, Acc) end,
+                Results, lists:zip(Items, Values));
+add_pipeline_reply(Items, {error, Reason}, Results) -> add_pipeline_errors(Items, Reason, Results);
+add_pipeline_reply(Items, _Other, Results) -> add_pipeline_errors(Items, invalid_response, Results).
+
+take_pipeline_monitor(_Mon, _Pid, []) -> error;
+take_pipeline_monitor(Mon, Pid, [{_Ref, Mon, Pid, Items} | Rest]) -> {ok, Items, Rest};
+take_pipeline_monitor(Mon, Pid, [Item | Rest]) ->
+    case take_pipeline_monitor(Mon, Pid, Rest) of
+        {ok, Items, Tail} -> {ok, Items, [Item | Tail]};
+        error -> error
+    end.
+
+redis_worker_start(State0) ->
+    process_flag(message_queue_data, off_heap),
+    State = case maps:get(enabled, State0, false) of
+        true ->
+            case ensure_connected(State0) of
+                {ok, Connected} -> Connected;
+                {error, _Reason, Failed} -> Failed
+            end;
+        false -> State0
+    end,
+    redis_worker_loop(State).
+
+redis_worker_loop(State0) ->
+    receive
+        {redis_command, From, Ref, Args, Timeout} when is_pid(From), is_list(Args) ->
+            {Reply, State} = execute(Args, Timeout, State0, true),
+            From ! {redis_reply, Ref, Reply},
+            redis_worker_loop(State);
+        {redis_cast, Args} when is_list(Args) ->
+            {_Reply, State} = execute(Args, maps:get(timeout, State0), State0, false),
+            redis_worker_loop(State);
+        {redis_pipeline, Commands} when is_list(Commands) ->
+            {_Reply, State} = execute_pipeline(Commands, maps:get(timeout, State0), State0, true),
+            redis_worker_loop(State);
+        {redis_pipeline_call, From, Ref, Commands, Timeout}
+          when is_pid(From), is_list(Commands), is_integer(Timeout), Timeout > 0 ->
+            {Reply, State} = execute_pipeline(Commands, Timeout, State0, true),
+            From ! {redis_pipeline_reply, Ref, Reply},
+            redis_worker_loop(State);
+        {redis_stats, From, Ref} when is_pid(From) ->
+            From ! {redis_worker_stats, Ref, local_stats(State0)},
+            redis_worker_loop(State0);
+        stop ->
+            _ = close_socket(State0),
+            ok;
+        _ -> redis_worker_loop(State0)
+    end.
+
+worker_base_state(State) ->
+    (maps:without([workers, pool_size], State))#{socket => undefined, transport => tcp,
+        commands => 0, failures => 0, connects => 0, last_error => undefined}.
+
+update_pool(Workers) ->
+    case persistent_term:get({?MODULE, pool}, undefined) of
+        {_OldEntries, Counter} ->
+            persistent_term:put({?MODULE, pool},
+                {[{worker, Pid} || Pid <- Workers], Counter});
+        _ -> ok
+    end.
+
+aggregate_stats(State) ->
+    Workers = maps:get(workers, State, []),
+    Requests = [begin Ref = make_ref(), Pid ! {redis_stats, self(), Ref}, Ref end || Pid <- Workers],
+    WorkerStats = collect_worker_stats(Requests, erlang:monotonic_time(millisecond) + 50, []),
+    AsyncDropped = case persistent_term:get({?MODULE, pool}, undefined) of
+        {_Entries, Counter} -> atomics:get(Counter, 2);
+        _ -> 0
+    end,
+    #{enabled => maps:get(enabled, State),
+      pool_size => maps:get(pool_size, State, 0),
+      connected => lists:any(fun(S) -> maps:get(connected, S, false) end, WorkerStats),
+      connected_workers => length([ok || S <- WorkerStats, maps:get(connected, S, false)]),
+      commands => lists:sum([maps:get(commands, S, 0) || S <- WorkerStats]),
+      failures => lists:sum([maps:get(failures, S, 0) || S <- WorkerStats]),
+      connects => lists:sum([maps:get(connects, S, 0) || S <- WorkerStats]),
+      async_dropped => AsyncDropped,
+      async_queue_limit => redis_async_queue_limit(),
+      sync_queue_limit => redis_sync_queue_limit(),
+      worker_mailboxes => [queue_len(Pid) || Pid <- Workers]}.
+
+collect_worker_stats([], _Deadline, Acc) -> Acc;
+collect_worker_stats(Pending, Deadline, Acc) ->
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    case Remaining of
+        0 -> Acc;
+        _ ->
+            receive
+                {redis_worker_stats, Ref, Stats} ->
+                    case lists:member(Ref, Pending) of
+                        true -> collect_worker_stats(lists:delete(Ref, Pending), Deadline, [Stats | Acc]);
+                        false -> collect_worker_stats(Pending, Deadline, Acc)
+                    end
+            after Remaining -> Acc
+            end
+    end.
+
+local_stats(State) ->
+    #{connected => maps:get(socket, State, undefined) =/= undefined,
+      commands => maps:get(commands, State, 0), failures => maps:get(failures, State, 0),
+      connects => maps:get(connects, State, 0), last_error => maps:get(last_error, State, undefined)}.
+
+queue_len(Pid) ->
+    case process_info(Pid, message_queue_len) of {message_queue_len, N} -> N; _ -> -1 end.
 
 execute(Args, Timeout, State0, Retry) ->
     case ensure_connected(State0) of
@@ -237,6 +560,32 @@ retry_or_fail(Args, Timeout, Reason, State0, true) ->
     State1 = failed(Reason, close_socket(State0)),
     execute(Args, Timeout, State1, false);
 retry_or_fail(_Args, _Timeout, Reason, State0, false) ->
+    {{error, Reason}, failed(Reason, close_socket(State0))}.
+
+execute_pipeline([], _Timeout, State, _Retry) -> {{ok, []}, State};
+execute_pipeline(Commands, Timeout, State0, Retry) ->
+    case ensure_connected(State0) of
+        {error, Reason, State1} -> {{error, Reason}, State1};
+        {ok, State1} ->
+            Socket = maps:get(socket, State1),
+            Transport = maps:get(transport, State1),
+            Packet = [encode_command(Args) || Args <- Commands],
+            case sock_send(Transport, Socket, Packet) of
+                ok ->
+                    case recv_responses(Transport, Socket, Timeout, length(Commands), <<>>, []) of
+                        {ok, Values} ->
+                            Count = length(Commands),
+                            {{ok, Values}, State1#{commands := maps:get(commands, State1) + Count, last_error => undefined}};
+                        {error, Reason} -> retry_pipeline_or_fail(Commands, Timeout, Reason, State1, Retry)
+                    end;
+                {error, Reason} -> retry_pipeline_or_fail(Commands, Timeout, Reason, State1, Retry)
+            end
+    end.
+
+retry_pipeline_or_fail(Commands, Timeout, Reason, State0, true) ->
+    State1 = failed(Reason, close_socket(State0)),
+    execute_pipeline(Commands, Timeout, State1, false);
+retry_pipeline_or_fail(_Commands, _Timeout, Reason, State0, false) ->
     {{error, Reason}, failed(Reason, close_socket(State0))}.
 
 ensure_connected(State=#{socket := Socket}) when Socket =/= undefined -> {ok, State};
@@ -334,6 +683,22 @@ recv_response(Transport, Socket, Timeout, Buffer) ->
         {error, Reason} -> {error, Reason}
     end.
 
+recv_responses(_Transport, _Socket, _Timeout, 0, _Buffer, Acc) ->
+    {ok, lists:reverse(Acc)};
+recv_responses(_Transport, _Socket, _Timeout, _N, Buffer, _Acc)
+  when byte_size(Buffer) > ?MAX_RESPONSE_BYTES ->
+    {error, response_too_large};
+recv_responses(Transport, Socket, Timeout, N, Buffer, Acc) ->
+    case parse_resp(Buffer) of
+        {ok, Value, Rest} -> recv_responses(Transport, Socket, Timeout, N - 1, Rest, [Value | Acc]);
+        more ->
+            case sock_recv(Transport, Socket, Timeout) of
+                {ok, Chunk} -> recv_responses(Transport, Socket, Timeout, N, <<Buffer/binary, Chunk/binary>>, Acc);
+                {error, Reason} -> {error, Reason}
+            end;
+        {error, Reason} -> {error, Reason}
+    end.
+
 encode_command(Args) ->
     Bins = [to_binary(A) || A <- Args],
     [<<"*", (integer_to_binary(length(Bins)))/binary, "\r\n">> |
@@ -424,6 +789,11 @@ safe_status(_) -> <<"online">>.
 normalize_presence(<<"away">>) -> <<"away">>;
 normalize_presence(<<"busy">>) -> <<"busy">>;
 normalize_presence(_) -> <<"online">>.
+
+chunk_list([], _) -> [];
+chunk_list(List, N) when N > 0 ->
+    {Head, Tail} = lists:split(min(N, length(List)), List),
+    [Head | chunk_list(Tail, N)].
 
 configured() ->
     case string:lowercase(os:getenv("PLAINWIRE_REDIS_ENABLED", "false")) of

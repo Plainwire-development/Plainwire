@@ -111,6 +111,28 @@ authed(<<"GET">>, [<<"users">>], Req, Session, _Hash, State) ->
     inspect_only(Req, Session, fun() ->
         reply_result(Req, pw_db:admin_users(qs(Req, <<"q">>, <<>>), qs(Req, <<"limit">>, <<"50">>), qs(Req, <<"offset">>, <<"0">>)), State)
     end, State);
+authed(<<"GET">>, [<<"users">>, IdBin, <<"moderation">>], Req, Session, _Hash, State) ->
+    inspect_only(Req, Session, fun() ->
+        case positive_int(IdBin) of
+            undefined -> reply_error(Req, 400, <<"invalid_user_id">>, State);
+            Id -> reply_result(Req, pw_db:admin_user_moderation(maps:get(user_id, Session), Id), State)
+        end
+    end, State);
+authed(<<"GET">>, [<<"users">>, IdBin, <<"moderation">>, <<"history">>], Req, Session, _Hash, State) ->
+    inspect_only(Req, Session, fun() ->
+        case positive_int(IdBin) of
+            undefined -> reply_error(Req, 400, <<"invalid_user_id">>, State);
+            Id -> reply_result(Req, pw_db:admin_user_moderation_history(maps:get(user_id, Session), Id), State)
+        end
+    end, State);
+authed(<<"POST">>, [<<"users">>, IdBin, <<"moderation">>], Req0, Session, _Hash, State) ->
+    operator_json(Req0, Session, fun(M, Req) ->
+        case positive_int(IdBin) of
+            undefined -> reply_error(Req, 400, <<"invalid_user_id">>, State);
+            Id -> reply_result(Req, pw_db:admin_apply_user_moderation(maps:get(user_id, Session), Id,
+                maps:get(<<"action">>, M, <<>>), M), State)
+        end
+    end, State);
 authed(<<"GET">>, [<<"users">>, IdBin], Req, Session, _Hash, State) ->
     inspect_only(Req, Session, fun() ->
         case positive_int(IdBin) of undefined -> reply_error(Req, 400, <<"invalid_user_id">>, State); Id -> reply_result(Req, pw_db:admin_user(Id), State) end
@@ -363,6 +385,14 @@ error_status(invalid_banner) -> {400, <<"invalid_banner">>};
 error_status(invalid_banner_window) -> {400, <<"invalid_banner_window">>};
 error_status(invalid_banner_link) -> {400, <<"invalid_banner_link">>};
 error_status(banner_conflict) -> {409, <<"banner_conflict">>};
+error_status(invalid_action) -> {400, <<"invalid_action">>};
+error_status(invalid_moderation) -> {400, <<"invalid_moderation">>};
+error_status(invalid_severity) -> {400, <<"invalid_severity">>};
+error_status(invalid_expiry) -> {400, <<"invalid_expiry">>};
+error_status(moderation_reason_required) -> {400, <<"moderation_reason_required">>};
+error_status(cannot_moderate_self) -> {409, <<"cannot_moderate_self">>};
+error_status(owner_protected) -> {409, <<"owner_protected">>};
+error_status(operator_protected) -> {403, <<"operator_protected">>};
 error_status(invalid_registration_mode) -> {400, <<"invalid_registration_mode">>};
 error_status(user_not_found) -> {404, <<"user_not_found">>};
 error_status(not_found) -> {404, <<"not_found">>};

@@ -152,6 +152,7 @@ assert.match(makefile, /^source: verify frontend backend$/m, 'source archives ar
 // Persistence transitions are atomic and do not couple committed writes to realtime/notification success.
 assert.match(db, /SELECT pg_advisory_lock\(\$1\)[\s\S]*lists:foreach\(fun\(\{V, Sqls\}\) -> migrate_to/, 'cluster startup serializes schema migrations');
 assert.match(db, /migrate_to\(Conn, Version, Sqls\)[\s\S]*with_tx\(Conn, fun\(\)[\s\S]*safe_exec\(Conn, Sql\)/, 'each schema migration is transactional');
+assert.match(db, /\{49, \[[\s\S]*idx_messages_channel_author_recent[\s\S]*scope='channel'[\s\S]*deleted_at IS NULL/, 'slowmode hot path has a targeted live channel-author index');
 assert.match(db, /route\(\{accept_message_request[\s\S]*FOR UPDATE[\s\S]*changed => true[\s\S]*best_effort_direct_notifications/, 'message-request acceptance is locked/idempotent and notifications are post-commit');
 assert.match(db, /route\(\{deny_message_request[\s\S]*remove_scope_upload_refs[\s\S]*DELETE FROM direct_threads[\s\S]*revoke_conversation_access/, 'message-request denial atomically removes data and revokes every former member after commit');
 assert.match(db, /create_conversation0\(Conn[\s\S]*with_tx\(Conn[\s\S]*best_effort_direct_notifications/, 'conversation creation commits membership before notification delivery');
@@ -226,7 +227,7 @@ assert.match(api, /username_changed_elsewhere[\s\S]*409/, 'concurrent username r
 assert.match(bridge, /expected_username: String\(currentUsername[\s\S]*username_changed_elsewhere/, 'username dialog submits its observed handle and explains cross-session conflicts');
 assert.match(db, /pg_advisory_xact_lock\(hashtextextended\(\$1, 1347175753\)\)[\s\S]*UPDATE users SET username=\$1,updated_at=\$2 WHERE id=\$3/, 'competing normalized username claims serialize before changing only the users identity row');
 assert.match(db, /best_effort_identity_changed[\s\S]*server_members WHERE user_id=\$1[\s\S]*direct_members WHERE user_id=\$1[\s\S]*friendships/, 'username changes discover the relevant server, DM, and friend views without changing their ID-based membership rows');
-assert.match(db, /best_effort_identity_changed[\s\S]*pw_hub:notify_user\(Uid, Event\)[\s\S]*spawn\(fun\(\)[\s\S]*pw_hub:broadcast\(\{server, Sid\}/, 'username fanout releases the DB worker before potentially large cross-node propagation');
+assert.match(db, /best_effort_identity_changed[\s\S]*pw_hub:notify_user\(Uid, Event\)[\s\S]*Fanout = fun\(\)[\s\S]*pw_hub:broadcast\(\{server, Sid\}[\s\S]*pw_async_pool:submit\(Fanout\)/, 'username fanout releases the DB worker into the bounded async pool before potentially large cross-node propagation');
 assert.match(ws, /apply_self_identity_update[\s\S]*voice_state[\s\S]*call_state[\s\S]*Session#\{user => User\}/, 'the renaming user\'s live websocket, voice, and call identity updates without reconnecting');
 assert.match(db, /user_ids_for_usernames[\s\S]*SELECT id,username FROM users WHERE username IN/, 'username-based DM member lookup resolves the current users table handle');
 assert.match(db, /SELECT u\.id, u\.username FROM users u JOIN server_members[\s\S]*pw_mention:resolve/, 'server mentions resolve against current usernames attached to stable member IDs');

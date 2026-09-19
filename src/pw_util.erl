@@ -1,9 +1,9 @@
 -module(pw_util).
 -export([
-    env_int/2, env_bool/2, env_str/2, now_ms/0, random_token/1, sha256_hex/1,
+    env_int/2, env_int_cached/2, env_bool/2, env_bool_cached/2, env_str/2, now_ms/0, random_token/1, sha256_hex/1,
     base64url/1, base64url_decode/1, pbkdf2/2, verify_password/3, password_needs_rehash/1,
     normalize_username/1, clean_text/2, int/1, bool/1, bin/1, json/1,
-    read_json/1, read_json/2, ok_json/2, err_json/3, set_cookie/3, clear_cookie/1, cookie_value/2,
+    read_json/1, read_json/2, ok_json/2, err_json/3, json_reply/3, set_cookie/3, clear_cookie/1, cookie_value/2,
     require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1, hex_binary/1,
     constant_time/2
 ]).
@@ -12,6 +12,16 @@ env_int(Name, Default) ->
     case os:getenv(Name) of
         false -> Default;
         V -> case safe_list_to_integer(V) of I when is_integer(I) -> I; _ -> Default end
+    end.
+
+env_int_cached(Name, Default) ->
+    Key = {?MODULE, env_int, Name},
+    case persistent_term:get(Key, undefined) of
+        Value when is_integer(Value) -> Value;
+        undefined ->
+            Value = env_int(Name, Default),
+            persistent_term:put(Key, Value),
+            Value
     end.
 
 env_bool(Name, Default) ->
@@ -29,6 +39,16 @@ env_bool(Name, Default) ->
                 "off" -> false;
                 _ -> Default
             end
+    end.
+
+env_bool_cached(Name, Default) ->
+    Key = {?MODULE, env_bool, Name},
+    case persistent_term:get(Key, undefined) of
+        Value when is_boolean(Value) -> Value;
+        undefined ->
+            Value = env_bool(Name, Default),
+            persistent_term:put(Key, Value),
+            Value
     end.
 
 env_str(Name, Default) ->
@@ -214,6 +234,10 @@ ok_json(Req0, Data) ->
 
 err_json(Req0, Code, Error) ->
     Req = cowboy_req:reply(Code, headers(), json(#{ok=>false,error=>Error}), Req0),
+    {ok, Req, undefined}.
+
+json_reply(Req0, Code, Data) ->
+    Req = cowboy_req:reply(Code, headers(), json(Data), Req0),
     {ok, Req, undefined}.
 
 headers() ->

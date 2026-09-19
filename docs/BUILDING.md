@@ -22,3 +22,39 @@ make package NATIVE=1
 `make clean` removes Erlang output, Elm compiler caches, test screenshots and the compiled native helper. It preserves PostgreSQL data, uploads, configuration, secrets, source, npm dependencies and generated frontend assets. Run cleanup separately from other targets. Nothing in the Makefile installs services, restarts a running instance, downloads a browser without an explicit request, or edits a production database.
 
 For an existing deployment, back up its database, uploads and configuration before replacing the release. Follow deploy/README.md for switching releases and rollback. The checks still needed against real services are listed in BUILD_STATUS.md.
+
+
+## Scalability and load tests
+
+Before raising connection limits, run the host preflight:
+
+```sh
+make load-doctor USERS=10000
+```
+
+The in-process BEAM stress harness exercises the actual realtime registry/delivery paths without paying for thousands of browser processes:
+
+```sh
+make load USERS=1000
+make load USERS=10000 DURATION=120 RATE=40000
+make load-soak USERS=10000
+```
+
+For end-to-end HTTP/WebSocket pressure, install the load-only Python dependency and provide a JSONL fixture of test accounts:
+
+```sh
+python -m pip install -r tools/load/requirements.txt
+make load-live USERS=1000 DURATION=120 RATE=4000 \
+  LOAD_BASE_URL=http://127.0.0.1:8080 \
+  LOAD_SESSIONS_FILE=/secure/path/load.sessions.jsonl
+```
+
+`load-live` refuses a non-loopback target unless the operator explicitly supplies `LOAD_ALLOW_REMOTE=1`. Never aim it at infrastructure you do not own or have permission to stress. The live harness tests the realtime/control plane; it does not generate encoded RTP/video/screen media.
+
+The typed capacity/backpressure/media model in `tools/load/gleam/` is checked with:
+
+```sh
+make load-gleam-check
+```
+
+Gleam is a load-model/test dependency only and is not required by the Plainwire production runtime. CI pins its compiler so model drift fails before release. See `docs/SCALING.md` and `tools/load/README.md`.

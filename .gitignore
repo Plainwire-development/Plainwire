@@ -45,3 +45,7 @@ dist/
 
 priv/bin/pw-media-quality
 priv/bin/.pw-media-quality.*
+
+# Local authenticated load-test fixtures contain live session cookies.
+tools/load/*.sessions.jsonl
+tools/load/*-load-result.json

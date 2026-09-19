@@ -48,9 +48,14 @@ configure_validated(C) ->
 
 channels() -> #{realtime => #{parallelism => 1}, events => #{parallelism => 1}}.
 send(Node, Channel, Envelope) ->
+    %% Durable realtime events and security-control messages use Partisan's
+    %% acknowledgement/retransmission path. Heartbeats stay best-effort so a
+    %% partition cannot accumulate irrelevant liveness traffic. The application
+    %% envelope is idempotently deduplicated by pw_cluster on the owner.
+    Reliable = Channel =:= events,
     try partisan:forward_message(Node, pw_cluster, Envelope,
-          #{channel => Channel, channel_fallback => false, ack => false,
-            retransmission => false, transitive => false})
+          #{channel => Channel, channel_fallback => false, ack => Reliable,
+            retransmission => Reliable, transitive => false})
     catch _:_ -> {error, unavailable} end.
 members() ->
     try partisan:nodes() catch _:_ -> [] end.

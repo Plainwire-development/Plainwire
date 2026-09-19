@@ -282,6 +282,38 @@
     queueMicrotask(() => search.focus());
   };
 
+  const showAccountRestriction = (restriction = {}) => {
+    const existing = document.getElementById('plainwire-account-restriction');
+    if (existing) existing.remove();
+    const severity = ['info','warning','critical'].includes(String(restriction.severity || '')) ? String(restriction.severity) : 'warning';
+    const state = String(restriction.state || 'suspended');
+    const overlay = document.createElement('section');
+    overlay.id = 'plainwire-account-restriction';
+    overlay.className = `account-restriction-screen ${severity}`;
+    overlay.setAttribute('role', 'alertdialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'plainwire-restriction-title');
+    const card = document.createElement('div');
+    card.className = 'account-restriction-card';
+    const mark = document.createElement('div'); mark.className = 'account-restriction-mark'; mark.textContent = severity === 'critical' ? '!' : 'i'; mark.setAttribute('aria-hidden','true');
+    const eyebrow = document.createElement('div'); eyebrow.className = 'account-restriction-eyebrow'; eyebrow.textContent = state === 'banned' ? 'Account banned' : 'Account suspended';
+    const title = document.createElement('h1'); title.id = 'plainwire-restriction-title'; title.textContent = String(restriction.title || (state === 'banned' ? 'Access revoked' : 'Account suspended'));
+    const reason = document.createElement('p'); reason.className = 'account-restriction-reason'; reason.textContent = String(restriction.reason || 'This account cannot access this Plainwire instance right now.');
+    card.append(mark, eyebrow, title, reason);
+    const expiresAt = Number(restriction.expires_at || 0);
+    if (expiresAt > 0) {
+      const expiry = document.createElement('p'); expiry.className = 'account-restriction-expiry';
+      expiry.textContent = `Access is scheduled to return ${new Date(expiresAt).toLocaleString()}.`;
+      card.append(expiry);
+    } else {
+      const expiry = document.createElement('p'); expiry.className = 'account-restriction-expiry'; expiry.textContent = 'No automatic expiry is set.'; card.append(expiry);
+    }
+    const help = document.createElement('p'); help.className = 'account-restriction-help'; help.textContent = 'Contact this Plainwire instance operator if you believe this action is incorrect.'; card.append(help);
+    const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'btn secondary'; retry.textContent = 'Check access again';
+    retry.addEventListener('click', () => location.reload()); card.append(retry);
+    overlay.append(card); document.body.append(overlay); retry.focus();
+  };
+
   const friendlyApiError = (code) => ({
     forbidden: 'You do not have permission to do that.',
     not_found: 'That item no longer exists.',
@@ -1082,6 +1114,32 @@
       }
       return wrap;
     };
+    const renderChannels = () => {
+      const wrap=document.createElement('div'); wrap.className='admin-form-stack';
+      const canManage=hasPermission(state,'manage_channels');
+      const channels=Array.isArray(serverData?.channels)?serverData.channels:[];
+      for(const channel of channels){
+        const card=document.createElement('section'); card.className='admin-role-card';
+        const head=document.createElement('div'); head.className='admin-role-head';
+        const copy=document.createElement('div'); const strong=document.createElement('strong'); strong.textContent=`# ${channel.name}`;
+        const small=document.createElement('small'); small.textContent=channel.kind==='voice'?'Voice channel':'Text channel'; copy.append(strong,small); head.append(copy); card.append(head);
+        const name=makeField('Channel name',channel.name||'',{maxLength:40});
+        const topic=makeField('Topic',channel.topic||'',{multiline:true,maxLength:1024,placeholder:'What is this channel for?'});
+        name.input.disabled=!canManage; topic.input.disabled=!canManage;
+        card.append(name.label,topic.label);
+        if(channel.kind==='text'){
+          const slow=document.createElement('label'); slow.className='admin-field'; const label=document.createElement('span'); label.textContent='Slowmode';
+          const select=document.createElement('select'); select.disabled=!canManage;
+          [[0,'Off'],[5,'5 seconds'],[10,'10 seconds'],[15,'15 seconds'],[30,'30 seconds'],[60,'1 minute'],[120,'2 minutes'],[300,'5 minutes'],[600,'10 minutes'],[1800,'30 minutes'],[3600,'1 hour'],[21600,'6 hours']].forEach(([value,text])=>{const option=document.createElement('option');option.value=String(value);option.textContent=text;if(Number(channel.slowmode_seconds||0)===value)option.selected=true;select.append(option)});
+          slow.append(label,select); card.append(slow);
+          if(canManage) card.append(actionButton('Save channel',async event=>{event.currentTarget.disabled=true;try{await directApi(`/channel/${channel.id}/settings`,{method:'POST',body:{name:name.input.value.trim(),topic:topic.input.value,slowmode_seconds:Number(select.value)}});await refresh();await api({method:'GET',path:`/server/${serverId}`});render();send(app.ports.bridgeReceive,{tag:'toast',data:'Channel settings saved'});}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:`Could not save channel: ${error.message}`});event.currentTarget.disabled=false;}}));
+        } else if(canManage) card.append(actionButton('Save channel',async event=>{event.currentTarget.disabled=true;try{await directApi(`/channel/${channel.id}/settings`,{method:'POST',body:{name:name.input.value.trim(),topic:topic.input.value}});await refresh();await api({method:'GET',path:`/server/${serverId}`});render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});event.currentTarget.disabled=false;}}));
+        wrap.append(card);
+      }
+      if(!channels.length) adminMessage(wrap,'No channels yet.');
+      if(!canManage) adminMessage(wrap,'Your roles do not grant Manage Channels.');
+      return wrap;
+    };
     const renderIntegrations = () => {
       const wrap = document.createElement('div'); wrap.className = 'admin-form-stack';
       const canWebhooks = hasPermission(state, 'manage_webhooks');
@@ -1094,7 +1152,7 @@
       if (canWebhooks) {
         const create = document.createElement('form'); create.className='admin-form-stack';
         const name=makeField('Webhook name','',{maxLength:80,placeholder:'Build notifications'}); const url=makeField('HTTPS endpoint','',{maxLength:2048,placeholder:'https://example.com/plainwire'});
-        const events = ['message.created','message.updated','message.deleted','message.reaction','member.joined','member.removed','server.updated'];
+        const events = ['message.created','message.updated','message.deleted','message.reaction','message.pinned','message.unpinned','member.joined','member.removed','member.banned','member.unbanned','channel.created','channel.updated','bot.added','bot.removed','server.updated'];
         const eventGrid=document.createElement('div'); eventGrid.className='admin-permission-grid';
         events.forEach((key)=>{ const label=document.createElement('label'); label.className='admin-permission'; const input=document.createElement('input'); input.type='checkbox'; input.value=key; input.checked=key==='message.created'; const copy=document.createElement('span'); const strong=document.createElement('strong'); strong.textContent=key; copy.append(strong); label.append(input,copy); eventGrid.append(label); });
         const status=document.createElement('div'); status.className='admin-inline-message muted'; const submit=document.createElement('button'); submit.type='submit'; submit.className='btn'; submit.textContent='Create webhook';
@@ -1104,26 +1162,90 @@
         directApi(`/server/${serverId}/webhooks`).then((items)=>{ webhookList.replaceChildren(); webhookList.removeAttribute('aria-busy'); for(const hook of (Array.isArray(items)?items:[])){ const row=document.createElement('section'); row.className='admin-role-card'; const head=document.createElement('div'); head.className='admin-role-head'; const copy=document.createElement('div'); const strong=document.createElement('strong'); strong.textContent=hook.name; const small=document.createElement('small'); small.textContent=`${hook.enabled?'Enabled':'Disabled'} · ${hook.failure_count||0} recent failures · ${(hook.events||[]).join(', ')}`; copy.append(strong,small); const actions=document.createElement('div'); actions.className='admin-row-actions';
           const test=actionButton('Test',async(e)=>{ e.currentTarget.disabled=true; try{await directApi(`/server/${serverId}/webhook/${hook.id}/test`,{method:'POST',body:{}}); send(app.ports.bridgeReceive,{tag:'toast',data:'Webhook test queued'});}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{e.currentTarget.disabled=false;}});
           const rotate=actionButton('Rotate secret',async(e)=>{ if(!window.confirm(`Rotate the secret for ${hook.name}? Existing signatures will immediately stop validating.`))return; e.currentTarget.disabled=true; try{const data=await directApi(`/server/${serverId}/webhook/${hook.id}/rotate`,{method:'POST',body:{}}); await copySecretDialog('New webhook secret',data.secret,'Update your receiver before closing this dialog.');}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{e.currentTarget.disabled=false;}});
+          const history=actionButton('Deliveries',async()=>{const modal=modalShell(`${hook.name} deliveries`,'Recent outbound delivery metadata. Payload bodies and signing secrets are never shown here.');const list=document.createElement('div');list.className='admin-role-stack';modal.body.append(list);try{const deliveries=await directApi(`/server/${serverId}/webhook/${hook.id}/deliveries?limit=50`);for(const d of (Array.isArray(deliveries)?deliveries:[])){const item=document.createElement('section');item.className='admin-role-card';const head2=document.createElement('div');head2.className='admin-role-head';const c2=document.createElement('div');const s2=document.createElement('strong');s2.textContent=`${d.event} · ${d.status}`;const sm=document.createElement('small');sm.textContent=`attempts ${d.attempts||0}${d.response_code?` · HTTP ${d.response_code}`:''}`;c2.append(s2,sm);const a2=document.createElement('div');a2.className='admin-row-actions';if(d.status==='failed'){a2.append(actionButton('Retry',async ev=>{ev.currentTarget.disabled=true;try{await directApi(`/server/${serverId}/webhook/${hook.id}/delivery/${d.id}/retry`,{method:'POST',body:{}});modal.destroy();send(app.ports.bridgeReceive,{tag:'toast',data:'Webhook delivery queued for retry'});}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});ev.currentTarget.disabled=false;}}));}head2.append(c2,a2);item.append(head2);if(d.last_error){const e=document.createElement('small');e.className='muted';e.textContent=d.last_error;item.append(e);}list.append(item);}if(!list.children.length)adminMessage(list,'No deliveries yet.');}catch(error){adminMessage(list,error.message,'error');}});
           const remove=actionButton('Delete',async(e)=>{if(!window.confirm(`Delete webhook ${hook.name}?`))return;e.currentTarget.disabled=true;try{await directApi(`/server/${serverId}/webhook/${hook.id}/delete`,{method:'POST',body:{}});render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});e.currentTarget.disabled=false;}},true);
-          actions.append(test,rotate,remove); head.append(copy,actions); row.append(head); const endpoint=document.createElement('code'); endpoint.textContent=hook.url; row.append(endpoint); webhookList.append(row); } if(!webhookList.children.length)adminMessage(webhookList,'No webhooks yet.'); }).catch((error)=>{webhookList.removeAttribute('aria-busy');adminMessage(webhookList,error.message,'error');});
+          actions.append(test,history,rotate,remove); head.append(copy,actions); row.append(head); const endpoint=document.createElement('code'); endpoint.textContent=hook.url; row.append(endpoint); webhookList.append(row); } if(!webhookList.children.length)adminMessage(webhookList,'No webhooks yet.'); }).catch((error)=>{webhookList.removeAttribute('aria-busy');adminMessage(webhookList,error.message,'error');});
       } else adminMessage(webhookList,'Your roles do not grant Manage Webhooks.');
       wrap.append(webhooksSection);
+
+      const incomingSection=document.createElement('section'); incomingSection.className='admin-role-card';
+      const incomingHead=document.createElement('div'); incomingHead.className='admin-role-head'; const incomingCopy=document.createElement('div'); const incomingStrong=document.createElement('strong'); incomingStrong.textContent='Incoming webhooks'; const incomingSmall=document.createElement('small'); incomingSmall.textContent='Give external services a fixed, revocable URL that can post into one text channel.'; incomingCopy.append(incomingStrong,incomingSmall); incomingHead.append(incomingCopy); incomingSection.append(incomingHead);
+      const incomingList=document.createElement('div'); incomingList.className='admin-role-stack'; incomingSection.append(incomingList);
+      if(canWebhooks){
+        const form=document.createElement('form');form.className='admin-role-create';const name=document.createElement('input');name.placeholder='Webhook name';name.maxLength=80;const destination=document.createElement('select');destination.setAttribute('aria-label','Destination channel');(serverData?.channels||[]).filter(c=>c.kind==='text').forEach(c=>{const o=document.createElement('option');o.value=String(c.id);o.textContent=`# ${c.name}`;destination.append(o)});const submit=document.createElement('button');submit.type='submit';submit.className='btn';submit.textContent='Create incoming webhook';form.append(name,destination,submit);incomingSection.insertBefore(form,incomingList);
+        form.addEventListener('submit',async event=>{event.preventDefault();submit.disabled=true;try{const data=await directApi(`/server/${serverId}/incoming-webhooks`,{method:'POST',body:{name:name.value.trim(),channel_id:Number(destination.value)}});const url=new URL(data.path,window.location.origin).href;await copySecretDialog('Incoming webhook URL',url,'This URL contains the webhook credential. Treat it like a password. POST JSON with a content field. It is shown only on creation or rotation.');render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});submit.disabled=false;}});
+        incomingList.setAttribute('aria-busy','true');directApi(`/server/${serverId}/incoming-webhooks`).then(items=>{incomingList.replaceChildren();incomingList.removeAttribute('aria-busy');for(const hook of (Array.isArray(items)?items:[])){const row=document.createElement('section');row.className='admin-role-card';const h=document.createElement('div');h.className='admin-role-head';const c=document.createElement('div');const strong=document.createElement('strong');strong.textContent=hook.name;const small=document.createElement('small');small.textContent=`#${hook.channel_name||hook.channel_id}${hook.last_used_at?` · last used ${new Date(hook.last_used_at).toLocaleString()}`:' · never used'}`;c.append(strong,small);const a=document.createElement('div');a.className='admin-row-actions';const rotate=actionButton('Rotate URL',async ev=>{if(!confirm(`Rotate ${hook.name}'s incoming webhook URL?`))return;ev.currentTarget.disabled=true;try{const data=await directApi(`/server/${serverId}/incoming-webhook/${hook.id}/rotate`,{method:'POST',body:{}});await copySecretDialog('New incoming webhook URL',new URL(data.path,window.location.origin).href,'The previous URL stopped working immediately.');}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{ev.currentTarget.disabled=false;}});const remove=actionButton('Delete',async ev=>{if(!confirm(`Delete incoming webhook ${hook.name}? Historical messages remain.`))return;ev.currentTarget.disabled=true;try{await directApi(`/server/${serverId}/incoming-webhook/${hook.id}/delete`,{method:'POST',body:{}});render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});ev.currentTarget.disabled=false;}},true);a.append(rotate,remove);h.append(c,a);row.append(h);incomingList.append(row);}if(!incomingList.children.length)adminMessage(incomingList,'No incoming webhooks yet.');}).catch(error=>{incomingList.removeAttribute('aria-busy');adminMessage(incomingList,error.message,'error');});
+      } else adminMessage(incomingList,'Your roles do not grant Manage Webhooks.');
+      wrap.append(incomingSection);
 
       const botsSection=document.createElement('section'); botsSection.className='admin-role-card'; const botHead=document.createElement('div'); botHead.className='admin-role-head'; const botCopy=document.createElement('div'); const botStrong=document.createElement('strong'); botStrong.textContent='Bots'; const botSmall=document.createElement('small'); botSmall.textContent='Server-scoped bot accounts use the same role and permission model as members.'; botCopy.append(botStrong,botSmall); botHead.append(botCopy); botsSection.append(botHead); const botList=document.createElement('div'); botList.className='admin-role-stack'; botsSection.append(botList);
       if(canBots){ const create=document.createElement('form'); create.className='admin-role-create'; const input=document.createElement('input'); input.placeholder='Bot name'; input.maxLength=48; const submit=document.createElement('button'); submit.type='submit'; submit.className='btn'; submit.textContent='Create bot'; create.append(input,submit); botsSection.insertBefore(create,botList); create.addEventListener('submit',async(event)=>{event.preventDefault();submit.disabled=true;try{const data=await directApi(`/server/${serverId}/bots`,{method:'POST',body:{name:input.value.trim()}}); await copySecretDialog('Bot token',data.token,'This token authenticates the bot SDK and is shown only once. Give the bot roles after creation to control what it can do.'); render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});submit.disabled=false;}});
         botList.setAttribute('aria-busy','true'); directApi(`/server/${serverId}/bots`).then((items)=>{botList.replaceChildren();botList.removeAttribute('aria-busy');for(const bot of (Array.isArray(items)?items:[])){const row=document.createElement('section');row.className='admin-role-card';const head=document.createElement('div');head.className='admin-role-head';const copy=document.createElement('div');const strong=document.createElement('strong');strong.textContent=bot.name;const small=document.createElement('small');small.textContent=`@${bot.username} · user ${bot.user_id}`;copy.append(strong,small);const actions=document.createElement('div');actions.className='admin-row-actions';const rotate=actionButton('Rotate token',async(e)=>{if(!window.confirm(`Rotate ${bot.name}'s token?`))return;e.currentTarget.disabled=true;try{const data=await directApi(`/server/${serverId}/bot/${bot.id}/rotate`,{method:'POST',body:{}});await copySecretDialog('New bot token',data.token,'The previous token is no longer valid.');}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{e.currentTarget.disabled=false;}});const remove=actionButton('Delete bot',async(e)=>{if(!window.confirm(`Delete bot ${bot.name} and its authored messages?`))return;e.currentTarget.disabled=true;try{await directApi(`/server/${serverId}/bot/${bot.id}/delete`,{method:'POST',body:{}});render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});e.currentTarget.disabled=false;}},true);actions.append(rotate,remove);head.append(copy,actions);row.append(head);botList.append(row);}if(!botList.children.length)adminMessage(botList,'No bots yet.');}).catch((error)=>{botList.removeAttribute('aria-busy');adminMessage(botList,error.message,'error');});
       } else adminMessage(botList,'Your roles do not grant Manage Bots.');
-      wrap.append(botsSection); return wrap;
+      wrap.append(botsSection);
+
+      const appsSection=document.createElement('section'); appsSection.className='admin-role-card';
+      const appHead=document.createElement('div');appHead.className='admin-role-head';const appCopy=document.createElement('div');const appStrong=document.createElement('strong');appStrong.textContent='Applications';const appSmall=document.createElement('small');appSmall.textContent='Browse installable apps, manage installed bot identities, and control where each command is available.';appCopy.append(appStrong,appSmall);appHead.append(appCopy);appsSection.append(appHead);
+      const appDirectory=document.createElement('div');appDirectory.className='admin-form-stack';
+      const appList=document.createElement('div');appList.className='admin-role-stack';appsSection.append(appDirectory,appList);
+      const permissionSubjectLabel=(type,id)=>{
+        id=Number(id);
+        if(type==='channel'){const channel=(serverData?.channels||[]).find(item=>Number(item.id)===id);return channel?`# ${channel.name}`:`Channel ${id}`;}
+        if(type==='role'){const role=(state?.roles||[]).find(item=>Number(item.id)===id);return role?`@${role.name}`:`Role ${id}`;}
+        const member=(state?.members||[]).find(item=>Number(item.user?.id)===id);return member?(member.user?.display_name||member.user?.username||`User ${id}`):`User ${id}`;
+      };
+      const openCommandPermissions=async(item)=>{
+        const modal=modalShell(`${item.name} commands`,'Command overrides are optional. With no override, members who can access the channel can use the command. Member rules take precedence over channel rules; role denies take precedence over role allows.');
+        const root=document.createElement('div');root.className='admin-role-stack';modal.body.append(root);adminMessage(root,'Loading commands…');
+        try{
+          const commands=await directApi(`/server/${serverId}/app/${item.installation_id}/commands`);root.replaceChildren();
+          for(const command of (Array.isArray(commands)?commands:[])){
+            const card=document.createElement('section');card.className='admin-role-card';
+            const head=document.createElement('div');head.className='admin-role-head';const copy=document.createElement('div');const title=document.createElement('strong');title.textContent=`/${command.name}`;const meta=document.createElement('small');meta.textContent=`${command.handler||'queue'} · ${command.description||'No description'}`;copy.append(title,meta);head.append(copy);card.append(head);
+            let rules=Array.isArray(command.permissions)?command.permissions.map(rule=>({type:String(rule.type||''),id:Number(rule.id),allow:rule.allow===true})):[];
+            const rulesBox=document.createElement('div');rulesBox.className='admin-role-stack';
+            const controls=document.createElement('div');controls.className='developer-inline';
+            const type=document.createElement('select');[['channel','Channel'],['role','Role'],['user','Member']].forEach(([value,label])=>{const option=document.createElement('option');option.value=value;option.textContent=label;type.append(option)});
+            const subject=document.createElement('select');const effect=document.createElement('select');[['true','Allow'],['false','Deny']].forEach(([value,label])=>{const option=document.createElement('option');option.value=value;option.textContent=label;effect.append(option)});
+            const populateSubjects=()=>{subject.replaceChildren();const add=(id,label)=>{const option=document.createElement('option');option.value=String(id);option.textContent=label;subject.append(option)};if(type.value==='channel'){for(const channel of (serverData?.channels||[]))add(channel.id,`# ${channel.name}`);}else if(type.value==='role'){for(const role of (state?.roles||[]))add(role.id,`@${role.name}`);}else{for(const member of (state?.members||[]))add(member.user?.id,member.user?.display_name||member.user?.username||`User ${member.user?.id}`);}};
+            type.addEventListener('change',populateSubjects);populateSubjects();
+            const addRule=actionButton('Add override',()=>{const id=Number(subject.value);if(!Number.isInteger(id)||id<=0)return;const next={type:type.value,id,allow:effect.value==='true'};rules=rules.filter(rule=>!(rule.type===next.type&&Number(rule.id)===id));rules.push(next);renderRules();});
+            controls.append(type,subject,effect,addRule);
+            const renderRules=()=>{rulesBox.replaceChildren();for(const rule of rules){const row=document.createElement('div');row.className='admin-role-head';const c=document.createElement('div');const strong=document.createElement('strong');strong.textContent=permissionSubjectLabel(rule.type,rule.id);const small=document.createElement('small');small.textContent=`${rule.type} · ${rule.allow?'Allowed':'Denied'}`;c.append(strong,small);const remove=actionButton('Remove',()=>{rules=rules.filter(item=>!(item.type===rule.type&&Number(item.id)===Number(rule.id)));renderRules();});row.append(c,remove);rulesBox.append(row);}if(!rules.length)adminMessage(rulesBox,'No overrides. This command follows normal channel access.');};
+            renderRules();
+            const save=actionButton('Save command access',async event=>{event.currentTarget.disabled=true;try{const data=await directApi(`/server/${serverId}/app/${item.installation_id}/command/${command.id}/permissions`,{method:'POST',body:{permissions:rules}});rules=Array.isArray(data.permissions)?data.permissions:rules;renderRules();send(app.ports.bridgeReceive,{tag:'toast',data:`/${command.name} permissions saved`});}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{event.currentTarget.disabled=false;}});
+            card.append(rulesBox,controls,save);root.append(card);
+          }
+          if(!root.children.length)adminMessage(root,'This application has no commands.');
+        }catch(error){root.replaceChildren();adminMessage(root,error.message,'error');}
+      };
+      const installPublicApp=async(publicId,button)=>{
+        if(button)button.disabled=true;
+        try{const preview=await directApi(`/apps/${encodeURIComponent(publicId)}`);if(!confirm(`Install ${preview.name} in this server? Plainwire will create a bot identity and grant only the application's requested permissions that you are allowed to grant.`))return;const data=await directApi(`/apps/${encodeURIComponent(publicId)}/install`,{method:'POST',body:{server_id:serverId}});if(data.token)await copySecretDialog(`${preview.name} installation token`,data.token,'You own this application, so Plainwire is showing this server-scoped bot token once. Other server managers never receive the developer credential.');render();}
+        catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}
+        finally{if(button)button.disabled=false;}
+      };
+      if(canBots){
+        const directoryTitle=document.createElement('strong');directoryTitle.textContent='App directory';const directoryHint=document.createElement('small');directoryHint.textContent='Public applications published by Plainwire users.';appDirectory.append(directoryTitle,directoryHint);
+        const searchForm=document.createElement('form');searchForm.className='admin-role-create';const search=document.createElement('input');search.placeholder='Search applications';search.maxLength=80;const searchBtn=document.createElement('button');searchBtn.type='submit';searchBtn.className='btn secondary';searchBtn.textContent='Search';searchForm.append(search,searchBtn);const results=document.createElement('div');results.className='admin-role-stack';appDirectory.append(searchForm,results);
+        const loadDirectory=async()=>{searchBtn.disabled=true;results.setAttribute('aria-busy','true');try{const q=search.value.trim();const items=await directApi(`/apps?limit=20${q?`&q=${encodeURIComponent(q)}`:''}`);results.replaceChildren();for(const appItem of (Array.isArray(items)?items:[])){const row=document.createElement('section');row.className='admin-role-card';const h=document.createElement('div');h.className='admin-role-head';const c=document.createElement('div');const strong=document.createElement('strong');strong.textContent=appItem.name;const small=document.createElement('small');small.textContent=`${appItem.installation_count||0} installation${Number(appItem.installation_count||0)===1?'':'s'} · ${appItem.public_id}`;c.append(strong,small);const install=actionButton('Install',event=>installPublicApp(appItem.public_id,event.currentTarget));h.append(c,install);row.append(h);if(appItem.description){const desc=document.createElement('p');desc.className='muted';desc.textContent=appItem.description;row.append(desc)}results.append(row);}if(!results.children.length)adminMessage(results,'No public applications matched your search.');}catch(error){results.replaceChildren();adminMessage(results,error.message,'error');}finally{results.removeAttribute('aria-busy');searchBtn.disabled=false;}};
+        searchForm.addEventListener('submit',event=>{event.preventDefault();loadDirectory();});loadDirectory();
+        const installForm=document.createElement('form');installForm.className='admin-role-create';const appId=document.createElement('input');appId.placeholder='Or paste a Public App ID · app_…';appId.maxLength=96;const installBtn=document.createElement('button');installBtn.type='submit';installBtn.className='btn';installBtn.textContent='Install by ID';installForm.append(appId,installBtn);appDirectory.append(installForm);
+        installForm.addEventListener('submit',async event=>{event.preventDefault();const id=appId.value.trim();if(!id)return;await installPublicApp(id,installBtn);appId.value='';});
+        appList.setAttribute('aria-busy','true');directApi(`/server/${serverId}/apps`).then(items=>{appList.replaceChildren();appList.removeAttribute('aria-busy');for(const item of (Array.isArray(items)?items:[])){const row=document.createElement('section');row.className='admin-role-card';const h=document.createElement('div');h.className='admin-role-head';const c=document.createElement('div');const strong=document.createElement('strong');strong.textContent=item.name;const small=document.createElement('small');small.textContent=`${item.public_id} · @${item.username}`;c.append(strong,small);const actions=document.createElement('div');actions.className='admin-row-actions';const commands=actionButton('Commands',()=>openCommandPermissions(item));const remove=actionButton('Uninstall',async event=>{if(!confirm(`Uninstall ${item.name} from this server? Its bot token will stop working immediately. Historical messages remain attributed to the disabled bot account.`))return;event.currentTarget.disabled=true;try{await directApi(`/server/${serverId}/app/${item.installation_id}/uninstall`,{method:'POST',body:{}});render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});event.currentTarget.disabled=false;}},true);const badge=document.createElement('span');badge.className='bot-badge';badge.textContent='APP';actions.append(commands,remove,badge);h.append(c,actions);row.append(h);if(item.description){const p=document.createElement('p');p.className='muted';p.textContent=item.description;row.append(p)}appList.append(row);}if(!appList.children.length)adminMessage(appList,'No reusable applications installed yet.');}).catch(error=>{appList.removeAttribute('aria-busy');adminMessage(appList,error.message,'error');});
+      } else adminMessage(appList,'Your roles do not grant Manage Bots.');
+      wrap.append(appsSection);
+      return wrap;
     };
     const copySecretDialog = async (title, secret, note) => {
       const modal=modalShell(title,note); const field=document.createElement('textarea'); field.readOnly=true; field.rows=4; field.value=String(secret||''); field.className='admin-secret-value'; const actions=document.createElement('div');actions.className='admin-row-actions';const copy=document.createElement('button');copy.type='button';copy.className='btn';copy.textContent='Copy';copy.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(field.value);copy.textContent='Copied';}catch(_){field.focus();field.select();}});const close=document.createElement('button');close.type='button';close.className='btn secondary';close.textContent='I saved it';close.addEventListener('click',modal.destroy);actions.append(copy,close);modal.body.append(field,actions);field.focus();field.select();
     };
     const render = () => {
       shell.body.replaceChildren(); const nav=document.createElement('nav');nav.className='admin-tabs';
-      const tabs=[['profile','My profile'],['overview','Overview'],['roles','Roles'],['members','Members'],['bans','Bans'],['wires','Wires'],['integrations','Integrations']];
+      const tabs=[['profile','My profile'],['overview','Overview'],['channels','Channels'],['roles','Roles'],['members','Members'],['bans','Bans'],['wires','Wires'],['integrations','Integrations']];
       tabs.forEach(([id,label])=>{const b=document.createElement('button');b.type='button';b.textContent=label;b.classList.toggle('active',activeTab===id);b.addEventListener('click',()=>{activeTab=id;render()});nav.append(b)});shell.body.append(nav);
       const panel=document.createElement('div');panel.className='admin-panel';
-      panel.append(activeTab==='overview'?renderOverview():activeTab==='roles'?renderRoles():activeTab==='members'?renderMembers():activeTab==='bans'?renderBans():activeTab==='wires'?renderWires():activeTab==='integrations'?renderIntegrations():renderProfile());shell.body.append(panel);
+      panel.append(activeTab==='overview'?renderOverview():activeTab==='channels'?renderChannels():activeTab==='roles'?renderRoles():activeTab==='members'?renderMembers():activeTab==='bans'?renderBans():activeTab==='wires'?renderWires():activeTab==='integrations'?renderIntegrations():renderProfile());shell.body.append(panel);
     };
     try { await refresh(); shell.setTitle(serverData?.server?.name || 'Server settings'); render(); }
     catch (error) { shell.body.replaceChildren(); adminMessage(shell.body, `Could not load server settings: ${error.message}`, 'error'); }
@@ -2510,6 +2632,7 @@
       // request failed.
       const succeeded = res.ok && json.ok === true;
       debug('API', 'response', { method, path, status: res.status, ok: succeeded, duration_ms: Math.round(performance.now() - requestStarted), error: json.error });
+      if (!succeeded && path === '/login' && json.error === 'account_restricted' && json.data) showAccountRestriction(json.data);
       if (res.status === 401 && json.error === 'not_authenticated' && !['/me', '/login', '/register'].includes(path)) {
         // A retry loop cannot repair an expired authenticated session. Reload
         // once so /me can render the signed-out shell instead of hammering
@@ -6439,6 +6562,14 @@
   };
 
   const handleSystemEvent = (msg) => {
+    if (msg.type === 'account_restricted') {
+      showAccountRestriction({ ...(msg.moderation || {}), state: msg.account_state || msg.moderation?.state || 'suspended' });
+      return true;
+    }
+    if (msg.type === 'account_restored') {
+      document.getElementById('plainwire-account-restriction')?.remove();
+      return true;
+    }
     if (msg.type === 'system_banners_changed') {
       refreshGlobalBanners();
       // Active-banner reads are cached very briefly on each API node. A hosted
@@ -6473,6 +6604,9 @@
     if (msg.type === 'call_quality_result') { callHealth?.receive(msg); return; }
     if (msg.type === 'realtime_resync') {
       api({ method: 'GET', path: '/sync?since=0' });
+      // Rebuild server-side presence-watch indexes after a realtime registry
+      // restart even when the browser's local Set itself did not change.
+      sendWs({ type: 'presence_watch', user_ids: Array.from(presenceWatch) });
       const route = location.hash.match(/^#(dm|channel)\/(\d+)$/);
       if (route) api({ method: 'GET', path: `/messages?scope=${route[1] === 'dm' ? 'direct' : 'channel'}&scope_id=${route[2]}` });
       return;
@@ -7656,6 +7790,140 @@
   // so an unauthenticated 401 here is harmless and is retried once the app renders.
   queueMicrotask(() => loadOnboardingState());
 
+
+  class PlainwireDeveloperPortal extends HTMLElement {
+    constructor() {
+      super();
+      this.apps = [];
+      this.servers = [];
+      this.permissions = [];
+      this.selectedId = 0;
+      this.detailTab = 'general';
+      this.loadGeneration = 0;
+    }
+    connectedCallback() { this.refresh(); }
+    disconnectedCallback() { this.loadGeneration += 1; }
+    el(tag, className = '', text = '') {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text) node.textContent = text;
+      return node;
+    }
+    button(label, fn, className = 'btn') {
+      const button = this.el('button', className, label); button.type = 'button';
+      button.addEventListener('click', fn); return button;
+    }
+    field(label, value = '', { multiline = false, placeholder = '', type = 'text', maxLength = 2048 } = {}) {
+      const wrap = this.el('label', 'developer-field');
+      const title = this.el('span', '', label);
+      const input = multiline ? document.createElement('textarea') : document.createElement('input');
+      if (!multiline) input.type = type;
+      input.value = String(value ?? ''); input.placeholder = placeholder; input.maxLength = maxLength;
+      if (multiline) input.rows = 4;
+      wrap.append(title, input); return { wrap, input };
+    }
+    async refresh(preferId = this.selectedId) {
+      const generation = ++this.loadGeneration;
+      this.replaceChildren(this.el('div', 'developer-loading', 'Loading applications…'));
+      try {
+        const [apps, servers, permissions] = await Promise.all([
+          directApi('/developer/apps'), directApi('/servers'), directApi('/developer/permissions')
+        ]);
+        if (!this.isConnected || generation !== this.loadGeneration) return;
+        this.apps = Array.isArray(apps) ? apps : [];
+        this.servers = Array.isArray(servers) ? servers : (Array.isArray(servers?.servers) ? servers.servers : []);
+        this.permissions = Array.isArray(permissions) ? permissions : [];
+        this.selectedId = this.apps.some(item => Number(item.id) === Number(preferId)) ? Number(preferId) : Number(this.apps[0]?.id || 0);
+        this.render();
+      } catch (error) {
+        if (!this.isConnected || generation !== this.loadGeneration) return;
+        const box = this.el('div', 'developer-empty'); box.append(this.el('strong', '', 'Developer Portal unavailable'), this.el('p', '', error.message)); this.replaceChildren(box);
+      }
+    }
+    async selectApp(id) { this.selectedId = Number(id); this.detailTab = 'general'; this.render(); await this.renderDetail(); }
+    render() {
+      const root = this.el('div', 'developer-portal');
+      const toolbar = this.el('div', 'developer-toolbar');
+      const intro = this.el('div'); intro.append(this.el('h2', '', 'Your applications'), this.el('p', '', 'Build reusable bots, commands, signed interactions, and optional AI-powered commands.'));
+      toolbar.append(intro, this.button('New application', () => this.createApp()));
+      root.append(toolbar);
+      const layout = this.el('div', 'developer-layout');
+      const sidebar = this.el('aside', 'developer-app-list');
+      for (const appItem of this.apps) {
+        const btn = this.el('button', 'developer-app-row'); btn.type = 'button'; btn.classList.toggle('active', Number(appItem.id) === this.selectedId);
+        const avatar = this.el('span', 'developer-app-avatar', String(appItem.name || '?').slice(0, 1).toUpperCase());
+        if (appItem.avatar_url) { avatar.style.backgroundImage = `url(${JSON.stringify(String(appItem.avatar_url)).slice(1,-1)})`; avatar.textContent = ''; }
+        const copy = this.el('span', 'developer-app-copy'); copy.append(this.el('b', '', appItem.name || 'Application'), this.el('small', '', appItem.public ? 'Public application' : 'Private application'));
+        btn.append(avatar, copy); btn.addEventListener('click', () => this.selectApp(appItem.id)); sidebar.append(btn);
+      }
+      if (!this.apps.length) sidebar.append(this.el('div', 'developer-empty compact', 'No applications yet. Create one to get started.'));
+      const panel = this.el('section', 'developer-panel'); panel.dataset.developerPanel = 'true';
+      layout.append(sidebar, panel); root.append(layout); this.replaceChildren(root); this.renderDetail();
+    }
+    async createApp() {
+      const modal = modalShell('Create application', 'Applications are owned by your account and can be installed into multiple servers.');
+      const name = this.field('Application name', '', { placeholder: 'My Plainwire Bot', maxLength: 48 });
+      const actions = this.el('div', 'developer-actions');
+      const create = this.button('Create application', async () => {
+        create.disabled = true;
+        try { const appData = await directApi('/developer/apps', { method: 'POST', body: { name: name.input.value.trim() } }); modal.destroy(); await this.refresh(appData.id); }
+        catch (error) { send(app.ports.bridgeReceive, { tag: 'toast', data: error.message }); create.disabled = false; }
+      });
+      actions.append(create); modal.body.append(name.wrap, actions); name.input.focus();
+    }
+    async renderDetail() {
+      const panel = this.querySelector('[data-developer-panel]'); if (!panel) return;
+      panel.replaceChildren(); if (!this.selectedId) { panel.append(this.el('div', 'developer-empty', 'Create an application to manage bots and commands.')); return; }
+      let appData;
+      try { appData = await directApi(`/developer/apps/${this.selectedId}`); }
+      catch (error) { panel.append(this.el('div', 'developer-empty', error.message)); return; }
+      if (!this.isConnected || Number(appData.id) !== this.selectedId) return;
+      const head = this.el('div', 'developer-detail-head');
+      const title = this.el('div'); title.append(this.el('h2', '', appData.name), this.el('p', '', `${appData.public_id} · ${appData.public ? 'Public' : 'Private'}`)); head.append(title);
+      const tabs = this.el('nav', 'developer-tabs');
+      [['general','General'],['installations','Installations'],['commands','Commands'],['interactions','Interactions'],['ai','AI']].forEach(([id,label]) => {
+        const b=this.el('button','',label); b.type='button'; b.classList.toggle('active',this.detailTab===id); b.addEventListener('click',()=>{this.detailTab=id;this.renderDetail()}); tabs.append(b);
+      });
+      panel.append(head,tabs);
+      if (this.detailTab === 'general') this.renderGeneral(panel, appData);
+      else if (this.detailTab === 'installations') await this.renderInstallations(panel, appData);
+      else if (this.detailTab === 'commands') await this.renderCommands(panel, appData);
+      else if (this.detailTab === 'interactions') this.renderInteractions(panel, appData);
+      else if (this.detailTab === 'ai') this.renderAi(panel, appData);
+    }
+    renderGeneral(panel, appData) {
+      const form=this.el('div','developer-form');
+      const name=this.field('Name',appData.name,{maxLength:48}); const desc=this.field('Description',appData.description,{multiline:true,maxLength:500,placeholder:'What does this app do?'}); const avatar=this.field('Avatar URL',appData.avatar_source||'',{maxLength:2048,placeholder:'https://… or /api/files/…'});
+      const publicLabel=this.el('label','developer-check'); const publicInput=document.createElement('input');publicInput.type='checkbox';publicInput.checked=appData.public===true;publicLabel.append(publicInput,this.el('span','', 'Public application · other server managers can install it by App ID'));
+      const publicId=this.el('div','developer-copy-row'); const code=this.el('code','',appData.public_id); publicId.append(this.el('span','','Application ID'),code,this.button('Copy',async()=>{try{await navigator.clipboard.writeText(appData.public_id)}catch(_){}} ,'btn ghost'));
+      const perms=this.el('fieldset','developer-permissions'); perms.append(this.el('legend','','Default requested permissions'));
+      for(const permission of this.permissions){const bit=Number(permission.bit||permission.mask||0);if(!bit)continue;const label=this.el('label','developer-check');const input=document.createElement('input');input.type='checkbox';input.checked=(Number(appData.default_permissions||0)&bit)!==0;input.dataset.permissionBit=String(bit);const copy=this.el('span');copy.append(this.el('b','',permission.label||permission.name),this.el('small','',permission.description||''));label.append(input,copy);perms.append(label)}
+      const actions=this.el('div','developer-actions');const save=this.button('Save changes',async()=>{save.disabled=true;try{let mask=0;perms.querySelectorAll('[data-permission-bit]:checked').forEach(i=>{mask|=Number(i.dataset.permissionBit)});await directApi(`/developer/apps/${appData.id}`,{method:'POST',body:{name:name.input.value.trim(),description:desc.input.value,avatar_url:avatar.input.value.trim(),public:publicInput.checked,default_permissions:mask}});await this.refresh(appData.id);send(app.ports.bridgeReceive,{tag:'toast',data:'Application saved'});}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});save.disabled=false;}});const remove=this.button('Delete application',async()=>{if(!confirm(`Delete ${appData.name}? All installations and tokens will be revoked. Historical bot messages stay.`))return;remove.disabled=true;try{await directApi(`/developer/apps/${appData.id}/delete`,{method:'POST',body:{}});await this.refresh(0);}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});remove.disabled=false;}},'btn danger');actions.append(save,remove);form.append(publicId,name.wrap,desc.wrap,avatar.wrap,publicLabel,perms,actions);panel.append(form);
+    }
+    async renderInstallations(panel, appData) {
+      const wrap=this.el('div','developer-form');const intro=this.el('div','developer-section-copy');intro.append(this.el('h3','','Server installations'),this.el('p','','Each server installation has its own bot identity and revocable token, limiting the blast radius of a leaked credential.'));wrap.append(intro);
+      const installRow=this.el('div','developer-inline');const select=document.createElement('select');const empty=document.createElement('option');empty.value='';empty.textContent='Choose a server';select.append(empty);for(const server of this.servers){const o=document.createElement('option');o.value=String(server.id);o.textContent=server.name||`Server ${server.id}`;select.append(o)}const install=this.button('Install',async()=>{const sid=Number(select.value);if(!sid)return;install.disabled=true;try{const data=await directApi(`/developer/apps/${appData.id}/install`,{method:'POST',body:{server_id:sid}});await this.showSecret('Installation token',data.token,'This token controls only this server installation. Save it now.');await this.renderDetail();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});install.disabled=false;}});installRow.append(select,install);wrap.append(installRow);
+      let items=[];try{items=await directApi(`/developer/apps/${appData.id}/installations`)}catch(error){wrap.append(this.el('p','developer-error',error.message));panel.append(wrap);return}
+      const list=this.el('div','developer-stack');for(const item of (Array.isArray(items)?items:[])){const row=this.el('section','developer-install-card');const copy=this.el('div');copy.append(this.el('b','',item.server_name||`Server ${item.server_id}`),this.el('small','',`@${item.username} · installation ${item.id}`));const actions=this.el('div','developer-actions');actions.append(this.button('Rotate token',async e=>{e.currentTarget.disabled=true;try{const data=await directApi(`/developer/apps/${appData.id}/installation/${item.id}/rotate`,{method:'POST',body:{}});await this.showSecret('New installation token',data.token,'The previous token stopped working immediately.');}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{e.currentTarget.disabled=false;}} ,'btn secondary'),this.button('Uninstall',async e=>{if(!confirm(`Uninstall ${appData.name} from ${item.server_name}?`))return;e.currentTarget.disabled=true;try{await directApi(`/developer/apps/${appData.id}/installation/${item.id}/uninstall`,{method:'POST',body:{}});await this.renderDetail();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});e.currentTarget.disabled=false;}},'btn danger'));row.append(copy,actions);list.append(row)}if(!list.children.length)list.append(this.el('div','developer-empty compact','Not installed on any servers yet.'));wrap.append(list);panel.append(wrap);
+    }
+    async renderCommands(panel, appData) {
+      const wrap=this.el('div','developer-form');const intro=this.el('div','developer-section-copy');intro.append(this.el('h3','','Application commands'),this.el('p','','Commands sync to every installation. Queue handlers are claimed by your SDK; interaction handlers POST signed JSON to your endpoint; AI handlers call your configured OpenAI-compatible model.'));wrap.append(intro);
+      const form=this.el('form','developer-command-form');const name=this.field('Command','',{placeholder:'summarize',maxLength:32});const desc=this.field('Description','',{placeholder:'Summarize the current input',maxLength:160});const handlerLabel=this.el('label','developer-field');handlerLabel.append(this.el('span','','Handler'));const handler=document.createElement('select');[['queue','Bot SDK queue'],['webhook','Signed interaction endpoint'],['ai','AI connector']].forEach(([v,l])=>{const o=document.createElement('option');o.value=v;o.textContent=l;handler.append(o)});handlerLabel.append(handler);const options=this.field('Options JSON','[]',{multiline:true,maxLength:4096,placeholder:'[{"name":"text","type":"string","required":true}]'});const submit=this.el('button','btn','Save command');submit.type='submit';form.append(name.wrap,desc.wrap,handlerLabel,options.wrap,submit);form.addEventListener('submit',async e=>{e.preventDefault();submit.disabled=true;try{let parsed=JSON.parse(options.input.value||'[]');await directApi(`/developer/apps/${appData.id}/commands`,{method:'POST',body:{name:name.input.value.trim(),description:desc.input.value,handler:handler.value,options:parsed}});name.input.value='';desc.input.value='';options.input.value='[]';await this.renderDetail();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});submit.disabled=false;}});wrap.append(form);
+      let commands=[];try{commands=await directApi(`/developer/apps/${appData.id}/commands`)}catch(error){wrap.append(this.el('p','developer-error',error.message));panel.append(wrap);return}
+      const list=this.el('div','developer-stack');for(const command of (Array.isArray(commands)?commands:[])){const row=this.el('section','developer-command-card');const copy=this.el('div');copy.append(this.el('b','',`/${command.name}`),this.el('small','',`${command.handler} · ${command.description||'No description'}`));const del=this.button('Delete',async e=>{if(!confirm(`Delete /${command.name}?`))return;e.currentTarget.disabled=true;try{await directApi(`/developer/apps/${appData.id}/commands/${command.id}`,{method:'DELETE'});await this.renderDetail();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});e.currentTarget.disabled=false;}},'btn danger');row.append(copy,del);list.append(row)}if(!list.children.length)list.append(this.el('div','developer-empty compact','No application commands yet.'));wrap.append(list);panel.append(wrap);
+    }
+    renderInteractions(panel, appData) {
+      const wrap=this.el('div','developer-form');const intro=this.el('div','developer-section-copy');intro.append(this.el('h3','','Signed interaction endpoint'),this.el('p','','Run a bot without a persistent WebSocket worker. Plainwire POSTs command invocations to your HTTPS endpoint and verifies the destination before connecting.'));wrap.append(intro);const url=this.field('Interaction endpoint',appData.interaction?.url||'',{placeholder:'https://bot.example.com/plainwire/interactions',maxLength:2048});const status=this.el('p','developer-status',appData.interaction?.configured?'Configured · command webhooks are active':'Not configured');const actions=this.el('div','developer-actions');const save=this.button('Save endpoint',async()=>{save.disabled=true;try{const data=await directApi(`/developer/apps/${appData.id}/interactions`,{method:'POST',body:{url:url.input.value.trim()}});if(data.secret)await this.showSecret('Interaction signing secret',data.secret,'Use this secret to verify X-Plainwire-Interaction-Signature. It is shown once.');await this.refresh(appData.id);}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});save.disabled=false;}});const rotate=this.button('Rotate signing secret',async()=>{rotate.disabled=true;try{const data=await directApi(`/developer/apps/${appData.id}/interactions/rotate`,{method:'POST',body:{}});await this.showSecret('New interaction signing secret',data.secret,'Update your endpoint before sending more commands. The old secret is invalid.');}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{rotate.disabled=false;}},'btn secondary');rotate.disabled=!appData.interaction?.configured;actions.append(save,rotate);wrap.append(url.wrap,status,actions);panel.append(wrap);
+    }
+    renderAi(panel, appData) {
+      const ai=appData.ai||{};const wrap=this.el('div','developer-form');const intro=this.el('div','developer-section-copy');intro.append(this.el('h3','','AI command connector'),this.el('p','','Optional OpenAI-compatible command execution. Plainwire sends only the invoked command and its arguments, not channel history. API keys and system prompts are encrypted at rest.'));wrap.append(intro);const enabledLabel=this.el('label','developer-check');const enabled=document.createElement('input');enabled.type='checkbox';enabled.checked=ai.enabled===true;enabledLabel.append(enabled,this.el('span','','Enable AI handler'));const endpoint=this.field('Chat completions endpoint',ai.endpoint||'',{placeholder:'https://api.example.com/v1/chat/completions',maxLength:2048});const model=this.field('Model',ai.model||'',{placeholder:'model-name',maxLength:160});const key=this.field(ai.has_api_key?'API key · leave blank to keep current':'API key','',{type:'password',placeholder:'Stored encrypted and never shown again',maxLength:1024});const prompt=this.field('System prompt',ai.system_prompt||'',{multiline:true,maxLength:8000,placeholder:'You are a helpful Plainwire bot…'});const save=this.button('Save AI connector',async()=>{save.disabled=true;try{await directApi(`/developer/apps/${appData.id}/ai`,{method:'POST',body:{enabled:enabled.checked,endpoint:endpoint.input.value.trim(),model:model.input.value.trim(),api_key:key.input.value,system_prompt:prompt.input.value}});key.input.value='';await this.refresh(appData.id);send(app.ports.bridgeReceive,{tag:'toast',data:'AI connector saved'});}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});save.disabled=false;}});wrap.append(enabledLabel,endpoint.wrap,model.wrap,key.wrap,prompt.wrap,this.el('p','developer-note','For security, endpoints must pass Plainwire outbound URL policy. Private-network targets remain blocked unless the host operator explicitly changes policy.'),save);panel.append(wrap);
+    }
+    async showSecret(title, secret, note) {
+      const modal=modalShell(title,note);const field=document.createElement('textarea');field.className='admin-secret-value';field.readOnly=true;field.rows=4;field.value=String(secret||'');const actions=this.el('div','developer-actions');const copy=this.button('Copy',async()=>{try{await navigator.clipboard.writeText(field.value);copy.textContent='Copied';}catch(_){field.focus();field.select();}});const close=this.button('I saved it',()=>modal.destroy(),'btn secondary');actions.append(copy,close);modal.body.append(field,actions);field.focus();field.select();
+    }
+  }
+  if (!customElements.get('pw-developer-portal')) customElements.define('pw-developer-portal', PlainwireDeveloperPortal);
+
   recv(app.ports.bridgeSend, ({ tag, data }) => {
     debug('ELM', 'command', { tag, data });
     switch (tag) {
@@ -7700,6 +7968,29 @@
           observeMessageHistory();
         }
         break;
+      case 'jump_to_message': {
+        const id = Number(data);
+        if (!Number.isSafeInteger(id) || id <= 0) break;
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          const list = document.getElementById('messages');
+          if (!list) return;
+          const wanted = String(id);
+          const target = [...list.querySelectorAll('.msg[data-mid]')].find((node) => node.dataset.mid === wanted);
+          if (!target) {
+            send(app.ports.bridgeReceive, { tag: 'message_jump_missing', data: id });
+            return;
+          }
+          const reduceMotion = document.documentElement.dataset.reduceMotion === 'true'
+            || window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+          target.scrollIntoView({ block: 'center', inline: 'nearest', behavior: reduceMotion ? 'auto' : 'smooth' });
+          target.classList.remove('message-jump-highlight');
+          // Restart the highlight if the same reply is clicked twice.
+          void target.offsetWidth;
+          target.classList.add('message-jump-highlight');
+          window.setTimeout(() => target.classList.remove('message-jump-highlight'), 2200);
+        }));
+        break;
+      }
       case 'connect_ws':
         connectWs();
         break;

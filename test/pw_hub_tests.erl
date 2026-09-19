@@ -4,45 +4,37 @@
 
 self_is_included_in_presence_watch_test() ->
     stop_existing_hub(),
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
     try
         pw_hub:connect(42, self(), <<"online">>),
         _ = gen_server:call(pw_hub, sync),
         flush_presence_state(),
         pw_hub:watch_presence(self(), []),
         _ = gen_server:call(pw_hub, sync),
-        receive
-            {hub_json, #{type := presence_state, statuses := Statuses}} ->
-                ?assertEqual(<<"online">>, maps:get(42, Statuses))
-        after 1000 ->
-            ?assert(false)
-        end
+        Presence = await_presence_state(),
+        ?assertEqual(<<"online">>, maps:get(42, maps:get(statuses, Presence)))
     after
-        gen_server:stop(Hub)
+        stop_test_hub(Hub)
     end.
 
 
 connect_seeds_own_presence_state_test() ->
     stop_existing_hub(),
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
     try
         pw_hub:connect(84, self(), <<"away">>),
         _ = gen_server:call(pw_hub, sync),
-        receive
-            {hub_json, #{type := presence_state, online := Online, statuses := Statuses}} ->
-                ?assert(lists:member(84, Online)),
-                ?assertEqual(<<"away">>, maps:get(84, Statuses))
-        after 1000 ->
-            ?assert(false)
-        end
+        Presence = await_presence_state(),
+        ?assert(lists:member(84, maps:get(online, Presence))),
+        ?assertEqual(<<"away">>, maps:get(84, maps:get(statuses, Presence)))
     after
-        gen_server:stop(Hub)
+        stop_test_hub(Hub)
     end.
 
 
 voice_roster_carries_profile_and_normalizes_media_state_test() ->
     stop_existing_hub(),
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
     Parent = self(),
     Socket = spawn(fun() -> socket_loop(Parent, voice_member) end),
     Profile = #{id => 71, username => <<"casey">>, display_name => <<"Casey Nguyen">>,
@@ -82,13 +74,13 @@ voice_roster_carries_profile_and_normalizes_media_state_test() ->
         ?assertEqual(false, maps:get(screen_audio, Stopped))
     after
         exit(Socket, kill),
-        gen_server:stop(Hub)
+        stop_test_hub(Hub)
     end.
 
 
 multi_session_presence_prefers_visible_session_test() ->
     stop_existing_hub(),
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
     P1 = spawn(fun idle_socket/0),
     P2 = spawn(fun idle_socket/0),
     try
@@ -99,12 +91,8 @@ multi_session_presence_prefers_visible_session_test() ->
         flush_hub_messages(),
         pw_hub:watch_presence(self(), [7]),
         _ = gen_server:call(pw_hub, sync),
-        receive
-            {hub_json, #{type := presence_state, statuses := Initial}} ->
-                ?assertEqual(<<"online">>, maps:get(7, Initial))
-        after 1000 ->
-            ?assert(false)
-        end,
+        Presence = await_presence_state(),
+        ?assertEqual(<<"online">>, maps:get(7, maps:get(statuses, Presence))),
 
         %% Making one tab invisible must not hide the account while another
         %% connected tab is still visible.
@@ -123,12 +111,12 @@ multi_session_presence_prefers_visible_session_test() ->
     after
         exit(P1, kill),
         exit(P2, kill),
-        gen_server:stop(Hub)
+        stop_test_hub(Hub)
     end.
 
 call_accept_establishes_bidirectional_signaling_test() ->
     stop_existing_hub(),
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
     Parent = self(),
     Caller = spawn(fun() -> socket_loop(Parent, rtc_caller) end),
     Callee = spawn(fun() -> socket_loop(Parent, rtc_callee) end),
@@ -151,19 +139,25 @@ call_accept_establishes_bidirectional_signaling_test() ->
         Answer = #{kind => answer, sdp => #{type => answer, sdp => <<"v=0">>}},
         pw_hub:call_signal(501, 1, Caller, 2, Offer),
         _ = gen_server:call(pw_hub, sync),
-        ?assertEqual(Offer, maps:get(signal, await_event(rtc_callee, call_signal, 501))),
+        ?assertEqual(
+            #{<<"kind">> => <<"offer">>,
+              <<"sdp">> => #{<<"type">> => <<"offer">>, <<"sdp">> => <<"v=0">>}},
+            maps:get(signal, await_event(rtc_callee, call_signal, 501))),
         pw_hub:call_signal(501, 2, Callee, 1, Answer),
         _ = gen_server:call(pw_hub, sync),
-        ?assertEqual(Answer, maps:get(signal, await_event(rtc_caller, call_signal, 501)))
+        ?assertEqual(
+            #{<<"kind">> => <<"answer">>,
+              <<"sdp">> => #{<<"type">> => <<"answer">>, <<"sdp">> => <<"v=0">>}},
+            maps:get(signal, await_event(rtc_caller, call_signal, 501)))
     after
         exit(Caller, kill),
         exit(Callee, kill),
-        gen_server:stop(Hub)
+        stop_test_hub(Hub)
     end.
 
 missed_call_ends_ring_and_rejects_late_accept_test() ->
     stop_existing_hub(),
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
     Parent = self(),
     Caller = spawn(fun() -> socket_loop(Parent, missed_caller) end),
     Callee = spawn(fun() -> socket_loop(Parent, missed_callee) end),
@@ -180,7 +174,7 @@ missed_call_ends_ring_and_rejects_late_accept_test() ->
         _ = gen_server:call(pw_hub, sync),
         CallerEvent = await_event(missed_caller, call_missed, 502),
         CalleeEvent = await_event(missed_callee, call_missed, 502),
-        ?assertEqual(timeout, maps:get(reason, CallerEvent)),
+        ?assertEqual(<<"timeout">>, maps:get(reason, CallerEvent)),
         ?assertEqual(1, maps:get(from_user_id, CallerEvent)),
         ?assertEqual(<<"Caller">>, maps:get(display_name, maps:get(profile, CallerEvent))),
         ?assertEqual(1, maps:get(from_user_id, CalleeEvent)),
@@ -192,12 +186,12 @@ missed_call_ends_ring_and_rejects_late_accept_test() ->
     after
         exit(Caller, kill),
         exit(Callee, kill),
-        gen_server:stop(Hub)
+        stop_test_hub(Hub)
     end.
 
 crossed_ring_connects_both_callers_test() ->
     stop_existing_hub(),
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
     Parent = self(),
     One = spawn(fun() -> socket_loop(Parent, crossed_one) end),
     Two = spawn(fun() -> socket_loop(Parent, crossed_two) end),
@@ -225,16 +219,19 @@ crossed_ring_connects_both_callers_test() ->
         Offer = #{kind => offer, sdp => #{type => offer, sdp => <<"v=0">>}},
         pw_hub:call_signal(503, 2, Two, 1, Offer),
         _ = gen_server:call(pw_hub, sync),
-        ?assertEqual(Offer, maps:get(signal, await_event(crossed_one, call_signal, 503)))
+        ?assertEqual(
+            #{<<"kind">> => <<"offer">>,
+              <<"sdp">> => #{<<"type">> => <<"offer">>, <<"sdp">> => <<"v=0">>}},
+            maps:get(signal, await_event(crossed_one, call_signal, 503)))
     after
         exit(One, kill),
         exit(Two, kill),
-        gen_server:stop(Hub)
+        stop_test_hub(Hub)
     end.
 
 call_presence_and_cross_room_eviction_test() ->
     stop_existing_hub(),
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
     Parent = self(),
     P1 = spawn(fun() -> socket_loop(Parent, one) end),
     P1b = spawn(fun() -> socket_loop(Parent, one_b) end),
@@ -284,19 +281,19 @@ call_presence_and_cross_room_eviction_test() ->
         assert_no_event(two, call_signal, 123),
         pw_hub:call_signal(123, 1, P1b, 2, #{kind => current_offer}),
         Signal = await_event(two, call_signal, 123),
-        ?assertEqual(#{kind => current_offer}, maps:get(signal, Signal))
+        ?assertEqual(#{<<"kind">> => <<"current_offer">>}, maps:get(signal, Signal))
     after
         exit(P1, kill),
         exit(P1b, kill),
         exit(P2, kill),
-        gen_server:stop(Hub)
+        stop_test_hub(Hub)
     end.
 
 call_refresh_reconnect_grace_test() ->
     Previous = os:getenv("PLAINWIRE_RTC_RECONNECT_GRACE_MS"),
     os:putenv("PLAINWIRE_RTC_RECONNECT_GRACE_MS", "250"),
     stop_existing_hub(),
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
     Parent = self(),
     P1 = spawn(fun() -> socket_loop(Parent, first_tab) end),
     P1b = spawn(fun() -> socket_loop(Parent, refreshed_tab) end),
@@ -340,7 +337,7 @@ call_refresh_reconnect_grace_test() ->
         exit(P1, kill),
         exit(P1b, kill),
         exit(P2, kill),
-        gen_server:stop(Hub),
+        stop_test_hub(Hub),
         restore_env("PLAINWIRE_RTC_RECONNECT_GRACE_MS", Previous)
     end.
 
@@ -348,7 +345,7 @@ call_refresh_grace_expires_test() ->
     Previous = os:getenv("PLAINWIRE_RTC_RECONNECT_GRACE_MS"),
     os:putenv("PLAINWIRE_RTC_RECONNECT_GRACE_MS", "50"),
     stop_existing_hub(),
-    {ok, Hub} = pw_hub:start_link(),
+    {ok, Hub} = start_test_hub(),
     Parent = self(),
     P1 = spawn(fun() -> socket_loop(Parent, expiring) end),
     P2 = spawn(fun() -> socket_loop(Parent, expiry_observer) end),
@@ -367,7 +364,7 @@ call_refresh_grace_expires_test() ->
     after
         exit(P1, kill),
         exit(P2, kill),
-        gen_server:stop(Hub),
+        stop_test_hub(Hub),
         restore_env("PLAINWIRE_RTC_RECONNECT_GRACE_MS", Previous)
     end.
 
@@ -508,14 +505,48 @@ restore_env(Name, false) -> os:unsetenv(Name);
 restore_env(Name, Value) -> os:putenv(Name, Value).
 
 flush_presence_state() ->
+    _ = await_presence_state(),
+    ok.
+
+await_presence_state() ->
     receive
-        {hub_json, #{type := presence_state}} -> ok
+        {hub_text, Payload, presence_state} ->
+            Json = jsx:decode(Payload, [return_maps]),
+            Statuses0 = maps:get(<<"statuses">>, Json, #{}),
+            Statuses = maps:from_list([
+                {presence_uid(Key), Value} || {Key, Value} <- maps:to_list(Statuses0)
+            ]),
+            #{type => presence_state,
+              online => maps:get(<<"online">>, Json, []),
+              statuses => Statuses}
     after 1000 ->
         ?assert(false)
     end.
 
+presence_uid(Key) when is_binary(Key) ->
+    try binary_to_integer(Key) catch _:_ -> Key end;
+presence_uid(Key) -> Key.
+
 stop_existing_hub() ->
-    case whereis(pw_hub) of
+    stop_named(pw_hub),
+    stop_named(pw_realtime_registry).
+
+start_test_hub() ->
+    stop_existing_hub(),
+    {ok, _Registry} = pw_realtime_registry:start_link(),
+    pw_hub:start_link().
+
+stop_test_hub(Hub) ->
+    case is_process_alive(Hub) of
+        true -> gen_server:stop(Hub);
+        false -> ok
+    end,
+    stop_named(pw_realtime_registry).
+
+stop_named(Name) ->
+    case whereis(Name) of
         undefined -> ok;
-        Pid -> gen_server:stop(Pid)
+        Pid when is_pid(Pid) ->
+            try gen_server:stop(Pid, normal, 1000)
+            catch exit:_ -> exit(Pid, kill), ok end
     end.
