@@ -28,7 +28,10 @@ pub fn build(workload: WorkloadProfile) -> LoadPlan {
 fn ceil_div(value: Int, divisor: Int) -> Int {
   case value <= 0 {
     True -> 0
-    False -> (value + divisor - 1) / divisor
+    False -> {
+      let numerator = value + divisor - 1
+      numerator / divisor
+    }
   }
 }
 

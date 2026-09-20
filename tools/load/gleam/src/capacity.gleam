@@ -12,7 +12,11 @@ pub type GatewayCapacity {
   )
 }
 
-pub fn plan(users: Int, target_connections_per_gateway: Int, supervisors: Int) -> GatewayCapacity {
+pub fn plan(
+  users: Int,
+  target_connections_per_gateway: Int,
+  supervisors: Int,
+) -> GatewayCapacity {
   let safe_users = int.max(1, users)
   let target = int.max(1000, target_connections_per_gateway)
   let headroom_users = ceil_div(safe_users * 125, 100)
@@ -33,6 +37,9 @@ pub fn plan(users: Int, target_connections_per_gateway: Int, supervisors: Int) -
 fn ceil_div(value: Int, divisor: Int) -> Int {
   case value <= 0 {
     True -> 0
-    False -> (value + divisor - 1) / divisor
+    False -> {
+      let numerator = value + divisor - 1
+      numerator / divisor
+    }
   }
 }

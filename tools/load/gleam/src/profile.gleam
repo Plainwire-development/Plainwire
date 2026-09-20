@@ -23,7 +23,8 @@ pub fn default(users: Int) -> WorkloadProfile {
 }
 
 pub fn validate(profile: WorkloadProfile) -> Result(WorkloadProfile, String) {
-  case profile.users >= 10,
+  case
+    profile.users >= 10,
     profile.duration_seconds >= 1,
     profile.operations_per_second >= 1,
     profile.channel_size >= 2,

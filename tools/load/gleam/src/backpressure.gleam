@@ -11,7 +11,12 @@ pub type QueueBudget {
   )
 }
 
-pub fn budget(users: Int, soft: Int, hard: Int, average_payload_bytes: Int) -> QueueBudget {
+pub fn budget(
+  users: Int,
+  soft: Int,
+  hard: Int,
+  average_payload_bytes: Int,
+) -> QueueBudget {
   let users = int.max(1, users)
   let soft = int.max(1, soft)
   let hard = int.max(soft + 1, hard)

@@ -27,7 +27,9 @@ pub fn evaluate(result: LoadResult) -> Verdict {
     True -> failures
     False -> ["a live client mailbox reached the hard limit", ..failures]
   }
-  let failures = case result.live_clients > 0 && result.live_clients <= result.requested_users {
+  let failures = case
+    result.live_clients > 0 && result.live_clients <= result.requested_users
+  {
     True -> failures
     False -> ["client accounting is inconsistent", ..failures]
   }
