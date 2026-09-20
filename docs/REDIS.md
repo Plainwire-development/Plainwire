@@ -1,6 +1,6 @@
 # Redis in Plainwire
 
-Plainwire 2.1.0 can use Redis as an optional realtime accelerator. Redis is never the durable authority. PostgreSQL is still the source of truth for accounts, relationships, memberships, permissions, uploads and other relational state; message-history durability follows `PLAINWIRE_MESSAGE_BACKEND`.
+Plainwire 2.2.0 can use Redis as an optional realtime accelerator. Redis is never the durable authority. PostgreSQL is still the source of truth for accounts, relationships, memberships, permissions, uploads and other relational state; message-history durability follows `PLAINWIRE_MESSAGE_BACKEND`.
 
 Redis is used for work that benefits from shared short-lived state:
 
@@ -33,7 +33,7 @@ The latest message window may be cached after an authoritative read. Pagination 
 
 ## Redis Cluster note
 
-Plainwire 2.1.0's built-in RESP client deliberately uses hash-slot-safe single-key operations, but it does **not** implement native Redis Cluster `MOVED`/`ASK` redirect discovery. Do not point it directly at an arbitrary native Redis Cluster shard endpoint. Use a normal Redis endpoint, a managed HA endpoint, or a compatible proxy/service endpoint that hides the shard topology.
+Plainwire 2.2.0's built-in RESP client deliberately uses hash-slot-safe single-key operations, but it does **not** implement native Redis Cluster `MOVED`/`ASK` redirect discovery. Do not point it directly at an arbitrary native Redis Cluster shard endpoint. Use a normal Redis endpoint, a managed HA endpoint, or a compatible proxy/service endpoint that hides the shard topology.
 
 This distinction matters: hash-slot-safe commands make a future cluster-aware transport possible, but they do not by themselves make the current raw RESP client a Redis Cluster client.
 

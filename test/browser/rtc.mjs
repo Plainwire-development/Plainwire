@@ -284,12 +284,24 @@ try {
   await a.evaluate(() => { window.__beforeShareAudio = window.__pcs.at(-1)._audioSender.track; });
   await a.getByRole('button', { name: 'Share', exact: true }).click();
   await a.waitForSelector('.call-sharing-row');
+  await a.locator('.call-overlay.expanded').evaluate(el => { el.style.width = '620px'; });
+  await a.waitForFunction(() => getComputedStyle(document.querySelector('.call-control')).flexDirection === 'row');
+  const wideControlOffset = await a.locator('.call-control').first().evaluate(button => {
+    const box = button.getBoundingClientRect();
+    const icon = button.querySelector('.call-icon').getBoundingClientRect();
+    const label = button.querySelector('span:last-child').getBoundingClientRect();
+    return Math.abs((icon.left + label.right) / 2 - (box.left + box.right) / 2);
+  });
+  assert(wideControlOffset <= 2, `wide call control icon and label stay centered together (${wideControlOffset}px offset)`);
   await a.waitForFunction(() => {
     const sender = window.__pcs.at(-1)._audioSender;
     return sender?.track && sender.track !== window.__beforeShareAudio && sender.track.readyState === 'live';
   });
   await a.evaluate(() => { window.__firstMixedScreenAudio = window.__pcs.at(-1)._audioSender.track; });
   assert.equal(await a.evaluate(() => window.__displayRequests[0].audio), true, 'screen chooser requests source audio');
+  assert.equal(await a.evaluate(() => window.__displayRequests[0].windowAudio), 'window', 'window sharing requests the selected window audio');
+  assert.equal(await a.evaluate(() => window.__displayRequests[0].systemAudio), 'include', 'monitor sharing keeps system audio available');
+  assert.equal(await a.evaluate(() => window.__displayRequests[0].audioSelection), 'preferred', 'the screen chooser is asked to prefer an audio-enabled source');
   assert.equal(await a.evaluate(() => window.__screens[0].stream.getAudioTracks().length), 1, 'display capture supplies shared audio');
   await b.waitForFunction(async () => [...(await window.__pcs.at(-1).getStats()).values()].some(r => r.type === 'inbound-rtp' && r.kind === 'video' && r.framesDecoded > 2));
   await b.getByRole('button', { name: 'Open call details', exact: true }).click();

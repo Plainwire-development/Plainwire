@@ -17,8 +17,10 @@ ok = plainwire_bot:subscribe(Bot, <<"channel:42">>),
 Commands are durable. Register a command once, then let one or more workers claim invocations. Each claim has a short-lived one-time token and lease. Responding completes the invocation; `fail_command/4` permanently rejects it.
 
 ```erlang
-{ok, _} = plainwire_bot:register_command(Bot, <<"hello">>, <<"Say hello">>, []),
+{ok, _} = plainwire_bot:sync_commands(Bot, [#{name => <<"hello">>, description => <<"Say hello">>}]),
 {ok, Claims} = plainwire_bot:claim_commands(Bot, 10).
 ```
+
+Use `defer_command/4` before a long-running handler and `members/2` with `#{after => Cursor, limit => 50}` to traverse large server rosters without loading them all at once.
 
 Realtime events arrive at the owner process as `{plainwire_bot, BotPid, {event, EventMap}}`. The SDK reconnects with bounded backoff and restores subscriptions.

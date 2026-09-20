@@ -1179,7 +1179,7 @@
       wrap.append(incomingSection);
 
       const botsSection=document.createElement('section'); botsSection.className='admin-role-card'; const botHead=document.createElement('div'); botHead.className='admin-role-head'; const botCopy=document.createElement('div'); const botStrong=document.createElement('strong'); botStrong.textContent='Bots'; const botSmall=document.createElement('small'); botSmall.textContent='Server-scoped bot accounts use the same role and permission model as members.'; botCopy.append(botStrong,botSmall); botHead.append(botCopy); botsSection.append(botHead); const botList=document.createElement('div'); botList.className='admin-role-stack'; botsSection.append(botList);
-      if(canBots){ const create=document.createElement('form'); create.className='admin-role-create'; const input=document.createElement('input'); input.placeholder='Bot name'; input.maxLength=48; const submit=document.createElement('button'); submit.type='submit'; submit.className='btn'; submit.textContent='Create bot'; create.append(input,submit); botsSection.insertBefore(create,botList); create.addEventListener('submit',async(event)=>{event.preventDefault();submit.disabled=true;try{const data=await directApi(`/server/${serverId}/bots`,{method:'POST',body:{name:input.value.trim()}}); await copySecretDialog('Bot token',data.token,'This token authenticates the bot SDK and is shown only once. Give the bot roles after creation to control what it can do.'); render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});submit.disabled=false;}});
+      if(canBots){ const create=document.createElement('form'); create.className='admin-role-create'; const input=document.createElement('input'); input.placeholder='Bot name'; input.maxLength=48; const submit=document.createElement('button'); submit.type='submit'; submit.className='btn'; submit.textContent='Create bot'; create.append(input,submit); botsSection.insertBefore(create,botList); create.addEventListener('submit',async(event)=>{event.preventDefault();submit.disabled=true;try{const data=await directApi(`/server/${serverId}/bots`,{method:'POST',body:{name:input.value.trim()}}); await copySecretDialog('Bot token',data.token,'This token authenticates the bot SDK and is shown only once. Give the bot roles after creation to control what it can do.',true); render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});submit.disabled=false;}});
         botList.setAttribute('aria-busy','true'); directApi(`/server/${serverId}/bots`).then((items)=>{botList.replaceChildren();botList.removeAttribute('aria-busy');for(const bot of (Array.isArray(items)?items:[])){const row=document.createElement('section');row.className='admin-role-card';const head=document.createElement('div');head.className='admin-role-head';const copy=document.createElement('div');const strong=document.createElement('strong');strong.textContent=bot.name;const small=document.createElement('small');small.textContent=`@${bot.username} · user ${bot.user_id}`;copy.append(strong,small);const actions=document.createElement('div');actions.className='admin-row-actions';const rotate=actionButton('Rotate token',async(e)=>{if(!window.confirm(`Rotate ${bot.name}'s token?`))return;e.currentTarget.disabled=true;try{const data=await directApi(`/server/${serverId}/bot/${bot.id}/rotate`,{method:'POST',body:{}});await copySecretDialog('New bot token',data.token,'The previous token is no longer valid.');}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{e.currentTarget.disabled=false;}});const remove=actionButton('Delete bot',async(e)=>{if(!window.confirm(`Delete bot ${bot.name} and its authored messages?`))return;e.currentTarget.disabled=true;try{await directApi(`/server/${serverId}/bot/${bot.id}/delete`,{method:'POST',body:{}});render();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});e.currentTarget.disabled=false;}},true);actions.append(rotate,remove);head.append(copy,actions);row.append(head);botList.append(row);}if(!botList.children.length)adminMessage(botList,'No bots yet.');}).catch((error)=>{botList.removeAttribute('aria-busy');adminMessage(botList,error.message,'error');});
       } else adminMessage(botList,'Your roles do not grant Manage Bots.');
       wrap.append(botsSection);
@@ -1237,8 +1237,26 @@
       wrap.append(appsSection);
       return wrap;
     };
-    const copySecretDialog = async (title, secret, note) => {
+    const copySecretDialog = async (title, secret, note, showBotStarter = false) => {
       const modal=modalShell(title,note); const field=document.createElement('textarea'); field.readOnly=true; field.rows=4; field.value=String(secret||''); field.className='admin-secret-value'; const actions=document.createElement('div');actions.className='admin-row-actions';const copy=document.createElement('button');copy.type='button';copy.className='btn';copy.textContent='Copy';copy.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(field.value);copy.textContent='Copied';}catch(_){field.focus();field.select();}});const close=document.createElement('button');close.type='button';close.className='btn secondary';close.textContent='I saved it';close.addEventListener('click',modal.destroy);actions.append(copy,close);modal.body.append(field,actions);field.focus();field.select();
+      if(showBotStarter){
+        const base=window.location.origin;
+        const snippets={
+          JavaScript:`import { PlainwireBot } from './plainwire-bot.mjs';\nconst bot = new PlainwireBot('${base}', process.env.PLAINWIRE_BOT_TOKEN);\nawait bot.syncCommands([{ name: 'ping', description: 'Replies pong' }]);\nawait bot.commandWorker({ ping: async () => 'pong' }).run();`,
+          Python:`import os\nfrom plainwire_bot import Client\nbot = Client('${base}', os.environ['PLAINWIRE_BOT_TOKEN'])\nbot.sync_commands([{'name': 'ping', 'description': 'Replies pong'}])\nbot.command_worker({'ping': lambda claim, client: 'pong'}).run()`,
+          Go:`bot, err := plainwirebot.New("${base}", os.Getenv("PLAINWIRE_BOT_TOKEN"))\n_, err = bot.SyncCommands(ctx, []plainwirebot.CommandDefinition{{Name: "ping", Description: "Replies pong"}})\nerr = bot.RunCommandWorker(ctx, handlers, plainwirebot.WorkerOptions{})`,
+          Rust:`let bot = plainwire_bot::Client::new("${base}", &std::env::var("PLAINWIRE_BOT_TOKEN")?)?;\nbot.sync_commands(serde_json::json!([{"name":"ping","description":"Replies pong"}]))?;`,
+          Erlang:`{ok, Bot} = plainwire_bot:start_link(#{base_url => <<"${base}">>, token => os:getenv("PLAINWIRE_BOT_TOKEN")}),\n{ok, _} = plainwire_bot:sync_commands(Bot, [#{name => <<"ping">>, description => <<"Replies pong">>}]).`,
+          C:`pw_bot_client bot;\npw_bot_client_init(&bot, "${base}", getenv("PLAINWIRE_BOT_TOKEN"));\npw_bot_sync_commands(&bot, "[{\\"name\\":\\"ping\\",\\"description\\":\\"Replies pong\\"}]", &response);`,
+          'C++':`plainwire::bot_client bot("${base}", std::getenv("PLAINWIRE_BOT_TOKEN"));\nauto result = bot.sync_commands(R"([{"name":"ping","description":"Replies pong"}])");`
+        };
+        const language=document.createElement('select');language.setAttribute('aria-label','Starter language');Object.keys(snippets).forEach(name=>{const option=document.createElement('option');option.value=name;option.textContent=name;language.append(option)});
+        const label=document.createElement('label');label.className='admin-field';const labelText=document.createElement('span');labelText.textContent='Starter';label.append(labelText,language);
+        const starter=document.createElement('textarea');starter.readOnly=true;starter.rows=8;starter.className='admin-secret-value';const update=()=>{starter.value=snippets[language.value]||''};language.addEventListener('change',update);update();
+        const hint=document.createElement('small');hint.className='muted';hint.textContent='Set PLAINWIRE_BOT_TOKEN to the token above. The starter syncs one command; the SDK guides cover every API.';
+        const copyStarter=document.createElement('button');copyStarter.type='button';copyStarter.className='btn secondary';copyStarter.textContent='Copy starter';copyStarter.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(starter.value);copyStarter.textContent='Copied starter';}catch(_){starter.focus();starter.select();}});
+        const starterActions=document.createElement('div');starterActions.className='admin-row-actions';starterActions.append(copyStarter);modal.body.insertBefore(label,actions);modal.body.insertBefore(starter,actions);modal.body.insertBefore(hint,actions);modal.body.insertBefore(starterActions,actions);
+      }
     };
     const render = () => {
       shell.body.replaceChildren(); const nav=document.createElement('nav');nav.className='admin-tabs';
@@ -5362,7 +5380,11 @@
         video: screenConstraints(),
         audio: shareScreenAudio,
         systemAudio: shareScreenAudio ? 'include' : 'exclude',
-        windowAudio: shareScreenAudio ? 'system' : 'exclude',
+        // A window and the whole system are separate audio choices in the
+        // Screen Capture API. Asking for system audio here left application
+        // windows silent even when the picker offered an audio checkbox.
+        windowAudio: shareScreenAudio ? 'window' : 'exclude',
+        audioSelection: shareScreenAudio ? 'preferred' : undefined,
         selfBrowserSurface: 'exclude',
         surfaceSwitching: 'include'
       });
@@ -6979,43 +7001,19 @@
       notification.close();
     };
   });
-  // Plainwire owns in-app context menus. Keep browser chrome out of the app,
-  // but do not sacrifice ordinary desktop editing actions: inputs/links/images get
-  // a small native-feeling fallback menu when Elm did not open a richer menu.
+  // Plainwire owns context menus for app surfaces. Editable controls retain the
+  // browser menu so privileged Cut/Copy/Paste remains reliable; links, images and
+  // non-editable selections get a small fallback when Elm has no richer menu.
   let fallbackContextMenu = null;
   const closeFallbackContextMenu = () => { fallbackContextMenu?.remove(); fallbackContextMenu = null; };
-  const setTextControlValue = (control, value, start, end) => {
-    if (typeof control.setRangeText === 'function') control.setRangeText(value, start, end, 'end');
-    else control.value = control.value.slice(0, start) + value + control.value.slice(end);
-    control.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-  };
+  const nativeEditingContextTarget = (target) => target?.closest?.('input:not([type="button"]):not([type="submit"]), textarea, [contenteditable]:not([contenteditable="false"])');
   const openFallbackContextMenu = (target, x, y) => {
     closeFallbackContextMenu();
-    const editable = target?.closest?.('input:not([type="button"]):not([type="submit"]), textarea, [contenteditable="true"]');
     const link = target?.closest?.('a[href]');
     const image = target?.closest?.('img[src]');
     const selectedText = String(window.getSelection?.()?.toString?.() || '').trim();
     const actions = [];
-    if (editable) {
-      const textControl = editable instanceof HTMLInputElement || editable instanceof HTMLTextAreaElement;
-      const writable = !editable.readOnly && !editable.disabled;
-      const selected = textControl ? editable.value.slice(editable.selectionStart || 0, editable.selectionEnd || 0) : String(window.getSelection?.()?.toString?.() || '');
-      actions.push(['Cut', async () => {
-        if (!selected) return;
-        try { await navigator.clipboard.writeText(selected); } catch (_) { send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not copy the selection. Your text has been kept.' }); return; }
-        if (textControl) setTextControlValue(editable, '', editable.selectionStart || 0, editable.selectionEnd || 0);
-        else document.execCommand?.('delete');
-      }, !selected || !writable]);
-      actions.push(['Copy', async () => { if (selected) await navigator.clipboard.writeText(selected).catch(() => {}); }, !selected]);
-      actions.push(['Paste', async () => {
-        try {
-          const value = await navigator.clipboard.readText();
-          if (textControl) setTextControlValue(editable, value, editable.selectionStart || 0, editable.selectionEnd || 0);
-          else document.execCommand?.('insertText', false, value);
-        } catch (_) { send(app.ports.bridgeReceive, { tag: 'toast', data: 'Clipboard paste permission was not available.' }); }
-      }, !writable || !navigator.clipboard?.readText]);
-      actions.push(['Select all', () => { if (textControl) editable.select(); else { const range = document.createRange(); range.selectNodeContents(editable); const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range); } }, false]);
-    } else if (selectedText) {
+    if (selectedText) {
       actions.push(['Copy selection', () => navigator.clipboard.writeText(selectedText).catch(() => {}), false]);
     }
     if (link) {
@@ -7056,8 +7054,15 @@
     menu.querySelector('button:not(:disabled)')?.focus({ preventScroll: true });
   };
   document.addEventListener('contextmenu', (event) => {
-    event.preventDefault();
     const target = event.target;
+    // Clipboard reads from a scripted menu are permission-gated and may be
+    // rejected even though the user just right-clicked. Native editing menus
+    // can paste without granting page-level clipboard-read permission.
+    if (nativeEditingContextTarget(target)) {
+      closeFallbackContextMenu();
+      return;
+    }
+    event.preventDefault();
     const x = event.clientX, y = event.clientY;
     closeFallbackContextMenu();
     requestAnimationFrame(() => {

@@ -1,6 +1,6 @@
 # Bots
 
-Plainwire 2.1 has server-scoped bot accounts and a stable language-neutral Bot API v1. A bot is a real server member with its own user id, role assignments and permission checks. Creating a bot does not grant administrator access.
+Plainwire 2.2 has server-scoped bot accounts and a stable language-neutral Bot API v1. A bot is a real server member with its own user id, role assignments and permission checks. Creating a bot does not grant administrator access.
 
 Server members with **Manage bots** can create, rotate and delete bot credentials from the server integrations UI. The `pwb_...` token is shown only when it is created or rotated. Plainwire stores only its hash, so a lost token must be rotated rather than recovered.
 
@@ -40,15 +40,37 @@ GET    /api/bot/v1
 GET    /api/bot/v1/me
 GET    /api/bot/v1/server
 GET    /api/bot/v1/channels
+POST   /api/bot/v1/channels
 GET    /api/bot/v1/channels/:channel_id/messages
 POST   /api/bot/v1/channels/:channel_id/messages
+GET    /api/bot/v1/channels/:channel_id/pins
+POST   /api/bot/v1/channels/:channel_id/settings
 POST   /api/bot/v1/messages/:message_id/delete
 POST   /api/bot/v1/messages/:message_id/reaction
+POST   /api/bot/v1/messages/:message_id/edit
+POST   /api/bot/v1/messages/:message_id/pin
+GET    /api/bot/v1/messages/:message_id/context
+
+GET    /api/bot/v1/members?after=0&limit=50
+GET    /api/bot/v1/members/:user_id
+POST   /api/bot/v1/members/:user_id/roles
+POST   /api/bot/v1/members/:user_id/kick
+POST   /api/bot/v1/members/:user_id/ban
+POST   /api/bot/v1/members/:user_id/unban
+GET    /api/bot/v1/roles
+POST   /api/bot/v1/roles
+POST   /api/bot/v1/roles/:role_id
+DELETE /api/bot/v1/roles/:role_id
+GET    /api/bot/v1/bans
+GET    /api/bot/v1/wires
+POST   /api/bot/v1/wires
 
 GET    /api/bot/v1/commands
 POST   /api/bot/v1/commands
+PUT    /api/bot/v1/commands
 DELETE /api/bot/v1/commands/:command_id
 GET    /api/bot/v1/commands/claims?limit=10
+POST   /api/bot/v1/commands/claims/:invocation_id/defer
 POST   /api/bot/v1/commands/claims/:invocation_id/respond
 POST   /api/bot/v1/commands/claims/:invocation_id/fail
 ```
@@ -58,6 +80,8 @@ The existing `/api/bot/*` message routes remain available for compatibility with
 ## Commands
 
 Bots can register server commands. Command names are lowercase identifiers beginning with a letter and containing letters, digits, `_` or `-`.
+
+For deployment, prefer `PUT /api/bot/v1/commands` with `{ "commands": [...] }`. Like a bulk application-command update, it atomically upserts the desired definitions and removes stale commands. The list is capped at 100 and a conflict rolls back the whole sync, so a failed deploy cannot leave half of a command set active. `POST /commands` remains useful for interactive one-command updates.
 
 A command definition can include up to 25 option descriptors. Supported option types are:
 
@@ -85,6 +109,14 @@ GET /api/bot/v1/commands/claims?limit=10
 Each claim includes a one-time `claim_token` and lease expiry. Plainwire stores only the token hash. Several workers for the same bot can claim concurrently because PostgreSQL row locks and `SKIP LOCKED` prevent one live invocation from being handed to two workers at the same time.
 
 If a worker disappears, the lease expires and the invocation can be reclaimed. The retry count is bounded so permanently broken work does not stay in the queue forever.
+
+Long-running handlers can renew a live lease before it expires:
+
+```text
+POST /api/bot/v1/commands/claims/:id/defer
+```
+
+Send the `claim_token` and an optional `lease_ms` between 5,000 and 120,000. Renewal never changes the claim token and cannot revive an expired, completed or failed invocation.
 
 ### Completing a command
 
@@ -124,7 +156,7 @@ Bots may authenticate to `/ws` and subscribe only to scopes they are permitted t
 
 ## Developer Applications
 
-Plainwire 2.1 can package bot commands as a reusable Developer Application. An application can be installed into multiple servers, where each installation receives its own server-scoped bot identity and credential. Application owners may publish an app to the public directory, but connector secrets and private owner metadata are never part of public app responses.
+Plainwire 2.2 can package bot commands as a reusable Developer Application. An application can be installed into multiple servers, where each installation receives its own server-scoped bot identity and credential. Application owners may publish an app to the public directory, but connector secrets and private owner metadata are never part of public app responses.
 
 A command handler can be `queue` (claimed through Bot API v1), `webhook` (delivered to an HMAC-signed HTTPS interaction endpoint), or `ai` (an optional OpenAI-compatible connector). Server managers can narrow individual commands by member, channel, or role. Plainwire rechecks those rules, the invoking member's channel access, and the bot's channel access again at claim time before command arguments are decrypted for delivery.
 
@@ -144,15 +176,42 @@ The repository includes first-party clients for:
 - `sdk/python`
 - `sdk/javascript`
 
-The SDKs intentionally stay thin. They expose the versioned HTTP contract rather than hiding Plainwire behind a proprietary runtime. That makes the API usable from other languages that can make HTTPS requests and parse JSON.
+Every SDK exposes messages, channels, roles, moderation, wires, cursor-paginated members, atomic command sync and renewable durable command claims. The Go, Python and JavaScript packages also include bounded concurrent command workers with handler maps and automatic lease extension. The API remains ordinary HTTPS/JSON, so any other language can integrate without a proprietary runtime.
 
-Each SDK README contains a small echo/command worker example and language-specific build instructions.
+Each SDK README contains a small command or transport example and language-specific build instructions.
+
+## Minimal JavaScript command bot
+
+```js
+import { PlainwireBot } from './sdk/javascript/plainwire-bot.mjs';
+
+const bot = new PlainwireBot(process.env.PLAINWIRE_BASE_URL, process.env.PLAINWIRE_BOT_TOKEN);
+await bot.syncCommands([
+  {name: 'ping', description: 'Replies with pong'}
+]);
+await bot.commandWorker({
+  ping: async claim => `pong (attempt ${claim.attempt})`
+}).run();
+```
+
+`run()` keeps claiming until its optional `AbortSignal` is cancelled. Return a string to reply automatically, return `{ body: "..." }`, or return nothing after responding manually through the client.
+
+## Minimal Python command bot
+
+```python
+import os
+from plainwire_bot import Client
+
+bot = Client(os.environ["PLAINWIRE_BASE_URL"], os.environ["PLAINWIRE_BOT_TOKEN"])
+bot.sync_commands([{"name": "ping", "description": "Replies with pong"}])
+bot.command_worker({"ping": lambda claim, client: "pong"}).run()
+```
 
 ## C example
 
 ```c
-pw_client client;
-if (pw_client_init(&client, "https://chat.example.com", getenv("PLAINWIRE_BOT_TOKEN")) != 0) {
+pw_bot_client client;
+if (pw_bot_client_init(&client, "https://chat.example.com", getenv("PLAINWIRE_BOT_TOKEN")) != 0) {
     return 1;
 }
 ```

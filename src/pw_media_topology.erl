@@ -1,7 +1,7 @@
 -module(pw_media_topology).
 -export([mode/0, room_capacity/0, share_capacity/0, capabilities/0]).
 
-%% Plainwire 2.1.0 deliberately supports exactly one media topology: WebRTC
+%% Plainwire 2.2.0 deliberately supports exactly one media topology: WebRTC
 %% full mesh. Keeping topology policy behind this module prevents call/session
 %% code from baking mesh-specific capacity decisions into unrelated state logic,
 %% while refusing to advertise an SFU mode that does not exist yet.

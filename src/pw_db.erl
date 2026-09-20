@@ -17,14 +17,14 @@
     webhook_claim_due/1, webhook_finish/2, webhook_prune/0,
     storage_outbox_claim/1, storage_outbox_finish/2, storage_outbox_prune/0, storage_status/0, storage_migration_page/2, storage_migration_checkpoint/0, storage_migration_set_checkpoint/2, storage_reconcile_page/1,
     storage_pg_message_get/1, storage_pg_message_recent/3, storage_pg_message_before/4, storage_pg_message_after/4, storage_pg_message_bulk/1, storage_pg_message_edit/3, storage_pg_message_delete/2,
-    server_bots/2, create_server_bot/3, rotate_server_bot/3, delete_server_bot/3, authenticate_bot/1, bot_post_channel_message/4,
+    server_bots/2, create_server_bot/3, rotate_server_bot/3, delete_server_bot/3, authenticate_bot/1, bot_server/2, bot_members/4, bot_post_channel_message/4,
     developer_apps/1, developer_app/2, create_developer_app/2, update_developer_app/3, delete_developer_app/2,
     developer_app_installations/2, install_developer_app/3, install_public_developer_app/3, rotate_developer_app_installation/3, uninstall_developer_app/3, public_developer_app/1, public_developer_apps/2, server_apps/2,
     server_app_commands/3, set_server_command_permissions/5, uninstall_server_app/3,
     developer_app_commands/2, upsert_developer_app_command/6, delete_developer_app_command/3,
     update_developer_app_interactions/3, rotate_developer_app_interaction_secret/2, update_developer_app_ai/3,
     app_interaction_claim_due/1, app_interaction_finish/2, ai_command_claim_due/1, ai_command_finish/2,
-    bot_commands/1, bot_register_command/4, bot_delete_command/2, bot_claim_commands/2, bot_respond_command/4, bot_fail_command/4,
+    bot_commands/1, bot_register_command/4, bot_sync_commands/2, bot_delete_command/2, bot_claim_commands/2, bot_defer_command/4, bot_respond_command/4, bot_fail_command/4,
     commands_for_channel/2, invoke_bot_command/4,
     search_messages/4, search_index_reconcile/1, search_index_status/0,
     create_invite/4, create_invite/5, list_invites/2, revoke_invite/3, invite_options/2, invite_preview/1, join_invite/2,
@@ -345,6 +345,8 @@ create_server_bot(Uid, ServerId, Name) -> call({create_server_bot, Uid, ServerId
 rotate_server_bot(Uid, ServerId, BotId) -> call({rotate_server_bot, Uid, ServerId, BotId}).
 delete_server_bot(Uid, ServerId, BotId) -> call({delete_server_bot, Uid, ServerId, BotId}).
 authenticate_bot(Token) -> call({authenticate_bot, Token}).
+bot_server(BotUid, ServerId) -> call({bot_server, BotUid, ServerId}).
+bot_members(BotUid, ServerId, After, Limit) -> call({bot_members, BotUid, ServerId, After, Limit}).
 bot_post_channel_message(BotUid, ChannelId, Body, ReplyTo) -> call({post_channel_message, BotUid, ChannelId, Body, ReplyTo}).
 developer_apps(Uid) -> call({developer_apps, Uid}).
 developer_app(Uid, AppId) -> call({developer_app, Uid, AppId}).
@@ -374,8 +376,10 @@ ai_command_claim_due(Limit) -> call({ai_command_claim_due, Limit}).
 ai_command_finish(Id, Result) -> call({ai_command_finish, Id, Result}).
 bot_commands(BotId) -> call({bot_commands, BotId}).
 bot_register_command(BotId, Name, Description, Options) -> call({bot_register_command, BotId, Name, Description, Options}).
+bot_sync_commands(BotId, Commands) -> call({bot_sync_commands, BotId, Commands}).
 bot_delete_command(BotId, CommandId) -> call({bot_delete_command, BotId, CommandId}).
 bot_claim_commands(BotId, Limit) -> call({bot_claim_commands, BotId, Limit}).
+bot_defer_command(BotId, InvocationId, ClaimToken, LeaseMs) -> call({bot_defer_command, BotId, InvocationId, ClaimToken, LeaseMs}).
 bot_respond_command(BotId, InvocationId, ClaimToken, Body) -> call({bot_respond_command, BotId, InvocationId, ClaimToken, Body}).
 bot_fail_command(BotId, InvocationId, ClaimToken, Reason) -> call({bot_fail_command, BotId, InvocationId, ClaimToken, Reason}).
 commands_for_channel(Uid, ChannelId) -> call({commands_for_channel, Uid, ChannelId}).
@@ -743,6 +747,7 @@ read_msg({create_server_bot, _, _, _}) -> false;
 read_msg({rotate_server_bot, _, _, _}) -> false;
 read_msg({delete_server_bot, _, _, _}) -> false;
 read_msg({bot_register_command, _, _, _, _}) -> false;
+read_msg({bot_sync_commands, _, _}) -> false;
 read_msg({create_developer_app, _, _}) -> false;
 read_msg({update_developer_app, _, _, _}) -> false;
 read_msg({delete_developer_app, _, _}) -> false;
@@ -763,6 +768,7 @@ read_msg({ai_command_claim_due, _}) -> false;
 read_msg({ai_command_finish, _, _}) -> false;
 read_msg({bot_delete_command, _, _}) -> false;
 read_msg({bot_claim_commands, _, _}) -> false;
+read_msg({bot_defer_command, _, _, _, _}) -> false;
 read_msg({bot_respond_command, _, _, _, _}) -> false;
 read_msg({bot_fail_command, _, _, _, _}) -> false;
 read_msg({invoke_bot_command, _, _, _, _}) -> false;
@@ -4212,6 +4218,60 @@ route({authenticate_bot, Token0}, Conn) ->
         _ -> {error, invalid_bot_token}
     end;
 
+route({bot_server, BotUid0, Sid0}, Conn) ->
+    BotUid = pw_util:int(BotUid0), Sid = pw_util:int(Sid0),
+    case one(Conn, "SELECT role FROM server_members WHERE server_id=$1 AND user_id=$2", [Sid, BotUid]) of
+        {ok, [Role]} ->
+            {ok, S} = one(Conn,
+                "SELECT id,owner_id,name,description,icon_url,banner_url,accent_color,welcome_message,created_at,updated_at,default_permissions "
+                "FROM servers WHERE id=$1", [Sid]),
+            {ok, Permissions} = server_permissions0(Conn, BotUid, Sid),
+            CanViewChannels = pw_permissions:has(Permissions, pw_permissions:mask(<<"view_channels">>)),
+            {ok, Ch} = case CanViewChannels of
+                true -> rows(Conn,
+                    "SELECT id,server_id,name,kind,position,topic,created_at,category_id,slowmode_seconds "
+                    "FROM channels WHERE server_id=$1 ORDER BY position ASC,id ASC", [Sid]);
+                false -> {ok, []}
+            end,
+            {ok, Cats} = case CanViewChannels of
+                true -> rows(Conn,
+                    "SELECT id,server_id,name,position,created_at FROM channel_categories "
+                    "WHERE server_id=$1 ORDER BY position ASC,id ASC", [Sid]);
+                false -> {ok, []}
+            end,
+            Server = (server_full_map(S, Role))#{permissions => Permissions},
+            {ok, #{server => Server, channels => [channel_map(R) || R <- Ch],
+                   categories => [category_map(R) || R <- Cats]}};
+        _ -> {error, forbidden}
+    end;
+route({bot_members, BotUid0, Sid0, After0, Limit0}, Conn) ->
+    BotUid = pw_util:int(BotUid0), Sid = pw_util:int(Sid0),
+    After = max(0, pw_util:int(After0)), Limit = clamp_int(Limit0, 1, 200, 50),
+    case one(Conn, "SELECT 1 FROM server_members WHERE server_id=$1 AND user_id=$2", [Sid, BotUid]) of
+        {ok, [_]} ->
+            {ok, Rows0} = rows(Conn,
+                "SELECT u.id,u.username,u.display_name,u.bio,u.avatar_url,u.banner_url,u.status,u.theme,"
+                "u.created_at,u.last_seen,sm.role,sm.muted,sm.joined_at,sm.nickname,sm.avatar_url,sm.bio,"
+                "COALESCE((SELECT r.color FROM server_member_roles mr JOIN server_roles r ON r.id=mr.role_id "
+                "WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id ORDER BY "
+                "(r.permissions & 1073741824) DESC,(r.permissions & 16) DESC,(r.permissions & 32) DESC,"
+                "(r.permissions & 8) DESC,(r.permissions & 4) DESC,(r.permissions & 64) DESC,"
+                "(r.permissions & 128) DESC,(r.permissions & 2048) DESC,(r.permissions & 4096) DESC,"
+                "(r.permissions & 256) DESC,(r.permissions & 512) DESC,(r.permissions & 2) DESC,"
+                "(r.permissions & 1) DESC,r.position DESC,r.id ASC LIMIT 1),''),"
+                "COALESCE((SELECT string_agg(r.name, ', ' ORDER BY r.position DESC,r.id ASC) "
+                "FROM server_member_roles mr JOIN server_roles r ON r.id=mr.role_id "
+                "WHERE mr.server_id=sm.server_id AND mr.user_id=sm.user_id),''),u.is_bot "
+                "FROM server_members sm JOIN users u ON u.id=sm.user_id "
+                "WHERE sm.server_id=$1 AND sm.user_id>$2 ORDER BY sm.user_id ASC LIMIT $3",
+                [Sid, After, Limit + 1]),
+            HasMore = length(Rows0) > Limit,
+            Page = lists:sublist(Rows0, Limit),
+            NextAfter = case lists:reverse(Page) of [[LastId | _] | _] -> LastId; [] -> null end,
+            {ok, #{items => [member_map(R) || R <- Page], next_after => NextAfter, has_more => HasMore}};
+        _ -> {error, forbidden}
+    end;
+
 
 route({bot_commands, BotId0}, Conn) ->
     BotId = pw_util:int(BotId0),
@@ -4242,6 +4302,39 @@ route({bot_register_command, BotId0, Name0, Description0, Options0}, Conn) ->
                 {ok, Row} -> {ok, bot_command_map(Row)};
                 _ -> {error, command_name_taken}
             end
+    end;
+route({bot_sync_commands, BotId0, Commands0}, Conn) ->
+    BotId = pw_util:int(BotId0),
+    case {normalize_bot_command_set(Commands0), bot_identity(Conn, BotId)} of
+        {{error, _}, _} -> {error, invalid_commands};
+        {_, {error, _}} -> {error, forbidden};
+        {{ok, Definitions}, {ok, _BotUid, Sid}} ->
+            with_tx(Conn, fun() ->
+                %% Serialize declarative syncs for one bot. All definitions are
+                %% validated before this transaction, and any name conflict rolls
+                %% the complete replacement back instead of leaving a partial set.
+                case one(Conn, "SELECT id FROM server_bots WHERE id=$1 FOR UPDATE", [BotId]) of
+                    {ok, [_]} ->
+                        {ok, ExistingRows} = rows(Conn,
+                            "SELECT id,name FROM bot_commands WHERE bot_id=$1 ORDER BY name ASC", [BotId]),
+                        ExistingNames = maps:from_list([{Name, Id} || [Id, Name] <- ExistingRows]),
+                        Now = pw_util:now_ms(),
+                        case sync_bot_command_definitions(Conn, BotId, Sid, Definitions, Now, []) of
+                            {error, _} = Error -> Error;
+                            {ok, SyncedRows} ->
+                                DesiredNames = maps:from_list([{Name, true} || {Name, _, _} <- Definitions]),
+                                Stale = [[Id, Name] || [Id, Name] <- ExistingRows, not maps:is_key(Name, DesiredNames)],
+                                [ok = exec(Conn, "DELETE FROM bot_commands WHERE id=$1 AND bot_id=$2", [Id, BotId])
+                                 || [Id, _] <- Stale],
+                                Created = length([Name || {Name, _, _} <- Definitions, not maps:is_key(Name, ExistingNames)]),
+                                Updated = length(Definitions) - Created,
+                                Commands = [bot_command_map(Row) || Row <- lists:sort(fun(A, B) -> lists:nth(2, A) =< lists:nth(2, B) end, SyncedRows)],
+                                {ok, #{commands => Commands, created => Created, updated => Updated,
+                                       deleted => length(Stale)}}
+                        end;
+                    _ -> {error, forbidden}
+                end
+            end)
     end;
 route({bot_delete_command, BotId0, CommandId0}, Conn) ->
     BotId = pw_util:int(BotId0), CommandId = pw_util:int(CommandId0),
@@ -4372,6 +4465,31 @@ route({bot_claim_commands, BotId0, Limit0}, Conn) ->
             end;
         _ -> {error, forbidden}
     end;
+route({bot_defer_command, BotId0, InvocationId0, ClaimToken0, LeaseMs0}, Conn) ->
+    BotId = pw_util:int(BotId0), InvocationId = pw_util:int(InvocationId0),
+    ClaimToken = pw_util:clean_text(ClaimToken0, 256),
+    DefaultLease = clamp_int(pw_util:env_int("PLAINWIRE_BOT_COMMAND_LEASE_MS", 30000), 5000, 120000, 30000),
+    LeaseMs = clamp_int(LeaseMs0, 5000, 120000, DefaultLease), Now = pw_util:now_ms(),
+    with_tx(Conn, fun() ->
+        case one(Conn,
+            "SELECT status,claim_token_hash,lease_until FROM bot_command_invocations "
+            "WHERE id=$1 AND bot_id=$2 FOR UPDATE", [InvocationId, BotId]) of
+            {ok, [<<"claimed">>, Hash, LeaseUntil]} when LeaseUntil >= Now ->
+                case secure_token_hash_match(ClaimToken, Hash) of
+                    true ->
+                        NewLease = Now + LeaseMs,
+                        ok = exec(Conn,
+                            "UPDATE bot_command_invocations SET lease_until=$1,updated_at=$2 WHERE id=$3 AND bot_id=$4",
+                            [NewLease, Now, InvocationId, BotId]),
+                        {ok, #{deferred => true, id => InvocationId, lease_until => NewLease}};
+                    false -> {error, invalid_claim}
+                end;
+            {ok, [<<"claimed">>, _Hash, _LeaseUntil]} -> {error, claim_expired};
+            {ok, [<<"completed">>, _Hash, _LeaseUntil]} -> {error, invocation_completed};
+            {ok, [<<"failed">>, _Hash, _LeaseUntil]} -> {error, invocation_failed};
+            _ -> {error, invalid_claim}
+        end
+    end);
 route({bot_respond_command, BotId0, InvocationId0, ClaimToken0, Body0}, Conn) ->
     BotId = pw_util:int(BotId0), InvocationId = pw_util:int(InvocationId0),
     ClaimToken = pw_util:clean_text(ClaimToken0, 256), Plain = pw_util:clean_text(Body0, ?MAX_MSG),
@@ -6788,6 +6906,43 @@ normalize_command_name(Value0) ->
          re:run(Lower, <<"^[a-z][a-z0-9_-]{0,31}$">>, [{capture, none}]) =:= match of
         true -> Lower;
         false -> invalid
+    end.
+
+normalize_bot_command_set(Commands) when is_list(Commands), length(Commands) =< 100 ->
+    normalize_bot_command_set(Commands, [], []);
+normalize_bot_command_set(_) -> {error, invalid_commands}.
+
+normalize_bot_command_set([], Acc, _Names) -> {ok, lists:reverse(Acc)};
+normalize_bot_command_set([Definition | Rest], Acc, Names) when is_map(Definition) ->
+    Name = normalize_command_name(maps:get(<<"name">>, Definition, maps:get(name, Definition, <<>>))),
+    Description = pw_util:clean_text(
+        maps:get(<<"description">>, Definition, maps:get(description, Definition, <<>>)), 160),
+    Options0 = maps:get(<<"options">>, Definition, maps:get(options, Definition, [])),
+    case {Name, normalize_command_options(Options0)} of
+        {invalid, _} -> {error, invalid_command_name};
+        {_, error} -> {error, invalid_command_options};
+        {CommandName, {ok, Options}} ->
+            case lists:member(CommandName, Names) of
+                true -> {error, duplicate_command_name};
+                false -> normalize_bot_command_set(Rest,
+                    [{CommandName, Description, Options} | Acc], [CommandName | Names])
+            end
+    end;
+normalize_bot_command_set(_, _, _) -> {error, invalid_commands}.
+
+sync_bot_command_definitions(_Conn, _BotId, _Sid, [], _Now, Acc) -> {ok, lists:reverse(Acc)};
+sync_bot_command_definitions(Conn, BotId, Sid, [{Name, Description, Options} | Rest], Now, Acc) ->
+    OptionsJson = pw_util:json(Options),
+    case one(Conn,
+        "INSERT INTO bot_commands(bot_id,server_id,name,description,options_json,enabled,created_at,updated_at) "
+        "VALUES($1,$2,$3,$4,$5,true,$6,$6) "
+        "ON CONFLICT(server_id,name) DO UPDATE SET description=EXCLUDED.description,"
+        "options_json=EXCLUDED.options_json,enabled=true,updated_at=EXCLUDED.updated_at "
+        "WHERE bot_commands.bot_id=EXCLUDED.bot_id "
+        "RETURNING id,name,description,options_json,enabled,created_at,updated_at",
+        [BotId, Sid, Name, Description, OptionsJson, Now]) of
+        {ok, Row} -> sync_bot_command_definitions(Conn, BotId, Sid, Rest, Now, [Row | Acc]);
+        _ -> {error, command_name_taken}
     end.
 
 normalize_command_options(Options) when is_list(Options), length(Options) =< 25 ->

@@ -8,11 +8,13 @@ from __future__ import annotations
 import ipaddress
 import json
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 API_PREFIX = "/api/bot/v1"
 DEFAULT_TIMEOUT = 15.0
@@ -84,7 +86,7 @@ class Client:
         headers = {
             "Authorization": f"Bot {self._token}",
             "Accept": "application/json",
-            "User-Agent": "plainwire-python-bot/2.1",
+            "User-Agent": "plainwire-python-bot/2.2",
         }
         if payload is not None:
             data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -148,6 +150,10 @@ class Client:
     def create_role(self, name: str, **patch): return self.request("POST", API_PREFIX + "/roles", {"name": name, **patch})
     def update_role(self, role_id: int, **patch): return self.request("POST", f"{API_PREFIX}/roles/{int(role_id)}", patch)
     def delete_role(self, role_id: int): return self.request("DELETE", f"{API_PREFIX}/roles/{int(role_id)}")
+    def members(self, *, after: int | None = None, limit: int = 50):
+        query = {"limit": str(max(1, min(200, int(limit))))}
+        if after is not None and after > 0: query["after"] = str(int(after))
+        return self.request("GET", API_PREFIX + "/members?" + urllib.parse.urlencode(query))
     def member(self, user_id: int): return self.request("GET", f"{API_PREFIX}/members/{int(user_id)}")
     def set_member_roles(self, user_id: int, role_ids: Sequence[int]): return self.request("POST", f"{API_PREFIX}/members/{int(user_id)}/roles", {"role_ids": [int(v) for v in role_ids]})
     def kick_member(self, user_id: int): return self.request("POST", f"{API_PREFIX}/members/{int(user_id)}/kick", {})
@@ -163,6 +169,9 @@ class Client:
             "name": name, "description": description, "options": list(options)
         })
 
+    def sync_commands(self, commands: Sequence[Mapping[str, Any]]):
+        return self.request("PUT", API_PREFIX + "/commands", {"commands": list(commands)})
+
     def commands(self): return self.request("GET", API_PREFIX + "/commands")
     def delete_command(self, command_id: int):
         return self.request("DELETE", f"{API_PREFIX}/commands/{int(command_id)}")
@@ -171,6 +180,11 @@ class Client:
         limit = max(1, min(50, int(limit)))
         return self.request("GET", f"{API_PREFIX}/commands/claims?limit={limit}")
 
+    def defer_command(self, invocation_id: int, claim_token: str, lease_ms: int = 120_000):
+        lease_ms = max(5_000, min(120_000, int(lease_ms)))
+        return self.request("POST", f"{API_PREFIX}/commands/claims/{int(invocation_id)}/defer",
+                            {"claim_token": claim_token, "lease_ms": lease_ms})
+
     def respond_command(self, invocation_id: int, claim_token: str, body: str):
         return self.request("POST", f"{API_PREFIX}/commands/claims/{int(invocation_id)}/respond",
                             {"claim_token": claim_token, "body": body})
@@ -178,3 +192,59 @@ class Client:
     def fail_command(self, invocation_id: int, claim_token: str, reason: str):
         return self.request("POST", f"{API_PREFIX}/commands/claims/{int(invocation_id)}/fail",
                             {"claim_token": claim_token, "reason": reason})
+
+    def command_worker(self, handlers: Mapping[str, Callable[[Mapping[str, Any], "Client"], Any]], **options):
+        return CommandWorker(self, handlers, **options)
+
+
+class CommandWorker:
+    """Bounded durable-command worker with automatic lease renewal and replies."""
+
+    def __init__(self, client: Client, handlers: Mapping[str, Callable[[Mapping[str, Any], Client], Any]],
+                 *, batch_size: int = 20, concurrency: int = 4, idle_seconds: float = 0.5,
+                 lease_ms: int = 120_000, on_error: Callable[[Exception, Mapping[str, Any] | None], None] | None = None):
+        self.client = client
+        self.handlers = dict(handlers)
+        self.batch_size = max(1, min(50, int(batch_size)))
+        self.concurrency = max(1, min(32, int(concurrency)))
+        self.idle_seconds = max(0.025, float(idle_seconds))
+        self.lease_ms = max(5_000, min(120_000, int(lease_ms)))
+        self.on_error = on_error or (lambda _error, _claim=None: None)
+
+    def _handle(self, claim: Mapping[str, Any]) -> None:
+        invocation_id, token = int(claim["id"]), str(claim["claim_token"])
+        handler = self.handlers.get(str(claim.get("command", "")))
+        if handler is None:
+            self.client.fail_command(invocation_id, token, f"No handler registered for /{claim.get('command', '')}")
+            return
+        try:
+            self.client.defer_command(invocation_id, token, self.lease_ms)
+            result = handler(claim, self.client)
+            body = result if isinstance(result, str) else result.get("body") if isinstance(result, Mapping) else None
+            if isinstance(body, str) and body.strip():
+                self.client.respond_command(invocation_id, token, body)
+        except Exception as error:
+            self.on_error(error, claim)
+            try:
+                self.client.fail_command(invocation_id, token, str(error or "command failed")[:240])
+            except Exception as failure:
+                self.on_error(failure, claim)
+
+    def run_once(self) -> int:
+        claims = self.client.claim_commands(self.batch_size).json().get("data", [])
+        if not isinstance(claims, list):
+            raise PlainwireError("Plainwire returned an invalid command envelope")
+        with ThreadPoolExecutor(max_workers=min(self.concurrency, max(1, len(claims)))) as pool:
+            list(pool.map(self._handle, claims))
+        return len(claims)
+
+    def run(self, stop: Callable[[], bool] | None = None) -> None:
+        should_stop = stop or (lambda: False)
+        while not should_stop():
+            try:
+                count = self.run_once()
+            except Exception as error:
+                self.on_error(error, None)
+                count = 0
+            if not count and not should_stop():
+                time.sleep(self.idle_seconds)

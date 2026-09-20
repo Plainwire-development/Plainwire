@@ -58,7 +58,7 @@ export class PlainwireBot {
         headers: {
           Authorization: `Bot ${this.token}`,
           Accept: 'application/json',
-          'User-Agent': 'plainwire-js-bot/2.1',
+          'User-Agent': 'plainwire-js-bot/2.2',
           ...(payload === undefined ? {} : {'Content-Type': 'application/json'})
         },
         body: payload
@@ -97,6 +97,10 @@ export class PlainwireBot {
   createRole(name, patch = {}) { return this.request('POST', `${API}/roles`, {name, ...patch}); }
   updateRole(roleId, patch = {}) { return this.request('POST', `${API}/roles/${Number(roleId)}`, patch); }
   deleteRole(roleId) { return this.request('DELETE', `${API}/roles/${Number(roleId)}`); }
+  members({after, limit = 50} = {}) {
+    const q = new URLSearchParams(); if (after > 0) q.set('after', after); q.set('limit', Math.max(1, Math.min(200, Number(limit) || 50)));
+    return this.request('GET', `${API}/members?${q}`);
+  }
   member(userId) { return this.request('GET', `${API}/members/${Number(userId)}`); }
   setMemberRoles(userId, roleIds = []) { return this.request('POST', `${API}/members/${Number(userId)}/roles`, {role_ids: roleIds.map(Number)}); }
   kickMember(userId) { return this.request('POST', `${API}/members/${Number(userId)}/kick`, {}); }
@@ -106,9 +110,69 @@ export class PlainwireBot {
   wires() { return this.request('GET', `${API}/wires`); }
   createWire(channelId, {maxUses = 0, expiresIn = 86400} = {}) { return this.request('POST', `${API}/wires`, {channel_id: Number(channelId), max_uses: Number(maxUses), expires_in: Number(expiresIn)}); }
   registerCommand(name, description = '', options = []) { return this.request('POST', `${API}/commands`, {name, description, options}); }
+  syncCommands(commands = []) { return this.request('PUT', `${API}/commands`, {commands}); }
   commands() { return this.request('GET', `${API}/commands`); }
   deleteCommand(commandId) { return this.request('DELETE', `${API}/commands/${Number(commandId)}`); }
   claimCommands(limit = 10) { return this.request('GET', `${API}/commands/claims?limit=${Math.max(1, Math.min(50, Number(limit) || 10))}`); }
+  deferCommand(id, claimToken, leaseMs = 120000) { return this.request('POST', `${API}/commands/claims/${Number(id)}/defer`, {claim_token: claimToken, lease_ms: Math.max(5000, Math.min(120000, Number(leaseMs) || 120000))}); }
   respondCommand(id, claimToken, body) { return this.request('POST', `${API}/commands/claims/${Number(id)}/respond`, {claim_token: claimToken, body}); }
   failCommand(id, claimToken, reason) { return this.request('POST', `${API}/commands/claims/${Number(id)}/fail`, {claim_token: claimToken, reason}); }
+
+  commandWorker(handlers, options = {}) { return new CommandWorker(this, handlers, options); }
+}
+
+export class CommandWorker {
+  constructor(bot, handlers, {batchSize = 20, concurrency = 4, idleMs = 500, leaseMs = 120000, onError = console.error} = {}) {
+    if (!(bot instanceof PlainwireBot)) throw new TypeError('bot must be a PlainwireBot');
+    if (!(handlers instanceof Map) && (handlers === null || typeof handlers !== 'object')) throw new TypeError('handlers must be an object or Map');
+    this.bot = bot;
+    this.handlers = handlers;
+    this.batchSize = Math.max(1, Math.min(50, Number(batchSize) || 20));
+    this.concurrency = Math.max(1, Math.min(32, Number(concurrency) || 4));
+    this.idleMs = Math.max(25, Number(idleMs) || 500);
+    this.leaseMs = Math.max(5000, Math.min(120000, Number(leaseMs) || 120000));
+    this.onError = typeof onError === 'function' ? onError : () => {};
+  }
+
+  handler(name) { return this.handlers instanceof Map ? this.handlers.get(name) : this.handlers[name]; }
+
+  async handle(claim) {
+    const handler = this.handler(claim.command);
+    if (typeof handler !== 'function') {
+      await this.bot.failCommand(claim.id, claim.claim_token, `No handler registered for /${claim.command}`);
+      return;
+    }
+    try {
+      await this.bot.deferCommand(claim.id, claim.claim_token, this.leaseMs);
+      const result = await handler(claim, this.bot);
+      const body = typeof result === 'string' ? result : result?.body;
+      if (typeof body === 'string' && body.trim()) await this.bot.respondCommand(claim.id, claim.claim_token, body);
+    } catch (error) {
+      this.onError(error, claim);
+      const reason = String(error?.message || error || 'command failed').slice(0, 240);
+      try { await this.bot.failCommand(claim.id, claim.claim_token, reason); } catch (failure) { this.onError(failure, claim); }
+    }
+  }
+
+  async runOnce() {
+    const envelope = (await this.bot.claimCommands(this.batchSize)).json();
+    const claims = Array.isArray(envelope?.data) ? envelope.data : [];
+    let next = 0;
+    const consume = async () => { while (next < claims.length) { const claim = claims[next++]; await this.handle(claim); } };
+    await Promise.all(Array.from({length: Math.min(this.concurrency, claims.length)}, consume));
+    return claims.length;
+  }
+
+  async run({signal} = {}) {
+    while (!signal?.aborted) {
+      let count = 0;
+      try { count = await this.runOnce(); } catch (error) { this.onError(error); }
+      if (!count && !signal?.aborted) await new Promise(resolve => {
+        let timer;
+        const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
+        timer = setTimeout(done, this.idleMs);
+        signal?.addEventListener('abort', done, {once: true});
+      });
+    }
+  }
 }

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -45,6 +46,12 @@ type CommandOption struct {
 	Type        string `json:"type"`
 	Required    bool   `json:"required,omitempty"`
 	Description string `json:"description,omitempty"`
+}
+
+type CommandDefinition struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Options     []CommandOption `json:"options,omitempty"`
 }
 
 type CommandClaim struct {
@@ -129,7 +136,7 @@ func (c *Client) Request(ctx context.Context, method, path string, body any) (*R
 	}
 	req.Header.Set("Authorization", "Bot "+c.token)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "plainwire-go-bot/2.1")
+	req.Header.Set("User-Agent", "plainwire-go-bot/2.2")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -239,6 +246,19 @@ func (c *Client) UpdateRole(ctx context.Context, roleID int64, patch map[string]
 func (c *Client) DeleteRole(ctx context.Context, roleID int64) (*Response, error) {
 	return c.Request(ctx, http.MethodDelete, fmt.Sprintf("/api/bot/v1/roles/%d", roleID), nil)
 }
+func (c *Client) Members(ctx context.Context, after int64, limit int) (*Response, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	q := url.Values{"limit": []string{strconv.Itoa(limit)}}
+	if after > 0 {
+		q.Set("after", strconv.FormatInt(after, 10))
+	}
+	return c.get(ctx, "/api/bot/v1/members?"+q.Encode())
+}
 func (c *Client) Member(ctx context.Context, userID int64) (*Response, error) {
 	return c.get(ctx, fmt.Sprintf("/api/bot/v1/members/%d", userID))
 }
@@ -263,6 +283,9 @@ func (c *Client) CreateWire(ctx context.Context, channelID int64, maxUses, expir
 }
 func (c *Client) RegisterCommand(ctx context.Context, name, description string, options []CommandOption) (*Response, error) {
 	return c.post(ctx, "/api/bot/v1/commands", map[string]any{"name": name, "description": description, "options": options})
+}
+func (c *Client) SyncCommands(ctx context.Context, commands []CommandDefinition) (*Response, error) {
+	return c.Request(ctx, http.MethodPut, "/api/bot/v1/commands", map[string]any{"commands": commands})
 }
 func (c *Client) Commands(ctx context.Context) (*Response, error) {
 	return c.get(ctx, "/api/bot/v1/commands")
@@ -293,9 +316,130 @@ func (c *Client) ClaimCommands(ctx context.Context, limit int) ([]CommandClaim, 
 	}
 	return envelope.Data, nil
 }
+func (c *Client) DeferCommand(ctx context.Context, claim CommandClaim, lease time.Duration) (*Response, error) {
+	leaseMS := lease.Milliseconds()
+	if leaseMS < 5000 {
+		leaseMS = 5000
+	}
+	if leaseMS > 120000 {
+		leaseMS = 120000
+	}
+	return c.post(ctx, fmt.Sprintf("/api/bot/v1/commands/claims/%d/defer", claim.ID), map[string]any{"claim_token": claim.ClaimToken, "lease_ms": leaseMS})
+}
 func (c *Client) RespondCommand(ctx context.Context, claim CommandClaim, body string) (*Response, error) {
 	return c.post(ctx, fmt.Sprintf("/api/bot/v1/commands/claims/%d/respond", claim.ID), map[string]any{"claim_token": claim.ClaimToken, "body": body})
 }
 func (c *Client) FailCommand(ctx context.Context, claim CommandClaim, reason string) (*Response, error) {
 	return c.post(ctx, fmt.Sprintf("/api/bot/v1/commands/claims/%d/fail", claim.ID), map[string]any{"claim_token": claim.ClaimToken, "reason": reason})
+}
+
+type CommandHandler func(context.Context, CommandClaim, *Client) (string, error)
+
+type WorkerOptions struct {
+	BatchSize   int
+	Concurrency int
+	IdleDelay   time.Duration
+	Lease       time.Duration
+	OnError     func(error, *CommandClaim)
+}
+
+// RunCommandWorker claims durable invocations until ctx is cancelled. A
+// non-empty handler result is posted as the command reply; an empty result lets
+// the handler complete the claim itself using the client.
+func (c *Client) RunCommandWorker(ctx context.Context, handlers map[string]CommandHandler, options WorkerOptions) error {
+	batch := options.BatchSize
+	if batch < 1 {
+		batch = 20
+	}
+	if batch > 50 {
+		batch = 50
+	}
+	concurrency := options.Concurrency
+	if concurrency < 1 {
+		concurrency = 4
+	}
+	if concurrency > 32 {
+		concurrency = 32
+	}
+	idle := options.IdleDelay
+	if idle <= 0 {
+		idle = 500 * time.Millisecond
+	}
+	lease := options.Lease
+	if lease <= 0 {
+		lease = 120 * time.Second
+	}
+	report := options.OnError
+	if report == nil {
+		report = func(error, *CommandClaim) {}
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		claims, err := c.ClaimCommands(ctx, batch)
+		if err != nil {
+			report(err, nil)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(idle):
+				continue
+			}
+		}
+		if len(claims) == 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(idle):
+				continue
+			}
+		}
+		jobs := make(chan CommandClaim)
+		var workers sync.WaitGroup
+		workerCount := concurrency
+		if workerCount > len(claims) {
+			workerCount = len(claims)
+		}
+		workers.Add(workerCount)
+		for i := 0; i < workerCount; i++ {
+			go func() {
+				defer workers.Done()
+				for claim := range jobs {
+					handler := handlers[claim.Command]
+					if handler == nil {
+						_, err := c.FailCommand(ctx, claim, "No handler registered for /"+claim.Command)
+						if err != nil {
+							report(err, &claim)
+						}
+						continue
+					}
+					if _, err := c.DeferCommand(ctx, claim, lease); err != nil {
+						report(err, &claim)
+						continue
+					}
+					body, err := handler(ctx, claim, c)
+					if err != nil {
+						report(err, &claim)
+						reason := err.Error()
+						if len(reason) > 240 {
+							reason = reason[:240]
+						}
+						if _, failErr := c.FailCommand(ctx, claim, reason); failErr != nil {
+							report(failErr, &claim)
+						}
+					} else if strings.TrimSpace(body) != "" {
+						if _, err := c.RespondCommand(ctx, claim, body); err != nil {
+							report(err, &claim)
+						}
+					}
+				}
+			}()
+		}
+		for _, claim := range claims {
+			jobs <- claim
+		}
+		close(jobs)
+		workers.Wait()
+	}
 }

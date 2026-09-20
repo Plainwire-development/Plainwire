@@ -9,3 +9,5 @@ std::cout << result.body();
 ```
 
 The response body is JSON. Use the JSON library already used by your bot application.
+
+`sync_commands`, `members` and `defer_command` wrap the 2.2 bulk-deploy, paginated-roster and renewable-claim APIs while keeping the response representation library-neutral.

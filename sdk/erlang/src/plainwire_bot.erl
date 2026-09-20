@@ -5,10 +5,10 @@
          capabilities/1, me/1, server/1, channels/1, messages/2, messages/3,
          send_message/3, send_message/4, delete_message/2, toggle_reaction/3, edit_message/3, pin_message/3,
          channel_pins/2, message_context/2, create_channel/4, update_channel/3,
-         roles/1, create_role/3, update_role/3, delete_role/2, member/2, set_member_roles/3,
+         roles/1, create_role/3, update_role/3, delete_role/2, members/2, member/2, set_member_roles/3,
          kick_member/2, ban_member/3, unban_member/2, bans/1, wires/1, create_wire/4,
-         commands/1, register_command/4, delete_command/2, claim_commands/2,
-         respond_command/4, fail_command/4,
+         commands/1, register_command/4, sync_commands/2, delete_command/2, claim_commands/2,
+         defer_command/4, respond_command/4, fail_command/4,
          subscribe/2, unsubscribe_all/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -ifdef(TEST).
@@ -73,6 +73,9 @@ update_role(Pid, RoleId, Patch) when is_map(Patch) ->
 delete_role(Pid, RoleId) ->
     Path = iolist_to_binary([<<"/api/bot/v1/roles/">>, id(RoleId)]),
     gen_server:call(Pid, {request, delete, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
+members(Pid, Params) when is_map(Params) ->
+    Path = with_query(<<"/api/bot/v1/members">>, Params),
+    gen_server:call(Pid, {request, get, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
 member(Pid, UserId) ->
     Path = iolist_to_binary([<<"/api/bot/v1/members/">>, id(UserId)]),
     gen_server:call(Pid, {request, get, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
@@ -97,6 +100,8 @@ commands(Pid) -> gen_server:call(Pid, {request, get, <<"/api/bot/v1/commands">>,
 register_command(Pid, Name, Description, Options) ->
     Payload = #{name => bin(Name), description => bin(Description), options => Options},
     gen_server:call(Pid, {request, post, <<"/api/bot/v1/commands">>, Payload}, ?DEFAULT_TIMEOUT + 2000).
+sync_commands(Pid, Commands) when is_list(Commands) ->
+    gen_server:call(Pid, {request, put, <<"/api/bot/v1/commands">>, #{commands => Commands}}, ?DEFAULT_TIMEOUT + 2000).
 delete_command(Pid, CommandId) ->
     Path = iolist_to_binary([<<"/api/bot/v1/commands/">>, id(CommandId)]),
     gen_server:call(Pid, {request, delete, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
@@ -104,6 +109,10 @@ claim_commands(Pid, Limit0) ->
     Limit = min(50, max(1, case Limit0 of I when is_integer(I) -> I; _ -> 10 end)),
     Path = <<"/api/bot/v1/commands/claims?limit=", (integer_to_binary(Limit))/binary>>,
     gen_server:call(Pid, {request, get, Path, undefined}, ?DEFAULT_TIMEOUT + 2000).
+defer_command(Pid, InvocationId, ClaimToken, LeaseMs0) ->
+    LeaseMs = min(120000, max(5000, case LeaseMs0 of I when is_integer(I) -> I; _ -> 120000 end)),
+    Path = iolist_to_binary([<<"/api/bot/v1/commands/claims/">>, id(InvocationId), <<"/defer">>]),
+    gen_server:call(Pid, {request, post, Path, #{claim_token => bin(ClaimToken), lease_ms => LeaseMs}}, ?DEFAULT_TIMEOUT + 2000).
 respond_command(Pid, InvocationId, ClaimToken, Body) ->
     Path = iolist_to_binary([<<"/api/bot/v1/commands/claims/">>, id(InvocationId), <<"/respond">>]),
     gen_server:call(Pid, {request, post, Path, #{claim_token => bin(ClaimToken), body => bin(Body)}}, ?DEFAULT_TIMEOUT + 2000).
@@ -224,7 +233,8 @@ api_request(Method, Path0, Body, State0) ->
             StreamRef = case Method of
                 get -> gun:get(Conn, Path, Headers);
                 delete -> gun:delete(Conn, Path, Headers);
-                post -> gun:post(Conn, Path, Headers, Payload)
+                post -> gun:post(Conn, Path, Headers, Payload);
+                put -> gun:put(Conn, Path, Headers, Payload)
             end,
             Reply = await_response(Conn, StreamRef),
             case transport_failed(Reply) of
@@ -273,7 +283,7 @@ request_body(Body, State) ->
     {[{<<"content-type">>, <<"application/json">>} | auth_headers(State)], jsx:encode(Body)}.
 
 auth_headers(State) -> [{<<"authorization">>, <<"Bot ", (maps:get(token, State))/binary>>},
-                        {<<"user-agent">>, <<"plainwire-erlang-bot/2.1">>}].
+                        {<<"user-agent">>, <<"plainwire-erlang-bot/2.2">>}].
 
 await_response(Conn, Ref) ->
     Deadline = erlang:monotonic_time(millisecond) + ?DEFAULT_TIMEOUT,

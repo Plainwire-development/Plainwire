@@ -2,9 +2,9 @@
 
 The default backend is local OTP messaging. Partisan is downloaded only with the `cluster` build profile. It is an optional deployment candidate, not enabled merely by installing the source archive.
 
-The supported 2.1.0 topology is deliberately narrow: **one realtime/WebSocket/call owner plus optional HTTP API nodes**. All `/ws` traffic must go to the realtime owner. API nodes reject WebSockets with 503. This release does not distribute a live voice room across owners, automatically elect a replacement realtime owner, or preserve active calls when that owner fails.
+The supported 2.2.0 topology is deliberately narrow: **one realtime/WebSocket/call owner plus optional HTTP API nodes**. All `/ws` traffic must go to the realtime owner. API nodes reject WebSockets with 503. This release does not distribute a live voice room across owners, automatically elect a replacement realtime owner, or preserve active calls when that owner fails.
 
-On the realtime owner, `pw_hub` remains the ordered control plane while `pw_realtime_registry` mirrors hot connection, subscription, presence-watch, RTC and call-audience indexes in concurrent ETS. Ordinary fanout and RTC routing use those indexes instead of serializing every delivery through the hub mailbox. This is a performance boundary inside the owner; it is **not** a claim that 2.1.0 supports multiple realtime owners.
+On the realtime owner, `pw_hub` remains the ordered control plane while `pw_realtime_registry` mirrors hot connection, subscription, presence-watch, RTC and call-audience indexes in concurrent ETS. Ordinary fanout and RTC routing use those indexes instead of serializing every delivery through the hub mailbox. This is a performance boundary inside the owner; it is **not** a claim that 2.2.0 supports multiple realtime owners.
 
 After committed durable operations, API nodes route eligible user/topic events through Plainwire's `pw_cluster` interface. PostgreSQL remains authoritative for relational state. Message history follows `PLAINWIRE_MESSAGE_BACKEND`; Redis remains ephemeral. Cluster mode bypasses the per-node HTTP session cache so revocation is checked against the database. All nodes must share the same database, encryption/media keys, origin configuration, release and durable upload storage. Budget database pool sizes across all nodes. Complete migrations on the first node before starting others.
 
@@ -39,7 +39,7 @@ A temporary transport outage retains the bounded outbox and periodically retries
 
 Envelopes include node identity, boot nonce and sequence. The realtime owner checks configured origins, sizes, term shape, event types, expiry and duplicates. Heartbeat gaps and node restarts request client resynchronization from durable state. In-flight live notifications can still be lost during failure or overload; that is an intentional property of this non-durable fanout layer.
 
-Use `pw_cluster:status()` to inspect readiness, membership, queue depth and sent/received/drop counters. It contains no credentials. Losing Partisan does not crash local chat/calls. Losing the single realtime owner ends its current realtime sessions/calls; clients must reconnect. Automatic owner failover is not implemented in 2.1.0.
+Use `pw_cluster:status()` to inspect readiness, membership, queue depth and sent/received/drop counters. It contains no credentials. Losing Partisan does not crash local chat/calls. Losing the single realtime owner ends its current realtime sessions/calls; clients must reconnect. Automatic owner failover is not implemented in 2.2.0.
 
 Before enabling: verify private listeners and native-distribution shutdown; reject clients with no certificate and an unrelated CA; deliver a committed API-node message to an owner-connected browser; disconnect/restart each node; check duplicate/stale rejection, bounded outage behavior and resync; verify revoked sessions and unauthorized subscriptions remain rejected. Unit fixtures do not substitute for that live staging check.
 

@@ -71,6 +71,7 @@ public:
     response create_role(const std::string& role_json) { return request([&](auto* c, auto* r){ return pw_bot_create_role(c, role_json.c_str(), r); }); }
     response update_role(std::int64_t role_id, const std::string& role_json) { return request([&](auto* c, auto* r){ return pw_bot_update_role(c, role_id, role_json.c_str(), r); }); }
     response delete_role(std::int64_t role_id) { return request([&](auto* c, auto* r){ return pw_bot_delete_role(c, role_id, r); }); }
+    response members(std::int64_t after = 0, int limit = 50) { return request([&](auto* c, auto* r){ return pw_bot_members(c, after, limit, r); }); }
     response member(std::int64_t user_id) { return request([&](auto* c, auto* r){ return pw_bot_member(c, user_id, r); }); }
     response set_member_roles(std::int64_t user_id, const std::string& role_ids_json) { return request([&](auto* c, auto* r){ return pw_bot_set_member_roles(c, user_id, role_ids_json.c_str(), r); }); }
     response kick_member(std::int64_t user_id) { return request([&](auto* c, auto* r){ return pw_bot_kick_member(c, user_id, r); }); }
@@ -83,12 +84,16 @@ public:
     response register_command(const std::string& name, const std::string& description, const std::string& options_json = "[]") {
         return request([&](auto* c, auto* r){ return pw_bot_register_command(c, name.c_str(), description.c_str(), options_json.c_str(), r); });
     }
+    response sync_commands(const std::string& commands_json) { return request([&](auto* c, auto* r){ return pw_bot_sync_commands(c, commands_json.c_str(), r); }); }
     response commands() { return request([](auto* c, auto* r){ return pw_bot_commands(c, r); }); }
     response delete_command(std::int64_t command_id) {
         return request([&](auto* c, auto* r){ return pw_bot_delete_command(c, command_id, r); });
     }
     response claim_commands(int limit = 10) {
         return request([&](auto* c, auto* r){ return pw_bot_claim_commands(c, limit, r); });
+    }
+    response defer_command(std::int64_t invocation_id, const std::string& claim_token, int lease_ms = 120000) {
+        return request([&](auto* c, auto* r){ return pw_bot_defer_command(c, invocation_id, claim_token.c_str(), lease_ms, r); });
     }
     response respond_command(std::int64_t invocation_id, const std::string& claim_token, const std::string& body) {
         return request([&](auto* c, auto* r){ return pw_bot_respond_command(c, invocation_id, claim_token.c_str(), body.c_str(), r); });

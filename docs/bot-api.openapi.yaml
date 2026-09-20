@@ -41,6 +41,26 @@ paths:
         '200': { $ref: '#/components/responses/Success' }
         '401': { $ref: '#/components/responses/Error' }
         '403': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createChannel
+      summary: Create a text or voice channel using the bot's server permissions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+                kind: { type: string, enum: [text, voice], default: text }
+                category_id: { type: integer, minimum: 1 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
   /api/bot/v1/channels/{channelId}/messages:
     parameters:
       - $ref: '#/components/parameters/ChannelId'
@@ -108,6 +128,261 @@ paths:
         '401': { $ref: '#/components/responses/Error' }
         '403': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/messages/{messageId}/edit:
+    parameters: [{ $ref: '#/components/parameters/MessageId' }]
+    post:
+      operationId: editMessage
+      summary: Edit a message authored by the bot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, minLength: 1, maxLength: 5000 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/messages/{messageId}/pin:
+    parameters: [{ $ref: '#/components/parameters/MessageId' }]
+    post:
+      operationId: setMessagePin
+      summary: Pin or unpin a message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pinned: { type: boolean, default: true }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/messages/{messageId}/context:
+    parameters: [{ $ref: '#/components/parameters/MessageId' }]
+    get:
+      operationId: getMessageContext
+      summary: Read bounded context around a visible message
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/channels/{channelId}/pins:
+    parameters: [{ $ref: '#/components/parameters/ChannelId' }]
+    get:
+      operationId: listChannelPins
+      summary: List pinned messages visible to the bot
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/channels/{channelId}/settings:
+    parameters: [{ $ref: '#/components/parameters/ChannelId' }]
+    post:
+      operationId: updateChannel
+      summary: Update channel settings allowed by the bot's role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/members:
+    get:
+      operationId: listMembers
+      summary: Traverse the server roster with a stable bounded cursor
+      parameters:
+        - name: after
+          in: query
+          description: Return user IDs greater than this cursor.
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: A bounded member page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, data]
+                properties:
+                  ok: { const: true }
+                  data: { $ref: '#/components/schemas/MemberPage' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/members/{userId}:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    get:
+      operationId: getMember
+      summary: Read one server member profile and its roles
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/members/{userId}/roles:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    post:
+      operationId: setMemberRoles
+      summary: Replace a member's explicit server roles
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role_ids]
+              properties:
+                role_ids: { type: array, maxItems: 100, items: { type: integer, minimum: 1 } }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/members/{userId}/kick:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    post:
+      operationId: kickMember
+      summary: Remove a member from the server
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/members/{userId}/ban:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    post:
+      operationId: banMember
+      summary: Ban a member from the server
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 240 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/members/{userId}/unban:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    post:
+      operationId: unbanMember
+      summary: Remove a server ban
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/bans:
+    get:
+      operationId: listBans
+      summary: List server bans
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/roles:
+    get:
+      operationId: listRoles
+      summary: List server roles
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createRole
+      summary: Create a server role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name], additionalProperties: true }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/roles/{roleId}:
+    parameters: [{ $ref: '#/components/parameters/RoleId' }]
+    post:
+      operationId: updateRole
+      summary: Update a server role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: deleteRole
+      summary: Delete a server role
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/wires:
+    get:
+      operationId: listWires
+      summary: List server invite links the bot can manage
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createWire
+      summary: Create a server invite link
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                channel_id: { type: integer, minimum: 1 }
+                max_uses: { type: integer, minimum: 0 }
+                expires_in: { type: integer, minimum: 0 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
   /api/bot/v1/commands:
     get:
       operationId: listCommands
@@ -129,6 +404,31 @@ paths:
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
+    put:
+      operationId: syncCommands
+      summary: Atomically replace this bot's complete command set
+      description: >-
+        Upserts the supplied definitions and removes commands omitted from the
+        list in one transaction. This is the recommended deployment endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [commands]
+              properties:
+                commands:
+                  type: array
+                  maxItems: 100
+                  items: { $ref: '#/components/schemas/RegisterCommandRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
   /api/bot/v1/commands/{commandId}:
     parameters:
       - name: commandId
@@ -188,6 +488,33 @@ paths:
         '401': { $ref: '#/components/responses/Error' }
         '403': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
+  /api/bot/v1/commands/claims/{invocationId}/defer:
+    parameters:
+      - $ref: '#/components/parameters/InvocationId'
+    post:
+      operationId: deferCommand
+      summary: Renew a live command-processing lease
+      description: >-
+        Extends a currently live claim by up to two minutes. The same one-lease
+        claim token is required and compared in constant time.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [claim_token]
+              properties:
+                claim_token: { type: string, minLength: 1, maxLength: 256 }
+                lease_ms: { type: integer, minimum: 5000, maximum: 120000, default: 120000 }
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
   /api/bot/v1/commands/claims/{invocationId}/fail:
     parameters:
       - $ref: '#/components/parameters/InvocationId'
@@ -231,12 +558,32 @@ components:
       in: path
       required: true
       schema: { type: integer, format: int64, minimum: 1 }
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema: { type: integer, format: int64, minimum: 1 }
+    RoleId:
+      name: roleId
+      in: path
+      required: true
+      schema: { type: integer, format: int64, minimum: 1 }
     InvocationId:
       name: invocationId
       in: path
       required: true
       schema: { type: integer, format: int64, minimum: 1 }
   schemas:
+    MemberPage:
+      type: object
+      required: [items, next_after, has_more]
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items: { type: object, additionalProperties: true }
+        next_after: { type: [integer, 'null'], format: int64 }
+        has_more: { type: boolean }
     SendMessageRequest:
       type: object
       additionalProperties: false

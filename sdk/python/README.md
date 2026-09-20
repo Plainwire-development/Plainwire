@@ -12,4 +12,13 @@ print(bot.me().json())
 bot.send_message(42, "hello from Python")
 ```
 
+Commands can be deployed and handled without writing a polling loop:
+
+```python
+bot.sync_commands([{"name": "ping", "description": "Replies pong"}])
+bot.command_worker({"ping": lambda claim, client: "pong"}).run()
+```
+
+The worker has bounded batch and concurrency settings, renews live claims, and reports handler failures through `on_error`.
+
 Run the transport-policy tests after an editable install with `python -m unittest discover -s sdk/python/tests -v` from the Plainwire repository root.

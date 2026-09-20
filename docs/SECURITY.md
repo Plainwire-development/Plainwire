@@ -41,7 +41,7 @@ Plainwire does not claim end-to-end encryption. The application server can decry
 
 ## Message search
 
-Plainwire 2.1 uses a keyed blind index. It does not write normalized plaintext search words to PostgreSQL.
+Plainwire 2.2 uses a keyed blind index. It does not write normalized plaintext search words to PostgreSQL.
 
 `PLAINWIRE_SEARCH_KEY` can be an independent base64 32-byte key. If it is absent, Plainwire derives a dedicated search key from the encryption key. A separate search key is preferable when operators want independent key rotation boundaries.
 

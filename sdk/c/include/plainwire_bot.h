@@ -50,6 +50,7 @@ int pw_bot_roles(pw_bot_client *client, pw_bot_response *response);
 int pw_bot_create_role(pw_bot_client *client, const char *role_json, pw_bot_response *response);
 int pw_bot_update_role(pw_bot_client *client, long long role_id, const char *role_json, pw_bot_response *response);
 int pw_bot_delete_role(pw_bot_client *client, long long role_id, pw_bot_response *response);
+int pw_bot_members(pw_bot_client *client, long long after, int limit, pw_bot_response *response);
 int pw_bot_member(pw_bot_client *client, long long user_id, pw_bot_response *response);
 int pw_bot_set_member_roles(pw_bot_client *client, long long user_id, const char *role_ids_json, pw_bot_response *response);
 int pw_bot_kick_member(pw_bot_client *client, long long user_id, pw_bot_response *response);
@@ -61,9 +62,14 @@ int pw_bot_create_wire(pw_bot_client *client, long long channel_id, int max_uses
 int pw_bot_register_command(pw_bot_client *client, const char *name,
                             const char *description, const char *options_json,
                             pw_bot_response *response);
+int pw_bot_sync_commands(pw_bot_client *client, const char *commands_json,
+                         pw_bot_response *response);
 int pw_bot_commands(pw_bot_client *client, pw_bot_response *response);
 int pw_bot_delete_command(pw_bot_client *client, long long command_id, pw_bot_response *response);
 int pw_bot_claim_commands(pw_bot_client *client, int limit, pw_bot_response *response);
+int pw_bot_defer_command(pw_bot_client *client, long long invocation_id,
+                         const char *claim_token, int lease_ms,
+                         pw_bot_response *response);
 int pw_bot_respond_command(pw_bot_client *client, long long invocation_id,
                            const char *claim_token, const char *body,
                            pw_bot_response *response);

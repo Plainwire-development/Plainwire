@@ -41,6 +41,8 @@ assert.match(bridge, /room_resume_suppressed_other_tab/, 'duplicate tabs do not 
 assert.match(elm, /Connected elsewhere/, 'duplicate-tab or other-client ownership is explained in the call UI');
 assert.match(elm, /Ready to rejoin/, 'reconnect grace is explained instead of looking like a ghost participant');
 assert.match(bridge, /SYSTEM_AUDIO_DEVICE_RE/, 'screen audio has a high-confidence monitor\/loopback fallback');
+assert.match(bridge, /windowAudio:\s*shareScreenAudio \? 'window' : 'exclude'/, 'window sharing requests window audio rather than unrelated system audio');
+assert.match(bridge, /audioSelection:\s*shareScreenAudio \? 'preferred' : undefined/, 'the display picker is asked to prioritize audio-enabled sources');
 assert.match(bridge, /screenAudioSource === 'loopback'/, 'screen audio UI reports loopback fallback accurately');
 assert.match(bridge, /this browser did not provide system audio/i, 'missing screen audio is surfaced instead of silently ignored');
 

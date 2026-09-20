@@ -74,7 +74,7 @@ html[data-theme='dark'] {
 .channel-glyph { display: grid; place-items: center; flex: 0 0 30px; width: 30px; height: 30px; border-radius: 8px; background: var(--bg3); color: var(--muted); }
 .channel-glyph::after { content: none; }
 .channel-glyph.text::before { content: '#'; font: 500 22px/1 ui-monospace, monospace; }
-.channel-glyph.voice::before { content: ''; width: 18px; height: 18px; background: currentColor; mask: url('/assets/icons/Headphones.svg') center / contain no-repeat; -webkit-mask: url('/assets/icons/Headphones.svg') center / contain no-repeat; }
+.channel-glyph.voice::before { content: ''; width: 18px; height: 18px; background: currentColor; mask: url('/assets/icons/Headphones.svg') center / contain no-repeat; -webkit-mask: url('/assets/icons/Headphones.svg') center / contain no-repeat; transform: translateY(-1px); }
 .channel-link { border-radius: 8px; gap: 12px; padding: 10px 12px; transition: background-color .12s; }
 .channel-link:hover { background: var(--hover); }
 .channel-link:hover .channel-glyph { color: var(--accent); }

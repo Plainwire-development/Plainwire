@@ -22,8 +22,9 @@
     "test:storage-contract": "node test/browser/storage-contract.mjs",
     "test:storage-tools": "node test/browser/storage-tools.mjs",
     "test:v21-contract": "node test/browser/v21-contract.mjs",
-    "test:v21-app-contract": "node test/browser/v21-app-contract.mjs"
-    ,"test:scalability-contract": "node test/browser/scalability-contract.mjs"
+    "test:v21-app-contract": "node test/browser/v21-app-contract.mjs",
+    "test:v22-bot-contract": "node test/browser/v22-bot-contract.mjs",
+    "test:scalability-contract": "node test/browser/scalability-contract.mjs"
   },
   "devDependencies": {
     "elm": "0.19.1-6",

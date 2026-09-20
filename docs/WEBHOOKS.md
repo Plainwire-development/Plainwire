@@ -1,6 +1,6 @@
 # Server webhooks
 
-Plainwire 2.1 supports two server-scoped webhook models. Both are managed with the **Manage webhooks** role permission.
+Plainwire 2.2 supports two server-scoped webhook models. Both are managed with the **Manage webhooks** role permission.
 
 - **Outbound webhooks** send signed Plainwire events to your HTTPS service.
 - **Incoming webhooks** give an external service a revocable URL that can post messages into one selected text channel.

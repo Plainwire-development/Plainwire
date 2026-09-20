@@ -188,11 +188,9 @@ try {
  assert.equal(await page.getByRole('note',{name:/Missed call/}).count(),1,'missed calls render as timeline events');
  assert.equal(await page.locator('.call-event.completed').count(),1,'completed calls render in chat history');
  assert((await page.locator('.call-event.completed').textContent()).includes('12:34'),'call duration remains visible');
- await page.locator('#compose').click({button:'right'});
- await page.locator('.fallback-context-menu').waitFor();
- assert.notEqual(await page.locator('.fallback-context-menu').evaluate(el=>getComputedStyle(el).backgroundColor),'rgba(0, 0, 0, 0)','composer context menu has an opaque surface');
- await page.keyboard.press('Escape');
- assert.equal(await page.locator('.fallback-context-menu').count(),0,'Escape closes the editing menu');
+ const composerNativeMenuAllowed=await page.locator('#compose').evaluate(el=>el.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,button:2})));
+ assert.equal(composerNativeMenuAllowed,true,'composer keeps the browser-native editing menu for reliable paste');
+ assert.equal(await page.locator('.fallback-context-menu').count(),0,'composer does not replace native paste with a permission-gated menu');
 
  const activeRowInset=await page.locator('.side .dm-row.active').evaluate(row=>{const side=row.closest('.side').getBoundingClientRect(),box=row.getBoundingClientRect();return side.right-box.right;});
  assert(activeRowInset>=8,`selected conversation stays clear of the navigation edge (${activeRowInset}px)`);

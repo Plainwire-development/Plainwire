@@ -8705,7 +8705,8 @@ input[type="file"]::file-selector-button:hover { background: var(--hover); }
 }
 .thread-delete-btn:hover, .thread-delete-btn:focus-visible { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
 .reply-actions { display: flex; gap: 4px; margin-top: 8px; }
-.icon-btn .call-icon, .call-bar-controls .call-icon, .call-overlay-controls .call-icon { display: block; margin: auto; transform: translateY(0); }
+.icon-btn .call-icon, .call-bar-controls .call-icon { display: block; margin: auto; transform: translateY(0); }
+.call-overlay-controls .call-icon { display: block; margin: 0; transform: translateY(0); }
 .call-icon-audio { transform-origin: center; }
 
 @media (max-width: 680px) {

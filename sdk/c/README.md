@@ -18,4 +18,6 @@ export PLAINWIRE_BOT_TOKEN=pwb_...
 
 `http://127.0.0.1`, `http://[::1]` and `http://localhost` are accepted for local development only.
 
-The durable command methods are `pw_bot_claim_commands`, `pw_bot_respond_command` and `pw_bot_fail_command`. A claim token is secret and valid only for its current lease. Do not persist or log it.
+Use `pw_bot_sync_commands` to atomically deploy a JSON array of command definitions. Durable workers use `pw_bot_claim_commands`, `pw_bot_defer_command`, `pw_bot_respond_command` and `pw_bot_fail_command`. A claim token is secret and valid only for its current lease. Do not persist or log it.
+
+The roster API is cursor-paginated through `pw_bot_members`; response JSON stays owned by the caller so a project can use yyjson, jansson, cJSON or its existing parser.

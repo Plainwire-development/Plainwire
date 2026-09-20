@@ -568,9 +568,10 @@ handle_bot_v1(<<"GET">>, [], Req0) ->
             api => <<"plainwire-bot">>, version => 1, bot => Bot,
             authentication => <<"Authorization: Bot pwb_...">>, websocket => <<"/ws">>,
             features => [<<"messages">>, <<"message_editing">>, <<"reactions">>, <<"pins">>, <<"message_context">>,
-                         <<"commands">>, <<"durable_command_claims">>, <<"realtime_events">>, <<"members">>,
+                         <<"commands">>, <<"command_sync">>, <<"durable_command_claims">>, <<"renewable_command_claims">>, <<"realtime_events">>, <<"members">>, <<"paginated_members">>,
                          <<"roles">>, <<"moderation">>, <<"channel_management">>, <<"wires">>],
-            command_claim => #{lease_ms => bot_command_lease_ms(), max_batch => 50},
+            command_claim => #{lease_ms => bot_command_lease_ms(), max_batch => 50, renewable => true, max_lease_ms => 120000},
+            command_sync => #{max_commands => 100}, member_page => #{default_limit => 50, max_limit => 200},
             limits_per_minute => bot_limits()
         }})
     end);
@@ -581,8 +582,8 @@ handle_bot_v1(<<"GET">>, [<<"server">>], Req0) ->
         case bot_rate_allow(Bot, read) of
             false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>);
             true ->
-                case pw_db:server(maps:get(user_id, Bot), maps:get(server_id, Bot)) of
-                    {ok, Data} -> pw_util:ok_json(Req, #{ok => true, data => maps:with([server, channels, categories], Data)});
+                case pw_db:bot_server(maps:get(user_id, Bot), maps:get(server_id, Bot)) of
+                    {ok, Data} -> pw_util:ok_json(Req, #{ok => true, data => Data});
                     {error, E} -> pw_util:err_json(Req, 403, pw_util:bin(E))
                 end
         end
@@ -592,7 +593,7 @@ handle_bot_v1(<<"GET">>, [<<"channels">>], Req0) ->
         case bot_rate_allow(Bot, read) of
             false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>);
             true ->
-                case pw_db:server(maps:get(user_id, Bot), maps:get(server_id, Bot)) of
+                case pw_db:bot_server(maps:get(user_id, Bot), maps:get(server_id, Bot)) of
                     {ok, #{channels := Channels}} -> pw_util:ok_json(Req, #{ok => true, data => Channels});
                     {error, E} -> pw_util:err_json(Req, 403, pw_util:bin(E))
                 end
@@ -701,6 +702,14 @@ handle_bot_v1(<<"DELETE">>, [<<"roles">>, RoleId], Req0) ->
             false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
         end
     end);
+handle_bot_v1(<<"GET">>, [<<"members">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req) ->
+        case bot_rate_allow(Bot, read) of
+            true -> result(Req, pw_db:bot_members(maps:get(user_id, Bot), maps:get(server_id, Bot),
+                qs(Req, <<"after">>), qs(Req, <<"limit">>)));
+            false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
 handle_bot_v1(<<"GET">>, [<<"members">>, UserId], Req0) ->
     with_bot(Req0, fun(Bot, Req) ->
         case bot_rate_allow(Bot, read) of
@@ -783,6 +792,15 @@ handle_bot_v1(<<"POST">>, [<<"commands">>], Req0) ->
             end)
         end
     end);
+handle_bot_v1(<<"PUT">>, [<<"commands">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, mutation) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:bot_sync_commands(maps:get(id, Bot), maps:get(<<"commands">>, M, invalid)))
+            end)
+        end
+    end);
 handle_bot_v1(<<"DELETE">>, [<<"commands">>, CommandId], Req0) ->
     with_bot(Req0, fun(Bot, Req) ->
         case bot_rate_allow(Bot, mutation) of
@@ -795,6 +813,16 @@ handle_bot_v1(<<"GET">>, [<<"commands">>, <<"claims">>], Req0) ->
         case bot_rate_allow(Bot, command_claim) of
             true -> result(Req, pw_db:bot_claim_commands(maps:get(id, Bot), qs(Req, <<"limit">>)));
             false -> pw_util:err_json(Req, 429, <<"bot_rate_limited">>)
+        end
+    end);
+handle_bot_v1(<<"POST">>, [<<"commands">>, <<"claims">>, InvocationId, <<"defer">>], Req0) ->
+    with_bot(Req0, fun(Bot, Req1) ->
+        case bot_rate_allow(Bot, command_claim) of
+            false -> pw_util:err_json(Req1, 429, <<"bot_rate_limited">>);
+            true -> with_json_public(Req1, fun(M, Req) ->
+                result(Req, pw_db:bot_defer_command(maps:get(id, Bot), InvocationId,
+                    maps:get(<<"claim_token">>, M, <<>>), maps:get(<<"lease_ms">>, M, bot_command_lease_ms())))
+            end)
         end
     end);
 handle_bot_v1(<<"POST">>, [<<"commands">>, <<"claims">>, InvocationId, <<"respond">>], Req0) ->

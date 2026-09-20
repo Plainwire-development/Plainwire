@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
-const [elm, types, bridge, markdown, sourceHub, githubBackend, githubCache, supervisor, api, db, util, less, sourceLess, scss, contentLess, callsScss, notificationView, componentsScss] = await Promise.all([
+const [elm, types, bridge, markdown, sourceHub, githubBackend, githubCache, supervisor, api, db, util, less, sourceLess, scss, contentLess, callsScss, notificationView, componentsScss, refinementsScss] = await Promise.all([
   readFile('priv/static/elm/src/Main.elm', 'utf8'),
   readFile('priv/static/elm/src/Types.elm', 'utf8'),
   readFile('priv/static/elm-bridge.js', 'utf8'),
@@ -19,7 +19,8 @@ const [elm, types, bridge, markdown, sourceHub, githubBackend, githubCache, supe
   readFile('priv/static/_content.less', 'utf8'),
   readFile('priv/static/_calls.scss', 'utf8'),
   readFile('priv/static/elm/src/View/Notifications.elm', 'utf8'),
-  readFile('priv/static/_components.scss', 'utf8')
+  readFile('priv/static/_components.scss', 'utf8'),
+  readFile('priv/static/_refinements.scss', 'utf8')
 ]);
 
 assert.match(markdown, /eyes:\s*'👀'/u, ':eyes: renders as the eyes emoji');
@@ -111,7 +112,9 @@ assert.match(elm, /Find a destination/, 'forwarding UI provides destination sear
 assert.match(bridge, /message-edit-input[\s\S]*focus/, 'message edit mode receives keyboard focus automatically');
 assert.match(elm, /Forwarded from/, 'forward provenance is visible in the message UI');
 
-assert.match(bridge, /addEventListener\('contextmenu'[\s\S]*event\.preventDefault\(\)/, 'native in-app context menu is suppressed');
+assert.match(bridge, /nativeEditingContextTarget\(target\)[\s\S]*return;[\s\S]*event\.preventDefault\(\)/, 'editable controls retain the native context menu while app surfaces suppress browser chrome');
+assert.match(componentsScss, /\.call-overlay-controls \.call-icon\s*\{[^}]*margin:\s*0;/, 'wide call controls keep their icon and label centered as one group');
+assert.match(refinementsScss, /\.channel-glyph\.voice::before\s*\{[^}]*transform:\s*translateY\(-1px\)/, 'voice-channel headphones receive the same optical centering as call controls');
 assert.match(elm, /attribute "role" "menuitem"/, 'custom context actions are keyboard-focusable menu items');
 assert.match(bridge, /data-context-x|dataset\.contextX/, 'custom context menus are viewport-positioned instead of blindly using raw coordinates');
 assert.match(bridge, /emitShortcut\('toggle_mute'\)/, 'mute shortcut is routed through the command layer');

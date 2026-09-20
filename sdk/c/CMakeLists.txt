@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(plainwire_bot_c VERSION 2.1.0 LANGUAGES C)
+project(plainwire_bot_c VERSION 2.2.0 LANGUAGES C)
 find_package(CURL REQUIRED)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)

@@ -215,7 +215,7 @@ int pw_bot_request(pw_bot_client *client, const char *method, const char *path,
 
     headers = curl_slist_append(headers, auth);
     headers = curl_slist_append(headers, "Accept: application/json");
-    headers = curl_slist_append(headers, "User-Agent: plainwire-c-bot/2.1");
+    headers = curl_slist_append(headers, "User-Agent: plainwire-c-bot/2.2");
     if (json_body) headers = curl_slist_append(headers, "Content-Type: application/json");
     if (!headers) goto done;
 
@@ -338,6 +338,10 @@ int pw_bot_roles(pw_bot_client *c, pw_bot_response *r) { return pw_simple(c, "GE
 int pw_bot_create_role(pw_bot_client *c, const char *role_json, pw_bot_response *r) { return pw_simple(c, "POST", "/api/bot/v1/roles", role_json ? role_json : "{}", r); }
 int pw_bot_update_role(pw_bot_client *c, long long role_id, const char *role_json, pw_bot_response *r) { char path[192]; snprintf(path,sizeof(path),"/api/bot/v1/roles/%lld",role_id); return pw_simple(c,"POST",path,role_json?role_json:"{}",r); }
 int pw_bot_delete_role(pw_bot_client *c, long long role_id, pw_bot_response *r) { char path[192]; snprintf(path,sizeof(path),"/api/bot/v1/roles/%lld",role_id); return pw_simple(c,"DELETE",path,NULL,r); }
+int pw_bot_members(pw_bot_client *c, long long after, int limit, pw_bot_response *r) {
+    char path[192]; if (after < 0) after = 0; if (limit < 1) limit = 1; if (limit > 200) limit = 200;
+    snprintf(path,sizeof(path),"/api/bot/v1/members?after=%lld&limit=%d",after,limit); return pw_simple(c,"GET",path,NULL,r);
+}
 int pw_bot_member(pw_bot_client *c, long long user_id, pw_bot_response *r) { char path[192]; snprintf(path,sizeof(path),"/api/bot/v1/members/%lld",user_id); return pw_simple(c,"GET",path,NULL,r); }
 int pw_bot_set_member_roles(pw_bot_client *c, long long user_id, const char *role_ids_json, pw_bot_response *r) {
     char path[192], *json; size_t n; int rc; const char *ids = role_ids_json ? role_ids_json : "[]";
@@ -368,6 +372,14 @@ int pw_bot_register_command(pw_bot_client *c, const char *name, const char *desc
     rc = pw_simple(c, "POST", "/api/bot/v1/commands", json, r);
     free(json); free(n1); free(d1); return rc;
 }
+int pw_bot_sync_commands(pw_bot_client *c, const char *commands_json, pw_bot_response *r) {
+    char *json; size_t n; int rc;
+    if (!commands_json) commands_json = "[]";
+    if (strlen(commands_json) > PW_MAX_REQUEST - 32) return -1;
+    n = strlen(commands_json) + 32; json = (char *)malloc(n); if (!json) return -2;
+    snprintf(json, n, "{\"commands\":%s}", commands_json);
+    rc = pw_simple(c, "PUT", "/api/bot/v1/commands", json, r); free(json); return rc;
+}
 int pw_bot_commands(pw_bot_client *c, pw_bot_response *r) { return pw_simple(c, "GET", "/api/bot/v1/commands", NULL, r); }
 int pw_bot_delete_command(pw_bot_client *c, long long command_id, pw_bot_response *r) {
     char path[160]; snprintf(path, sizeof(path), "/api/bot/v1/commands/%lld", command_id); return pw_simple(c, "DELETE", path, NULL, r);
@@ -375,6 +387,16 @@ int pw_bot_delete_command(pw_bot_client *c, long long command_id, pw_bot_respons
 int pw_bot_claim_commands(pw_bot_client *c, int limit, pw_bot_response *r) {
     char path[160]; if (limit < 1) limit = 1; if (limit > 50) limit = 50;
     snprintf(path, sizeof(path), "/api/bot/v1/commands/claims?limit=%d", limit); return pw_simple(c, "GET", path, NULL, r);
+}
+int pw_bot_defer_command(pw_bot_client *c, long long id, const char *token, int lease_ms, pw_bot_response *r) {
+    char path[224], *escaped = pw_json_escape(token), *json; size_t n; int rc;
+    if (!escaped) return -2;
+    if (lease_ms < 5000) lease_ms = 5000;
+    if (lease_ms > 120000) lease_ms = 120000;
+    snprintf(path, sizeof(path), "/api/bot/v1/commands/claims/%lld/defer", id);
+    n = strlen(escaped) + 80; json = (char *)malloc(n); if (!json) { free(escaped); return -2; }
+    snprintf(json, n, "{\"claim_token\":\"%s\",\"lease_ms\":%d}", escaped, lease_ms);
+    rc = pw_simple(c, "POST", path, json, r); free(json); free(escaped); return rc;
 }
 
 static int pw_claim_action(pw_bot_client *c, long long id, const char *token, const char *field, const char *value, const char *action, pw_bot_response *r) {
