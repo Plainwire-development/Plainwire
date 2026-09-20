@@ -3157,10 +3157,13 @@
     if (!target?.isConnected) { removeTourSpotlight(); return; }
     const rect = target.getBoundingClientRect();
     const pad = 7;
+    const viewportWidth = window.visualViewport?.width || innerWidth;
+    const viewportHeight = window.visualViewport?.height || innerHeight;
+    if (onboardingGuideNode) onboardingGuideNode.classList.toggle('is-top', rect.top + rect.height / 2 > viewportHeight * .58);
     node.style.left = `${Math.max(4, rect.left - pad)}px`;
     node.style.top = `${Math.max(4, rect.top - pad)}px`;
-    node.style.width = `${Math.max(12, rect.width + pad * 2)}px`;
-    node.style.height = `${Math.max(12, rect.height + pad * 2)}px`;
+    node.style.width = `${Math.max(12, Math.min(rect.right + pad, viewportWidth - 4) - Math.max(4, rect.left - pad))}px`;
+    node.style.height = `${Math.max(12, Math.min(rect.bottom + pad, viewportHeight - 4) - Math.max(4, rect.top - pad))}px`;
   };
   const requestTourSpotlightPosition = () => {
     if (!onboardingSpotlightRaf) onboardingSpotlightRaf = requestAnimationFrame(positionTourSpotlight);
@@ -3330,14 +3333,22 @@
     const body = document.createElement('div'); body.className = 'pw-tour-guide-body';
     const typing = document.createElement('pw-typing-indicator'); typing.setAttribute('data-scope', ONBOARDING_SCOPE); body.append(typing);
     const footer = document.createElement('div'); footer.className = 'pw-tour-guide-actions';
-    guide.append(head, body, footer); document.body.append(guide); onboardingGuideNode = guide;
+    const progressBar = document.createElement('div'); progressBar.className = 'pw-tour-progress';
+    progressBar.setAttribute('role', 'progressbar'); progressBar.setAttribute('aria-label', 'Tour progress');
+    progressBar.setAttribute('aria-valuemin', '0'); progressBar.setAttribute('aria-valuemax', String(onboardingSteps.length)); progressBar.setAttribute('aria-valuenow', String(stepNumber));
+    onboardingSteps.forEach((_, index) => { const segment = document.createElement('span'); segment.classList.toggle('is-complete', index < stepNumber); progressBar.append(segment); });
+    guide.append(head, progressBar, body, footer); document.body.append(guide); onboardingGuideNode = guide;
+    guide.classList.add('is-visible'); guide.focus({ preventScroll: true });
+    guide.addEventListener('keydown', event => {
+      if (event.key === 'Escape') { event.preventDefault(); closeOnboardingGuide(); scheduleOnboardingHop(); }
+    });
     if (window.matchMedia?.('(max-width: 760px)').matches && target) {
       const targetRect = target.getBoundingClientRect();
       const viewportHeight = window.visualViewport?.height || window.innerHeight;
       guide.classList.toggle('is-top', targetRect.top + targetRect.height / 2 > viewportHeight * 0.58);
     }
     setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, true);
-    await sleep(reducedMotion() ? 220 : 720 + Math.min(480, step.body.length * 3));
+    await sleep(reducedMotion() ? 0 : 180);
     if (epoch !== onboardingEpoch || onboardingGuideNode !== guide) return;
     setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, false);
     typing.remove();
@@ -6987,13 +6998,14 @@
     const actions = [];
     if (editable) {
       const textControl = editable instanceof HTMLInputElement || editable instanceof HTMLTextAreaElement;
+      const writable = !editable.readOnly && !editable.disabled;
       const selected = textControl ? editable.value.slice(editable.selectionStart || 0, editable.selectionEnd || 0) : String(window.getSelection?.()?.toString?.() || '');
       actions.push(['Cut', async () => {
         if (!selected) return;
-        try { await navigator.clipboard.writeText(selected); } catch (_) {}
+        try { await navigator.clipboard.writeText(selected); } catch (_) { send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not copy the selection. Your text has been kept.' }); return; }
         if (textControl) setTextControlValue(editable, '', editable.selectionStart || 0, editable.selectionEnd || 0);
         else document.execCommand?.('delete');
-      }, !selected]);
+      }, !selected || !writable]);
       actions.push(['Copy', async () => { if (selected) await navigator.clipboard.writeText(selected).catch(() => {}); }, !selected]);
       actions.push(['Paste', async () => {
         try {
@@ -7001,7 +7013,7 @@
           if (textControl) setTextControlValue(editable, value, editable.selectionStart || 0, editable.selectionEnd || 0);
           else document.execCommand?.('insertText', false, value);
         } catch (_) { send(app.ports.bridgeReceive, { tag: 'toast', data: 'Clipboard paste permission was not available.' }); }
-      }, !navigator.clipboard?.readText]);
+      }, !writable || !navigator.clipboard?.readText]);
       actions.push(['Select all', () => { if (textControl) editable.select(); else { const range = document.createRange(); range.selectNodeContents(editable); const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range); } }, false]);
     } else if (selectedText) {
       actions.push(['Copy selection', () => navigator.clipboard.writeText(selectedText).catch(() => {}), false]);
@@ -7027,6 +7039,15 @@
     actions.forEach(([label, action, disabled]) => {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = label; button.disabled = !!disabled; button.setAttribute('role', 'menuitem');
       button.addEventListener('click', async () => { closeFallbackContextMenu(); await action(); }); menu.append(button);
+    });
+    menu.addEventListener('keydown', event => {
+      const items = [...menu.querySelectorAll('button:not(:disabled)')];
+      const index = items.indexOf(document.activeElement);
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeFallbackContextMenu(); target?.focus?.({ preventScroll: true }); return; }
+      if (!items.length || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+      items[next].focus();
     });
     document.body.append(menu); fallbackContextMenu = menu;
     const rect = menu.getBoundingClientRect();

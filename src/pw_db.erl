@@ -29,7 +29,7 @@
     search_messages/4, search_index_reconcile/1, search_index_status/0,
     create_invite/4, create_invite/5, list_invites/2, revoke_invite/3, invite_options/2, invite_preview/1, join_invite/2,
     messages/5, message_context/2, channel_pins/2, set_message_pin/3,
-    post_channel_message/4, delete_message/2, edit_message/3, forward_message/4, toggle_message_reaction/3, record_missed_call/2,
+    post_channel_message/4, delete_message/2, edit_message/3, forward_message/4, toggle_message_reaction/3, record_missed_call/2, record_completed_call/3,
     conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4,
     set_conversation_member_role/4, kick_conversation_member/3,
     add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4,
@@ -420,6 +420,9 @@ deny_message_request(Uid, Cid) -> call({deny_message_request, Uid, Cid}).
 mark_conversation_read(Uid, Cid) -> call({mark_conversation_read, Uid, Cid}).
 post_direct_message(Uid, Cid, Body, ReplyTo) -> call({post_direct_message, Uid, Cid, Body, ReplyTo}).
 record_missed_call(Uid, Cid) -> call({record_missed_call, Uid, Cid}).
+record_completed_call(Uid, Cid, Seconds) when is_integer(Seconds), Seconds >= 0 ->
+    Duration = iolist_to_binary(io_lib:format("~B:~2..0B", [Seconds div 60, Seconds rem 60])),
+    call({record_call_event, Uid, Cid, <<"call_ended">>, <<"Call ended · "/utf8, Duration/binary>>}).
 notifications(Uid) -> call({notifications, Uid}).
 mark_notifications_seen(Uid) -> call({mark_notifications_seen, Uid}).
 clear_notifications(Uid) -> call({clear_notifications, Uid}).
@@ -779,6 +782,7 @@ read_msg({edit_message, _, _, _}) -> false;
 read_msg({forward_message, _, _, _, _}) -> false;
 read_msg({toggle_message_reaction, _, _, _}) -> false;
 read_msg({record_missed_call, _, _}) -> false;
+read_msg({record_call_event, _, _, _, _}) -> false;
 read_msg({create_conversation, _, _, _}) -> false;
 read_msg({create_conversation_usernames, _, _, _}) -> false;
 read_msg({update_conversation, _, _, _, _}) -> false;
@@ -5272,17 +5276,19 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
             end
     end;
 route({record_missed_call, Uid, Cid0}, Conn) ->
+    route({record_call_event, Uid, Cid0, <<"missed_call">>, <<"Missed call">>}, Conn);
+route({record_call_event, Uid, Cid0, Kind, Text}, Conn) ->
     Cid = pw_util:int(Cid0),
     Result = with_tx(Conn, fun() ->
         case conversation_can_send(Conn, Uid, Cid) of
             false -> {error, forbidden};
             true ->
                 Now = pw_util:now_ms(),
-                Body = store_message(<<"Missed call">>),
+                Body = store_message(Text),
                 Mid = new_message_id(),
                 ok = exec(Conn,
-                    "INSERT INTO messages(id,scope,scope_id,user_id,body,reply_to_id,created_at,kind) VALUES($1,'direct',$2,$3,$4,NULL,$5,'missed_call')",
-                    [Mid, Cid, Uid, Body, Now]),
+                    "INSERT INTO messages(id,scope,scope_id,user_id,body,reply_to_id,created_at,kind) VALUES($1,'direct',$2,$3,$4,NULL,$5,$6)",
+                    [Mid, Cid, Uid, Body, Now, Kind]),
                 ok = exec(Conn, "UPDATE direct_threads SET updated_at=$1 WHERE id=$2", [Now, Cid]),
                 ok = exec(Conn, "UPDATE direct_members SET last_read_message_id=$1 WHERE thread_id=$2 AND user_id=$3", [Mid, Cid, Uid]),
                 ok = exec(Conn, "UPDATE direct_members SET hidden=false WHERE thread_id=$1", [Cid]),
@@ -5295,7 +5301,10 @@ route({record_missed_call, Uid, Cid0}, Conn) ->
         {ok, #{message := Msg, notify_at := Now}} ->
             invalidate_message_cache(<<"direct">>, Cid),
             pw_hub:broadcast({direct, Cid}, #{type => message_created, scope => direct, scope_id => Cid, message => Msg}),
-            best_effort_missed_call_notifications(Conn, Cid, Uid, Msg, Now),
+            case Kind of
+                <<"missed_call">> -> best_effort_missed_call_notifications(Conn, Cid, Uid, Msg, Now);
+                _ -> ok
+            end,
             {ok, Msg};
         Other -> Other
     end;
@@ -6327,6 +6336,10 @@ migrations() -> [
         %% index serves the exact channel+author live-message lookup without
         %% adding write amplification to deleted/direct/profile message rows.
         "CREATE INDEX IF NOT EXISTS idx_messages_channel_author_recent ON messages(scope_id,user_id,created_at DESC) WHERE scope='channel' AND deleted_at IS NULL"
+    ]}
+    ,{50, [
+        "ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check",
+        "ALTER TABLE messages ADD CONSTRAINT messages_kind_check CHECK(kind IN ('text','missed_call','call_ended'))"
     ]}
 ].
 

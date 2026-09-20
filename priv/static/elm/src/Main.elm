@@ -7328,7 +7328,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "2.1.0", attribute "data-ui-revision" "interface-5" ]
+    div [ class "layout", attribute "data-ui-version" "2.1.1", attribute "data-ui-revision" "interface-5" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -11704,7 +11704,7 @@ shouldGroup previous message =
 
 messageView : Model -> Bool -> Message -> Html Msg
 messageView model grouped m =
-    if m.kind == "missed_call" then
+    if m.kind == "missed_call" || m.kind == "call_ended" then
         missedCallView model m
 
     else
@@ -11925,28 +11925,37 @@ missedCallView model m =
             Maybe.map .id model.me == Just m.userId
 
         callTitle =
-            if mine then
+            if m.kind == "call_ended" then
+                "Call ended"
+
+            else if mine then
                 "No answer"
 
             else
                 "Missed call"
 
         callDetail =
-            if mine then
+            if m.kind == "call_ended" then
+                m.body
+
+            else if mine then
                 "Your call was not answered"
 
             else
                 m.displayName ++ " tried to reach you"
 
         callAction =
-            if mine then
+            if m.kind == "call_ended" then
+                "Call again"
+
+            else if mine then
                 "Call again"
 
             else
                 "Call back"
     in
     div
-        [ class ("msg call-event" ++ (if mine then " mine" else ""))
+        [ class ("msg call-event" ++ (if m.kind == "call_ended" then " completed" else "") ++ (if mine then " mine" else ""))
         , attribute "data-mid" (String.fromInt m.id)
         , attribute "role" "note"
         , attribute "aria-label" (callTitle ++ ". " ++ callDetail)

@@ -26,7 +26,7 @@ public_config_has_release_version_test() ->
     Config = pw_client_config:public(),
     ?assert(maps:is_key(version, Config)),
     ?assert(maps:is_key(asset_version, Config)),
-    ?assertEqual(<<"2.1.0">>, maps:get(version, Config)),
+    ?assertEqual(<<"2.1.1">>, maps:get(version, Config)),
     AssetVersion = maps:get(asset_version, Config),
     ?assert(is_binary(AssetVersion)),
     ?assert(byte_size(AssetVersion) > 0).

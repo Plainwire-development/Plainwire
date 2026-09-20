@@ -550,3 +550,17 @@ stop_named(Name) ->
             try gen_server:stop(Pid, normal, 1000)
             catch exit:_ -> exit(Pid, kill), ok end
     end.
+
+completed_call_timing_test() ->
+    Solo = #{1 => #{}},
+    ?assertEqual(Solo, pw_hub:track_call_session(#{}, Solo)),
+    ?assertEqual(none, pw_hub:completed_call(Solo, 1000)),
+    Joined = pw_hub:track_call_session(Solo, Solo#{2 => #{}}),
+    #{call_session := #{started := Start} = Session} = maps:get(1, Joined),
+    ?assertEqual(Session, maps:get(call_session, maps:get(2, Joined))),
+    Remaining = maps:remove(1, Joined),
+    %% A replacement socket does not reset the server's duration.
+    Rejoined = pw_hub:track_call_session(Remaining, #{2 => #{}, 3 => #{}}),
+    ?assertEqual(Session, maps:get(call_session, maps:get(3, Rejoined))),
+    ?assertEqual({2, 83}, pw_hub:completed_call(Remaining, Start + 83999)),
+    ?assertEqual(none, pw_hub:completed_call(#{}, Start + 90000)).

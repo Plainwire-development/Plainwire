@@ -53,12 +53,13 @@ int main(void) {
     const double maxima[9] = {300, 100, 10000, 30000, 100, 30000, 100000, 100000, 100};
     double rows[24 * 9], result[OUTPUT_COUNT];
     int status;
-    while ((status = read_exact(header, 4)) == 1) {
+    while ((status = read_exact(header, 1)) == 1) {
+        /* Start the deadline on the first byte, including a partial header.
+           Waiting for an entirely idle stream remains unlimited. */
+        alarm(1);
+        if (read_exact(header + 1, 3) != 1) return 2;
         uint32_t size = u32(header);
         if (size < 4 || size > sizeof(input)) return 2;
-        /* An incomplete frame cannot keep the process stuck in a read. Idle
-           workers have no timer; only an active request has a deadline. */
-        alarm(1);
         if (read_exact(input, size) != 1) return 2;
         uint32_t n = u32(input);
         if (n < 1 || n > 24 || size != 4 + n * 9 * 8) return 3;

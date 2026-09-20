@@ -1077,31 +1077,39 @@ class PlainwireSourceHub extends HTMLElement {
 
   startTour() {
     this.stopTour();
+    this.tourReturnFocus = document.activeElement;
     this.tour = { index: 0 };
     this.tourAbort = new AbortController();
     window.addEventListener('resize', this.repositionTour, { signal: this.tourAbort.signal });
+    window.visualViewport?.addEventListener('resize', this.repositionTour, { signal: this.tourAbort.signal });
+    window.visualViewport?.addEventListener('scroll', this.repositionTour, { signal: this.tourAbort.signal });
     document.addEventListener('scroll', this.repositionTour, { capture: true, passive: true, signal: this.tourAbort.signal });
     document.addEventListener('keydown', event => { if (event.key === 'Escape') this.stopTour(); }, { signal: this.tourAbort.signal });
     this.showTourStep(0);
   }
 
   stopTour() {
+    const returnFocus = this.tourReturnFocus;
+    this.tourReturnFocus = null;
+    this.tourResize?.disconnect();
     this.tour = null;
     this.tourAbort?.abort(); this.tourAbort = null;
     this.tourTarget = null;
     this.tourGuide?.remove(); this.tourGuide = null;
     this.tourSpotlight?.remove(); this.tourSpotlight = null;
+    if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+    else if (this.isConnected) this.querySelector('.source-tour-button')?.focus({ preventScroll: true });
   }
 
   tourSteps() {
     return [
-      { title: 'Plainwire Source', copy: 'This page is a read-only window into Plainwire’s public development work, refreshed from GitHub through the Plainwire server.', section: 'pulse', selector: '.source-tour-overview' },
-      { title: 'Development pulse', copy: 'Public organization events update here: pushes, releases, pull requests, issues, forks, and other GitHub activity.', section: 'pulse', selector: '.source-tour-pulse' },
-      { title: 'Every public repository', copy: 'Browse the main server, desktop app, forum, license, and any future public repositories without hard-coding the page to four projects.', section: 'repositories', selector: '.source-tour-repos' },
-      { title: 'Source architecture', copy: 'The architecture map connects the UI, browser bridge, Cowboy API, realtime hub, PostgreSQL data layer, media boundary, and native worker to their real source files.', section: 'architecture', selector: '.source-tour-architecture' },
-      { title: 'Repository inspector', copy: 'Open any repository for commits and diffs, releases, tags, branches, README, files, language statistics, contributors, and raw GitHub metadata.', section: 'repositories', selector: '.source-repo-card', fallbackSelector: '.source-tour-repos' },
-      { title: 'Contributor mirrors', copy: 'Linked contributor names open current public GitHub profile mirrors with follower counts, repositories, organizations, and recent activity. Unlinked commit authors remain visible without exposing their e-mail.', section: 'pulse', selector: '.source-active-contributors', fallbackSelector: '.source-tour-pulse' },
-      { title: 'Raw metadata when you need it', copy: 'The polished UI never hides the underlying public response: metadata panels expose the full bounded GitHub objects for debugging and curiosity.', section: 'metadata', selector: '.source-tour-metadata' }
+      { title: 'Plainwire Source', copy: 'Follow what’s being built, explore the code, and meet the people behind Plainwire. This short tour shows you where to start.', section: 'pulse', selector: '.source-tour-overview' },
+      { title: 'Development pulse', copy: 'See recent changes across Plainwire in one place. Open an activity item to follow a commit, release, or discussion.', section: 'pulse', selector: '.source-tour-pulse' },
+      { title: 'Every public repository', copy: 'Find the server, desktop app, forum, and other projects. Search by name, then open a repository to explore its work.', section: 'repositories', selector: '.source-tour-repos' },
+      { title: 'Source architecture', copy: 'See how Plainwire fits together, from the interface to calls and storage. Select a component to jump into its source files.', section: 'architecture', selector: '.source-tour-architecture' },
+      { title: 'Repository inspector', copy: 'Read the README, browse files, or inspect exactly what changed in a commit. Releases and branches are here too.', section: 'repositories', selector: '.source-repo-card', fallbackSelector: '.source-tour-repos' },
+      { title: 'Contributor mirrors', copy: 'Meet the people contributing to Plainwire. Select a linked name to explore their public profile, projects, and recent work.', section: 'pulse', selector: '.source-active-contributors', fallbackSelector: '.source-tour-pulse' },
+      { title: 'Raw metadata when you need it', copy: 'For a closer look, expand the public data behind this page. You’re ready to explore — you can replay this tour any time.', section: 'metadata', selector: '.source-tour-metadata' }
     ];
   }
 
@@ -1125,6 +1133,7 @@ class PlainwireSourceHub extends HTMLElement {
     if (!this.tour || this.tour.index !== index || !target?.isConnected) return;
     this.tourGuide?.remove(); this.tourSpotlight?.remove();
     const spotlight = textNode('div', 'pw-tour-spotlight source-tour-spotlight');
+    spotlight.setAttribute('aria-hidden', 'true');
     const guide = textNode('aside', 'pw-tour-guide source-tour-guide');
     guide.setAttribute('role', 'dialog'); guide.setAttribute('aria-modal', 'false'); guide.setAttribute('aria-label', 'Plainwire Source tour'); guide.tabIndex = -1;
     const head = textNode('div', 'pw-tour-guide-head');
@@ -1133,13 +1142,26 @@ class PlainwireSourceHub extends HTMLElement {
     const close = button('×', 'pw-tour-guide-close', () => this.stopTour()); close.setAttribute('aria-label', 'Close source tour');
     head.append(brand, headCopy, close);
     const body = textNode('div', 'pw-tour-guide-body');
-    body.append(textNode('h3', '', step.title), textNode('p', '', step.copy), textNode('small', 'pw-tour-guide-hint', 'GitHub data comes through this Plainwire server; credentials are never exposed to the browser, and GitHub’s public event feed can be delayed.'));
+    body.append(textNode('h3', '', step.title), textNode('p', '', step.copy), textNode('small', 'pw-tour-guide-hint', 'Use ← and → to move between stops. Escape closes the tour.'));
     const foot = textNode('div', 'pw-tour-guide-actions');
     if (index > 0) foot.append(button('Back', 'btn ghost', () => this.showTourStep(index - 1)));
     foot.append(button(index === total - 1 ? 'Done' : 'Next', 'btn', () => index === total - 1 ? this.stopTour() : this.showTourStep(index + 1)));
-    guide.append(head, body, foot);
+    const progress = textNode('div', 'pw-tour-progress');
+    progress.setAttribute('role', 'progressbar'); progress.setAttribute('aria-label', 'Tour progress');
+    progress.setAttribute('aria-valuemin', '0'); progress.setAttribute('aria-valuemax', String(total)); progress.setAttribute('aria-valuenow', String(index + 1));
+    for (let i = 0; i < total; i++) progress.append(textNode('span', i <= index ? 'is-complete' : ''));
+    guide.append(head, progress, body, foot);
+    guide.addEventListener('keydown', event => {
+      if (event.altKey || event.ctrlKey || event.metaKey || !['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+      event.preventDefault();
+      if (event.key === 'ArrowLeft' && index > 0) this.showTourStep(index - 1);
+      if (event.key === 'ArrowRight') index === total - 1 ? this.stopTour() : this.showTourStep(index + 1);
+    });
     document.body.append(spotlight, guide);
     this.tourSpotlight = spotlight; this.tourGuide = guide; this.tourTarget = target;
+    this.tourResize?.disconnect();
+    this.tourResize = new ResizeObserver(this.repositionTour);
+    this.tourResize.observe(target); this.tourResize.observe(guide);
     this.repositionTour();
     requestAnimationFrame(() => { if (guide.isConnected) guide.classList.add('is-visible'); });
     guide.focus({ preventScroll: true });
@@ -1149,11 +1171,27 @@ class PlainwireSourceHub extends HTMLElement {
     const target = this.tourTarget, spotlight = this.tourSpotlight, guide = this.tourGuide;
     if (!this.tour || !target?.isConnected || !spotlight?.isConnected || !guide?.isConnected) return;
     const rect = target.getBoundingClientRect();
-    spotlight.style.left = `${Math.max(4, rect.left - 7)}px`;
-    spotlight.style.top = `${Math.max(4, rect.top - 7)}px`;
-    spotlight.style.width = `${Math.max(16, rect.width + 14)}px`;
-    spotlight.style.height = `${Math.max(16, rect.height + 14)}px`;
-    guide.classList.toggle('is-top', rect.top > window.innerHeight * .56);
+    const view = window.visualViewport;
+    const left = view?.offsetLeft || 0, top = view?.offsetTop || 0;
+    const width = view?.width || innerWidth, height = view?.height || innerHeight;
+    const x = Math.max(left + 6, Math.min(rect.left - 7, left + width - 18));
+    const y = Math.max(top + 6, Math.min(rect.top - 7, top + height - 18));
+    spotlight.style.left = `${x}px`; spotlight.style.top = `${y}px`;
+    spotlight.style.width = `${Math.max(12, Math.min(rect.right + 7, left + width - 6) - x)}px`;
+    spotlight.style.height = `${Math.max(12, Math.min(rect.bottom + 7, top + height - 6) - y)}px`;
+    const mobile = width <= 760;
+    const nav = mobile ? (parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--mobile-nav-h')) || 64) : 0;
+    guide.style.maxHeight = `${Math.max(100, height - nav - 28)}px`;
+    guide.style.width = `${Math.min(400, width - 24)}px`;
+    const guideHeight = guide.offsetHeight, guideWidth = guide.offsetWidth;
+    // Prefer a free side of the target; on phones use the opposite end of the viewport.
+    let gx = left + width - guideWidth - 12;
+    let gy = rect.top + rect.height / 2 > top + height / 2 ? top + 12 : top + height - nav - guideHeight - 12;
+    if (!mobile && rect.right + guideWidth + 24 < left + width) gx = rect.right + 14;
+    else if (!mobile && rect.left - guideWidth - 14 > left) gx = rect.left - guideWidth - 14;
+    guide.style.left = `${Math.max(left + 12, gx)}px`;
+    guide.style.top = `${Math.max(top + 12, Math.min(gy, top + height - guideHeight - 12))}px`;
+    guide.style.right = 'auto'; guide.style.bottom = 'auto';
   };
 
 }

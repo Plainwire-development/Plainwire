@@ -11,6 +11,10 @@
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
+-ifdef(TEST).
+-export([track_call_session/2, completed_call/2]).
+-endif.
+
 -define(RING_MS, 45000).
 -define(JOIN_TIMEOUT, 5000).
 -define(RECONNECT_GRACE_MS, 15000).
@@ -494,7 +498,8 @@ do_call_join(ConversationId, Uid, Pid, Profile, Audience0, St0) ->
     send_many(room_pids(maps:remove(Uid, Room0)),
         #{type => call_peer_joined, conversation_id => ConversationId, user_id => Uid, profile => strip_profile(Profile)}),
     Audience = lists:usort([Uid | [U || U <- Audience0, is_integer(U), U > 0]]),
-    Room = maps:put(Uid, new_call_member(Pid, Profile, Audience, maps:get(Uid, Room0, #{})), Room0),
+    Joined = maps:put(Uid, new_call_member(Pid, Profile, Audience, maps:get(Uid, Room0, #{})), Room0),
+    Room = track_call_session(Room0, Joined),
     sync_room(call, ConversationId, Room),
     log("call_join", #{uid => Uid, conversation_id => ConversationId, participants => map_size(Room)}),
     send_many(room_pids(Room), #{type => call_state, conversation_id => ConversationId, users => room_users(Room)}),
@@ -519,6 +524,40 @@ new_call_member(Pid, Profile, Audience, Previous) ->
     (new_member(Pid, Profile, Previous))#{
         audience => lists:usort(Audience ++ maps:get(audience, Previous, []))
     }.
+
+%% Session timing is shared by every member, so it survives the starter leaving,
+%% reconnects, and device replacement. Ringing and solitary rooms do not count.
+track_call_session(Previous, Joined) ->
+    Existing = [Session || #{call_session := Session} <- maps:values(Previous)],
+    case Existing of
+        [Session | _] -> maps:map(fun(_, Info) -> Info#{call_session => Session} end, Joined);
+        [] when map_size(Joined) >= 2 ->
+            Session = #{started => erlang:monotonic_time(millisecond)},
+            maps:map(fun(_, Info) -> Info#{call_session => Session} end, Joined);
+        [] -> Joined
+    end.
+
+completed_call(Previous, Ended) ->
+    case maps:to_list(Previous) of
+        [{Uid, #{call_session := #{started := Started}}} | _] -> {Uid, max(0, (Ended - Started) div 1000)};
+        _ -> none
+    end.
+
+persist_completed_call(Cid, Previous) ->
+    case completed_call(Previous, erlang:monotonic_time(millisecond)) of
+        {Uid, Seconds} ->
+            Job = fun() ->
+                case pw_db:record_completed_call(Uid, Cid, Seconds) of
+                    {ok, _} -> ok;
+                    {error, Reason} -> logger:warning("[plainwire:hub] completed_call_not_persisted ~p", [Reason])
+                end
+            end,
+            case pw_async_pool:submit(Job) of
+                ok -> ok;
+                {error, Reason} -> logger:warning("[plainwire:hub] completed_call_queue_full ~p", [Reason])
+            end;
+        _ -> ok
+    end.
 
 %% one user, one RTC room. enforce it here too; tabs are sneaky.
 evict_other_rooms(Uid, NewPid, KeepKey, St0) ->
@@ -797,6 +836,9 @@ remove_user_from_room_now(Kind, Id, Uid, Rooms0, Users) ->
             end,
             put_or_remove(Key, Room, Rooms0)
     end.
+put_or_remove({call, Cid} = Key, Room, Map) when map_size(Room) =:= 0 ->
+    persist_completed_call(Cid, maps:get(Key, Map, #{})),
+    maps:remove(Key, Map);
 put_or_remove(Key, Room, Map) when map_size(Room) =:= 0 -> maps:remove(Key, Map);
 put_or_remove(Key, Room, Map) -> maps:put(Key, Room, Map).
 room_users(Room) ->

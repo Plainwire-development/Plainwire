@@ -41,6 +41,7 @@ messages.push(message(20, 'Happy to. New walkthrough:\n\nhttps://www.youtube.com
 messages.push(message(21, 'Also tracking progress here: https://example.com/project'));
 messages.push(message(22, 'Nothing to see: https://gone.example/nope'));
 messages.push({...message(23, 'Missed call'),kind:'missed_call'});
+messages.push({...message(30, 'Call ended · 12:34'),kind:'call_ended'});
 messages.push(message(26, 'A direct GIF:\n\nhttps://media.example/celebrate.gif'));
 messages.push(message(27, 'Markdown image syntax:\n\n![Celebration](https://media.example/confetti.gif)'));
 messages.push(message(28, 'A static image beside a caption: https://media.example/diagram.png and it stays in this message.'));
@@ -148,6 +149,18 @@ try {
  await page.getByText('Development pulse',{exact:true}).last().waitFor();
  await page.getByRole('button',{name:'Close source tour',exact:true}).click();
  assert.equal(await page.locator('.source-tour-guide,.source-tour-spotlight').count(),0,'source tour cleans up all overlay UI');
+ for (const width of [820,390]) {
+  await page.setViewportSize({width,height:740});
+  await page.getByRole('button',{name:'Take the tour',exact:true}).click();
+  for(let step=1;step<=7;step++) {
+   await page.waitForFunction(n=>document.querySelector('.source-tour-guide [role="progressbar"]')?.getAttribute('aria-valuenow')===String(n),step);
+   const box=await page.locator('.source-tour-guide').boundingBox();
+   assert(box.x>=0&&box.y>=0&&box.x+box.width<=width+1&&box.y+box.height<=741,`source guide stays in ${width}px viewport at step ${step}`);
+   await page.locator('.source-tour-guide').press('ArrowRight');
+  }
+  assert.equal(await page.locator('.source-tour-guide').count(),0);
+ }
+
  await page.setViewportSize({width:390,height:844});
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'Source page has no mobile viewport overflow');
  await page.screenshot({path:'test-results/source-mobile.png',animations:'disabled'});
@@ -171,6 +184,14 @@ try {
  try { await page.waitForFunction(()=>{const el=document.querySelector('#messages');return el&&el.scrollHeight-el.scrollTop-el.clientHeight<5;},{timeout:5000}); }
  catch (error) { console.log(await page.evaluate(()=>({metrics:(()=>{const el=document.querySelector('#messages');return {top:el?.scrollTop,height:el?.scrollHeight,client:el?.clientHeight};})(),trace:window.__plainwireScrollTrace}))); throw error; }
  assert.equal(await page.getByRole('note',{name:/Missed call/}).count(),1,'missed calls render as timeline events');
+ assert.equal(await page.locator('.call-event.completed').count(),1,'completed calls render in chat history');
+ assert((await page.locator('.call-event.completed').textContent()).includes('12:34'),'call duration remains visible');
+ await page.locator('#compose').click({button:'right'});
+ await page.locator('.fallback-context-menu').waitFor();
+ assert.notEqual(await page.locator('.fallback-context-menu').evaluate(el=>getComputedStyle(el).backgroundColor),'rgba(0, 0, 0, 0)','composer context menu has an opaque surface');
+ await page.keyboard.press('Escape');
+ assert.equal(await page.locator('.fallback-context-menu').count(),0,'Escape closes the editing menu');
+
  const activeRowInset=await page.locator('.side .dm-row.active').evaluate(row=>{const side=row.closest('.side').getBoundingClientRect(),box=row.getBoundingClientRect();return side.right-box.right;});
  assert(activeRowInset>=8,`selected conversation stays clear of the navigation edge (${activeRowInset}px)`);
  await page.keyboard.press('Control+k');await page.getByRole('searchbox',{name:'Find conversations and servers'}).fill('no such room');
@@ -273,7 +294,7 @@ try {
    const mobileCompose=await page.locator('#compose').evaluate(el=>({height:el.clientHeight,scroll:el.scrollHeight,overflow:getComputedStyle(el).overflowY}));
    assert(mobileCompose.height<=112&&mobileCompose.scroll>mobileCompose.height&&mobileCompose.overflow==='auto',JSON.stringify({message:'mobile composer stays bounded',mobileCompose}));
    assert(await page.locator('#messages').evaluate(el=>el.clientHeight>=120),'long drafts leave room to read chat on mobile');
-   const callLayout=await page.locator('.call-event').evaluate(card=>{const action=card.querySelector('.call-event-action').getBoundingClientRect(),box=card.getBoundingClientRect(),next=card.nextElementSibling?.getBoundingClientRect(),style=getComputedStyle(card);return {actionInside:action.bottom<=box.bottom+.5,nextClear:!next||next.top>=box.bottom-.5,actionBottom:action.bottom,boxBottom:box.bottom,boxHeight:box.height,display:style.display,rows:style.gridTemplateRows,overflow:style.overflow,visibility:style.contentVisibility};});
+   const callLayout=await page.locator('.call-event:not(.completed)').evaluate(card=>{const action=card.querySelector('.call-event-action').getBoundingClientRect(),box=card.getBoundingClientRect(),next=card.nextElementSibling?.getBoundingClientRect(),style=getComputedStyle(card);return {actionInside:action.bottom<=box.bottom+.5,nextClear:!next||next.top>=box.bottom-.5,actionBottom:action.bottom,boxBottom:box.bottom,boxHeight:box.height,display:style.display,rows:style.gridTemplateRows,overflow:style.overflow,visibility:style.contentVisibility};});
    assert(callLayout.actionInside&&callLayout.nextClear,`mobile missed-call action stays inside its card and clear of the next message: ${JSON.stringify(callLayout)}`);
   }
   await page.getByLabel('Message formatting',{exact:true}).click();
@@ -425,5 +446,17 @@ try {
  await page.screenshot({path:'test-results/group-chat-mobile.png',animations:'disabled'});
  authenticated=false;const auth=await browser.newContext({viewport:{width:1440,height:960},colorScheme:'light'});await setup(auth);const login=await auth.newPage();login.on('pageerror',e=>errors.push(e.message));await login.goto(origin);await login.waitForSelector('.auth-submit');await login.screenshot({path:'test-results/login-desktop.png'});await login.setViewportSize({width:390,height:844});await login.screenshot({path:'test-results/login-mobile.png'});
  const blocked=await browser.newContext();await setup(blocked);await blocked.addInitScript(()=>Object.defineProperty(window,'localStorage',{get(){throw new DOMException('Storage blocked','SecurityError')}}));const blockedPage=await blocked.newPage();blockedPage.on('pageerror',e=>errors.push(e.message));await blockedPage.goto(origin);await blockedPage.waitForSelector('.auth-submit');
+ const welcome=await browser.newContext({viewport:{width:390,height:640},reducedMotion:'reduce'});authenticated=true;await setup(welcome);
+ await welcome.route('**/api/onboarding**',route=>route.fulfill({json:{ok:true,data:{state:'active',step:1}}}));
+ const tourPage=await welcome.newPage();tourPage.on('pageerror',e=>errors.push(e.message));await tourPage.goto(origin);await tourPage.evaluate(()=>location.hash='#dms');
+ await tourPage.locator('.dm-inbox').getByRole('button',{name:'Resume Plainwire welcome tour'}).click();
+ await tourPage.getByRole('button',{name:'Resume tour',exact:true}).click();
+ await tourPage.locator('.pw-tour-guide [role="progressbar"]').waitFor();
+ await tourPage.locator('.pw-tour-guide').getByRole('button',{name:'Next',exact:true}).waitFor();
+ const welcomeBox=await tourPage.locator('.pw-tour-guide').boundingBox();
+ assert(welcomeBox.x>=0&&welcomeBox.y>=0&&welcomeBox.x+welcomeBox.width<=391&&welcomeBox.y+welcomeBox.height<=641,'welcome guide fits a small phone');
+ await tourPage.screenshot({path:'test-results/welcome-tour-mobile.png'});
+ await tourPage.keyboard.press('Escape');assert.equal(await tourPage.locator('.pw-tour-guide').count(),0);
+ await welcome.close();
  assert.deepEqual(errors,[],'no browser exceptions');console.log('PASS: missed-call cards; recent-DM Markdown; mentions and autocomplete; initial latest-message positioning; bounded mobile composer; click-select group creation and adding members; live membership refresh; long server names; functional Plainwire Source mark and guided architecture tour; mobile customization footer; quick switcher keyboard navigation/dismissal; sidebar resizing; workspace menu dismissal; latest-message navigation and preserved reading position; scoped media updates; settings tab scroll reset; Markdown and syntax highlighting; unsafe markup rejection; settings search; welcome preview; Wire expiry/revocation; desktop/light/dark/mobile layouts; drafts across routes; concurrent sends out of order; new draft preserved; late send isolated; failed send/retry; sign-in; no runtime exceptions.');
 } finally {await browser.close();server.close();}

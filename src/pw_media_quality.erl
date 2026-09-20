@@ -85,6 +85,9 @@ policy(#{upstream_score := Score, upstream_loss_pct := Loss})
   when is_number(Score), Score =< 75, is_number(Loss), Loss >= 5 -> reduce_screen_bitrate;
 policy(#{score := Score}) when Score =:= null -> insufficient_data;
 policy(#{score := Score, upstream_loss_pct := Loss}) when is_number(Loss), Loss >= 5, Score < 60 -> reduce_screen_bitrate;
+policy(#{score := Score, recent_score := Recent, confidence_pct := Evidence})
+  when is_number(Score), is_number(Recent), is_number(Evidence), Evidence >= 40,
+       Score < 75, Recent >= 90 -> connection_recovered;
 policy(#{concealment_pct := Conceal}) when is_number(Conceal), Conceal >= 5 -> audio_gaps;
 policy(#{score := Score, recent_score := Recent, confidence_pct := Evidence,
          jitter_trend := Jitter, loss_trend := Loss})

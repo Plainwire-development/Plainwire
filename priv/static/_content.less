@@ -542,19 +542,20 @@
 .group-member { min-height: 54px; padding: 8px 9px; border-radius: @r-md; }
 .group-member:hover { background: var(--hover); }
 
-.settings-page { height: 100%; border: 0; border-radius: 0; background: var(--bg2); box-shadow: none; }
+.settings-page { width: 100%; min-height: 0; margin-inline: 0; height: 100%; border: 0; border-radius: 0; background: var(--bg2); box-shadow: none; }
 .settings-sidebar { width: 210px; min-width: 210px; padding: 28px 10px; border-right: 1px solid var(--line); background: var(--bg); }
 .settings-nav-label { padding: 0 12px 12px; color: var(--muted); font-size: 10px; font-weight: 750; letter-spacing: .08em; }
 .settings-tab { min-height: 42px; margin: 2px 0; padding: 10px 12px; border: 0; border-radius: 9px; background: transparent; color: var(--text2); font-size: 12px; }
 .settings-tab:hover { background: var(--hover); color: var(--text1); transform: none; }
 .settings-tab.active { border-left-color: transparent; background: var(--active); color: var(--text1); font-weight: 680; }
-.settings-content { padding: 0; background: var(--bg2); }
+.settings-content { min-height: 0; padding: 0; background: var(--bg2); scrollbar-gutter: stable; }
 .settings-content-top { min-height: 104px; padding: 27px clamp(28px, 4vw, 44px) 22px; border-bottom: 1px solid var(--line); background: var(--bg2); }
 .settings-content-top h1 { margin: 3px 0 0; color: var(--text1); font-size: 27px; font-weight: 680; letter-spacing: -.04em; }
 .settings-user-chip { padding: 6px 10px 6px 7px; border: 1px solid var(--line); border-radius: 999px; background: var(--bg); }
 .settings-search { padding: 22px clamp(28px, 4vw, 44px) 0; }
 .settings-search input { width: min(820px, 100%); min-height: 44px; background: var(--bg); }
 .settings-content-inner { padding: 26px clamp(28px, 4vw, 44px) 48px; }
+.settings-content:has(pw-developer-portal) .settings-search-field { width: 100%; }
 .settings-card { width: min(820px, 100%); overflow: hidden; border-radius: var(--card-radius); background: var(--bg2); box-shadow: var(--shadow-xs); }
 .settings-card-head { padding: 25px 26px 19px; border-bottom: 1px solid var(--line); }
 .settings-card-head h2 { margin: 0; color: var(--text1); font-size: 19px; font-weight: 680; letter-spacing: -.02em; }

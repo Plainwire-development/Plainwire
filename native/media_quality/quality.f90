@@ -12,7 +12,21 @@ contains
     integer, intent(in) :: n
     real(c_double), intent(inout) :: values(:)
     real(c_double) :: value
-    integer :: i, j
+    integer :: i, j, last
+    ! Pairwise trend windows contain up to 276 values. Heap sort bounds these
+    ! at O(n log n); insertion sort remains cheaper for the 24-sample windows.
+    if (n > max_rows) then
+      do i = n / 2, 1, -1
+        call sift_down(values, i, n)
+      end do
+      do last = n, 2, -1
+        value = values(last)
+        values(last) = values(1)
+        values(1) = value
+        call sift_down(values, 1, last - 1)
+      end do
+      return
+    end if
     do i = 2, n
       value = values(i)
       j = i - 1
@@ -24,6 +38,25 @@ contains
       values(j + 1) = value
     end do
   end subroutine sort_values
+
+  pure subroutine sift_down(values, start, last)
+    real(c_double), intent(inout) :: values(:)
+    integer, intent(in) :: start, last
+    integer :: root, child
+    real(c_double) :: value
+    root = start
+    value = values(root)
+    do while (root * 2 <= last)
+      child = root * 2
+      if (child < last) then
+        if (values(child) < values(child + 1)) child = child + 1
+      end if
+      if (value >= values(child)) exit
+      values(root) = values(child)
+      root = child
+    end do
+    values(root) = value
+  end subroutine sift_down
 
   ! Median pairwise slope (Theil-Sen), in units per ten seconds. A single
   ! arrival spike should affect p95, but should not manufacture a rising trend.
@@ -83,27 +116,13 @@ contains
     score = max(0.0_c_double, 100 - penalty)
   end function network_score
 
-  ! Evidence needs sustained observations. A tab suspended for a minute does
-  ! not provide a minute of measured network quality when it wakes up.
-  pure function observed_seconds(times, n) result(seconds)
-    integer, intent(in) :: n
-    real(c_double), intent(in) :: times(:)
-    real(c_double) :: seconds, gap
-    integer :: i
-    seconds = 0
-    do i = 2, n
-      gap = times(i) - times(i - 1)
-      if (gap <= 20) seconds = seconds + gap
-    end do
-  end function observed_seconds
-
   subroutine analyze(n, x, out) bind(C, name='pw_quality_analyze')
     integer(c_int), value :: n
     real(c_double), intent(in) :: x(9, n)
     real(c_double), intent(out) :: out(output_count)
     real(c_double) :: means(8), devs(8), stable_devs(8), slopes(8), vals(max_rows), times(max_rows), weights(max_rows)
     real(c_double) :: recent(8), jitter_p95, recent_p95, duration, measured, burst, longest, run
-    real(c_double) :: weight, evidence(8), total_span, stability_penalty
+    real(c_double) :: weight, evidence(8), total_span, stability_penalty, recent_evidence
     real(c_double), parameter :: maxima(9) = [300.0_c_double, 100.0_c_double, 10000.0_c_double, &
       30000.0_c_double, 100.0_c_double, 30000.0_c_double, 100000.0_c_double, 100000.0_c_double, 100.0_c_double]
     integer :: counts(8), i, j, m, first
@@ -153,13 +172,19 @@ contains
       end do
       counts(j) = m
       if (m == 0) cycle
-      evidence(j) = observed_seconds(times, m)
+      evidence(j) = 0
+      do i = 2, n
+        duration = x(1, i) - x(1, i - 1)
+        if (x(j + 1, i) >= 0 .and. x(j + 1, i - 1) >= 0 .and. duration <= 20) then
+          evidence(j) = evidence(j) + duration
+        end if
+      end do
       weight = sum(weights(1:m))
       if (weight <= 0) cycle
       means(j) = sum(vals(1:m) * weights(1:m)) / weight
       devs(j) = sqrt(sum(weights(1:m) * (vals(1:m) - means(j))**2) / weight)
       stable_devs(j) = robust_deviation(vals, m)
-      eligible(j) = m >= 3 .and. evidence(j) >= 10
+      eligible(j) = m >= 3 .and. evidence(j) >= 10 .and. times(m) >= x(1, n) - 10
       if (j <= 2 .and. eligible(j)) slopes(j) = robust_slope(vals, times, m)
       if (j <= 5) then
         first = 1
@@ -170,7 +195,15 @@ contains
         if (first <= m) then
           weight = sum(weights(first:m))
           if (weight > 0) recent(j) = sum(vals(first:m) * weights(first:m)) / weight
-          recent_eligible(j) = m - first + 1 >= 3 .and. observed_seconds(times(first:m), m - first + 1) >= 10
+          recent_evidence = 0
+          do i = 2, n
+            if (x(1, i - 1) < x(1, n) - 20) cycle
+            duration = x(1, i) - x(1, i - 1)
+            if (x(j + 1, i) >= 0 .and. x(j + 1, i - 1) >= 0 .and. duration <= 20) then
+              recent_evidence = recent_evidence + duration
+            end if
+          end do
+          recent_eligible(j) = m - first + 1 >= 3 .and. recent_evidence >= 10
           if (j == 2) then
             call sort_values(vals(first:m), m - first + 1)
             recent_p95 = vals(first - 1 + ceiling(0.95_c_double * (m - first + 1)))

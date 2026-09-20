@@ -48,6 +48,7 @@
     receiving_packet_loss: 'Incoming audio packets are being lost.',
     high_latency: 'Network delay is high. Avoid busy Wi-Fi or heavy downloads.',
     unstable_arrival: 'Audio packets are arriving unevenly. A steadier connection may help.',
+    connection_recovered: 'The last 20 seconds look healthy again. Earlier disruption still affects the full-call score.',
     burst_packet_loss: 'Packets are being lost in sustained bursts. Check for competing network traffic.',
     deteriorating_connection: 'Recent measurements are worse than earlier in this call.'
   };

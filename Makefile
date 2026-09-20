@@ -136,6 +136,7 @@ test-release-contract:
 
 test-browser: frontend test-rtc-contract test-ui-contract test-admin-contract test-integrations-contract test-storage-contract test-storage-tools test-v21-contract test-scalability-contract test-release-contract
 	$(NPM) run test:browser
+	$(NODE) test/browser/settings-responsive.mjs
 	$(NPM) run test:rtc
 
 test-native: native

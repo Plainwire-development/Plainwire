@@ -76,3 +76,7 @@ native_calculation() ->
         after 1500 -> ?assert(false) end
     after gen_server:stop(Worker) end.
 rows() -> [[T, 0, 5, 40, 0, 20, 24, 24, -1] || T <- [0,5,10]].
+
+recovery_policy_test() ->
+    ?assertEqual(connection_recovered, pw_media_quality:policy(#{score => 60, recent_score => 95, confidence_pct => 80})),
+    ?assertNotEqual(connection_recovered, pw_media_quality:policy(#{score => 60, recent_score => 95, confidence_pct => 10})).

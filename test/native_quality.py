@@ -67,6 +67,18 @@ for end in range(1, len(packet(good))):
 with subprocess.Popen([worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as stalled:
     stalled.stdin.write(packet(good)[:8]); stalled.stdin.flush()
     assert stalled.wait(timeout=2) != 0
+# A stalled header has the same deadline as a stalled payload.
+with subprocess.Popen([worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as stalled:
+    stalled.stdin.write(packet(good)[:1]); stalled.stdin.flush()
+    assert stalled.wait(timeout=2) != 0
+# Missing samples cannot be bridged into evidence of a continuous connection.
+intermittent = [[t, -1, 5 if t % 10 == 0 else -1, 40 if t % 10 == 0 else -1, -1, -1, -1, -1, -1] for t in range(0, 45, 5)]
+assert analyze(intermittent)[0] == -1 and analyze(intermittent)[18] == 0
+stale = good + [[t] + [-1] * 8 for t in (15, 20, 25)]
+assert analyze(stale)[0] == -1, 'stale measurements must not report a healthy live connection'
+# Pairwise slope sort must retain exact median behavior for full windows.
+full_rise = [[t, 0, 5 + t, 40, 0, 20, 24, 24, -1] for t in range(0, 120, 5)]
+assert math.isclose(analyze(full_rise)[8], 10)
 # Deterministic bounded random windows exercise numerical output limits.
 rng = random.Random(1701)
 limits = [100, 10000, 30000, 100, 30000, 100000, 100000, 100]
