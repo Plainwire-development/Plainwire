@@ -26,10 +26,11 @@ const [bridge, elm, api, db, ws, cluster, clusterWire, clusterLocal, klipy, conf
   readFile('priv/static/plainwire-mark.svg', 'utf8')
 ]);
 
-const [adminMarkSvg, fullLogoSvg, browserRun] = await Promise.all([
+const [adminMarkSvg, fullLogoSvg, browserRun, markdown] = await Promise.all([
   readFile('priv/admin/plainwire-mark.svg', 'utf8'),
   readFile('priv/static/plainwire-logo.svg', 'utf8'),
-  readFile('test/browser/run.mjs', 'utf8')
+  readFile('test/browser/run.mjs', 'utf8'),
+  readFile('web/markdown.js', 'utf8')
 ]);
 
 const between = (text, start, end) => {
@@ -213,6 +214,9 @@ assert.match(db, /queue_server_storage_event\(Conn, <<"member\.banned">>/, 'ban 
 assert.match(bridge, /const parseWireUrl = \(url\)/, 'client recognizes first-party Plainwire Wire links before generic unfurling');
 assert.match(bridge, /directApi\(`\/wires\/\$\{encodeURIComponent\(wireCode\)\}`\)/, 'Wire embeds resolve through Plainwire invite metadata instead of fetching URL fragments server-side');
 assert.match(bridge, /createWireEmbedCard[\s\S]*PLAINWIRE SERVER INVITE[\s\S]*Open Wire/, 'Wire links render a dedicated Discord-style server invite card with an explicit action');
+assert.match(markdown, /wireCodeForUrl[\s\S]*plainwi\.re/, 'the active Markdown embed path recognizes canonical plainwi.re Wire URLs');
+assert.match(markdown, /wireCode \? `\/api\/wires\//, 'the active Markdown embed path resolves Wires through authoritative invite metadata');
+assert.match(markdown, /wireEmbedCard[\s\S]*PLAINWIRE WIRE[\s\S]*Open Wire/, 'the active Markdown embed path renders the server invite card');
 assert.match(bridge, /const renderBans = \(\) =>[\s\S]*directApi\(`\/server\/\$\{serverId\}\/bans`\)[\s\S]*actionButton\('Unban'/, 'server administration has a real bans management view backed by the bans API and unban action');
 assert.match(elm, /profile\.canBanMembers && not viewingSelf/, 'server profile popup exposes Ban only when backend capability permits it and never as self moderation');
 

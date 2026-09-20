@@ -46,6 +46,7 @@ messages.push(message(26, 'A direct GIF:\n\nhttps://media.example/celebrate.gif'
 messages.push(message(27, 'Markdown image syntax:\n\n![Celebration](https://media.example/confetti.gif)'));
 messages.push(message(28, 'A static image beside a caption: https://media.example/diagram.png and it stays in this message.'));
 messages.push(message(29, 'Text before ![inline.gif](/api/files/pasted-gif) and text after the pasted GIF.'));
+messages.push(message(33, 'Join the server: https://plainwi.re/#wire/wire-card-123'));
 async function setup(context){
  await context.route('**/api/**',async route=>{
   const req=route.request(), url=new URL(req.url()), path=url.pathname;
@@ -67,6 +68,7 @@ async function setup(context){
   if(path==='/api/server/1/wires' && req.method()==='GET')return reply([{code:'test-link',max_uses:10,uses:2,expires_at:now+86400000,created_at:now,revoked:inviteRevoked}]);
   if(path==='/api/server/1/wires' && req.method()==='POST'){inviteOptions=req.postDataJSON();return reply({code:'new-link',url:'#wire/new-link',expires_at:now+3600000});}
   if(path==='/api/server/1/wires/test-link' && req.method()==='DELETE'){inviteRevoked=true;return reply({});}
+  if(path==='/api/wires/wire-card-123')return reply({code:'wire-card-123',valid:true,expires_at:now+86400000,channel_name:'general',creator:{display_name:'Alex Morgan'},server:{name:'The Workshop',description:'A place to build and share.',icon_url:'',banner_url:'',accent_color:'#326b98',member_count:4}});
   if(path==='/api/server/1'){if(req.method()==='POST')testServer={...testServer,...req.postDataJSON()};return reply(serverData());}
   if(path==='/api/messages'){messageFetches++;return reply(url.searchParams.get('scope_id')==='1'?messages:[]);}
   if(/^\/api\/conversation\/\d+\/messages$/.test(path)){
@@ -240,6 +242,15 @@ try {
  assert(embedHits.includes('https://gone.example/nope'),'unresolvable link still attempted then dropped');
  assert(!embedHits.some(h=>h.includes('youtube.com')),'video cards never call the metadata proxy');
  assert(!embedHits.includes('https://example.com/notes'),'link text differing from href is never embedded');
+ const wireMsg=page.locator('.msg',{hasText:'Join the server'});await wireMsg.scrollIntoViewIfNeeded();await wireMsg.locator('.wire-embed').waitFor();
+ assert.equal(await wireMsg.locator('.wire-embed-identity strong').textContent(),'The Workshop','plainwi.re Wire renders the server identity card');
+ assert.equal(await wireMsg.locator('.wire-embed-actions a').getAttribute('href'),'#wire/wire-card-123','Wire card opens the local invite route');
+ assert(!embedHits.some(h=>h.includes('plainwi.re')),'Wire links bypass the generic external metadata crawler');
+ await page.screenshot({path:'test-results/wire-embed.png'});
+ await page.setViewportSize({width:390,height:844});await wireMsg.scrollIntoViewIfNeeded();
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'Wire card does not widen the mobile viewport');
+ assert((await wireMsg.locator('.wire-embed').boundingBox()).width<=360,'Wire card stays within the mobile message column');
+ await page.screenshot({path:'test-results/wire-embed-mobile.png'});await page.setViewportSize({width:1440,height:960});
  const directGif=page.locator('.msg',{hasText:'A direct GIF'});await directGif.scrollIntoViewIfNeeded();await directGif.locator('.message-gif-link .animated-image').waitFor();
  const markdownGif=page.locator('.msg',{hasText:'Markdown image syntax'});await markdownGif.scrollIntoViewIfNeeded();await markdownGif.locator('.message-gif-link .animated-image').waitFor();
  const staticImage=page.locator('.msg',{hasText:'A static image beside a caption'});await staticImage.scrollIntoViewIfNeeded();await staticImage.locator('.remote-image-embed .message-image').waitFor();
@@ -366,8 +377,8 @@ try {
  await page.getByRole('button',{name:'Customize',exact:true}).click();
  await page.getByPlaceholder('Server name',{exact:true}).fill('plainwire development and friends');
  await page.getByPlaceholder('What is this server for?').fill('Building things together, hanging out, and talking every day.');
- await page.getByRole('button',{name:'Use #3b82f6',exact:true}).click();
- assert.equal(await page.getByRole('button',{name:'Use #3b82f6',exact:true}).getAttribute('aria-pressed'),'true');
+ await page.getByRole('button',{name:'Use Ocean accent',exact:true}).click();
+ assert.equal(await page.getByRole('button',{name:'Use Ocean accent',exact:true}).getAttribute('aria-pressed'),'true');
  assert.equal(await page.locator('.server-preview-identity h3').textContent(),'plainwire development and friends');
  await page.setViewportSize({width:390,height:640});
  await page.locator('.modal-body').evaluate(el=>{el.scrollTop=0;});

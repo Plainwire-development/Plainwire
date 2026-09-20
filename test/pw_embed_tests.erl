@@ -33,6 +33,13 @@ relative_image_resolves_against_page_test() ->
     Meta = pw_embed:parse_og(Html, ?URL),
     ?assertEqual(pw_media:proxy_url(<<"https://news.example.com/img/cover.jpg">>), maps:get(<<"image">>, Meta)).
 
+favicon_and_page_kind_test() ->
+    Html = <<"<head><link href='/icons/app.png' rel='shortcut icon'>",
+             "<meta property='og:type' content='article'></head>">>,
+    Meta = pw_embed:parse_og(Html, ?URL),
+    ?assertEqual(pw_media:proxy_url(<<"https://news.example.com/icons/app.png">>), maps:get(<<"favicon">>, Meta)),
+    ?assertEqual(<<"article">>, maps:get(<<"kind">>, Meta)).
+
 non_utf8_and_truncated_pages_still_parse_test() ->
     Latin1 = <<"<head><meta property=\"og:title\" content=\"Caf", 233, "\"></head>">>,
     ?assertEqual(<<"Caf", 195, 169>>, maps:get(<<"title">>, pw_embed:parse_og(Latin1, ?URL))),
@@ -49,4 +56,5 @@ response_types_test() ->
     ?assertMatch({ok, #{<<"kind">> := <<"gif">>}}, pw_embed:page_meta(?URL, <<"image/gif">>, <<>>)),
     ?assertMatch({ok, #{<<"kind">> := <<"image">>}}, pw_embed:page_meta(?URL, <<"image/png">>, <<>>)),
     ?assertMatch({ok, #{<<"title">> := <<"T">>}}, pw_embed:page_meta(?URL, <<"text/html">>, <<"<title>T</title>">>)),
-    ?assertEqual({error, unsupported_type}, pw_embed:page_meta(?URL, <<"application/pdf">>, <<>>)).
+    ?assertMatch({ok, #{<<"kind">> := <<"pdf">>}}, pw_embed:page_meta(<<"https://example.com/guide.pdf">>, <<"application/pdf">>, <<>>)),
+    ?assertEqual({error, unsupported_type}, pw_embed:page_meta(?URL, <<"application/octet-stream">>, <<>>)).

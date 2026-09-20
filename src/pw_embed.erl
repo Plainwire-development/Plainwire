@@ -50,6 +50,9 @@ page_meta(Url, <<"image/gif">>, _) -> {ok, image_meta(Url, gif)};
 page_meta(Url, Type, _) when Type =:= <<"image/png">>; Type =:= <<"image/jpeg">>;
                              Type =:= <<"image/webp">>; Type =:= <<"image/avif">> ->
     {ok, image_meta(Url, image)};
+page_meta(Url, <<"application/pdf">>, _) -> {ok, document_meta(Url, <<"PDF document">>, <<"pdf">>)};
+page_meta(Url, <<"text/plain">>, _) -> {ok, document_meta(Url, <<"Text document">>, <<"text">>)};
+page_meta(Url, <<"application/json">>, _) -> {ok, document_meta(Url, <<"JSON document">>, <<"code">>)};
 page_meta(_, _, _) -> {error, unsupported_type}.
 
 image_kind(Url) ->
@@ -78,6 +81,17 @@ image_meta(Url, Kind) ->
         <<"kind">> => atom_to_binary(Kind, utf8)
     }.
 
+document_meta(Url, FallbackTitle, Kind) ->
+    #{
+        <<"url">> => Url,
+        <<"title">> => pick(url_filename(Url), FallbackTitle, FallbackTitle),
+        <<"description">> => FallbackTitle,
+        <<"image">> => <<>>,
+        <<"favicon">> => <<>>,
+        <<"site_name">> => host_of(Url),
+        <<"kind">> => Kind
+    }.
+
 parse_og(Html, Url) ->
     Meta = meta_tags(Html),
     Get = fun(Keys) -> first_value(Keys, Meta) end,
@@ -86,9 +100,15 @@ parse_og(Html, Url) ->
     Image = text(Get([<<"og:image:secure_url">>, <<"og:image">>, <<"og:image:url">>,
                       <<"twitter:image">>, <<"twitter:image:src">>]), 2048),
     Site = text(Get([<<"og:site_name">>, <<"application-name">>]), 200),
+    PageKind = text(Get([<<"og:type">>]), 40),
     ProxiedImage = case absolutize(Image, Url) of
         <<"http://", _/binary>> = Abs -> pw_media:proxy_url(Abs);
         <<"https://", _/binary>> = Abs -> pw_media:proxy_url(Abs);
+        _ -> <<>>
+    end,
+    ProxiedIcon = case absolutize(icon_href(Html), Url) of
+        <<"http://", _/binary>> = IconAbs -> pw_media:proxy_url(IconAbs);
+        <<"https://", _/binary>> = IconAbs -> pw_media:proxy_url(IconAbs);
         _ -> <<>>
     end,
     #{
@@ -96,7 +116,9 @@ parse_og(Html, Url) ->
         <<"title">> => pick(Title, text(title_tag(Html), 300), host_of(Url)),
         <<"description">> => Desc,
         <<"image">> => ProxiedImage,
-        <<"site_name">> => pick(Site, host_of(Url), <<>>)
+        <<"favicon">> => ProxiedIcon,
+        <<"site_name">> => pick(Site, host_of(Url), <<>>),
+        <<"kind">> => pick(PageKind, <<"link">>, <<"link">>)
     }.
 
 %% Decoded per value rather than per page, so one stray byte elsewhere cannot turn
@@ -115,13 +137,33 @@ to_utf8(Bin) ->
 %% Attribute order and quoting vary: content may come before property, values may
 %% be single-quoted, and names differ in case.
 meta_tags(Html) ->
-    Head = case re:run(Html, <<"</head\\s*>">>, [caseless, {capture, first, index}]) of
-        {match, [{Pos, _}]} -> binary:part(Html, 0, Pos);
-        nomatch -> Html
-    end,
+    Head = head_html(Html),
     case re:run(Head, <<"<meta\\s[^>]*>">>, [global, caseless, {capture, first, binary}]) of
         {match, Tags} -> lists:reverse(lists:foldl(fun([Tag], Acc) -> add_meta(attrs(Tag), Acc) end, [], Tags));
         nomatch -> []
+    end.
+
+head_html(Html) ->
+    case re:run(Html, <<"</head\\s*>">>, [caseless, {capture, first, index}]) of
+        {match, [{Pos, _}]} -> binary:part(Html, 0, Pos);
+        nomatch -> Html
+    end.
+
+icon_href(Html) ->
+    Head = head_html(Html),
+    case re:run(Head, <<"<link\\s[^>]*>">>, [global, caseless, {capture, first, binary}]) of
+        {match, Tags} -> first_icon_href(Tags);
+        nomatch -> <<>>
+    end.
+
+first_icon_href([]) -> <<>>;
+first_icon_href([[Tag] | Rest]) ->
+    Attrs = attrs(Tag),
+    Rel = string:lowercase(first_value([<<"rel">>], Attrs)),
+    Href = first_value([<<"href">>], Attrs),
+    case Href =/= <<>> andalso re:run(Rel, <<"(?:^|\\s)(?:shortcut\\s+)?icon(?:\\s|$)|(?:^|\\s)apple-touch-icon(?:\\s|$)">>, [{capture, none}]) =:= match of
+        true -> Href;
+        false -> first_icon_href(Rest)
     end.
 
 add_meta(Attrs, Acc) ->
@@ -200,6 +242,20 @@ host_of(Url) ->
     case uri_string:parse(binary_to_list(Url)) of
         #{host := H} -> pw_util:bin(H);
         _ -> <<>>
+    end.
+
+url_filename(Url) ->
+    try uri_string:parse(binary_to_list(Url)) of
+        #{path := Path} ->
+            Name0 = pw_util:bin(filename:basename(Path)),
+            Name = try uri_string:percent_decode(Name0) of
+                Decoded when is_binary(Decoded) -> Decoded;
+                _ -> Name0
+            catch _:_ -> Name0
+            end,
+            text(Name, 300);
+        _ -> <<>>
+    catch _:_ -> <<>>
     end.
 
 pick(<<>>, Alt, _Def) when byte_size(Alt) > 0 -> Alt;

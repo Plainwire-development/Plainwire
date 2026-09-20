@@ -29,6 +29,9 @@ assert.match(elm, /emojiPickerItems/, 'emoji picker uses a maintained item list'
 assert.match(bridge, /insert_composer_text/, 'emoji selection inserts at the active composer cursor');
 assert.match(markdown, /mention\.dataset\.mentionUsername/, 'mentions retain an exact username target');
 assert.match(markdown, /profile-by-username\?username=/, 'clicking a mention resolves the exact profile');
+assert.match(markdown, /const EMBED_LIMIT = 5/, 'chat supports several bounded rich previews per message');
+assert.match(markdown, /wireCodeForUrl[\s\S]*plainwi\.re[\s\S]*\/api\/wires\//, 'active Markdown rendering resolves canonical plainwi.re Wire links through invite metadata');
+assert.match(markdown, /wireEmbedCard[\s\S]*PLAINWIRE WIRE[\s\S]*Open Wire/, 'active Markdown rendering builds a first-party server invite card');
 
 
 // Plainwire Source: the logo opens a real first-class route backed by a bounded,

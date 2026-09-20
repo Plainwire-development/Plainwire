@@ -2691,18 +2691,8 @@ submitModal model =
 
             else if kind == "join_invite" then
                 let
-                    rawWire =
-                        String.trim model.modalUserIds
-
                     code =
-                        if String.contains "#wire/" rawWire then
-                            rawWire |> String.split "#wire/" |> List.reverse |> List.head |> Maybe.withDefault ""
-
-                        else if String.contains "#invite/" rawWire then
-                            rawWire |> String.split "#invite/" |> List.reverse |> List.head |> Maybe.withDefault ""
-
-                        else
-                            rawWire
+                        wireCodeFromInput model.modalUserIds
                 in
                 if String.isEmpty code then
                     ( { model | toast = Just "Enter a Wire code" }, Cmd.none )
@@ -2821,6 +2811,9 @@ submitModal model =
                     Just serverId ->
                         if String.length (String.trim model.modalTitle) < 2 then
                             ( { model | toast = Just "Server name must be at least 2 characters" }, Cmd.none )
+
+                        else if not (validAccentColor model.modalAccentColor) then
+                            ( { model | toast = Just "Accent color must use a six-digit hex value like #5865f2" }, Cmd.none )
 
                         else
                             ( { model | modal = Nothing }
@@ -5707,77 +5700,112 @@ modalContent kind model =
 
             canDeleteServer =
                 List.any (\server -> server.id == serverId && server.role == "owner") model.servers
+
+            accentPresets =
+                [ ( "Plainwire", "#5865f2" )
+                , ( "Ocean", "#3b82f6" )
+                , ( "Lagoon", "#14b8a6" )
+                , ( "Forest", "#22c55e" )
+                , ( "Sunset", "#f97316" )
+                , ( "Rose", "#ec4899" )
+                , ( "Violet", "#8b5cf6" )
+                , ( "Graphite", "#64748b" )
+                ]
         in
         [ modalHead "Customize server" "Give this server its own identity across desktop and mobile."
         , div [ class "modal-body server-customization" ]
-            [ renderServerIdentityPreview model
-            , div [ class "field" ] [ label [] [ text "Server name" ], input [ value model.modalTitle, maxlength 80, placeholder "Server name", onInput ModalTitle ] [] ]
-            , div [ class "field" ] [ label [] [ text "Description" ], textarea [ value model.modalBody, maxlength 280, placeholder "What is this server for?", onInput ModalBody ] [] ]
-            , div [ class "field" ]
-                [ label [] [ text "Welcome message" ]
-                , textarea [ value model.modalWelcome, maxlength 2000, rows 4, placeholder "A welcome note, a few rules, or where to start. Markdown is supported.", onInput (SetModalChoice "welcome") ] []
-                , small [ class "muted" ] [ text "Shown on your server home. Up to 2,000 characters." ]
-                ]
-            , div [ class "server-customize-preview", style "--server-accent" model.modalAccentColor ]
-                [ span [ class "eyebrow" ] [ text "Welcome preview" ]
-                , h3 [] [ text model.modalTitle ]
-                , Html.node "pw-markdown" [ attribute "source" model.modalWelcome ] []
-                ]
-            , div [ class "field" ]
-                [ label [] [ text "Server icon" ]
-                , input [ value model.modalUserIds, placeholder "Upload an image or paste a URL", onInput ModalUserIds ] []
-                , div [ class "file-picker-row" ]
-                    [ input [ id "serverIconFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverIconFile")) ] []
-                    , label [ class "btn secondary file-picker-button", attribute "for" "serverIconFile" ] [ text "Choose icon" ]
-                    , button [ class "btn ghost", type_ "button", onClick (ModalUserIds ""), disabled (String.isEmpty model.modalUserIds) ] [ text "Remove icon" ]
-                    , small [ class "muted" ] [ text "JPEG, PNG, GIF, WebP, or AVIF" ]
+            [ div [ class "server-customization-layout" ]
+                [ aside [ class "server-customization-preview-column" ]
+                    [ renderServerIdentityPreview model
+                    , div [ class "server-preview-note" ]
+                        [ b [] [ text "Live preview" ]
+                        , p [ class "muted" ] [ text "Your banner, icon, name, description, and accent update here as you type." ]
+                        ]
                     ]
-                ]
-            , div [ class "field" ]
-                [ label [] [ text "Server banner" ]
-                , input [ value model.modalBannerUrl, placeholder "Upload an image or paste a URL", onInput ModalBannerUrl ] []
-                , div [ class "file-picker-row" ]
-                    [ input [ id "serverBannerFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverBannerFile")) ] []
-                    , label [ class "btn secondary file-picker-button", attribute "for" "serverBannerFile" ] [ text "Choose banner" ]
-                    , button [ class "btn ghost", type_ "button", onClick (ModalBannerUrl ""), disabled (String.isEmpty model.modalBannerUrl) ] [ text "Remove banner" ]
-                    , small [ class "muted" ] [ text "JPEG, PNG, GIF, WebP, or AVIF" ]
-                    ]
-                ]
-            , div [ class "field server-color-field" ]
-                [ label [] [ text "Accent color" ]
-                , div [ class "server-color-control" ]
-                    [ input [ type_ "color", value model.modalAccentColor, onInput ModalAccentColor, attribute "aria-label" "Server accent color" ] []
-                    , input [ value model.modalAccentColor, placeholder "#5865f2", maxlength 7, onInput ModalAccentColor ] []
-                    ]
-                , div [ class "accent-swatches", attribute "aria-label" "Suggested accent colors" ]
-                    (List.map
-                        (\color ->
-                            button
-                                [ type_ "button"
-                                , class
-                                    ("accent-swatch"
-                                        ++ (if model.modalAccentColor == color then
-                                                " active"
-
-                                            else
-                                                ""
-                                           )
-                                    )
-                                , style "background-color" color
-                                , onClick (SetModalChoice "accent" color)
-                                , attribute "aria-label" ("Use " ++ color)
-                                , attribute "aria-pressed"
-                                    (if model.modalAccentColor == color then
-                                        "true"
-
-                                     else
-                                        "false"
-                                    )
+                , div [ class "server-customization-fields" ]
+                    [ section [ class "server-customization-section" ]
+                        [ div [ class "server-customization-section-head" ] [ h3 [] [ text "Identity" ], p [ class "muted" ] [ text "The essentials people see in navigation and invites." ] ]
+                        , div [ class "field" ]
+                            [ label [] [ text "Server name" ]
+                            , input [ value model.modalTitle, maxlength 80, placeholder "Server name", onInput ModalTitle ] []
+                            , small [ class "muted field-counter" ] [ text (String.fromInt (String.length model.modalTitle) ++ " / 80") ]
+                            ]
+                        , div [ class "field" ]
+                            [ label [] [ text "Description" ]
+                            , textarea [ value model.modalBody, maxlength 280, rows 3, placeholder "What is this server for?", onInput ModalBody ] []
+                            , small [ class "muted field-counter" ] [ text (String.fromInt (String.length model.modalBody) ++ " / 280") ]
+                            ]
+                        ]
+                    , section [ class "server-customization-section" ]
+                        [ div [ class "server-customization-section-head" ] [ h3 [] [ text "Artwork" ], p [ class "muted" ] [ text "Upload images or use an HTTPS image URL." ] ]
+                        , div [ class "server-media-fields" ]
+                            [ div [ class "field" ]
+                                [ label [] [ text "Server icon" ]
+                                , input [ value model.modalUserIds, placeholder "Image URL", onInput ModalUserIds, attribute "inputmode" "url" ] []
+                                , div [ class "file-picker-row" ]
+                                    [ input [ id "serverIconFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverIconFile")) ] []
+                                    , label [ class "btn secondary file-picker-button", attribute "for" "serverIconFile" ] [ text "Upload icon" ]
+                                    , button [ class "btn ghost", type_ "button", onClick (ModalUserIds ""), disabled (String.isEmpty model.modalUserIds) ] [ text "Remove" ]
+                                    ]
+                                , small [ class "muted" ] [ text "Square images work best." ]
                                 ]
-                                []
-                        )
-                        [ "#5865f2", "#3b82f6", "#14b8a6", "#22c55e", "#eab308", "#f97316", "#ec4899", "#8b5cf6" ]
-                    )
+                            , div [ class "field" ]
+                                [ label [] [ text "Server banner" ]
+                                , input [ value model.modalBannerUrl, placeholder "Image URL", onInput ModalBannerUrl, attribute "inputmode" "url" ] []
+                                , div [ class "file-picker-row" ]
+                                    [ input [ id "serverBannerFile", class "file-picker-input", type_ "file", accept "image/jpeg,image/png,image/gif,image/webp,image/avif", on "change" (D.succeed (ReadFile "serverBannerFile")) ] []
+                                    , label [ class "btn secondary file-picker-button", attribute "for" "serverBannerFile" ] [ text "Upload banner" ]
+                                    , button [ class "btn ghost", type_ "button", onClick (ModalBannerUrl ""), disabled (String.isEmpty model.modalBannerUrl) ] [ text "Remove" ]
+                                    ]
+                                , small [ class "muted" ] [ text "Wide images around 3:1 work best." ]
+                                ]
+                            ]
+                        ]
+                    , section [ class "server-customization-section" ]
+                        [ div [ class "server-customization-section-head" ] [ h3 [] [ text "Accent theme" ], p [ class "muted" ] [ text "Used on the server home, channel details, and Wire cards." ] ]
+                        , div [ class "server-theme-presets", attribute "aria-label" "Server accent themes" ]
+                            (List.map
+                                (\( name, color ) ->
+                                    button
+                                        [ type_ "button"
+                                        , class ("server-theme-preset" ++ (if model.modalAccentColor == color then " active" else ""))
+                                        , style "--server-accent" color
+                                        , onClick (SetModalChoice "accent" color)
+                                        , attribute "aria-label" ("Use " ++ name ++ " accent")
+                                        , attribute "aria-pressed" (if model.modalAccentColor == color then "true" else "false")
+                                        ]
+                                        [ span [ class "server-theme-dot", style "background-color" color ] []
+                                        , span [] [ text name ]
+                                        ]
+                                )
+                                accentPresets
+                            )
+                        , div [ class "field server-color-field" ]
+                            [ label [] [ text "Custom color" ]
+                            , div [ class "server-color-control" ]
+                                [ input [ type_ "color", value model.modalAccentColor, onInput ModalAccentColor, attribute "aria-label" "Server accent color" ] []
+                                , input [ value model.modalAccentColor, placeholder "#5865f2", maxlength 7, onInput ModalAccentColor, attribute "aria-label" "Server accent hex value" ] []
+                                , button [ class "btn ghost", type_ "button", onClick (SetModalChoice "accent" "#5865f2") ] [ text "Reset" ]
+                                ]
+                            ]
+                        ]
+                    , section [ class "server-customization-section" ]
+                        [ div [ class "server-customization-section-head" ] [ h3 [] [ text "Welcome" ], p [ class "muted" ] [ text "Give new members context, links, or a few lightweight rules." ] ]
+                        , div [ class "field" ]
+                            [ label [] [ text "Welcome message" ]
+                            , textarea [ value model.modalWelcome, maxlength 2000, rows 5, placeholder "A welcome note, a few rules, or where to start. Markdown is supported.", onInput (SetModalChoice "welcome") ] []
+                            , small [ class "muted field-counter" ] [ text (String.fromInt (String.length model.modalWelcome) ++ " / 2,000 · Markdown supported") ]
+                            ]
+                        , if String.isEmpty (String.trim model.modalWelcome) then
+                            text ""
+
+                          else
+                            div [ class "server-customize-preview", style "--server-accent" model.modalAccentColor ]
+                                [ span [ class "eyebrow" ] [ text "Welcome preview" ]
+                                , Html.node "pw-markdown" [ attribute "source" model.modalWelcome, attribute "no-embeds" "" ] []
+                                ]
+                        ]
+                    ]
                 ]
             , if canDeleteServer then
                 div [ class "server-danger-zone" ]
@@ -7328,7 +7356,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "2.1.1", attribute "data-ui-revision" "interface-5" ]
+    div [ class "layout", attribute "data-ui-version" "2.1.2", attribute "data-ui-revision" "interface-5" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -9398,7 +9426,7 @@ renderServerPage model =
                     else
                         "server-hero has-banner"
             in
-            div [ class "server-page page-stack" ]
+            div [ class "server-page page-stack", style "--server-accent" data.server.accentColor ]
                 [ section
                     [ class ("card " ++ bannerClass)
                     , style "--server-accent" data.server.accentColor
@@ -10995,7 +11023,16 @@ renderMessagePage draftKey placeholderText model =
                     []
 
         chatSurface =
-            div [ class "chat-surface" ]
+            div
+                ([ class "chat-surface" ]
+                    ++ (case ( model.active, model.currentServer ) of
+                            ( ChannelView _, Just data ) ->
+                                [ style "--server-accent" data.server.accentColor ]
+
+                            _ ->
+                                []
+                       )
+                )
                 (callBar
                     ++ [ renderChatHeader model
                        , Keyed.node "div"
@@ -11188,6 +11225,10 @@ renderServerIdentityPreview model =
                     ]
                 , p [ class "muted" ] [ text model.modalBody ]
                 ]
+            ]
+        , div [ class "server-preview-channels" ]
+            [ div [ class "server-preview-channel active" ] [ span [] [ text "#" ], text " general" ]
+            , div [ class "server-preview-channel" ] [ span [] [ text "♪" ], text " lounge" ]
             ]
         ]
 
@@ -12171,6 +12212,47 @@ searchThreadView t =
 
 
 -- HELPERS
+
+
+wireCodeFromInput : String -> String
+wireCodeFromInput raw =
+    let
+        value =
+            String.trim raw
+
+        markers =
+            [ "#/wire/", "#wire/", "#/invite/", "#invite/", "/wire/", "/invite/", "/w/" ]
+
+        afterMarker marker =
+            value
+                |> String.split marker
+                |> List.reverse
+                |> List.head
+                |> Maybe.withDefault value
+
+        candidate =
+            markers
+                |> List.filter (\marker -> String.contains marker value)
+                |> List.head
+                |> Maybe.map afterMarker
+                |> Maybe.withDefault value
+
+        before separator input =
+            input |> String.split separator |> List.head |> Maybe.withDefault input
+
+        cleaned =
+            candidate |> before "?" |> before "&" |> before "#" |> before "/" |> String.trim
+    in
+    Url.percentDecode cleaned |> Maybe.withDefault cleaned
+
+
+validAccentColor : String -> Bool
+validAccentColor value =
+    let
+        isHex character =
+            Char.isDigit character || List.member (Char.toLower character) [ 'a', 'b', 'c', 'd', 'e', 'f' ]
+    in
+    String.length value == 7 && String.startsWith "#" value && String.all isHex (String.dropLeft 1 value)
 
 
 parseRoute : String -> ActiveRoute
