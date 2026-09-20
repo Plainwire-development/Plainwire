@@ -1,6 +1,6 @@
 # Scaling Plainwire
 
-Plainwire 2.2.0 is designed to stay simple on a small self-hosted instance while keeping the hot paths bounded enough to grow. This document describes the actual 2.2.0 architecture, what scales horizontally today, which limits are intentional, and how to test a host before raising them.
+Plainwire 2.3.0 is designed to stay simple on a small self-hosted instance while keeping the hot paths bounded enough to grow. This document describes the actual 2.3.0 architecture, what scales horizontally today, which limits are intentional, and how to test a host before raising them.
 
 Capacity is workload- and hardware-dependent. The numbers in configuration are ceilings and starting points, not a promise that a particular host can sustain that many active users. Measure the real deployment with the load tools in `tools/load/` and watch the health/metrics surfaces while increasing load.
 
@@ -16,7 +16,7 @@ The split is intentional:
 - a registry restart can be rebuilt from the authoritative hub state;
 - WebSocket processes are monitored so hard-killed sockets are cleaned up even when Cowboy termination does not run normally.
 
-Plainwire 2.2.0 still supports exactly **one realtime/WebSocket owner** in the optional Partisan topology. Additional nodes may handle HTTP/API work and forward committed realtime events to that owner. Do not put `/ws` behind a round-robin pool of multiple owners in 2.2.0. The internal routing boundaries are structured so a future multi-owner gateway can be added without moving normal fanout back through `pw_hub`, but multi-owner session/call routing is not claimed by this release.
+Plainwire 2.3.0 still supports exactly **one realtime/WebSocket owner** in the optional Partisan topology. Additional nodes may handle HTTP/API work and forward committed realtime events to that owner. Do not put `/ws` behind a round-robin pool of multiple owners in 2.3.0. The internal routing boundaries are structured so a future multi-owner gateway can be added without moving normal fanout back through `pw_hub`, but multi-owner session/call routing is not claimed by this release.
 
 ## Backpressure and overload behavior
 
@@ -53,7 +53,7 @@ Redis is optional and non-authoritative. Plainwire uses a scheduler-aware pool o
 
 Cross-node presence uses one expiring hash field per Plainwire node, so one node disconnecting cannot erase another node's online state. Multi-user presence reads use independent single-key operations and are safe with hash-slot partitioning.
 
-The built-in RESP client does **not** implement Redis Cluster `MOVED`/`ASK` redirect discovery in 2.2.0. Point it at a normal single Redis endpoint (including a managed/HA endpoint or compatible proxy that hides topology) rather than directly at a native Redis Cluster shard endpoint. See `docs/REDIS.md`.
+The built-in RESP client does **not** implement Redis Cluster `MOVED`/`ASK` redirect discovery in 2.3.0. Point it at a normal single Redis endpoint (including a managed/HA endpoint or compatible proxy that hides topology) rather than directly at a native Redis Cluster shard endpoint. See `docs/REDIS.md`.
 
 ## Cluster event transport
 
@@ -63,9 +63,9 @@ This is intentionally not a durable message queue. The durable database remains 
 
 ## Calls, screen sharing and Cloudflare TURN
 
-TURN and an SFU solve different problems. Cloudflare TURN gives Plainwire a globally operated relay path when peers cannot connect directly, but it does not change Plainwire 2.2.0's full-mesh WebRTC topology.
+TURN and an SFU solve different problems. Cloudflare TURN gives Plainwire a globally operated relay path when peers cannot connect directly, but it does not change Plainwire 2.3.0's full-mesh WebRTC topology.
 
-For a room of `N` participants, a full mesh has `N * (N - 1) / 2` peer relationships and each sender may upload to `N - 1` peers. The default participant/share limits exist to protect client CPU/uplink and are not merely server limits. Large voice/video rooms or thousands of users simultaneously participating in large calls should move to an SFU architecture. `pw_media_topology` is the explicit boundary for that future implementation; 2.2.0 reports `mesh` and does not fake an SFU backend.
+For a room of `N` participants, a full mesh has `N * (N - 1) / 2` peer relationships and each sender may upload to `N - 1` peers. The default participant/share limits exist to protect client CPU/uplink and are not merely server limits. Large voice/video rooms or thousands of users simultaneously participating in large calls should move to an SFU architecture. `pw_media_topology` is the explicit boundary for that future implementation; 2.3.0 reports `mesh` and does not fake an SFU backend.
 
 Cloudflare TURN removes the need to operate a large TURN fleet yourself, but load testing must still include client media CPU, uplink/downlink and relay bandwidth. The included Plainwire load harness exercises RTC **control-plane** signaling/activity/state. It does not synthesize encoded RTP/video/screen traffic.
 
@@ -154,7 +154,7 @@ Before raising a public instance's capacity target, test at load while deliberat
 - making TURN unavailable for test users;
 - restarting the single realtime owner and verifying clients recover durable state.
 
-The last operation necessarily ends current 2.2.0 realtime sessions/calls because automatic realtime-owner failover is not implemented. Document that limitation in production operations rather than pretending otherwise.
+The last operation necessarily ends current 2.3.0 realtime sessions/calls because automatic realtime-owner failover is not implemented. Document that limitation in production operations rather than pretending otherwise.
 
 ### Cluster recovery authorization sweep
 

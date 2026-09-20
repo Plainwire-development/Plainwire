@@ -208,9 +208,46 @@
 .voice-note-recorder .voice-note-live { display:flex; align-items:center; gap:.65rem; padding:.8rem 0; font-variant-numeric:tabular-nums; }
 .voice-note-live-dot { width:.7rem; height:.7rem; border-radius:999px; background:var(--danger, #d84b4b); box-shadow:0 0 0 .3rem color-mix(in srgb, var(--danger, #d84b4b) 18%, transparent); }
 .voice-note-live-dot.stopped { background:var(--muted); box-shadow:none; }
-.voice-note-player { display:flex; flex-direction:column; gap:.35rem; max-width:min(28rem, 100%); padding:.55rem .7rem; border:1px solid var(--border); border-radius:.8rem; background:var(--surface2); }
-.voice-note-player audio { width:min(26rem, 100%); height:2.3rem; }
-.voice-note-label { font-size:.78rem; color:var(--muted); font-weight:650; }
+.voice-note-preview { margin-top:.35rem; }
+.voice-note-player {
+  grid-template-columns:48px minmax(9rem, 1fr) auto auto;
+  width:min(32rem, 100%);
+  max-width:100%;
+  gap:.55rem;
+  padding:.6rem;
+  border:1px solid var(--line2);
+  border-radius:.8rem;
+  background:var(--bg2);
+  box-shadow:0 5px 16px rgba(0,0,0,.08);
+}
+.voice-note-player > .pw-media-play { width:48px; height:42px; }
+.voice-note-player .pw-media-timeline { grid-template-columns:34px minmax(72px, 1fr) 38px; gap:5px; }
+.voice-note-speed {
+  min-width:50px;
+  min-height:36px;
+  padding:0 10px;
+  border:0;
+  border-radius:8px;
+  background:var(--hover);
+  color:var(--text2);
+  font:inherit;
+  font-size:12px;
+  font-weight:700;
+  line-height:1;
+  cursor:pointer;
+}
+.voice-note-speed:hover { background:var(--active); color:var(--text1); }
+.voice-note-speed:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.voice-note-player.probing-duration .pw-media-play,
+.voice-note-player.buffering .pw-media-play { opacity:.72; }
+.voice-note-preview-player { width:100%; }
+@media (max-width:620px) {
+  .voice-note-player { grid-template-columns:44px minmax(0, 1fr) auto; width:100%; }
+  .voice-note-player > .pw-media-play { width:44px; }
+  .voice-note-player > .pw-media-mute { display:none; }
+  .voice-note-player .pw-media-heading { gap:6px; }
+  .voice-note-player .pw-media-timeline { grid-template-columns:32px minmax(44px, 1fr) 36px; }
+}
 .composer-action-voice { font-size:.72rem; line-height:1; }
 .account-destructive-warning { padding:.7rem .8rem; border:1px solid color-mix(in srgb, var(--danger, #d84b4b) 45%, var(--border)); border-radius:.7rem; background:color-mix(in srgb, var(--danger, #d84b4b) 8%, transparent); }
 .danger-zone-actions { display:flex; flex-wrap:wrap; gap:.5rem; }

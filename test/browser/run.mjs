@@ -47,6 +47,7 @@ messages.push(message(27, 'Markdown image syntax:\n\n![Celebration](https://medi
 messages.push(message(28, 'A static image beside a caption: https://media.example/diagram.png and it stays in this message.'));
 messages.push(message(29, 'Text before ![inline.gif](/api/files/pasted-gif) and text after the pasted GIF.'));
 messages.push(message(33, 'Join the server: https://plainwi.re/#wire/wire-card-123'));
+messages.push(message(34, '[Voice note · 0:12](/api/files/voice-note.webm#plainwire-voice-note)'));
 async function setup(context){
  await context.route('**/api/**',async route=>{
   const req=route.request(), url=new URL(req.url()), path=url.pathname;
@@ -89,6 +90,7 @@ async function setup(context){
   if(path==='/api/voice-processing-config')return reply({krisp_available:false});
   if(path==='/api/uploads'&&req.method()==='POST'){pastedUploadType=req.headers()['content-type']||'';return reply({id:'pasted-gif',name:'pasted.gif',content_type:'image/gif',url:'/api/files/pasted-gif'});}
   if(path==='/api/files/pasted-gif')return route.fulfill({status:200,contentType:'image/gif',body:previewGif});
+  if(path==='/api/files/voice-note.webm')return route.fulfill({status:200,contentType:'audio/webm',body:''});
   if(path==='/api/media/test-gif')return route.fulfill({status:200,contentType:'image/gif',body:previewGif});
   if(path==='/api/media/test-image')return route.fulfill({status:200,contentType:'image/gif',body:previewGif});
   if(path==='/api/embed'){
@@ -188,6 +190,10 @@ try {
  assert.equal(await page.getByRole('note',{name:/Missed call/}).count(),1,'missed calls render as timeline events');
  assert.equal(await page.locator('.call-event.completed').count(),1,'completed calls render in chat history');
  assert((await page.locator('.call-event.completed').textContent()).includes('12:34'),'call duration remains visible');
+ const voiceNote=page.locator('.voice-note-player').first();await voiceNote.waitFor();
+ assert.equal(await voiceNote.locator('.pw-media-duration').textContent(),'0:12','voice-note duration is stable before browser metadata is available');
+ assert.equal(await voiceNote.locator('audio[controls]').count(),0,'voice notes use the consistent Plainwire player instead of buggy native controls');
+ assert.equal(await voiceNote.locator('[data-media-action="speed"]').count(),1,'voice notes expose playback speed as a compact control');
  const composerNativeMenuAllowed=await page.locator('#compose').evaluate(el=>el.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,button:2})));
  assert.equal(composerNativeMenuAllowed,true,'composer keeps the browser-native editing menu for reliable paste');
  assert.equal(await page.locator('.fallback-context-menu').count(),0,'composer does not replace native paste with a permission-gated menu');

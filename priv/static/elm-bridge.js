@@ -1965,6 +1965,7 @@
       const fullscreen = player.querySelector('[data-media-action="fullscreen"]');
       const seek = player.querySelector('.pw-media-seek');
       const volume = player.querySelector('.pw-media-volume');
+      const speed = player.querySelector('[data-media-action="speed"]');
       const elapsed = player.querySelector('.pw-media-time');
       const duration = player.querySelector('.pw-media-duration');
       if (!media || !playButtons.length || !seek) return;
@@ -1972,16 +1973,57 @@
       player.dataset.playerReady = 'true';
       let scrubbing = false;
       let resumeAfterScrub = false;
+      let durationProbe = null;
+      let durationProbeAttempted = false;
+      let playQueuedForProbe = false;
+      const durationHint = Math.max(0, Number(player.dataset.duration) || 0);
       const savedSetting = storage.getItem('plainwire_media_volume');
       const savedVolume = savedSetting === null ? NaN : Number(savedSetting);
       media.volume = Number.isFinite(savedVolume) ? Math.max(0, Math.min(1, savedVolume)) : 0.85;
       seek.value = '0';
       if (volume) volume.value = String(media.volume);
 
+      const nativeDuration = () => Number.isFinite(media.duration) && media.duration > 0 ? media.duration : 0;
+      const totalDuration = () => nativeDuration() || durationHint;
+
+      // MediaRecorder WebM files commonly omit a duration header. Chromium then
+      // reports Infinity until it has scanned the stream, which makes a native
+      // seek bar jump to the end. A large metadata-only seek asks the demuxer to
+      // discover the real end without playing the whole note. UI updates stay on
+      // the known recorder duration while the probe is active.
+      const probeDuration = () => {
+        if (durationProbe || durationProbeAttempted || nativeDuration() || media.readyState < HTMLMediaElement.HAVE_METADATA) return;
+        durationProbeAttempted = true;
+        const restoreTime = Number.isFinite(media.currentTime) ? media.currentTime : 0;
+        const listeners = ['durationchange', 'timeupdate', 'seeked'];
+        const finish = (resolved) => {
+          if (!durationProbe) return;
+          if (resolved && !nativeDuration()) return;
+          const state = durationProbe;
+          clearTimeout(state.timer);
+          listeners.forEach((event) => media.removeEventListener(event, detect));
+          try { media.currentTime = Math.min(restoreTime, nativeDuration() || durationHint || 0); } catch (_) {}
+          durationProbe = null;
+          player.classList.remove('probing-duration');
+          update();
+          player.dispatchEvent(new Event('plainwire:duration-probe-finished'));
+        };
+        const detect = () => finish(true);
+        durationProbe = { restoreTime, timer: 0 };
+        player.classList.add('probing-duration');
+        listeners.forEach((event) => media.addEventListener(event, detect));
+        durationProbe.timer = setTimeout(() => finish(false), 1500);
+        try { media.currentTime = Number.MAX_SAFE_INTEGER; }
+        catch (_) { finish(false); }
+      };
+
       const update = () => {
-        const total = media.duration;
-        if (!scrubbing) seek.value = Number.isFinite(total) && total > 0 ? String(Math.round(media.currentTime * 1000 / total)) : '0';
-        if (elapsed) elapsed.textContent = mediaTime(media.currentTime);
+        const total = totalDuration();
+        const current = durationProbe ? durationProbe.restoreTime : (Number.isFinite(media.currentTime) ? media.currentTime : 0);
+        if (!scrubbing) seek.value = total > 0 ? String(Math.round(Math.max(0, Math.min(1, current / total)) * 1000)) : '0';
+        seek.disabled = !(total > 0);
+        seek.setAttribute('aria-valuetext', total > 0 ? `${mediaTime(current)} of ${mediaTime(total)}` : mediaTime(current));
+        if (elapsed) elapsed.textContent = mediaTime(current);
         if (duration) duration.textContent = mediaTime(total);
         const label = media.paused ? 'Play' : 'Pause';
         playButtons.forEach((button) => {
@@ -1989,6 +2031,7 @@
           button.setAttribute('aria-label', `${label} media`);
         });
         if (mute) mute.textContent = media.muted || media.volume === 0 ? 'Muted' : 'Sound';
+        if (speed) speed.textContent = `${media.playbackRate}×`;
         player.classList.toggle('playing', !media.paused);
         player.classList.toggle('muted', media.muted || media.volume === 0);
       };
@@ -1998,6 +2041,21 @@
         document.querySelectorAll('.pw-media-player audio, .pw-media-player video').forEach((other) => {
           if (other !== media) other.pause();
         });
+        const total = totalDuration();
+        if (media.ended || (total > 0 && media.currentTime >= total - 0.05)) media.currentTime = 0;
+        probeDuration();
+        if (durationProbe) {
+          if (!playQueuedForProbe) {
+            playQueuedForProbe = true;
+            playButtons.forEach((button) => { button.disabled = true; button.setAttribute('aria-busy', 'true'); });
+            player.addEventListener('plainwire:duration-probe-finished', () => {
+              playQueuedForProbe = false;
+              playButtons.forEach((button) => { button.disabled = false; button.removeAttribute('aria-busy'); });
+              if (media.paused) togglePlayback();
+            }, { once: true });
+          }
+          return;
+        }
         media.play().catch(() => send(app.ports.bridgeReceive, { tag: 'toast', data: 'Playback was blocked. Tap Play again.' }));
       };
       playButtons.forEach((button) => button.addEventListener('click', togglePlayback));
@@ -2009,8 +2067,9 @@
         if (resumeAfterScrub) media.pause();
       };
       const applyScrub = () => {
-        if (Number.isFinite(media.duration) && media.duration > 0) {
-          media.currentTime = Number(seek.value) * media.duration / 1000;
+        const total = totalDuration();
+        if (total > 0) {
+          media.currentTime = Number(seek.value) * total / 1000;
           if (elapsed) elapsed.textContent = mediaTime(media.currentTime);
         }
       };
@@ -2040,13 +2099,22 @@
         update();
       });
       mute?.addEventListener('click', () => { media.muted = !media.muted; update(); });
+      speed?.addEventListener('click', () => {
+        const rates = [1, 1.5, 2];
+        const index = rates.findIndex((rate) => Math.abs(rate - media.playbackRate) < 0.01);
+        media.playbackRate = rates[(index + 1 + rates.length) % rates.length];
+        update();
+      });
       fullscreen?.addEventListener('click', () => {
         const target = player.querySelector('.pw-video-frame') || media;
         if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
         else target.requestFullscreen?.().catch(() => media.webkitEnterFullscreen?.());
       });
 
-      ['loadedmetadata', 'durationchange', 'timeupdate', 'play', 'pause', 'volumechange', 'ended'].forEach((event) => media.addEventListener(event, update));
+      media.addEventListener('loadedmetadata', () => { update(); probeDuration(); });
+      ['durationchange', 'timeupdate', 'play', 'pause', 'volumechange', 'ratechange', 'ended'].forEach((event) => media.addEventListener(event, update));
+      ['waiting', 'stalled'].forEach((event) => media.addEventListener(event, () => player.classList.add('buffering')));
+      ['canplay', 'playing', 'pause', 'ended'].forEach((event) => media.addEventListener(event, () => player.classList.remove('buffering')));
       media.addEventListener('error', () => player.classList.add('media-error'));
       update();
     });
@@ -3752,12 +3820,50 @@
     return candidates.find((type) => globalThis.MediaRecorder?.isTypeSupported?.(type)) || '';
   };
 
+  const voiceNoteDuration = (label) => {
+    const match = String(label || '').match(/(?:^|·\s*)(\d+):([0-5]\d)\s*$/);
+    return match ? Number(match[1]) * 60 + Number(match[2]) : 0;
+  };
+
+  const makeVoiceNotePlayer = ({ src, label = 'Voice note', seconds = 0, preview = false }) => {
+    const wrap = document.createElement('span');
+    wrap.className = `voice-note-player pw-media-player pw-audio-player${preview ? ' voice-note-preview-player' : ''}`;
+    if (seconds > 0) wrap.dataset.duration = String(seconds);
+    const audio = document.createElement('audio');
+    audio.className = 'pw-audio-element'; audio.preload = 'metadata'; audio.src = src;
+    const play = document.createElement('button');
+    play.type = 'button'; play.className = 'pw-media-play'; play.dataset.mediaAction = 'play'; play.textContent = 'Play'; play.setAttribute('aria-label', `Play ${label}`);
+    const copy = document.createElement('span'); copy.className = 'pw-media-copy';
+    const heading = document.createElement('span'); heading.className = 'pw-media-heading';
+    const name = document.createElement('strong'); name.className = 'pw-media-name'; name.textContent = label;
+    heading.append(name);
+    if (!preview) {
+      const download = document.createElement('a');
+      download.className = 'pw-media-download'; download.href = src; download.download = 'voice-note'; download.textContent = 'Download'; download.title = 'Download voice note';
+      heading.append(download);
+    }
+    const timeline = document.createElement('span'); timeline.className = 'pw-media-timeline';
+    const elapsed = document.createElement('span'); elapsed.className = 'pw-media-time'; elapsed.textContent = '0:00';
+    const seek = document.createElement('input');
+    seek.className = 'pw-media-seek'; seek.type = 'range'; seek.min = '0'; seek.max = '1000'; seek.step = '1'; seek.value = '0'; seek.setAttribute('aria-label', `Seek ${label}`);
+    const duration = document.createElement('span'); duration.className = 'pw-media-duration'; duration.textContent = seconds > 0 ? mediaTime(seconds) : '-:--';
+    timeline.append(elapsed, seek, duration); copy.append(heading, timeline);
+    const speed = document.createElement('button');
+    speed.type = 'button'; speed.className = 'voice-note-speed'; speed.dataset.mediaAction = 'speed'; speed.textContent = '1×'; speed.setAttribute('aria-label', 'Change voice-note playback speed');
+    const mute = document.createElement('button');
+    mute.type = 'button'; mute.className = 'pw-media-mute'; mute.dataset.mediaAction = 'mute'; mute.textContent = 'Sound'; mute.setAttribute('aria-label', 'Mute voice note');
+    wrap.append(audio, play, copy, speed, mute);
+    return wrap;
+  };
+
   const openVoiceNoteRecorder = async () => {
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== 'function') {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Voice notes are not supported by this browser.' });
       return;
     }
-    if (!activeComposer()) {
+    const recordingComposer = activeComposer();
+    const recordingRoute = location.hash;
+    if (!recordingComposer) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Open a DM, thread, or text channel before recording a voice note.' });
       return;
     }
@@ -3772,12 +3878,16 @@
     const startedAt = performance.now();
     let stopped = false;
     let durationSeconds = 0;
+    let recordedBlob = null;
+    let previewUrl = '';
+    let abandoned = false;
     const shell = document.createElement('div'); shell.className = 'account-password-fields voice-note-recorder';
     const meter = document.createElement('div'); meter.className = 'voice-note-live';
     const dot = document.createElement('span'); dot.className = 'voice-note-live-dot';
     const elapsed = document.createElement('strong'); elapsed.textContent = '0:00';
     const hint = document.createElement('p'); hint.className = 'muted'; hint.textContent = 'Recording locally. Nothing uploads until you choose Use voice note.';
-    meter.append(dot, elapsed); shell.append(meter, hint);
+    const preview = document.createElement('div'); preview.className = 'voice-note-preview'; preview.hidden = true;
+    meter.append(dot, elapsed); shell.append(meter, hint, preview);
     const dialog = showAccountDialog({ title: 'Record voice note', subtitle: 'Up to 5 minutes. Opus is used when your browser supports it.', content: shell, actions: [] });
     const footer = document.createElement('div'); footer.className = 'account-dialog-actions'; dialog.dialog.append(footer);
     const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'btn secondary'; cancel.textContent = 'Cancel';
@@ -3785,41 +3895,55 @@
     const use = document.createElement('button'); use.type = 'button'; use.className = 'btn'; use.textContent = 'Use voice note'; use.disabled = true;
     footer.append(cancel, stop, use);
     const finishTracks = () => stream.getTracks().forEach((track) => { try { track.stop(); } catch (_) {} });
-    const timer = setInterval(() => {
+    let timer = 0;
+    const cleanupRecorder = () => {
+      if (abandoned) return;
+      abandoned = true;
+      clearInterval(timer);
+      if (!stopped && recorder.state !== 'inactive') { try { recorder.stop(); } catch (_) {} }
+      finishTracks();
+      if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = ''; }
+    };
+    dialog.backdrop.addEventListener('plainwire:dialog-close', cleanupRecorder, { once: true });
+    timer = setInterval(() => {
       if (stopped) return;
       durationSeconds = Math.min(300, (performance.now() - startedAt) / 1000);
       elapsed.textContent = formatVoiceDuration(durationSeconds);
-      if (durationSeconds >= 300) recorder.stop();
+      if (durationSeconds >= 300 && recorder.state !== 'inactive') recorder.stop();
     }, 200);
     recorder.addEventListener('dataavailable', (event) => { if (event.data?.size) chunks.push(event.data); });
     recorder.addEventListener('stop', () => {
       stopped = true; clearInterval(timer); finishTracks();
+      if (abandoned || !dialog.backdrop.isConnected) return;
       durationSeconds = Math.min(300, Math.max(0.1, (performance.now() - startedAt) / 1000));
-      elapsed.textContent = formatVoiceDuration(durationSeconds); dot.classList.add('stopped'); stop.disabled = true; stop.textContent = 'Recorded'; use.disabled = chunks.length === 0;
+      recordedBlob = new Blob(chunks, { type: recorder.mimeType || mimeType || 'audio/webm' });
+      elapsed.textContent = formatVoiceDuration(durationSeconds); dot.classList.add('stopped'); stop.disabled = true; stop.textContent = 'Recorded'; use.disabled = !recordedBlob.size;
+      if (recordedBlob.size) {
+        previewUrl = URL.createObjectURL(recordedBlob);
+        const player = makeVoiceNotePlayer({ src: previewUrl, label: 'Preview', seconds: durationSeconds, preview: true });
+        preview.replaceChildren(player); preview.hidden = false; mountMediaPlayers(player);
+        hint.textContent = 'Review the recording, then attach it. It is still local until you choose Use voice note.';
+      }
     }, { once: true });
     recorder.start(250);
-    const closeCleanly = () => {
-      clearInterval(timer);
-      if (!stopped && recorder.state !== 'inactive') { try { recorder.stop(); } catch (_) {} }
-      finishTracks(); closeAccountDialog();
-    };
-    cancel.addEventListener('click', closeCleanly);
+    cancel.addEventListener('click', closeAccountDialog);
     stop.addEventListener('click', () => { if (recorder.state !== 'inactive') recorder.stop(); });
     use.addEventListener('click', async () => {
-      if (!stopped || !chunks.length) return;
+      if (!stopped || !recordedBlob?.size) return;
       use.disabled = true; cancel.disabled = true;
       use.textContent = 'Uploading…';
       try {
-        const type = recorder.mimeType || mimeType || 'audio/webm';
+        const type = recordedBlob.type || recorder.mimeType || mimeType || 'audio/webm';
         const ext = type.includes('ogg') ? 'ogg' : type.includes('mp4') ? 'm4a' : 'webm';
-        const blob = new Blob(chunks, { type });
-        if (!blob.size) throw new Error('empty_voice_note');
-        const file = new File([blob], `voice-note-${Date.now()}.${ext}`, { type, lastModified: Date.now() });
+        const file = new File([recordedBlob], `voice-note-${Date.now()}.${ext}`, { type, lastModified: Date.now() });
         const uploaded = await uploadOne(file);
         const markup = `[Voice note · ${formatVoiceDuration(durationSeconds)}](${uploaded.url}#plainwire-voice-note)`;
         closeAccountDialog();
-        if (!insertIntoComposer(markup)) {
-          send(app.ports.bridgeReceive, { tag: 'attachment_ready', route: location.hash, data: markup });
+        const sameComposer = recordingComposer.isConnected && location.hash === recordingRoute && activeComposer() === recordingComposer;
+        if (sameComposer) {
+          appendToComposer(markup);
+        } else {
+          send(app.ports.bridgeReceive, { tag: 'attachment_ready', route: recordingRoute, data: markup });
         }
         send(app.ports.bridgeReceive, { tag: 'toast', data: 'Voice note attached. Send when ready.' });
       } catch (error) {
@@ -3830,16 +3954,16 @@
   };
 
   const upgradeVoiceNoteLinks = (root = document) => {
-    root.querySelectorAll?.('a[href*="#plainwire-voice-note"]:not([data-voice-upgraded])').forEach((link) => {
+    matchingNodes(root, 'a[href*="#plainwire-voice-note"]:not([data-voice-upgraded])').forEach((link) => {
       link.dataset.voiceUpgraded = 'true';
       const href = link.getAttribute('href') || '';
       if (!href.startsWith('/api/files/')) return;
-      const wrap = document.createElement('span'); wrap.className = 'voice-note-player';
-      const label = document.createElement('span'); label.className = 'voice-note-label'; label.textContent = link.textContent || 'Voice note';
-      const audio = document.createElement('audio'); audio.controls = true; audio.preload = 'metadata'; audio.src = href.replace('#plainwire-voice-note', '');
-      wrap.append(label, audio);
+      const text = link.textContent || 'Voice note';
+      const seconds = voiceNoteDuration(text);
+      const label = text.split('·', 1)[0].trim() || 'Voice note';
+      const wrap = makeVoiceNotePlayer({ src: href.replace('#plainwire-voice-note', ''), label, seconds });
       const parent = link.parentNode;
-      if (parent) { parent.insertBefore(wrap, link); link.remove(); }
+      if (parent) { parent.insertBefore(wrap, link); link.remove(); mountMediaPlayers(wrap); }
     });
   };
   const voiceNoteObserver = new MutationObserver((records) => {
@@ -7410,7 +7534,12 @@
     return json.data;
   };
 
-  const closeAccountDialog = () => document.querySelector('.account-dialog-backdrop')?.remove();
+  const closeAccountDialog = () => {
+    const backdrop = document.querySelector('.account-dialog-backdrop');
+    if (!backdrop) return;
+    backdrop.dispatchEvent(new Event('plainwire:dialog-close'));
+    backdrop.remove();
+  };
 
   const showAccountDialog = ({ title, subtitle, content, actions = [] }) => {
     closeAccountDialog();

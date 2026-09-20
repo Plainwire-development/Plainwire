@@ -9,7 +9,7 @@ pub type ShardPlan {
   )
 }
 
-// Planning model only. Plainwire 2.2.0 intentionally keeps one realtime owner;
+// Planning model only. Plainwire 2.3.0 intentionally keeps one realtime owner;
 // this prevents capacity planning from being hidden in ad-hoc shell arithmetic
 // while the transport/routing boundary evolves independently.
 pub fn gateways(

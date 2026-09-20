@@ -113,6 +113,11 @@ assert.match(bridge, /message-edit-input[\s\S]*focus/, 'message edit mode receiv
 assert.match(elm, /Forwarded from/, 'forward provenance is visible in the message UI');
 
 assert.match(bridge, /nativeEditingContextTarget\(target\)[\s\S]*return;[\s\S]*event\.preventDefault\(\)/, 'editable controls retain the native context menu while app surfaces suppress browser chrome');
+assert.match(bridge, /MediaRecorder WebM files commonly omit a duration header[\s\S]*Number\.MAX_SAFE_INTEGER/, 'voice notes discover missing WebM duration metadata without requiring full playback');
+assert.match(bridge, /durationHint[\s\S]*dataset\.duration[\s\S]*totalDuration/, 'voice notes use their recorded duration while browser metadata is incomplete');
+assert.match(bridge, /makeVoiceNotePlayer[\s\S]*dataMediaAction = 'speed'|makeVoiceNotePlayer[\s\S]*dataset\.mediaAction = 'speed'/, 'voice notes use the custom player with playback-speed control');
+assert.match(bridge, /plainwire:dialog-close[\s\S]*cleanupRecorder/, 'closing the voice recorder through any dialog control releases its capture resources');
+assert.match(scss, /\.voice-note-player\s*\{[\s\S]*grid-template-columns:[\s\S]*@media \(max-width:620px\)/, 'voice-note controls use the shared responsive UI language');
 assert.match(componentsScss, /\.call-overlay-controls \.call-icon\s*\{[^}]*margin:\s*0;/, 'wide call controls keep their icon and label centered as one group');
 assert.match(refinementsScss, /\.channel-glyph\.voice::before\s*\{[^}]*transform:\s*translateY\(-1px\)/, 'voice-channel headphones receive the same optical centering as call controls');
 assert.match(elm, /attribute "role" "menuitem"/, 'custom context actions are keyboard-focusable menu items');

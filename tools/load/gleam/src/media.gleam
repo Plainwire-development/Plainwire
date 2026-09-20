@@ -9,7 +9,7 @@ pub type MeshCost {
   )
 }
 
-// This models Plainwire 2.2.0's real topology. TURN may relay a peer path, but
+// This models Plainwire 2.3.0's real topology. TURN may relay a peer path, but
 // it does not change the N*(N-1)/2 relationship of a full-mesh room.
 pub fn mesh_cost(participants: Int, per_peer_screen_kbps: Int) -> MeshCost {
   let participants = int.clamp(participants, min: 1, max: 32)
