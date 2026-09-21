@@ -16,7 +16,7 @@ const markdown=read('priv/static/elm/src/View/Markdown.elm');
 const components=read('priv/static/_components.scss');
 const version=read('VERSION').trim();
 
-assert.match(version,/^2\.3\.\d+$/,'the 2.1 feature contracts remain supported by the 2.3 release series');
+assert.match(version,/^2\.4\.\d+$/,'the 2.1 feature contracts remain supported by the 2.4 release series');
 assert.match(crypto,/aes_256_gcm[\s\S]*PLAINWIRE_ENC_PREVIOUS_KEYS/,'message encryption remains AES-256-GCM and supports rotation');
 assert.match(crypto,/PLAINWIRE_SEARCH_KEY[\s\S]*crypto:mac\(hmac, sha256/,'message search uses an independent or derived keyed HMAC');
 assert.match(crypto,/MAX_SEARCH_TOKENS/,'search indexing is bounded');

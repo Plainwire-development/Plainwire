@@ -86,7 +86,7 @@ class Client:
         headers = {
             "Authorization": f"Bot {self._token}",
             "Accept": "application/json",
-            "User-Agent": "plainwire-python-bot/2.2",
+            "User-Agent": "plainwire-python-bot/2.4",
         }
         if payload is not None:
             data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -195,6 +195,31 @@ class Client:
 
     def command_worker(self, handlers: Mapping[str, Callable[[Mapping[str, Any], "Client"], Any]], **options):
         return CommandWorker(self, handlers, **options)
+
+    def listen(self, handlers: Mapping[str, Callable[[Mapping[str, Any], "Client"], Any]], **options) -> None:
+        self.command_worker(handlers, **options).run()
+
+    @staticmethod
+    def options(claim: Mapping[str, Any] | None) -> dict[str, Any]:
+        return command_options(claim)
+
+    @staticmethod
+    def option(claim: Mapping[str, Any] | None, name: str, default: Any = None) -> Any:
+        return command_option(claim, name, default)
+
+
+def command_options(claim: Mapping[str, Any] | None) -> dict[str, Any]:
+    payload = claim or {}
+    options = payload.get("options")
+    if isinstance(options, Mapping) and not isinstance(options, (str, bytes)):
+        return dict(options)
+    args = payload.get("args") if isinstance(payload.get("args"), Mapping) else {}
+    return {key: value for key, value in dict(args).items() if key not in {"raw", "source"}}
+
+
+def command_option(claim: Mapping[str, Any] | None, name: str, default: Any = None) -> Any:
+    options = command_options(claim)
+    return options[name] if name in options else default
 
 
 class CommandWorker:

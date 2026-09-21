@@ -54,3 +54,11 @@ func TestV22Routes(t *testing.T) {
 		t.Fatalf("unexpected defer request: %+v", requests[2])
 	}
 }
+
+func TestCommandClaimOption(t *testing.T) {
+	claim := CommandClaim{Args: map[string]any{"raw": "hello", "text": "hello"}, Options: map[string]any{"text": "hello"}}
+	value, ok := claim.Option("text")
+	if !ok || value != "hello" {
+		t.Fatalf("expected named option, got %v %v", value, ok)
+	}
+}

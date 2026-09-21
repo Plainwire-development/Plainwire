@@ -65,12 +65,18 @@ dispatch(#{workers := Workers, max := Max, timeout := Timeout} = State) ->
 
 deliver(Job, Timeout) ->
     Timestamp = integer_to_binary(pw_util:now_ms()),
+    Args = maps:get(args, Job, #{}),
+    Options = maps:get(options, Job, interaction_options(Args)),
     Payload = pw_util:json(#{
-        type => <<"command">>, version => 1,
+        type => <<"command">>, version => 1, name => maps:get(command, Job),
         invocation_id => maps:get(id, Job),
         application => #{id => maps:get(app_id, Job), public_id => maps:get(app_public_id, Job), name => maps:get(app_name, Job)},
-        server_id => maps:get(server_id, Job), channel_id => maps:get(channel_id, Job), user_id => maps:get(user_id, Job),
-        command => maps:get(command, Job), arguments => maps:get(args, Job), request_message_id => maps:get(request_message_id, Job)
+        guild_id => maps:get(server_id, Job), server_id => maps:get(server_id, Job),
+        channel_id => maps:get(channel_id, Job), user_id => maps:get(user_id, Job),
+        member => #{user_id => maps:get(user_id, Job), display_name => maps:get(member_name, Job, <<>>)},
+        data => #{name => maps:get(command, Job), options => Options, arguments => Args},
+        command => maps:get(command, Job), arguments => Args, options => Options,
+        request_message_id => maps:get(request_message_id, Job)
     }),
     Secret = maps:get(secret, Job),
     Mac = crypto:mac(hmac, sha256, Secret, <<Timestamp/binary, ".", Payload/binary>>),
@@ -88,7 +94,23 @@ parse_response(<<>>) -> {ok, <<>>};
 parse_response(Body) ->
     try jsx:decode(Body, [return_maps]) of
         M when is_map(M) ->
-            Content = maps:get(<<"body">>, M, maps:get(<<"content">>, M, <<>>)),
-            {ok, pw_util:clean_text(Content, 5000)};
+            Content = maps:get(<<"body">>, M, maps:get(<<"content">>, M, maps:get(<<"response">>, M, <<>>))),
+            Text = case Content of
+                Nested when is_map(Nested) -> maps:get(<<"content">>, Nested, maps:get(<<"body">>, Nested, <<>>));
+                Other -> Other
+            end,
+            {ok, pw_util:clean_text(Text, 5000)};
         _ -> {error, <<"invalid_interaction_response">>}
     catch _:_ -> {error, <<"invalid_interaction_json">>} end.
+
+interaction_options(Args) when is_map(Args) ->
+    maps:fold(fun(Key, Value, Acc) ->
+        case Key of
+            <<"raw">> -> Acc;
+            <<"source">> -> Acc;
+            raw -> Acc;
+            source -> Acc;
+            _ -> Acc#{pw_util:bin(Key) => Value}
+        end
+    end, #{}, Args);
+interaction_options(_) -> #{}.

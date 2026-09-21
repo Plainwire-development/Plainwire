@@ -21,7 +21,7 @@
     developer_apps/1, developer_app/2, create_developer_app/2, update_developer_app/3, delete_developer_app/2,
     developer_app_installations/2, install_developer_app/3, install_public_developer_app/3, rotate_developer_app_installation/3, uninstall_developer_app/3, public_developer_app/1, public_developer_apps/2, server_apps/2,
     server_app_commands/3, set_server_command_permissions/5, uninstall_server_app/3,
-    developer_app_commands/2, upsert_developer_app_command/6, delete_developer_app_command/3,
+    developer_app_commands/2, developer_app_activity/3, upsert_developer_app_command/6, delete_developer_app_command/3,
     update_developer_app_interactions/3, rotate_developer_app_interaction_secret/2, update_developer_app_ai/3,
     app_interaction_claim_due/1, app_interaction_finish/2, ai_command_claim_due/1, ai_command_finish/2,
     bot_commands/1, bot_register_command/4, bot_sync_commands/2, bot_delete_command/2, bot_claim_commands/2, bot_defer_command/4, bot_respond_command/4, bot_fail_command/4,
@@ -53,7 +53,9 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -ifdef(TEST).
 -export([profile_file_signature/2, extract_file_ids/1,
-         normalize_banner_patch/2, safe_banner_link/1, normalize_registration_mode/1]).
+         normalize_banner_patch/2, safe_banner_link/1, normalize_registration_mode/1,
+         normalize_ai_provider/1, normalize_ai_chat_trigger/1, normalize_ai_temperature/1,
+         command_options_from_args/1]).
 -endif.
 
 -record(st, {}).
@@ -365,6 +367,7 @@ server_app_commands(Uid, ServerId, InstallationId) -> call({server_app_commands,
 set_server_command_permissions(Uid, ServerId, InstallationId, CommandId, Rules) -> call({set_server_command_permissions, Uid, ServerId, InstallationId, CommandId, Rules}).
 uninstall_server_app(Uid, ServerId, InstallationId) -> call({uninstall_server_app, Uid, ServerId, InstallationId}).
 developer_app_commands(Uid, AppId) -> call({developer_app_commands, Uid, AppId}).
+developer_app_activity(Uid, AppId, Limit) -> call({developer_app_activity, Uid, AppId, Limit}).
 upsert_developer_app_command(Uid, AppId, Name, Description, Options, Handler) -> call({upsert_developer_app_command, Uid, AppId, Name, Description, Options, Handler}).
 delete_developer_app_command(Uid, AppId, CommandId) -> call({delete_developer_app_command, Uid, AppId, CommandId}).
 update_developer_app_interactions(Uid, AppId, Patch) -> call({update_developer_app_interactions, Uid, AppId, Patch}).
@@ -3984,6 +3987,20 @@ route({developer_app_commands, Uid, AppId0}, Conn) ->
             {ok, [developer_command_map(R) || R <- Rows]};
         _ -> {error, not_found}
     end;
+route({developer_app_activity, Uid, AppId0, Limit0}, Conn) ->
+    AppId = pw_util:int(AppId0), Limit = clamp_int(Limit0, 1, 100, 30),
+    case developer_app_owned_row(Conn, Uid, AppId, false) of
+        {ok, _} ->
+            {ok, Rows} = rows(Conn,
+                "SELECT i.id,c.name,i.status,i.attempts,i.fail_reason,i.server_id,s.name,i.channel_id,"
+                "i.user_id,i.request_message_id,i.response_message_id,i.created_at,i.updated_at,i.completed_at "
+                "FROM bot_command_invocations i JOIN bot_commands c ON c.id=i.command_id "
+                "JOIN developer_app_commands dc ON dc.id=c.developer_command_id "
+                "JOIN servers s ON s.id=i.server_id WHERE dc.app_id=$1 ORDER BY i.id DESC LIMIT $2",
+                [AppId, Limit]),
+            {ok, [developer_activity_map(Row) || Row <- Rows]};
+        _ -> {error, not_found}
+    end;
 route({upsert_developer_app_command, Uid, AppId0, Name0, Description0, Options0, Handler0}, Conn) ->
     AppId = pw_util:int(AppId0), Name = normalize_command_name(Name0), Description = pw_util:clean_text(Description0, 160),
     Handler = normalize_developer_handler(Handler0),
@@ -4082,21 +4099,34 @@ route({update_developer_app_ai, Uid, AppId0, Patch}, Conn) ->
         case developer_app_owned_row(Conn, Uid, AppId, true) of
             {ok, Row0} ->
                 App0 = developer_app_map(Row0), Ai0 = maps:get(ai, App0),
-                Enabled = maps:get(<<"enabled">>, Patch, maps:get(enabled, Ai0, false)) =:= true,
+                ChatEnabled = maps:get(<<"chat_enabled">>, Patch, maps:get(chat_enabled, Ai0, false)) =:= true,
+                Enabled = ChatEnabled orelse maps:get(<<"enabled">>, Patch, maps:get(enabled, Ai0, false)) =:= true,
+                Provider = normalize_ai_provider(maps:get(<<"provider">>, Patch, maps:get(provider, Ai0, <<"openai_compatible">>))),
                 Endpoint = pw_util:clean_text(maps:get(<<"endpoint">>, Patch, maps:get(endpoint, Ai0, <<>>)), 2048),
                 Model = pw_util:clean_text(maps:get(<<"model">>, Patch, maps:get(model, Ai0, <<>>)), 160),
                 SystemPrompt = pw_util:clean_text(maps:get(<<"system_prompt">>, Patch, maps:get(system_prompt, Ai0, <<>>)), 8000),
+                Temperature = normalize_ai_temperature(maps:get(<<"temperature">>, Patch, maps:get(temperature, Ai0, 0.7))),
+                MaxOutputTokens = clamp_int(maps:get(<<"max_output_tokens">>, Patch, maps:get(max_output_tokens, Ai0, 1000)), 64, 8192, 1000),
+                IncludeHistory = maps:get(<<"include_history">>, Patch, maps:get(include_history, Ai0, false)) =:= true,
+                HistoryMessages = clamp_int(maps:get(<<"history_messages">>, Patch, maps:get(history_messages, Ai0, 8)), 0, 20, 8),
+                ChatTrigger = normalize_ai_chat_trigger(maps:get(<<"chat_trigger">>, Patch, maps:get(chat_trigger, Ai0, <<"mention_or_reply">>))),
                 {ok, [StoredKey0]} = one(Conn, "SELECT ai_api_key FROM developer_applications WHERE id=$1", [AppId]),
                 NewKey0 = pw_util:clean_text(maps:get(<<"api_key">>, Patch, <<>>), 1024),
                 StoredKey = case NewKey0 of <<>> -> StoredKey0; _ -> pw_crypto:encrypt(NewKey0) end,
-                ConfigOk = (not Enabled) orelse (developer_endpoint_valid(Endpoint) andalso Model =/= <<>> andalso pw_util:bin(StoredKey) =/= <<>>),
+                ConfigOk = Provider =/= invalid andalso ChatTrigger =/= invalid andalso
+                    ((not Enabled) orelse (developer_endpoint_valid(Endpoint) andalso Model =/= <<>> andalso
+                     ((not ai_provider_requires_key(Provider)) orelse pw_util:bin(StoredKey) =/= <<>>))),
                 case ConfigOk of
                     false -> {error, invalid_ai_configuration};
                     true ->
                         Now = pw_util:now_ms(),
                         ok = exec(Conn,
-                            "UPDATE developer_applications SET ai_enabled=$1,ai_endpoint=$2,ai_model=$3,ai_api_key=$4,ai_system_prompt=$5,updated_at=$6 WHERE id=$7 AND owner_user_id=$8",
-                            [Enabled, Endpoint, Model, StoredKey, pw_crypto:encrypt(SystemPrompt), Now, AppId, Uid]),
+                            "UPDATE developer_applications SET ai_enabled=$1,ai_provider=$2,ai_endpoint=$3,ai_model=$4,ai_api_key=$5,ai_system_prompt=$6,"
+                            "ai_temperature=$7,ai_max_output_tokens=$8,ai_include_history=$9,ai_history_messages=$10,ai_chat_enabled=$11,ai_chat_trigger=$12,updated_at=$13 "
+                            "WHERE id=$14 AND owner_user_id=$15",
+                            [Enabled, Provider, Endpoint, Model, StoredKey, pw_crypto:encrypt(SystemPrompt),
+                             Temperature, MaxOutputTokens, IncludeHistory, HistoryMessages, ChatEnabled, ChatTrigger, Now, AppId, Uid]),
+                        case ChatEnabled of true -> ok = ensure_ai_chat_command(Conn, AppId, Now); false -> ok end,
                         {ok, Row} = developer_app_owned_row(Conn, Uid, AppId, false),
                         {ok, maps:get(ai, developer_app_map(Row))}
                 end;
@@ -4958,7 +4988,8 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
                         Msg = message_map(Conn, Row),
                         ok = maybe_enqueue_message_webhook(Conn, <<"channel">>, Cid, <<"message.created">>,
                             #{message => Msg, actor_id => Uid}),
-                        {ok, #{message => Msg, server_id => Sid, notify_at => Now}};
+                        AiQueued = maybe_enqueue_ai_chat(Conn, Sid, Cid, Uid, Mid, Plain, ReplyTo, Now),
+                        {ok, #{message => Msg, server_id => Sid, notify_at => Now, ai_queued => AiQueued}};
                             {true, true, {ok, [_]}, false} -> {error, invalid_message};
                             {false, _, _, _} -> {error, voice_notes_forbidden};
                             {true, false, _, _} -> {error, attachments_forbidden};
@@ -4968,10 +4999,11 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
                 end
             end),
             case Result of
-                {ok, #{message := Msg, server_id := Sid, notify_at := Now}} ->
+                {ok, #{message := Msg, server_id := Sid, notify_at := Now, ai_queued := AiQueued}} ->
                     invalidate_message_cache(<<"channel">>, Cid),
                     pw_hub:broadcast({channel, Cid}, #{type => message_created, scope => channel, scope_id => Cid, message => Msg}),
                     best_effort_channel_notifications(Conn, Sid, Uid, Cid, Msg, Now, false),
+                    case AiQueued > 0 of true -> try pw_ai_bot_dispatcher:poke() catch _:_ -> ok end; false -> ok end,
                     {ok, Msg};
                 Other -> Other
             end
@@ -6459,13 +6491,39 @@ migrations() -> [
         "ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check",
         "ALTER TABLE messages ADD CONSTRAINT messages_kind_check CHECK(kind IN ('text','missed_call','call_ended'))"
     ]}
+    ,{51, [
+        %% Provider-aware no-code AI assistants. Chat triggering is deliberately
+        %% mention/reply-only so a bad prompt cannot make bots answer each other
+        %% forever. Context is opt-in, bounded, and assembled only after the same
+        %% channel authorization check used for command delivery.
+        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_provider text NOT NULL DEFAULT 'openai_compatible'",
+        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_temperature double precision NOT NULL DEFAULT 0.7",
+        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_max_output_tokens integer NOT NULL DEFAULT 1000",
+        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_include_history boolean NOT NULL DEFAULT false",
+        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_history_messages integer NOT NULL DEFAULT 8",
+        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_chat_enabled boolean NOT NULL DEFAULT false",
+        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_chat_trigger text NOT NULL DEFAULT 'mention_or_reply'",
+        "ALTER TABLE developer_applications DROP CONSTRAINT IF EXISTS developer_applications_ai_provider_check",
+        "ALTER TABLE developer_applications ADD CONSTRAINT developer_applications_ai_provider_check CHECK(ai_provider IN ('openai','openai_responses','openai_compatible','anthropic','google','openrouter','groq','mistral','ollama'))",
+        "ALTER TABLE developer_applications DROP CONSTRAINT IF EXISTS developer_applications_ai_temperature_check",
+        "ALTER TABLE developer_applications ADD CONSTRAINT developer_applications_ai_temperature_check CHECK(ai_temperature BETWEEN 0 AND 2)",
+        "ALTER TABLE developer_applications DROP CONSTRAINT IF EXISTS developer_applications_ai_max_output_tokens_check",
+        "ALTER TABLE developer_applications ADD CONSTRAINT developer_applications_ai_max_output_tokens_check CHECK(ai_max_output_tokens BETWEEN 64 AND 8192)",
+        "ALTER TABLE developer_applications DROP CONSTRAINT IF EXISTS developer_applications_ai_history_messages_check",
+        "ALTER TABLE developer_applications ADD CONSTRAINT developer_applications_ai_history_messages_check CHECK(ai_history_messages BETWEEN 0 AND 20)",
+        "ALTER TABLE developer_applications DROP CONSTRAINT IF EXISTS developer_applications_ai_chat_trigger_check",
+        "ALTER TABLE developer_applications ADD CONSTRAINT developer_applications_ai_chat_trigger_check CHECK(ai_chat_trigger IN ('mention','mention_or_reply'))",
+        "CREATE INDEX IF NOT EXISTS idx_bot_command_invocations_developer_activity ON bot_command_invocations(command_id,id DESC)"
+    ]}
 ].
 
 
 
 developer_app_select() ->
     "SELECT a.id,a.owner_user_id,a.public_id,a.name,a.description,a.avatar_url,a.public,a.default_permissions,"
-    "a.interaction_url,a.interaction_secret,a.ai_enabled,a.ai_endpoint,a.ai_model,a.ai_api_key,a.ai_system_prompt,a.created_at,a.updated_at FROM developer_applications a".
+    "a.interaction_url,a.interaction_secret,a.ai_enabled,a.ai_endpoint,a.ai_model,a.ai_api_key,a.ai_system_prompt,"
+    "a.ai_provider,a.ai_temperature,a.ai_max_output_tokens,a.ai_include_history,a.ai_history_messages,a.ai_chat_enabled,a.ai_chat_trigger,"
+    "a.created_at,a.updated_at FROM developer_applications a".
 
 developer_app_owned_row(Conn, Uid, AppId, Lock) when is_integer(AppId), AppId > 0 ->
     Suffix = case Lock of true -> " FOR UPDATE OF a"; false -> "" end,
@@ -6474,14 +6532,19 @@ developer_app_owned_row(_Conn, _Uid, _AppId, _Lock) -> {error, not_found}.
 
 developer_app_map([Id, Owner, PublicId, Name, Description, Avatar, Public, DefaultPermissions,
                    InteractionUrl, InteractionSecret, AiEnabled, AiEndpoint, AiModel, AiApiKey, AiSystemPrompt,
+                   AiProvider, AiTemperature, AiMaxOutputTokens, AiIncludeHistory, AiHistoryMessages, AiChatEnabled, AiChatTrigger,
                    CreatedAt, UpdatedAt]) ->
     #{id => Id, owner_user_id => Owner, public_id => PublicId, name => Name, description => Description,
       avatar_source => pw_util:bin(Avatar), avatar_url => pw_util:proxied_image(Avatar), public => Public =:= true,
       default_permissions => pw_permissions:sanitize(DefaultPermissions),
       interaction => #{url => pw_util:bin(InteractionUrl), configured => pw_util:bin(InteractionUrl) =/= <<>> andalso pw_util:bin(InteractionSecret) =/= <<>>},
-      ai => #{enabled => AiEnabled =:= true, endpoint => pw_util:bin(AiEndpoint), model => pw_util:bin(AiModel),
+      ai => #{enabled => AiEnabled =:= true, provider => pw_util:bin(AiProvider),
+              endpoint => pw_util:bin(AiEndpoint), model => pw_util:bin(AiModel),
               has_api_key => pw_util:bin(AiApiKey) =/= <<>>, system_prompt => load_message(AiSystemPrompt),
-              configured => AiEnabled =:= true andalso pw_util:bin(AiEndpoint) =/= <<>> andalso pw_util:bin(AiModel) =/= <<>> andalso pw_util:bin(AiApiKey) =/= <<>>},
+              temperature => AiTemperature, max_output_tokens => AiMaxOutputTokens,
+              include_history => AiIncludeHistory =:= true, history_messages => AiHistoryMessages,
+              chat_enabled => AiChatEnabled =:= true, chat_trigger => pw_util:bin(AiChatTrigger),
+              configured => ai_configuration_available(AiEnabled, AiProvider, AiEndpoint, AiModel, AiApiKey)},
       created_at => CreatedAt, updated_at => UpdatedAt}.
 
 developer_installation_map([Id, Sid, ServerName, BotId, BotUid, Username, Display, Avatar, RoleId, InstalledBy, CreatedAt]) ->
@@ -6498,6 +6561,14 @@ developer_command_map([Id, Name, Description, OptionsJson, Handler, CreatedAt, U
     #{id => Id, name => Name, description => Description, options => decode_json_value(OptionsJson, []), handler => Handler,
       created_at => CreatedAt, updated_at => UpdatedAt}.
 
+developer_activity_map([Id, Command, Status, Attempts, FailReason, Sid, ServerName, Cid,
+                        UserId, RequestMid, ResponseMid, CreatedAt, UpdatedAt, CompletedAt]) ->
+    #{id => Id, command => Command, status => Status, attempts => Attempts,
+      fail_reason => pw_util:bin(FailReason), server_id => Sid, server_name => ServerName,
+      channel_id => Cid, user_id => db_null(UserId), request_message_id => db_null(RequestMid),
+      response_message_id => db_null(ResponseMid), created_at => CreatedAt,
+      updated_at => UpdatedAt, completed_at => CompletedAt}.
+
 developer_public_command_map([Name, Description, OptionsJson, Handler]) ->
     #{name => Name, description => Description, options => decode_json_value(OptionsJson, []), handler => Handler}.
 
@@ -6509,6 +6580,72 @@ normalize_developer_handler(Value0) ->
         _ -> invalid
     end.
 
+normalize_ai_provider(Value0) ->
+    case string:lowercase(pw_util:bin(Value0)) of
+        <<"openai">> -> <<"openai">>;
+        <<"openai_responses">> -> <<"openai_responses">>;
+        <<"openai_compatible">> -> <<"openai_compatible">>;
+        <<"anthropic">> -> <<"anthropic">>;
+        <<"google">> -> <<"google">>;
+        <<"openrouter">> -> <<"openrouter">>;
+        <<"groq">> -> <<"groq">>;
+        <<"mistral">> -> <<"mistral">>;
+        <<"ollama">> -> <<"ollama">>;
+        _ -> invalid
+    end.
+
+normalize_ai_chat_trigger(Value0) ->
+    case string:lowercase(pw_util:bin(Value0)) of
+        <<"mention">> -> <<"mention">>;
+        <<"mention_or_reply">> -> <<"mention_or_reply">>;
+        _ -> invalid
+    end.
+
+normalize_ai_temperature(Value) ->
+    Number = case Value of
+        I when is_integer(I) -> float(I);
+        F when is_float(F) -> F;
+        B when is_binary(B) ->
+            try binary_to_float(B) catch _:_ ->
+                try float(binary_to_integer(B)) catch _:_ -> 0.7 end
+            end;
+        _ -> 0.7
+    end,
+    min(2.0, max(0.0, Number)).
+
+ai_provider_requires_key(<<"ollama">>) -> false;
+ai_provider_requires_key(_) -> true.
+
+ai_configuration_available(AiEnabled, Provider0, Endpoint, Model, ApiKey) ->
+    Provider = normalize_ai_provider(Provider0),
+    AiEnabled =:= true andalso Provider =/= invalid andalso
+    pw_util:bin(Endpoint) =/= <<>> andalso pw_util:bin(Model) =/= <<>> andalso
+    ((not ai_provider_requires_key(Provider)) orelse pw_util:bin(ApiKey) =/= <<>>).
+
+ensure_ai_chat_command(Conn, AppId, Now) ->
+    Options = [#{name => <<"prompt">>, type => <<"string">>, required => true,
+                 description => <<"What you want the assistant to answer">>}],
+    OptionsJson = pw_util:json(Options),
+    case one(Conn,
+        "SELECT id,handler FROM developer_app_commands WHERE app_id=$1 AND name='chat' FOR UPDATE",
+        [AppId]) of
+        {ok, [_Id, <<"ai">>]} -> ok;
+        {ok, [_Id, _Other]} -> throw({plainwire_error, ai_chat_command_conflict});
+        _ ->
+            {ok, [_]} = one(Conn,
+                "INSERT INTO developer_app_commands(app_id,name,description,options_json,handler,created_at,updated_at) "
+                "VALUES($1,'chat','Ask the AI assistant',$2,'ai',$3,$3) RETURNING id",
+                [AppId, OptionsJson, Now]),
+            ok
+    end,
+    {ok, Installs} = rows(Conn,
+        "SELECT server_bot_id,server_id FROM developer_app_installations WHERE app_id=$1 ORDER BY id ASC",
+        [AppId]),
+    lists:foreach(fun([BotId, Sid]) ->
+        ok = sync_developer_commands_to_installation(Conn, AppId, BotId, Sid, Now)
+    end, Installs),
+    ok.
+
 developer_handler_available(_App, <<"queue">>) -> true;
 developer_handler_available(App, <<"webhook">>) -> maps:get(configured, maps:get(interaction, App), false);
 developer_handler_available(App, <<"ai">>) -> maps:get(configured, maps:get(ai, App), false);
@@ -6516,7 +6653,7 @@ developer_handler_available(_, _) -> false.
 
 developer_endpoint_valid(<<>>) -> true;
 developer_endpoint_valid(Url) when is_binary(Url) ->
-    case pw_outbound_url:resolve_allowed(Url) of {ok, _} -> true; _ -> false end;
+    case pw_outbound_url:resolve_app_allowed(Url) of {ok, _} -> true; _ -> false end;
 developer_endpoint_valid(_) -> false.
 
 unique_developer_public_id(Conn) ->
@@ -6650,7 +6787,8 @@ internal_app_claim_route(Conn, Handler, Limit0) ->
             [Now, Handler, MaxAttempts]),
         {ok, Rows0} = rows(Conn,
             "SELECT i.id,c.name,c.id,i.server_id,i.channel_id,i.user_id,i.request_message_id,i.args_cipher,i.attempts,i.created_at,"
-            "b.bot_user_id,a.id,a.public_id,a.name,a.interaction_url,a.interaction_secret,a.ai_enabled,a.ai_endpoint,a.ai_model,a.ai_api_key,a.ai_system_prompt "
+            "b.bot_user_id,a.id,a.public_id,a.name,a.interaction_url,a.interaction_secret,a.ai_enabled,a.ai_endpoint,a.ai_model,a.ai_api_key,a.ai_system_prompt,"
+            "a.ai_provider,a.ai_temperature,a.ai_max_output_tokens,a.ai_include_history,a.ai_history_messages "
             "FROM bot_command_invocations i JOIN bot_commands c ON c.id=i.command_id "
             "JOIN server_bots b ON b.id=i.bot_id JOIN users bu ON bu.id=b.bot_user_id "
             "JOIN developer_app_installations di ON di.server_bot_id=b.id "
@@ -6675,12 +6813,12 @@ claim_internal_app_rows(_Conn, _Handler, [], _Now, _LeaseMs, Jobs, Failed) -> {J
 claim_internal_app_rows(Conn, Handler,
         [[Id, Command, CommandId, Sid, Cid, UserId, RequestMid, ArgsCipher, Attempts0, CreatedAt,
           BotUid, AppId, PublicId, AppName, InteractionUrl, InteractionSecret,
-          AiEnabled, AiEndpoint, AiModel, AiApiKey, AiSystemPrompt] | Rest],
+          AiEnabled, AiEndpoint, AiModel, AiApiKey, AiSystemPrompt,
+          AiProvider, AiTemperature, AiMaxOutputTokens, AiIncludeHistory, AiHistoryMessages] | Rest],
         Now, LeaseMs, Jobs, Failed) ->
     Available = case Handler of
         <<"webhook">> -> pw_util:bin(InteractionUrl) =/= <<>> andalso pw_util:bin(InteractionSecret) =/= <<>>;
-        <<"ai">> -> AiEnabled =:= true andalso pw_util:bin(AiEndpoint) =/= <<>> andalso
-                    pw_util:bin(AiModel) =/= <<>> andalso pw_util:bin(AiApiKey) =/= <<>>;
+        <<"ai">> -> ai_configuration_available(AiEnabled, AiProvider, AiEndpoint, AiModel, AiApiKey);
         _ -> false
     end,
     Authorization = case Available of
@@ -6693,14 +6831,20 @@ claim_internal_app_rows(Conn, Handler,
             ok = exec(Conn,
                 "UPDATE bot_command_invocations SET status='claimed',claim_token_hash='',lease_until=$1,attempts=$2,updated_at=$3 WHERE id=$4",
                 [Now + LeaseMs, Attempts, Now, Id]),
-            Base = #{id => Id, command => Command, server_id => Sid, channel_id => Cid,
+            Args = decode_command_args(ArgsCipher),
+            {MemberName, ChannelName} = invocation_context_labels(Conn, UserId, Cid),
+            Base = #{id => Id, command => Command, server_id => Sid, guild_id => Sid, channel_id => Cid,
                      user_id => db_null(UserId), request_message_id => db_null(RequestMid),
-                     args => decode_command_args(ArgsCipher), attempts => Attempts, created_at => CreatedAt,
+                     args => Args, options => command_options_from_args(Args),
+                     member_name => MemberName, channel_name => ChannelName,
+                     attempts => Attempts, created_at => CreatedAt,
                      bot_user_id => BotUid, app_id => AppId, app_public_id => PublicId, app_name => AppName},
             Job = case Handler of
                 <<"webhook">> -> Base#{url => pw_util:bin(InteractionUrl), secret => pw_crypto:decrypt(pw_util:bin(InteractionSecret))};
-                <<"ai">> -> Base#{endpoint => pw_util:bin(AiEndpoint), model => pw_util:bin(AiModel),
-                    api_key => pw_crypto:decrypt(pw_util:bin(AiApiKey)), system_prompt => pw_crypto:decrypt(pw_util:bin(AiSystemPrompt))}
+                <<"ai">> -> Base#{provider => pw_util:bin(AiProvider), endpoint => pw_util:bin(AiEndpoint), model => pw_util:bin(AiModel),
+                    api_key => pw_crypto:decrypt(pw_util:bin(AiApiKey)), system_prompt => pw_crypto:decrypt(pw_util:bin(AiSystemPrompt)),
+                    temperature => AiTemperature, max_output_tokens => AiMaxOutputTokens,
+                    context => ai_context_messages(Conn, Cid, RequestMid, AiIncludeHistory, AiHistoryMessages)}
             end,
             claim_internal_app_rows(Conn, Handler, Rest, Now, LeaseMs, [Job | Jobs], Failed);
         {error, Reason} ->
@@ -6710,6 +6854,33 @@ claim_internal_app_rows(Conn, Handler,
             Failure = #{id => Id, user_id => db_null(UserId), channel_id => Cid, reason => Reason},
             claim_internal_app_rows(Conn, Handler, Rest, Now, LeaseMs, Jobs, [Failure | Failed])
     end.
+
+ai_context_messages(_Conn, _Cid, _RequestMid, false, _Limit) -> [];
+ai_context_messages(_Conn, _Cid, RequestMid, true, _Limit) when not is_integer(RequestMid) -> [];
+ai_context_messages(Conn, Cid, RequestMid, true, Limit0) ->
+    Limit = clamp_int(Limit0, 0, 20, 8),
+    case Limit of
+        0 -> [];
+        _ ->
+            case rows(Conn,
+                "SELECT u.display_name,u.username,u.is_bot,m.body FROM messages m "
+                "JOIN users u ON u.id=m.user_id JOIN messages request ON request.id=$2 "
+                "WHERE m.scope='channel' AND m.scope_id=$1 AND m.deleted_at IS NULL AND m.id<>$2 "
+                "AND (m.created_at<request.created_at OR (m.created_at=request.created_at AND m.id<request.id)) "
+                "ORDER BY m.created_at DESC,m.id DESC LIMIT $3",
+                [Cid, RequestMid, Limit]) of
+                {ok, Rows} -> [ai_context_message_map(Row) || Row <- lists:reverse(Rows)];
+                _ -> []
+            end
+    end.
+
+ai_context_message_map([DisplayName0, Username0, IsBot, Body0]) ->
+    DisplayName = pw_util:clean_text(DisplayName0, 80),
+    Username = pw_util:clean_text(Username0, 32),
+    Name = case DisplayName of <<>> -> Username; _ -> DisplayName end,
+    Body = pw_util:clean_text(load_message(Body0), 1200),
+    #{role => case IsBot of true -> <<"assistant">>; _ -> <<"user">> end,
+      content => <<Name/binary, ": ", Body/binary>>}.
 
 internal_app_finish_route(Conn, Handler, InvocationId0, Result0) ->
     InvocationId = pw_util:int(InvocationId0),
@@ -6778,6 +6949,13 @@ finish_internal_app_claim(Conn, InvocationId, Cid, _RequestMid, _BotUid, UserId,
             ok = exec(Conn, "UPDATE bot_command_invocations SET status='claimed',fail_reason=$1,claim_token_hash='',lease_until=$2,updated_at=$3 WHERE id=$4", [Reason, Now + Delay, Now, InvocationId]),
             {ok, #{retrying => true, retry_in_ms => Delay, attempts => Attempts}}
     end;
+finish_internal_app_claim(Conn, InvocationId, Cid, _RequestMid, _BotUid, UserId, _Attempts, _MaxAttempts, {terminal_error, Reason0}, Now) ->
+    Reason = pw_util:clean_text(Reason0, 500),
+    ok = exec(Conn,
+        "UPDATE bot_command_invocations SET status='failed',fail_reason=$1,claim_token_hash='',lease_until=0,completed_at=$2,updated_at=$2 WHERE id=$3",
+        [Reason, Now, InvocationId]),
+    {ok, #{failed => true, terminal_failed => true, reason => Reason,
+           user_id => db_null(UserId), channel_id => Cid}};
 finish_internal_app_claim(Conn, InvocationId, Cid, RequestMid, BotUid, UserId, Attempts, MaxAttempts, Other, Now) ->
     finish_internal_app_claim(Conn, InvocationId, Cid, RequestMid, BotUid, UserId, Attempts, MaxAttempts,
         {error, pw_util:clean_text(io_lib:format("invalid dispatcher result: ~p", [Other]), 500)}, Now).
@@ -6796,9 +6974,10 @@ bot_command_handler_available(Conn, BotId, <<"webhook">>) ->
     end;
 bot_command_handler_available(Conn, BotId, <<"ai">>) ->
     case one(Conn,
-        "SELECT a.ai_enabled,a.ai_endpoint,a.ai_model,a.ai_api_key FROM developer_app_installations di "
+        "SELECT a.ai_enabled,a.ai_provider,a.ai_endpoint,a.ai_model,a.ai_api_key FROM developer_app_installations di "
         "JOIN developer_applications a ON a.id=di.app_id WHERE di.server_bot_id=$1", [BotId]) of
-        {ok, [true, Endpoint, Model, ApiKey]} -> pw_util:bin(Endpoint) =/= <<>> andalso pw_util:bin(Model) =/= <<>> andalso pw_util:bin(ApiKey) =/= <<>>;
+        {ok, [Enabled, Provider, Endpoint, Model, ApiKey]} ->
+            ai_configuration_available(Enabled, Provider, Endpoint, Model, ApiKey);
         _ -> false
     end;
 bot_command_handler_available(_Conn, _BotId, _) -> false.
@@ -6967,9 +7146,9 @@ normalize_command_options([Opt | Rest], Acc, Names) when is_map(Opt) ->
     end;
 normalize_command_options(_, _, _) -> error.
 
-normalize_command_arguments(Args0, _Options) when is_binary(Args0); is_list(Args0) ->
+normalize_command_arguments(Args0, Options) when is_binary(Args0); is_list(Args0) ->
     Raw = pw_util:clean_text(Args0, 2000),
-    {ok, #{<<"raw">> => Raw}};
+    {ok, maybe_promote_raw_argument(Raw, Options)};
 normalize_command_arguments(Args0, Options) when is_map(Args0), map_size(Args0) =< 32 ->
     try
         Pairs = maps:to_list(Args0),
@@ -7033,21 +7212,135 @@ command_argument_type_valid(<<"user">>, V) -> is_integer(V) andalso V > 0;
 command_argument_type_valid(<<"channel">>, V) -> is_integer(V) andalso V > 0;
 command_argument_type_valid(_, _) -> false.
 
-command_display(Name, Args) ->
+command_display(Name, Args) when is_map(Args) ->
     Raw = case maps:get(<<"raw">>, Args, <<>>) of
         B when is_binary(B) -> B;
         _ -> <<>>
     end,
-    case Raw of
-        <<>> -> <<"/", Name/binary>>;
-        _ -> <<"/", Name/binary, " ", Raw/binary>>
+    case pw_util:bin(Raw) of
+        <<>> ->
+            Pairs = lists:sort(maps:to_list(command_options_from_args(Args))),
+            case Pairs of
+                [] -> <<"/", Name/binary>>;
+                _ ->
+                    Formatted = lists:join(<<" ">>, [<<K/binary, ":", (format_command_arg(V))/binary>> || {K, V} <- Pairs]),
+                    iolist_to_binary([<<"/">>, Name, <<" ">>, Formatted])
+            end;
+        Text -> <<"/", Name/binary, " ", Text/binary>>
+    end;
+command_display(Name, _) -> <<"/", Name/binary>>.
+
+maybe_promote_raw_argument(Raw, Options) ->
+    Base = #{<<"raw">> => Raw},
+    case {Raw, primary_string_option(Options)} of
+        {<<>>, _} -> Base;
+        {_, undefined} -> Base;
+        {_, Name} -> Base#{Name => Raw}
     end.
+
+primary_string_option(Options) when is_list(Options) ->
+    StringNames = [Name || Opt <- Options, is_map(Opt),
+                           maps:get(<<"type">>, Opt, maps:get(type, Opt, <<"string">>)) =:= <<"string">>,
+                           Name <- [maps:get(<<"name">>, Opt, maps:get(name, Opt, undefined))],
+                           is_binary(Name)],
+    case StringNames of
+        [Only] -> Only;
+        _ ->
+            Required = [Name || Opt <- Options, is_map(Opt),
+                                maps:get(<<"required">>, Opt, maps:get(required, Opt, false)) =:= true,
+                                maps:get(<<"type">>, Opt, maps:get(type, Opt, <<"string">>)) =:= <<"string">>,
+                                Name <- [maps:get(<<"name">>, Opt, maps:get(name, Opt, undefined))],
+                                is_binary(Name)],
+            case Required of [First | _] -> First; _ -> undefined end
+    end;
+primary_string_option(_) -> undefined.
+
+command_options_from_args(Args) when is_map(Args) ->
+    maps:fold(fun(Key, Value, Acc) ->
+        case Key of
+            <<"raw">> -> Acc;
+            <<"source">> -> Acc;
+            raw -> Acc;
+            source -> Acc;
+            _ -> Acc#{pw_util:bin(Key) => Value}
+        end
+    end, #{}, Args);
+command_options_from_args(_) -> #{}.
+
+format_command_arg(Value) when is_binary(Value) -> pw_util:clean_text(Value, 200);
+format_command_arg(Value) when is_integer(Value) -> integer_to_binary(Value);
+format_command_arg(Value) when is_float(Value) -> float_to_binary(Value, [{decimals, 4}, compact]);
+format_command_arg(true) -> <<"true">>;
+format_command_arg(false) -> <<"false">>;
+format_command_arg(null) -> <<"null">>;
+format_command_arg(Value) -> pw_util:clean_text(pw_util:json(Value), 200).
+
+invocation_context_labels(Conn, UserId, Cid) ->
+    Member = case is_integer(UserId) of
+        true ->
+            case one(Conn, "SELECT COALESCE(NULLIF(display_name,''),username) FROM users WHERE id=$1", [UserId]) of
+                {ok, [MemberName]} -> pw_util:clean_text(MemberName, 80);
+                _ -> <<"member">>
+            end;
+        false -> <<"member">>
+    end,
+    Channel = case one(Conn, "SELECT name FROM channels WHERE id=$1", [Cid]) of
+        {ok, [ChannelName]} -> pw_util:clean_text(ChannelName, 80);
+        _ -> <<"channel">>
+    end,
+    {Member, Channel}.
 
 encode_command_args(Args) -> pw_crypto:encrypt(pw_util:json(Args)).
 
 decode_command_args(Value) ->
     Plain = pw_crypto:decrypt(pw_util:bin(Value)),
     decode_json_value(Plain, #{}).
+
+maybe_enqueue_ai_chat(_Conn, _Sid, _Cid, _Uid, _Mid, Plain, _ReplyTo, _Now) when not is_binary(Plain) -> 0;
+maybe_enqueue_ai_chat(Conn, Sid, Cid, Uid, Mid, Plain, ReplyTo, Now) ->
+    case {is_voice_note_body(Plain), one(Conn, "SELECT is_bot FROM users WHERE id=$1", [Uid])} of
+        {true, _} -> 0;
+        {_, {ok, [true]}} -> 0;
+        _ ->
+            {ok, Rows} = rows(Conn,
+                "SELECT c.id,c.bot_id,b.bot_user_id,u.username,a.id,a.ai_chat_trigger,"
+                "a.ai_enabled,a.ai_provider,a.ai_endpoint,a.ai_model,a.ai_api_key "
+                "FROM developer_app_installations di JOIN developer_applications a ON a.id=di.app_id "
+                "JOIN server_bots b ON b.id=di.server_bot_id JOIN users u ON u.id=b.bot_user_id "
+                "JOIN developer_app_commands dc ON dc.app_id=a.id AND dc.name='chat' AND dc.handler='ai' "
+                "JOIN bot_commands c ON c.developer_command_id=dc.id AND c.bot_id=b.id AND c.server_id=di.server_id "
+                "WHERE di.server_id=$1 AND a.ai_chat_enabled=true AND u.account_state='active' "
+                "ORDER BY a.id ASC LIMIT 8",
+                [Sid]),
+            Tokens = pw_mention:tokens(Plain),
+            Limit = clamp_int(pw_util:env_int("PLAINWIRE_AI_CHAT_MENTIONS_PER_USER_PER_MINUTE", 20), 1, 120, 20),
+            lists:foldl(fun([CommandId, BotId, BotUid, Username, AppId, Trigger,
+                             AiEnabled, Provider, Endpoint, Model, ApiKey], Count) ->
+                Mentioned = lists:member(pw_util:normalize_username(Username), Tokens),
+                Replied = Trigger =:= <<"mention_or_reply">> andalso ai_chat_reply_targets(Conn, ReplyTo, BotUid),
+                Available = ai_configuration_available(AiEnabled, Provider, Endpoint, Model, ApiKey),
+                Authorized = command_claim_authorization(Conn, Uid, Sid, Cid, CommandId, BotUid) =:= ok,
+                Eligible = Available andalso Authorized andalso (Mentioned orelse Replied),
+                Allowed = Eligible andalso pw_rate:allow_shared({ai_chat_enqueue, AppId, Uid}, Limit, 60000),
+                case Allowed of
+                    true ->
+                        Args = #{<<"raw">> => pw_util:clean_text(Plain, 4000), <<"source">> => <<"chat">>},
+                        ok = exec(Conn,
+                            "INSERT INTO bot_command_invocations(command_id,bot_id,server_id,channel_id,user_id,request_message_id,args_cipher,status,created_at,updated_at) "
+                            "VALUES($1,$2,$3,$4,$5,$6,$7,'pending',$8,$8)",
+                            [CommandId, BotId, Sid, Cid, Uid, Mid, encode_command_args(Args), Now]),
+                        Count + 1;
+                    false -> Count
+                end
+            end, 0, Rows)
+    end.
+
+ai_chat_reply_targets(_Conn, ReplyTo, _BotUid) when not is_integer(ReplyTo) -> false;
+ai_chat_reply_targets(Conn, ReplyTo, BotUid) ->
+    case one(Conn, "SELECT user_id FROM messages WHERE id=$1", [ReplyTo]) of
+        {ok, [BotUid]} -> true;
+        _ -> false
+    end.
 
 decode_json_value(Value, Default) when is_binary(Value) ->
     try jsx:decode(Value, [return_maps]) catch _:_ -> Default end;
@@ -7109,8 +7402,10 @@ claim_bot_invocation(Conn, BotId,
     ok = exec(Conn,
         "UPDATE bot_command_invocations SET status='claimed',claim_token_hash=$1,lease_until=$2,attempts=$3,updated_at=$4 WHERE id=$5 AND bot_id=$6",
         [Hash, LeaseUntil, Attempts, Now, Id, BotId]),
-    #{id => Id, command_id => CommandId, command => Name, server_id => Sid, channel_id => Cid,
-      user_id => db_null(UserId), request_message_id => db_null(RequestMid), args => decode_command_args(ArgsCipher),
+    Args = decode_command_args(ArgsCipher),
+    #{id => Id, command_id => CommandId, command => Name, server_id => Sid, guild_id => Sid, channel_id => Cid,
+      user_id => db_null(UserId), request_message_id => db_null(RequestMid), args => Args,
+      options => command_options_from_args(Args),
       claim_token => Token, lease_until => LeaseUntil, attempt => Attempts, created_at => CreatedAt}.
 
 secure_token_hash_match(Token, ExpectedHash) ->

@@ -58,7 +58,7 @@ export class PlainwireBot {
         headers: {
           Authorization: `Bot ${this.token}`,
           Accept: 'application/json',
-          'User-Agent': 'plainwire-js-bot/2.2',
+          'User-Agent': 'plainwire-js-bot/2.4',
           ...(payload === undefined ? {} : {'Content-Type': 'application/json'})
         },
         body: payload
@@ -119,6 +119,23 @@ export class PlainwireBot {
   failCommand(id, claimToken, reason) { return this.request('POST', `${API}/commands/claims/${Number(id)}/fail`, {claim_token: claimToken, reason}); }
 
   commandWorker(handlers, options = {}) { return new CommandWorker(this, handlers, options); }
+  listen(handlers, options = {}) { return this.commandWorker(handlers, options).run(); }
+  options(claim) { return commandOptions(claim); }
+  option(claim, name, fallback) { return commandOption(claim, name, fallback); }
+}
+
+export function commandOptions(claim = {}) {
+  if (claim && typeof claim.options === 'object' && claim.options && !Array.isArray(claim.options)) return { ...claim.options };
+  const args = claim && typeof claim.args === 'object' && claim.args && !Array.isArray(claim.args) ? claim.args : {};
+  const rest = { ...args };
+  delete rest.raw;
+  delete rest.source;
+  return rest;
+}
+
+export function commandOption(claim, name, fallback) {
+  const options = commandOptions(claim);
+  return Object.prototype.hasOwnProperty.call(options, name) ? options[name] : fallback;
 }
 
 export class CommandWorker {

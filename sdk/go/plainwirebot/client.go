@@ -63,10 +63,25 @@ type CommandClaim struct {
 	UserID           *int64         `json:"user_id"`
 	RequestMessageID *int64         `json:"request_message_id"`
 	Args             map[string]any `json:"args"`
+	Options          map[string]any `json:"options"`
+	GuildID          int64          `json:"guild_id"`
 	ClaimToken       string         `json:"claim_token"`
 	LeaseUntil       int64          `json:"lease_until"`
 	Attempt          int            `json:"attempt"`
 	CreatedAt        int64          `json:"created_at"`
+}
+
+func (c CommandClaim) Option(name string) (any, bool) {
+	if c.Options != nil {
+		if value, ok := c.Options[name]; ok {
+			return value, true
+		}
+	}
+	if c.Args == nil {
+		return nil, false
+	}
+	value, ok := c.Args[name]
+	return value, ok
 }
 
 func New(baseURL, token string) (*Client, error) {
@@ -136,7 +151,7 @@ func (c *Client) Request(ctx context.Context, method, path string, body any) (*R
 	}
 	req.Header.Set("Authorization", "Bot "+c.token)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "plainwire-go-bot/2.2")
+	req.Header.Set("User-Agent", "plainwire-go-bot/2.4")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

@@ -1,6 +1,6 @@
 import unittest
 from unittest.mock import Mock
-from plainwire_bot import Client, Response
+from plainwire_bot import Client, Response, command_option, command_options
 
 TOKEN = "pwb_" + "x" * 32
 
@@ -44,5 +44,12 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(client.command_worker({"ping": lambda _claim, _bot: "pong"}).run_once(), 1)
         client.defer_command.assert_called_once()
         client.respond_command.assert_called_once_with(7, "pwc_x", "pong")
+
+    def test_command_options_ignore_raw_metadata(self):
+        claim = {"args": {"raw": "hello there", "source": "chat", "text": "hello there"}, "options": {"text": "hello there"}}
+        self.assertEqual(command_options(claim), {"text": "hello there"})
+        self.assertEqual(command_option(claim, "text"), "hello there")
+        self.assertEqual(command_option({"args": {"prompt": "hi"}}, "prompt"), "hi")
+        self.assertEqual(command_option({"args": {}}, "missing", "fallback"), "fallback")
 
 if __name__ == "__main__": unittest.main()

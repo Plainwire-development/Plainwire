@@ -7,6 +7,7 @@ module Types exposing
     , CallUI
     , CallUser
     , BotCommand
+    , BotCommandOption
     , Category
     , Channel
     , ContextMenu
@@ -275,6 +276,14 @@ type alias Channel =
     }
 
 
+type alias BotCommandOption =
+    { name : String
+    , optionType : String
+    , required : Bool
+    , description : String
+    }
+
+
 type alias BotCommand =
     { id : Int
     , name : String
@@ -284,6 +293,7 @@ type alias BotCommand =
     , botName : String
     , botDisplayName : String
     , botAvatarUrl : String
+    , options : List BotCommandOption
     }
 
 
@@ -963,15 +973,25 @@ decodeServer =
 
 decodeBotCommand : D.Decoder BotCommand
 decodeBotCommand =
-    D.map8 BotCommand
-        (D.field "id" D.int)
+    D.succeed BotCommand
+        |> andMap (D.field "id" D.int)
+        |> andMap (D.field "name" D.string)
+        |> andMap (D.field "description" D.string |> defaultValue "")
+        |> andMap (D.at [ "bot", "id" ] D.int)
+        |> andMap (D.at [ "bot", "user_id" ] D.int)
+        |> andMap (D.at [ "bot", "name" ] D.string |> defaultValue "")
+        |> andMap (D.at [ "bot", "display_name" ] D.string |> defaultValue "")
+        |> andMap (D.at [ "bot", "avatar_url" ] D.string |> defaultValue "")
+        |> andMap (D.field "options" (resilientList decodeBotCommandOption) |> defaultValue [])
+
+
+decodeBotCommandOption : D.Decoder BotCommandOption
+decodeBotCommandOption =
+    D.map4 BotCommandOption
         (D.field "name" D.string)
+        (D.field "type" D.string |> defaultValue "string")
+        (D.field "required" D.bool |> defaultValue False)
         (D.field "description" D.string |> defaultValue "")
-        (D.at [ "bot", "id" ] D.int)
-        (D.at [ "bot", "user_id" ] D.int)
-        (D.at [ "bot", "name" ] D.string |> defaultValue "")
-        (D.at [ "bot", "display_name" ] D.string |> defaultValue "")
-        (D.at [ "bot", "avatar_url" ] D.string |> defaultValue "")
 
 
 decodeChannel : D.Decoder Channel

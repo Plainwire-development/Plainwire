@@ -37,10 +37,12 @@ assert.match(http,/gun:open\(Address, Port/,'HTTP connects to the policy-resolve
 assert.doesNotMatch(http,/location/i,'app HTTP helper does not inspect Location headers or follow redirects');
 
 assert.match(db,/command_claim_authorization[\s\S]*channel_message_access\(Conn, UserId, Cid\)[\s\S]*bot_command_permission_allowed/,'claim-time delivery rechecks the invoking user and command permission before decrypting arguments');
-assert.ok(db.indexOf('command_claim_authorization(Conn, UserId, Sid, Cid, CommandId, BotUid)') < db.indexOf('args => decode_command_args(ArgsCipher)'), 'internal app delivery authorizes before decrypting command arguments');
-assert.ok(db.includes('pw_crypto:encrypt(NewKey0)') && db.includes('ai_api_key=$4'), 'AI API keys are encrypted before durable storage');
-assert.ok(db.includes('pw_crypto:encrypt(SystemPrompt)') && db.includes('ai_system_prompt=$5'), 'AI system prompts are encrypted before durable storage');
-assert.doesNotMatch(ai,/history|messages_for_|message_history/i,'hosted AI command execution does not fetch channel/message history');
+assert.ok(db.indexOf('command_claim_authorization(Conn, UserId, Sid, Cid, CommandId, BotUid)') < db.indexOf('Args = decode_command_args(ArgsCipher)'), 'internal app delivery authorizes before decrypting command arguments');
+assert.ok(db.includes('pw_crypto:encrypt(NewKey0)') && db.includes('ai_api_key=$5'), 'AI API keys are encrypted before durable storage');
+assert.ok(db.includes('pw_crypto:encrypt(SystemPrompt)') && db.includes('ai_system_prompt=$6'), 'AI system prompts are encrypted before durable storage');
+assert.doesNotMatch(ai,/FROM messages |ai_context_messages/,'hosted AI dispatcher does not query message history itself');
+assert.match(db,/ai_context_messages\(Conn, Cid, RequestMid, AiIncludeHistory, AiHistoryMessages\)/,'opt-in AI context is assembled at claim time after authorization');
+assert.ok(db.indexOf('command_claim_authorization(Conn, UserId, Sid, Cid, CommandId, BotUid)') < db.indexOf('ai_context_messages(Conn, Cid, RequestMid'), 'channel history is not loaded until claim-time authorization succeeds');
 assert.match(ai,/PLAINWIRE_AI_COMMANDS_PER_APP_PER_MINUTE[\s\S]*allow_shared/,'AI commands have a shared per-application rate limit');
 assert.match(ai,/PLAINWIRE_AI_COMMAND_CONCURRENCY/,'AI command concurrency is bounded');
 assert.match(db,/bot_command_handler_available[\s\S]*ai_enabled/,'disabled AI handlers become unavailable dynamically');
@@ -55,5 +57,11 @@ assert.ok(portal.length > 1000, 'Developer Portal source is present');
 assert.doesNotMatch(portal,/innerHTML\s*=|insertAdjacentHTML|document\.write/,'Developer Portal does not inject app/operator strings as HTML');
 assert.match(portal,/textContent/,'Developer Portal writes text through DOM textContent');
 assert.match(api,/\[<<"developer">>, <<"apps">>/,'developer application API is authenticated under the developer route family');
+
+assert.match(db,/\{51, \[[\s\S]*ai_chat_enabled[\s\S]*ai_provider/,'migration 51 installs provider-aware AI chat settings');
+assert.match(db,/maybe_enqueue_ai_chat[\s\S]*ai_chat_enabled=true/,'mention/reply chat is opt-in per application');
+assert.match(db,/resolve_app_allowed\(Url\)/,'developer and AI endpoints use the app HTTPS/loopback policy');
+assert.match(bridge,/Answer mentions and replies/,'Developer Portal can enable a no-code AI chatbot');
+assert.match(bridge,/Command options/,'Developer Portal builds typed command options without JSON');
 
 console.log('PASS: Plainwire 2.1 Developer Applications, interaction egress, AI connector, claim-time authorization, secret handling, and DOM-safety contracts.');

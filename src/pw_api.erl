@@ -368,6 +368,8 @@ authed(<<"POST">>, [<<"developer">>, <<"apps">>, AppId, <<"installation">>, Inst
     result(Req, pw_db:uninstall_developer_app(uid(Session), AppId, InstallationId));
 authed(<<"GET">>, [<<"developer">>, <<"apps">>, AppId, <<"commands">>], Req, Session, _) ->
     result(Req, pw_db:developer_app_commands(uid(Session), AppId));
+authed(<<"GET">>, [<<"developer">>, <<"apps">>, AppId, <<"activity">>], Req, Session, _) ->
+    result(Req, pw_db:developer_app_activity(uid(Session), AppId, qs(Req, <<"limit">>)));
 authed(<<"POST">>, [<<"developer">>, <<"apps">>, AppId, <<"commands">>], Req0, Session, _) ->
     with_json(Req0, fun(M, Req) ->
         result(Req, pw_db:upsert_developer_app_command(uid(Session), AppId,
@@ -553,7 +555,7 @@ authed(<<"POST">>, [<<"commands">>, Name, <<"invoke">>], Req0, Session, _) ->
     case pw_rate:allow_shared({command_invoke, uid(Session)}, 90, 60000) of
         false -> pw_util:err_json(Req0, 429, <<"command_rate_limited">>);
         true -> with_json(Req0, fun(M, Req) ->
-            result(Req, pw_db:invoke_bot_command(uid(Session), maps:get(<<"channel_id">>, M, undefined), Name, maps:get(<<"args">>, M, <<>>)))
+            result(Req, pw_db:invoke_bot_command(uid(Session), maps:get(<<"channel_id">>, M, undefined), Name, invoke_command_args(M)))
         end)
     end;
 authed(<<"GET">>, [<<"notifications">>], Req, Session, _) -> result(Req, pw_db:notifications(uid(Session)));
@@ -568,8 +570,9 @@ handle_bot_v1(<<"GET">>, [], Req0) ->
             api => <<"plainwire-bot">>, version => 1, bot => Bot,
             authentication => <<"Authorization: Bot pwb_...">>, websocket => <<"/ws">>,
             features => [<<"messages">>, <<"message_editing">>, <<"reactions">>, <<"pins">>, <<"message_context">>,
-                         <<"commands">>, <<"command_sync">>, <<"durable_command_claims">>, <<"renewable_command_claims">>, <<"realtime_events">>, <<"members">>, <<"paginated_members">>,
-                         <<"roles">>, <<"moderation">>, <<"channel_management">>, <<"wires">>],
+                         <<"commands">>, <<"command_sync">>, <<"durable_command_claims">>, <<"renewable_command_claims">>,
+                         <<"typed_command_options">>, <<"realtime_events">>, <<"members">>, <<"paginated_members">>,
+                         <<"roles">>, <<"moderation">>, <<"channel_management">>, <<"wires">>, <<"ai_commands">>],
             command_claim => #{lease_ms => bot_command_lease_ms(), max_batch => 50, renewable => true, max_lease_ms => 120000},
             command_sync => #{max_commands => 100}, member_page => #{default_limit => 50, max_limit => 200},
             limits_per_minute => bot_limits()
@@ -941,6 +944,13 @@ listener_health(Ref) ->
         _ -> #{status => unavailable}
     catch _:_ -> #{status => unavailable}
     end.
+
+invoke_command_args(M) when is_map(M) ->
+    case maps:get(<<"options">>, M, undefined) of
+        Options when is_map(Options) -> Options;
+        _ -> maps:get(<<"args">>, M, <<>>)
+    end;
+invoke_command_args(_) -> <<>>.
 
 result(Req, {ok, Data}) -> pw_util:ok_json(Req, #{ok=>true,data=>Data});
 result(Req, ok) -> pw_util:ok_json(Req, #{ok=>true});

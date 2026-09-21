@@ -7,7 +7,7 @@ import Html.Events exposing (custom, onClick, onInput)
 import Json.Decode as D
 import Json.Encode as E
 import Set
-import Types exposing (ActiveRoute(..), Model, Msg(..), User)
+import Types exposing (ActiveRoute(..), BotCommand, Model, Msg(..), User)
 
 
 view : String -> String -> Model -> Html Msg
@@ -189,11 +189,30 @@ commandSuggestions model =
                                     command.description
                                 )
                             ]
+                        , if String.isEmpty (commandOptionHint command) then
+                            text ""
+
+                          else
+                            span [ class "command-suggestion-options" ] [ text (commandOptionHint command) ]
                         , span [ class "pill bot-badge" ] [ text "BOT" ]
                         ]
                 )
                 matches
             )
+
+
+commandOptionHint : BotCommand -> String
+commandOptionHint command =
+    command.options
+        |> List.map
+            (\option ->
+                if option.required then
+                    "<" ++ option.name ++ ">"
+
+                else
+                    "[" ++ option.name ++ "]"
+            )
+        |> String.join " "
 
 
 onComposerKeyDown : Bool -> Attribute Msg

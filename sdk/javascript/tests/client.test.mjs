@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {PlainwireBot} from '../plainwire-bot.mjs';
+import {PlainwireBot, commandOption, commandOptions} from '../plainwire-bot.mjs';
 const T = 'pwb_' + 'x'.repeat(32);
 test('remote HTTP is refused', () => assert.throws(() => new PlainwireBot('http://chat.example', T)));
 test('loopback HTTP is accepted', () => { new PlainwireBot('http://127.0.0.1:8080', T); new PlainwireBot('http://localhost:8080', T); });
@@ -35,6 +35,14 @@ test('2.2 member, command sync, and deferral routes are typed helpers', async ()
   assert.equal(calls[1].opts.method, 'PUT');
   assert.deepEqual(calls[1].body.commands, [{name:'ping', description:'Replies pong'}]);
   assert.match(calls[2].url, /\/commands\/claims\/9\/defer$/);
+});
+
+test('typed command options ignore raw/source metadata', () => {
+  const claim = {args: {raw: 'hello there', source: 'chat', text: 'hello there'}, options: {text: 'hello there'}};
+  assert.deepEqual(commandOptions(claim), {text: 'hello there'});
+  assert.equal(commandOption(claim, 'text'), 'hello there');
+  assert.equal(commandOption({args: {prompt: 'hi'}}, 'prompt'), 'hi');
+  assert.equal(commandOption({args: {}}, 'missing', 'fallback'), 'fallback');
 });
 
 test('command worker dispatches a claimed command and replies', async () => {

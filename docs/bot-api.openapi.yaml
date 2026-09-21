@@ -625,10 +625,15 @@ components:
         command_id: { type: integer, format: int64 }
         command: { type: string }
         server_id: { type: integer }
+        guild_id: { type: integer, description: "Alias of server_id for Discord-style clients." }
         channel_id: { type: integer }
         user_id: { type: [integer, 'null'] }
         request_message_id: { type: [integer, 'null'], format: int64 }
         args: { type: object, additionalProperties: true }
+        options:
+          type: object
+          additionalProperties: true
+          description: Named command options with raw/source metadata removed.
         claim_token: { type: string, description: "One-lease credential. Never log or persist it." }
         lease_until: { type: integer, format: int64 }
         attempt: { type: integer, minimum: 1 }

@@ -34,7 +34,7 @@ try {
    else await page.locator('.settings-mobile-nav button').nth(['profile','appearance','chat','voice','sound','privacy','account','developer'].indexOf(section)).click();
    if(section==='developer') {
     await page.waitForSelector('.developer-tabs');
-    for(const tab of ['General','Installations','Commands','Interactions','AI']) {
+    for(const tab of ['General','Installations','Commands','Interactions','AI assistant']) {
      await page.locator('.developer-tabs').getByRole('button',{name:tab,exact:true}).click();
      await page.waitForTimeout(60);
      const overflow=await page.locator('.developer-panel').evaluate(el=>[el.clientWidth,el.scrollWidth]);

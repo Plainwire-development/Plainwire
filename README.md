@@ -43,7 +43,7 @@ If you just want to use Plainwire, you should not need to worry about any of tha
 * Mobile and desktop layouts
 * PostgreSQL-backed relational persistence, with optional Redis acceleration and ScyllaDB timeline storage
 * Voice notes with server permission controls
-* Signed outbound webhooks, write-only incoming channel webhooks, and first-class bot accounts/SDK support
+* Signed outbound webhooks, write-only incoming channel webhooks, first-class bot accounts/SDKs, and no-code AI chatbots
 * Whole-app Less themes and sandboxed client plugins
 * STUN and TURN support for calls
 * Wires for sharing/joining servers, with legacy invite-link compatibility
@@ -282,10 +282,11 @@ Deployment and update instructions are kept in [deploy/README.md](deploy/README.
 
 ## Version
 
-Current release: **2.3.0**
+Current release: **2.4.0**
 
 Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history.
 
+* [2.4.0 release notes](RELEASE_NOTES_2.4.0.md)
 * [2.3.0 release notes](RELEASE_NOTES_2.3.0.md)
 * [2.2.0 release notes](RELEASE_NOTES_2.2.0.md)
 * [2.1.2 release notes](RELEASE_NOTES_2.1.2.md)

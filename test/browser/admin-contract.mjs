@@ -105,6 +105,9 @@ assert.match(components,/pw-global-banner-stack[\s\S]*pw-global-banner/,'global 
 assert.match(components,/pw-global-banner-stack[\s\S]{0,400}safe-area-inset-top/,'global banner stack respects mobile safe areas');
 assert.match(js,/renderControl[\s\S]*registration[\s\S]*Reconcile clients[\s\S]*Global banners/,'admin control view exposes service registration, reconciliation, and banner management');
 assert.match(js,/showBannerEditor[\s\S]*dismissible/,'admin banner editor supports permanent scheduling and dismissal controls');
+assert.match(js,/form\.id='account-moderation-form'[\s\S]*apply\.setAttribute\('form',form\.id\)/,'ban and suspend footer buttons submit the moderation form rather than sitting inert outside it');
+assert.match(js,/showModal[\s\S]*HTMLFormElement[\s\S]*type==='submit'[\s\S]*setAttribute\('form',body\.id\)/,'modal footer submit buttons are associated with a form body so they send the request');
+assert.match(js,/confirmAction[\s\S]*go\.type='button'[\s\S]*addEventListener\('click'/,'restore and other confirm-modals use explicit click handlers on footer buttons');
 assert.match(js,/parseLocalDateTime\(value\)\{if\(!value\)return null[\s\S]*endRaw&&endValue===null[\s\S]*endValue>0&&endValue<=startValue/,'admin banner editor rejects malformed or non-forward schedule windows instead of translating them into permanent banners');
 
 console.log('PASS: host-admin isolation/auth, global-banner and service-control persistence/realtime delivery, Erlang binding regressions, privacy boundaries, CSRF/rate limits, safe host telemetry, and DOM-safe admin UI contracts.');

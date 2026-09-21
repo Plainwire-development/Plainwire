@@ -1,6 +1,12 @@
 # Bots
 
-Plainwire 2.2 has server-scoped bot accounts and a stable language-neutral Bot API v1. A bot is a real server member with its own user id, role assignments and permission checks. Creating a bot does not grant administrator access.
+Plainwire 2.4 has server-scoped bot accounts, Discord-style slash commands, and a stable language-neutral Bot API v1. A bot is a real server member with its own user id, role assignments and permission checks. Creating a bot does not grant administrator access.
+
+You can run a bot three ways:
+
+1. **No code.** Create a Developer Application, paste an AI provider key, and turn on mention replies. Plainwire hosts the bot.
+2. **A little code.** Register slash commands visually and handle them with a first-party SDK worker.
+3. **Full control.** Use Bot API v1 over HTTPS, or receive signed interaction POSTs at your own endpoint.
 
 Server members with **Manage bots** can create, rotate and delete bot credentials from the server integrations UI. The `pwb_...` token is shown only when it is created or rotated. Plainwire stores only its hash, so a lost token must be rotated rather than recovered.
 
@@ -79,7 +85,13 @@ The existing `/api/bot/*` message routes remain available for compatibility with
 
 ## Commands
 
-Bots can register server commands. Command names are lowercase identifiers beginning with a letter and containing letters, digits, `_` or `-`.
+Bots can register server commands. Command names are lowercase identifiers beginning with a letter and containing letters, digits, `_` or `-`. Users invoke them like Discord slash commands: type `/`, pick a command, and fill the shown options.
+
+You do not need to hand-write JSON to define those options. The Developer Portal command builder and the SDKs both accept ordinary objects:
+
+```js
+{name: 'echo', description: 'Repeat text', options: [{name: 'text', type: 'string', required: true}]}
+```
 
 For deployment, prefer `PUT /api/bot/v1/commands` with `{ "commands": [...] }`. Like a bulk application-command update, it atomically upserts the desired definitions and removes stale commands. The list is capped at 100 and a conflict rolls back the whole sync, so a failed deploy cannot leave half of a command set active. `POST /commands` remains useful for interactive one-command updates.
 
@@ -93,6 +105,8 @@ boolean
 user
 channel
 ```
+
+When a user types `/echo hello`, Plainwire stores both the original text and, when the command has a single string option, that value under the option name (`text` in the example). Workers can read `claim.options.text` instead of parsing JSON or a raw argument string.
 
 Plainwire currently accepts either a bounded raw argument string or a bounded structured argument object. Command arguments are encrypted before durable storage.
 
@@ -156,13 +170,26 @@ Bots may authenticate to `/ws` and subscribe only to scopes they are permitted t
 
 ## Developer Applications
 
-Plainwire 2.2 can package bot commands as a reusable Developer Application. An application can be installed into multiple servers, where each installation receives its own server-scoped bot identity and credential. Application owners may publish an app to the public directory, but connector secrets and private owner metadata are never part of public app responses.
+Plainwire 2.4 can package bot commands as a reusable Developer Application. An application can be installed into multiple servers, where each installation receives its own server-scoped bot identity and credential. Application owners may publish an app to the public directory, but connector secrets and private owner metadata are never part of public app responses.
 
-A command handler can be `queue` (claimed through Bot API v1), `webhook` (delivered to an HMAC-signed HTTPS interaction endpoint), or `ai` (an optional OpenAI-compatible connector). Server managers can narrow individual commands by member, channel, or role. Plainwire rechecks those rules, the invoking member's channel access, and the bot's channel access again at claim time before command arguments are decrypted for delivery.
+A command handler can be `queue` (claimed through Bot API v1), `webhook` (delivered to an HMAC-signed HTTPS interaction endpoint), or `ai` (a hosted provider connector). Server managers can narrow individual commands by member, channel, or role. Plainwire rechecks those rules, the invoking member's channel access, and the bot's channel access again at claim time before command arguments are decrypted for delivery.
 
-For signed interaction endpoints, verify `X-Plainwire-Interaction-Timestamp` and `X-Plainwire-Interaction-Signature`; the signature is `v1=` followed by the lowercase HMAC-SHA256 hex digest of `timestamp + "." + raw_json_body`. Use HTTPS in production. Plain HTTP application endpoints are accepted only for exact loopback development when the host explicitly enables `PLAINWIRE_APP_ALLOW_LOOPBACK_HTTP=true`.
+For signed interaction endpoints, verify `X-Plainwire-Interaction-Timestamp` and `X-Plainwire-Interaction-Signature`; the signature is `v1=` followed by the lowercase HMAC-SHA256 hex digest of `timestamp + "." + raw_json_body`. The JSON body includes the original `command`/`arguments` fields and a Discord-style `data.name` / `data.options` object. Use HTTPS in production. Plain HTTP application endpoints are accepted only for exact loopback development when the host explicitly enables `PLAINWIRE_APP_ALLOW_LOOPBACK_HTTP=true`.
 
-The optional AI handler stores its API key and system prompt encrypted at rest and sends only the invoked command and arguments, not channel history. Rate limits, response sizes, timeouts, retries, and worker concurrency are bounded by the server.
+### No-code AI chatbot
+
+The AI handler can run slash commands and, separately, answer ordinary chat:
+
+1. Open **Developer Portal**, create an application, and open **AI assistant**.
+2. Pick OpenAI, Anthropic, Gemini, OpenRouter, Groq, Mistral, Ollama, or a custom OpenAI-compatible endpoint.
+3. Paste an API key. Keys and instructions are encrypted at rest and never shown again.
+4. Enable **AI commands** for `/command` handlers, and/or **Answer mentions and replies** to make the installed bot a chatbot.
+
+Mention chat creates a `/chat` command automatically. The bot replies only when mentioned, or when a member replies to one of its messages. Bot messages never trigger another AI bot. Recent channel context is off by default and, when enabled, is a bounded window assembled only after the same claim-time authorization used for commands.
+
+Hosted AI rate limits, response sizes, timeouts, retries, and worker concurrency are bounded by the server. Ollama and other loopback HTTP endpoints require `PLAINWIRE_APP_ALLOW_LOOPBACK_HTTP=true`.
+
+The optional AI handler stores its API key and system prompt encrypted at rest. Command-only mode sends the invoked command and arguments. Chat mode sends the triggering message, your instructions, and the optional bounded history.
 
 ## First-party SDKs
 
@@ -190,7 +217,8 @@ await bot.syncCommands([
   {name: 'ping', description: 'Replies with pong'}
 ]);
 await bot.commandWorker({
-  ping: async claim => `pong (attempt ${claim.attempt})`
+  ping: async claim => `pong (attempt ${claim.attempt})`,
+  echo: async (claim, client) => client.option(claim, 'text', '')
 }).run();
 ```
 

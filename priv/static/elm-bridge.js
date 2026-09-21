@@ -7999,7 +7999,7 @@
     render() {
       const root = this.el('div', 'developer-portal');
       const toolbar = this.el('div', 'developer-toolbar');
-      const intro = this.el('div'); intro.append(this.el('h2', '', 'Your applications'), this.el('p', '', 'Build reusable bots, commands, signed interactions, and optional AI-powered commands.'));
+      const intro = this.el('div'); intro.append(this.el('h2', '', 'Your applications'), this.el('p', '', 'Build Discord-style slash commands, signed HTTPS bots, or a no-code AI chatbot. Mix them whenever you want more control.'));
       toolbar.append(intro, this.button('New application', () => this.createApp()));
       root.append(toolbar);
       const layout = this.el('div', 'developer-layout');
@@ -8016,15 +8016,19 @@
       layout.append(sidebar, panel); root.append(layout); this.replaceChildren(root); this.renderDetail();
     }
     async createApp() {
-      const modal = modalShell('Create application', 'Applications are owned by your account and can be installed into multiple servers.');
+      const modal = modalShell('Create application', 'Start no-code, connect your own code later, or combine both. Every server install gets an isolated bot identity and token.');
       const name = this.field('Application name', '', { placeholder: 'My Plainwire Bot', maxLength: 48 });
+      const kindWrap = this.el('label', 'developer-field'); kindWrap.append(this.el('span', '', 'Start with'));
+      const kind = document.createElement('select');
+      [['ai','AI assistant · no code'],['commands','Command bot · use an SDK'],['interactions','HTTPS interaction bot'],['general','Blank application']].forEach(([value,label]) => { const option=document.createElement('option'); option.value=value; option.textContent=label; kind.append(option); });
+      kindWrap.append(kind, this.el('small','developer-provider-help','This only chooses the next setup screen. You can mix AI, SDK commands, and HTTPS interactions at any time.'));
       const actions = this.el('div', 'developer-actions');
       const create = this.button('Create application', async () => {
         create.disabled = true;
-        try { const appData = await directApi('/developer/apps', { method: 'POST', body: { name: name.input.value.trim() } }); modal.destroy(); await this.refresh(appData.id); }
+        try { const appData = await directApi('/developer/apps', { method: 'POST', body: { name: name.input.value.trim() } }); modal.destroy(); this.detailTab=kind.value; await this.refresh(appData.id); }
         catch (error) { send(app.ports.bridgeReceive, { tag: 'toast', data: error.message }); create.disabled = false; }
       });
-      actions.append(create); modal.body.append(name.wrap, actions); name.input.focus();
+      actions.append(create); modal.body.append(name.wrap, kindWrap, actions); name.input.focus();
     }
     async renderDetail() {
       const panel = this.querySelector('[data-developer-panel]'); if (!panel) return;
@@ -8036,7 +8040,7 @@
       const head = this.el('div', 'developer-detail-head');
       const title = this.el('div'); title.append(this.el('h2', '', appData.name), this.el('p', '', `${appData.public_id} · ${appData.public ? 'Public' : 'Private'}`)); head.append(title);
       const tabs = this.el('nav', 'developer-tabs');
-      [['general','General'],['installations','Installations'],['commands','Commands'],['interactions','Interactions'],['ai','AI']].forEach(([id,label]) => {
+      [['general','General'],['installations','Installations'],['commands','Commands'],['interactions','Interactions'],['ai','AI assistant'],['activity','Activity']].forEach(([id,label]) => {
         const b=this.el('button','',label); b.type='button'; b.classList.toggle('active',this.detailTab===id); b.addEventListener('click',()=>{this.detailTab=id;this.renderDetail()}); tabs.append(b);
       });
       panel.append(head,tabs);
@@ -8045,6 +8049,7 @@
       else if (this.detailTab === 'commands') await this.renderCommands(panel, appData);
       else if (this.detailTab === 'interactions') this.renderInteractions(panel, appData);
       else if (this.detailTab === 'ai') this.renderAi(panel, appData);
+      else if (this.detailTab === 'activity') await this.renderActivity(panel, appData);
     }
     renderGeneral(panel, appData) {
       const form=this.el('div','developer-form');
@@ -8062,16 +8067,244 @@
       const list=this.el('div','developer-stack');for(const item of (Array.isArray(items)?items:[])){const row=this.el('section','developer-install-card');const copy=this.el('div');copy.append(this.el('b','',item.server_name||`Server ${item.server_id}`),this.el('small','',`@${item.username} · installation ${item.id}`));const actions=this.el('div','developer-actions');actions.append(this.button('Rotate token',async e=>{e.currentTarget.disabled=true;try{const data=await directApi(`/developer/apps/${appData.id}/installation/${item.id}/rotate`,{method:'POST',body:{}});await this.showSecret('New installation token',data.token,'The previous token stopped working immediately.');}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{e.currentTarget.disabled=false;}} ,'btn secondary'),this.button('Uninstall',async e=>{if(!confirm(`Uninstall ${appData.name} from ${item.server_name}?`))return;e.currentTarget.disabled=true;try{await directApi(`/developer/apps/${appData.id}/installation/${item.id}/uninstall`,{method:'POST',body:{}});await this.renderDetail();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});e.currentTarget.disabled=false;}},'btn danger'));row.append(copy,actions);list.append(row)}if(!list.children.length)list.append(this.el('div','developer-empty compact','Not installed on any servers yet.'));wrap.append(list);panel.append(wrap);
     }
     async renderCommands(panel, appData) {
-      const wrap=this.el('div','developer-form');const intro=this.el('div','developer-section-copy');intro.append(this.el('h3','','Application commands'),this.el('p','','Commands sync to every installation. Queue handlers are claimed by your SDK; interaction handlers POST signed JSON to your endpoint; AI handlers call your configured OpenAI-compatible model.'));wrap.append(intro);
-      const form=this.el('form','developer-command-form');const name=this.field('Command','',{placeholder:'summarize',maxLength:32});const desc=this.field('Description','',{placeholder:'Summarize the current input',maxLength:160});const handlerLabel=this.el('label','developer-field');handlerLabel.append(this.el('span','','Handler'));const handler=document.createElement('select');[['queue','Bot SDK queue'],['webhook','Signed interaction endpoint'],['ai','AI connector']].forEach(([v,l])=>{const o=document.createElement('option');o.value=v;o.textContent=l;handler.append(o)});handlerLabel.append(handler);const options=this.field('Options JSON','[]',{multiline:true,maxLength:4096,placeholder:'[{"name":"text","type":"string","required":true}]'});const submit=this.el('button','btn','Save command');submit.type='submit';form.append(name.wrap,desc.wrap,handlerLabel,options.wrap,submit);form.addEventListener('submit',async e=>{e.preventDefault();submit.disabled=true;try{let parsed=JSON.parse(options.input.value||'[]');await directApi(`/developer/apps/${appData.id}/commands`,{method:'POST',body:{name:name.input.value.trim(),description:desc.input.value,handler:handler.value,options:parsed}});name.input.value='';desc.input.value='';options.input.value='[]';await this.renderDetail();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});submit.disabled=false;}});wrap.append(form);
-      let commands=[];try{commands=await directApi(`/developer/apps/${appData.id}/commands`)}catch(error){wrap.append(this.el('p','developer-error',error.message));panel.append(wrap);return}
-      const list=this.el('div','developer-stack');for(const command of (Array.isArray(commands)?commands:[])){const row=this.el('section','developer-command-card');const copy=this.el('div');copy.append(this.el('b','',`/${command.name}`),this.el('small','',`${command.handler} · ${command.description||'No description'}`));const del=this.button('Delete',async e=>{if(!confirm(`Delete /${command.name}?`))return;e.currentTarget.disabled=true;try{await directApi(`/developer/apps/${appData.id}/commands/${command.id}`,{method:'DELETE'});await this.renderDetail();}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});e.currentTarget.disabled=false;}},'btn danger');row.append(copy,del);list.append(row)}if(!list.children.length)list.append(this.el('div','developer-empty compact','No application commands yet.'));wrap.append(list);panel.append(wrap);
+      const wrap = this.el('div', 'developer-form');
+      const intro = this.el('div', 'developer-section-copy');
+      intro.append(
+        this.el('h3', '', 'Application commands'),
+        this.el('p', '', 'Create Discord-style slash commands visually. They sync to every installation; advanced bots can claim them with any Plainwire SDK.')
+      );
+      wrap.append(intro);
+
+      const templates = this.el('div', 'developer-template-row');
+      templates.append(this.el('span', 'developer-template-label', 'Start with'));
+      const templateData = [
+        ['Ping', {name:'ping', description:'Check whether the bot is online', handler:'queue', options:[]}],
+        ['Echo', {name:'echo', description:'Repeat supplied text', handler:'queue', options:[{name:'text',type:'string',required:true,description:'Text to repeat'}]}],
+        ['AI chat', {name:'chat', description:'Ask the AI assistant', handler:'ai', options:[{name:'prompt',type:'string',required:true,description:'What you want to ask'}]}]
+      ];
+
+      const form = this.el('form', 'developer-command-form developer-command-builder');
+      const name = this.field('Command name', '', {placeholder:'summarize', maxLength:32});
+      const desc = this.field('Description', '', {placeholder:'What this command does', maxLength:160});
+      const handlerLabel = this.el('label', 'developer-field');
+      handlerLabel.append(this.el('span', '', 'How it runs'));
+      const handler = document.createElement('select');
+      [['queue','Your code · Bot SDK'],['webhook','Your HTTPS endpoint'],['ai','No-code AI assistant']].forEach(([value,label]) => {
+        const option = document.createElement('option'); option.value = value; option.textContent = label; handler.append(option);
+      });
+      handlerLabel.append(handler);
+      const optionsSection = this.el('section', 'developer-option-builder');
+      const optionsHead = this.el('div', 'developer-option-head');
+      optionsHead.append(
+        this.el('div', '', ''),
+        this.button('Add option', () => addOption(), 'btn secondary')
+      );
+      optionsHead.firstChild.append(
+        this.el('b', '', 'Command options'),
+        this.el('small', '', 'Add typed fields instead of writing JSON.')
+      );
+      const optionsList = this.el('div', 'developer-option-list');
+      optionsSection.append(optionsHead, optionsList);
+      const formActions = this.el('div', 'developer-actions developer-command-actions');
+      const submit = this.el('button', 'btn', 'Save command'); submit.type = 'submit';
+      const clear = this.button('Clear', () => resetForm(), 'btn ghost');
+      formActions.append(submit, clear);
+      form.append(name.wrap, desc.wrap, handlerLabel, optionsSection, formActions);
+
+      const addOption = (value = {}) => {
+        if (optionsList.children.length >= 25) return;
+        const row = this.el('div', 'developer-option-row');
+        const optionName = document.createElement('input'); optionName.placeholder = 'name'; optionName.maxLength = 32; optionName.value = value.name || '';
+        const optionType = document.createElement('select');
+        [['string','Text'],['integer','Whole number'],['number','Number'],['boolean','Yes / no'],['user','Member'],['channel','Channel']].forEach(([kind,label]) => {
+          const choice = document.createElement('option'); choice.value = kind; choice.textContent = label; choice.selected = (value.type || 'string') === kind; optionType.append(choice);
+        });
+        const optionDescription = document.createElement('input'); optionDescription.placeholder = 'What should the user enter?'; optionDescription.maxLength = 120; optionDescription.value = value.description || '';
+        const requiredLabel = this.el('label', 'developer-option-required'); const required = document.createElement('input'); required.type = 'checkbox'; required.checked = value.required === true; requiredLabel.append(required, this.el('span', '', 'Required'));
+        const remove = this.button('Remove', () => row.remove(), 'btn ghost');
+        row.append(optionName, optionType, optionDescription, requiredLabel, remove); optionsList.append(row);
+      };
+      const readOptions = () => Array.from(optionsList.children).map(row => {
+        const [optionName, optionType, optionDescription] = row.querySelectorAll('input:not([type="checkbox"]), select');
+        return {name: optionName.value.trim(), type: optionType.value, required: row.querySelector('input[type="checkbox"]').checked, description: optionDescription.value.trim()};
+      }).filter(option => option.name);
+      const resetForm = (definition = {}) => {
+        name.input.value = definition.name || '';
+        desc.input.value = definition.description || '';
+        handler.value = definition.handler || 'queue';
+        optionsList.replaceChildren();
+        (Array.isArray(definition.options) ? definition.options : []).forEach(addOption);
+        submit.textContent = definition.id ? `Update /${definition.name}` : 'Save command';
+        name.input.readOnly = Boolean(definition.id);
+      };
+      for (const [label, definition] of templateData) templates.append(this.button(label, () => { resetForm(definition); name.input.focus(); }, 'btn ghost'));
+      wrap.append(templates, form);
+
+      form.addEventListener('submit', async event => {
+        event.preventDefault(); submit.disabled = true;
+        try {
+          const commandName = name.input.value.trim().toLowerCase();
+          if (!/^[a-z][a-z0-9_-]{0,31}$/.test(commandName)) throw new Error('Command names start with a letter and use lowercase letters, numbers, _ or -.');
+          const options = readOptions();
+          if (options.some(option => !/^[a-z][a-z0-9_-]{0,31}$/.test(option.name))) throw new Error('Every option needs a valid lowercase name.');
+          await directApi(`/developer/apps/${appData.id}/commands`, {method:'POST', body:{name:commandName, description:desc.input.value.trim(), handler:handler.value, options}});
+          resetForm(); await this.renderDetail();
+          send(app.ports.bridgeReceive, {tag:'toast', data:`/${commandName} saved`});
+        } catch (error) {
+          send(app.ports.bridgeReceive, {tag:'toast', data:error.message}); submit.disabled = false;
+        }
+      });
+
+      let commands = [];
+      try { commands = await directApi(`/developer/apps/${appData.id}/commands`); }
+      catch (error) { wrap.append(this.el('p', 'developer-error', error.message)); panel.append(wrap); return; }
+      const list = this.el('div', 'developer-stack');
+      for (const command of (Array.isArray(commands) ? commands : [])) {
+        const row = this.el('section', 'developer-command-card');
+        const copy = this.el('div');
+        const title = this.el('div', 'developer-command-title');
+        title.append(this.el('b', '', `/${command.name}`), this.el('span', `developer-handler-badge ${command.handler}`, ({queue:'SDK',webhook:'HTTP',ai:'AI'})[command.handler] || command.handler));
+        copy.append(title, this.el('small', '', command.description || 'No description'));
+        const chips = this.el('div', 'developer-option-chips');
+        for (const option of (Array.isArray(command.options) ? command.options : [])) chips.append(this.el('span', '', `${option.name}: ${option.type}${option.required ? ' · required' : ''}`));
+        if (chips.children.length) copy.append(chips);
+        const actions = this.el('div', 'developer-actions');
+        actions.append(
+          this.button('Edit', () => { resetForm(command); form.scrollIntoView({behavior:'smooth', block:'start'}); }, 'btn secondary'),
+          this.button('Delete', async event => {
+            if (!confirm(`Delete /${command.name}?`)) return;
+            event.currentTarget.disabled = true;
+            try { await directApi(`/developer/apps/${appData.id}/commands/${command.id}`, {method:'DELETE'}); await this.renderDetail(); }
+            catch (error) { send(app.ports.bridgeReceive, {tag:'toast', data:error.message}); event.currentTarget.disabled = false; }
+          }, 'btn danger')
+        );
+        row.append(copy, actions); list.append(row);
+      }
+      if (!list.children.length) list.append(this.el('div', 'developer-empty compact', 'No commands yet. Pick a starter above or build your own.'));
+      wrap.append(list); panel.append(wrap);
     }
     renderInteractions(panel, appData) {
       const wrap=this.el('div','developer-form');const intro=this.el('div','developer-section-copy');intro.append(this.el('h3','','Signed interaction endpoint'),this.el('p','','Run a bot without a persistent WebSocket worker. Plainwire POSTs command invocations to your HTTPS endpoint and verifies the destination before connecting.'));wrap.append(intro);const url=this.field('Interaction endpoint',appData.interaction?.url||'',{placeholder:'https://bot.example.com/plainwire/interactions',maxLength:2048});const status=this.el('p','developer-status',appData.interaction?.configured?'Configured · command webhooks are active':'Not configured');const actions=this.el('div','developer-actions');const save=this.button('Save endpoint',async()=>{save.disabled=true;try{const data=await directApi(`/developer/apps/${appData.id}/interactions`,{method:'POST',body:{url:url.input.value.trim()}});if(data.secret)await this.showSecret('Interaction signing secret',data.secret,'Use this secret to verify X-Plainwire-Interaction-Signature. It is shown once.');await this.refresh(appData.id);}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});save.disabled=false;}});const rotate=this.button('Rotate signing secret',async()=>{rotate.disabled=true;try{const data=await directApi(`/developer/apps/${appData.id}/interactions/rotate`,{method:'POST',body:{}});await this.showSecret('New interaction signing secret',data.secret,'Update your endpoint before sending more commands. The old secret is invalid.');}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});}finally{rotate.disabled=false;}},'btn secondary');rotate.disabled=!appData.interaction?.configured;actions.append(save,rotate);wrap.append(url.wrap,status,actions);panel.append(wrap);
     }
     renderAi(panel, appData) {
-      const ai=appData.ai||{};const wrap=this.el('div','developer-form');const intro=this.el('div','developer-section-copy');intro.append(this.el('h3','','AI command connector'),this.el('p','','Optional OpenAI-compatible command execution. Plainwire sends only the invoked command and its arguments, not channel history. API keys and system prompts are encrypted at rest.'));wrap.append(intro);const enabledLabel=this.el('label','developer-check');const enabled=document.createElement('input');enabled.type='checkbox';enabled.checked=ai.enabled===true;enabledLabel.append(enabled,this.el('span','','Enable AI handler'));const endpoint=this.field('Chat completions endpoint',ai.endpoint||'',{placeholder:'https://api.example.com/v1/chat/completions',maxLength:2048});const model=this.field('Model',ai.model||'',{placeholder:'model-name',maxLength:160});const key=this.field(ai.has_api_key?'API key · leave blank to keep current':'API key','',{type:'password',placeholder:'Stored encrypted and never shown again',maxLength:1024});const prompt=this.field('System prompt',ai.system_prompt||'',{multiline:true,maxLength:8000,placeholder:'You are a helpful Plainwire bot…'});const save=this.button('Save AI connector',async()=>{save.disabled=true;try{await directApi(`/developer/apps/${appData.id}/ai`,{method:'POST',body:{enabled:enabled.checked,endpoint:endpoint.input.value.trim(),model:model.input.value.trim(),api_key:key.input.value,system_prompt:prompt.input.value}});key.input.value='';await this.refresh(appData.id);send(app.ports.bridgeReceive,{tag:'toast',data:'AI connector saved'});}catch(error){send(app.ports.bridgeReceive,{tag:'toast',data:error.message});save.disabled=false;}});wrap.append(enabledLabel,endpoint.wrap,model.wrap,key.wrap,prompt.wrap,this.el('p','developer-note','For security, endpoints must pass Plainwire outbound URL policy. Private-network targets remain blocked unless the host operator explicitly changes policy.'),save);panel.append(wrap);
+      const ai = appData.ai || {};
+      const wrap = this.el('div', 'developer-form developer-ai-form');
+      const intro = this.el('div', 'developer-section-copy');
+      intro.append(
+        this.el('h3', '', 'No-code AI assistant'),
+        this.el('p', '', 'Choose a provider, paste a key, and Plainwire can run AI slash commands or answer mentions and replies as this bot. No worker, JSON, or custom code is required.')
+      );
+      wrap.append(intro);
+
+      const presets = {
+        openai: {label:'OpenAI · Chat Completions', endpoint:'https://api.openai.com/v1/chat/completions', model:'gpt-5-mini', help:'Works with OpenAI chat-completions models.'},
+        openai_responses: {label:'OpenAI · Responses API', endpoint:'https://api.openai.com/v1/responses', model:'gpt-5-mini', help:'Uses OpenAI’s newer Responses endpoint.'},
+        anthropic: {label:'Anthropic', endpoint:'https://api.anthropic.com/v1/messages', model:'claude-sonnet-4-5', help:'Uses the native Anthropic Messages API.'},
+        google: {label:'Google Gemini', endpoint:'https://generativelanguage.googleapis.com/v1beta/models', model:'gemini-2.5-flash', help:'Plainwire appends the selected model and generateContent path.'},
+        openrouter: {label:'OpenRouter', endpoint:'https://openrouter.ai/api/v1/chat/completions', model:'openai/gpt-5-mini', help:'Access multiple providers through one OpenAI-compatible endpoint.'},
+        groq: {label:'Groq', endpoint:'https://api.groq.com/openai/v1/chat/completions', model:'llama-3.3-70b-versatile', help:'Fast OpenAI-compatible inference.'},
+        mistral: {label:'Mistral', endpoint:'https://api.mistral.ai/v1/chat/completions', model:'mistral-small-latest', help:'Uses Mistral’s OpenAI-compatible endpoint.'},
+        ollama: {label:'Ollama · local', endpoint:'http://127.0.0.1:11434/v1/chat/completions', model:'llama3.2', help:'No API key. Enable PLAINWIRE_APP_ALLOW_LOOPBACK_HTTP on the host first; remote HTTP stays blocked.'},
+        openai_compatible: {label:'Custom OpenAI-compatible', endpoint:'', model:'', help:'Use any HTTPS endpoint that accepts chat-completions requests.'}
+      };
+      const providerWrap = this.el('label', 'developer-field'); providerWrap.append(this.el('span', '', 'AI provider'));
+      const provider = document.createElement('select');
+      for (const [value, preset] of Object.entries(presets)) { const option=document.createElement('option'); option.value=value; option.textContent=preset.label; provider.append(option); }
+      provider.value = presets[ai.provider] ? ai.provider : 'openai_compatible'; providerWrap.append(provider);
+      const providerHelp = this.el('small', 'developer-provider-help', presets[provider.value].help); providerWrap.append(providerHelp);
+      const endpoint = this.field('API endpoint', ai.endpoint || presets[provider.value].endpoint, {placeholder:'https://provider.example/v1/chat/completions', maxLength:2048});
+      const model = this.field('Model', ai.model || presets[provider.value].model, {placeholder:'provider model name', maxLength:160});
+      const key = this.field(ai.has_api_key ? 'API key · leave blank to keep current' : 'API key', '', {type:'password', placeholder:'Encrypted at rest and never shown again', maxLength:1024});
+      provider.addEventListener('change', () => {
+        const previousDefaults = Object.values(presets);
+        const preset = presets[provider.value];
+        if (!endpoint.input.value || previousDefaults.some(item => item.endpoint === endpoint.input.value)) endpoint.input.value = preset.endpoint;
+        if (!model.input.value || previousDefaults.some(item => item.model === model.input.value)) model.input.value = preset.model;
+        providerHelp.textContent = preset.help;
+        key.wrap.hidden = provider.value === 'ollama';
+      });
+      key.wrap.hidden = provider.value === 'ollama';
+
+      const behavior = this.el('section', 'developer-ai-behavior');
+      behavior.append(this.el('h4', '', 'Behavior'));
+      const enabledLabel = this.el('label', 'developer-check'); const enabled = document.createElement('input'); enabled.type='checkbox'; enabled.checked=ai.enabled===true;
+      const enabledCopy = this.el('span'); enabledCopy.append(this.el('b','','Enable AI commands'), this.el('small','','Commands using the AI handler can run without your own bot process.')); enabledLabel.append(enabled, enabledCopy);
+      const chatLabel = this.el('label', 'developer-check'); const chat = document.createElement('input'); chat.type='checkbox'; chat.checked=ai.chat_enabled===true;
+      const chatCopy = this.el('span'); chatCopy.append(this.el('b','','Answer mentions and replies'), this.el('small','','Creates /chat automatically and replies in the channel. Bot messages never trigger another AI bot.')); chatLabel.append(chat, chatCopy);
+      const triggerWrap = this.el('label', 'developer-field'); triggerWrap.append(this.el('span', '', 'When to answer'));
+      const trigger = document.createElement('select');
+      [['mention_or_reply','Mentions and replies to the bot'],['mention','Mentions only']].forEach(([value,label]) => {
+        const option=document.createElement('option'); option.value=value; option.textContent=label; option.selected=(ai.chat_trigger||'mention_or_reply')===value; trigger.append(option);
+      });
+      triggerWrap.append(trigger, this.el('small','developer-provider-help','Replies still require the original message to be from this bot. Random channel chatter is ignored.'));
+      const syncChatUi = () => { triggerWrap.hidden = !chat.checked; if (chat.checked) enabled.checked = true; };
+      chat.addEventListener('change', syncChatUi); syncChatUi();
+      const historyLabel = this.el('label', 'developer-check'); const history = document.createElement('input'); history.type='checkbox'; history.checked=ai.include_history===true;
+      const historyCopy = this.el('span'); historyCopy.append(this.el('b','','Include recent channel context'), this.el('small','','Opt in to sending a bounded window of messages the bot is already allowed to read.')); historyLabel.append(history, historyCopy);
+      behavior.append(enabledLabel, chatLabel, triggerWrap, historyLabel);
+
+      const tuning = this.el('div', 'developer-ai-tuning');
+      const historyCount = this.field('Context messages', ai.history_messages ?? 8, {type:'number'}); historyCount.input.min='0'; historyCount.input.max='20';
+      const temperature = this.field('Creativity', ai.temperature ?? 0.7, {type:'number'}); temperature.input.min='0'; temperature.input.max='2'; temperature.input.step='0.1';
+      const maxTokens = this.field('Maximum output tokens', ai.max_output_tokens ?? 1000, {type:'number'}); maxTokens.input.min='64'; maxTokens.input.max='8192';
+      tuning.append(historyCount.wrap, temperature.wrap, maxTokens.wrap);
+
+      const prompt = this.field('Assistant instructions', ai.system_prompt || '', {multiline:true, maxLength:8000, placeholder:'You are a helpful assistant for this Plainwire server. Be concise and say when you are unsure.'});
+      const promptTemplates = this.el('div', 'developer-template-row'); promptTemplates.append(this.el('span','developer-template-label','Instruction starter'));
+      const promptChoices = [
+        ['Helpful', 'You are a helpful Plainwire community assistant. Be concise, friendly, and honest when you are unsure.'],
+        ['Support', 'You are a support assistant. Ask one clarifying question when needed, give numbered troubleshooting steps, and never invent account or system status.'],
+        ['Coding', 'You are a practical coding assistant. Prefer secure, maintainable examples and explain important tradeoffs briefly.']
+      ];
+      for (const [label, value] of promptChoices) promptTemplates.append(this.button(label, () => { prompt.input.value=value; prompt.input.focus(); }, 'btn ghost'));
+
+      const privacy = this.el('div', 'developer-ai-privacy');
+      privacy.append(
+        this.el('b', '', 'What leaves your server'),
+        this.el('p', '', 'The command or triggering message, your instructions, and—only when enabled—the bounded recent context. API keys and instructions are encrypted in PostgreSQL. Private-network destinations stay blocked except explicitly enabled loopback development.')
+      );
+      const status = this.el('p', `developer-status ${ai.configured ? 'good' : ''}`, ai.configured ? `${presets[provider.value].label} is configured` : 'Add provider details and save to enable the assistant.');
+      const save = this.button('Save AI assistant', async () => {
+        save.disabled = true;
+        try {
+          await directApi(`/developer/apps/${appData.id}/ai`, {method:'POST', body:{
+            enabled:enabled.checked, provider:provider.value, endpoint:endpoint.input.value.trim(), model:model.input.value.trim(), api_key:key.input.value,
+            system_prompt:prompt.input.value, temperature:Number(temperature.input.value), max_output_tokens:Number(maxTokens.input.value),
+            include_history:history.checked, history_messages:Number(historyCount.input.value), chat_enabled:chat.checked, chat_trigger:trigger.value
+          }});
+          key.input.value=''; await this.refresh(appData.id); this.detailTab='ai'; await this.renderDetail();
+          send(app.ports.bridgeReceive,{tag:'toast',data:chat.checked?'AI assistant saved · mention the bot or use /chat':'AI assistant saved'});
+        } catch (error) {
+          const message = error.message === 'ai_chat_command_conflict' ? 'The app already has a non-AI /chat command. Rename or remove it first.' : error.message;
+          send(app.ports.bridgeReceive,{tag:'toast',data:message}); save.disabled=false;
+        }
+      });
+      wrap.append(providerWrap, endpoint.wrap, model.wrap, key.wrap, behavior, tuning, promptTemplates, prompt.wrap, privacy, status, save); panel.append(wrap);
+    }
+    async renderActivity(panel, appData) {
+      const wrap = this.el('div', 'developer-form');
+      const intro = this.el('div', 'developer-section-copy developer-activity-head');
+      const copy = this.el('div'); copy.append(this.el('h3','','Command activity'), this.el('p','','Recent command and AI deliveries across every installation. Arguments and secrets are never shown here.'));
+      const refresh = this.button('Refresh', () => this.renderDetail(), 'btn secondary'); intro.append(copy, refresh); wrap.append(intro);
+      let activity = [];
+      try { activity = await directApi(`/developer/apps/${appData.id}/activity?limit=50`); }
+      catch (error) { wrap.append(this.el('p','developer-error',error.message)); panel.append(wrap); return; }
+      const summary = this.el('div', 'developer-activity-summary');
+      const counts = {pending:0, claimed:0, completed:0, failed:0};
+      for (const item of (Array.isArray(activity) ? activity : [])) if (item.status in counts) counts[item.status] += 1;
+      for (const [status,count] of Object.entries(counts)) { const card=this.el('div',''); card.append(this.el('b','',String(count)),this.el('span','',status)); summary.append(card); }
+      wrap.append(summary);
+      const list = this.el('div', 'developer-stack');
+      for (const item of (Array.isArray(activity) ? activity : [])) {
+        const row = this.el('section', 'developer-activity-row');
+        const state = this.el('span', `developer-activity-state ${item.status}`, item.status || 'unknown');
+        const body = this.el('div'); body.append(this.el('b','',`/${item.command}`), this.el('small','',`${item.server_name || `Server ${item.server_id}`} · channel ${item.channel_id} · ${new Date(Number(item.created_at || 0)).toLocaleString()}`));
+        if (item.fail_reason) body.append(this.el('p','developer-activity-error',item.fail_reason));
+        const attempts = this.el('span','developer-activity-attempts',`${item.attempts || 0} attempt${Number(item.attempts) === 1 ? '' : 's'}`);
+        row.append(state, body, attempts); list.append(row);
+      }
+      if (!list.children.length) list.append(this.el('div','developer-empty compact','No command activity yet. Install the application and invoke a command to see delivery status here.'));
+      wrap.append(list); panel.append(wrap);
     }
     async showSecret(title, secret, note) {
       const modal=modalShell(title,note);const field=document.createElement('textarea');field.className='admin-secret-value';field.readOnly=true;field.rows=4;field.value=String(secret||'');const actions=this.el('div','developer-actions');const copy=this.button('Copy',async()=>{try{await navigator.clipboard.writeText(field.value);copy.textContent='Copied';}catch(_){field.focus();field.select();}});const close=this.button('I saved it',()=>modal.destroy(),'btn secondary');actions.append(copy,close);modal.body.append(field,actions);field.focus();field.select();

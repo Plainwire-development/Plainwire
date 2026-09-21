@@ -41,7 +41,7 @@ FRONTEND_OUTPUTS := priv/static/index.html priv/static/app.css priv/static/app.j
 NATIVE_TARGET := $(if $(filter 1,$(NATIVE)),native)
 NATIVE_TEST := $(if $(filter 1,$(NATIVE)),test-native)
 
-.PHONY: help doctor deps frontend backend native build verify test-health test-rtc-contract test-ui-contract test-admin-contract test-integrations-contract test-storage-contract test-storage-tools test-v21-contract test-v22-bot-contract test-scalability-contract test-release-contract test-sdks test-browser test-native test-backend test check release source package run clean browsers load load-soak load-live load-live-selftest load-doctor load-gleam-check
+.PHONY: help doctor deps frontend backend native build verify test-health test-rtc-contract test-ui-contract test-admin-contract test-integrations-contract test-storage-contract test-storage-tools test-v21-contract test-v22-bot-contract test-v24-bot-contract test-scalability-contract test-release-contract test-sdks test-browser test-native test-backend test check release source package run clean browsers load load-soak load-live load-live-selftest load-doctor load-gleam-check
 # Rebar invocations and test servers are sequenced even with make -j.
 .NOTPARALLEL: check test test-browser test-backend
 
@@ -128,6 +128,9 @@ test-v21-contract:
 test-v22-bot-contract:
 	$(NPM) run test:v22-bot-contract
 
+test-v24-bot-contract:
+	$(NPM) run test:v24-bot-contract
+
 test-scalability-contract:
 	$(NPM) run test:scalability-contract
 
@@ -137,9 +140,10 @@ test-sdks:
 test-release-contract:
 	$(NPM) run test:release-contract
 
-test-browser: frontend test-rtc-contract test-ui-contract test-admin-contract test-integrations-contract test-storage-contract test-storage-tools test-v21-contract test-v22-bot-contract test-scalability-contract test-release-contract
+test-browser: frontend test-rtc-contract test-ui-contract test-admin-contract test-integrations-contract test-storage-contract test-storage-tools test-v21-contract test-v22-bot-contract test-v24-bot-contract test-scalability-contract test-release-contract
 	$(NPM) run test:browser
 	$(NODE) test/browser/settings-responsive.mjs
+	$(NODE) test/browser/admin-moderation.mjs
 	$(NPM) run test:rtc
 
 test-native: native

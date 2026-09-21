@@ -22,7 +22,7 @@
 -define(REDIS_PRESENCE_REFRESH_MS, 15000).
 
 %% Capacity is centralized so the call state machine is not coupled to a
-%% particular media topology. Plainwire 2.3.0 intentionally remains mesh-only.
+%% particular media topology. Plainwire 2.4.0 intentionally remains mesh-only.
 room_capacity() -> pw_media_topology:room_capacity().
 share_capacity() -> pw_media_topology:share_capacity().
 

@@ -16,7 +16,7 @@ Commands can be deployed and handled without writing a polling loop:
 
 ```python
 bot.sync_commands([{"name": "ping", "description": "Replies pong"}])
-bot.command_worker({"ping": lambda claim, client: "pong"}).run()
+bot.command_worker({"echo": lambda claim, client: client.option(claim, "text", "")}).run()
 ```
 
 The worker has bounded batch and concurrency settings, renews live claims, and reports handler failures through `on_error`.
