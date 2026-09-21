@@ -5,6 +5,7 @@
   gap: 8px;
   filter: none;
   transition: none;
+  max-height: calc(100dvh - 24px);
 }
 
 .call-layer.detached { right: auto; bottom: auto; }
@@ -58,6 +59,7 @@
   gap: 8px;
   padding: 8px;
   cursor: default;
+  pointer-events: auto;
 }
 .call-bar.compact:hover { transform: none; border-color: var(--line); }
 

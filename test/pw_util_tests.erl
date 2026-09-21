@@ -14,6 +14,12 @@ normalize_username_test() ->
     ?assertEqual(<<"alice_123-ok">>, pw_util:normalize_username(<<" Alice_123-OK!! ">>)),
     ?assertEqual(<<"">>, pw_util:normalize_username(<<"!@#$">>)).
 
+normalize_email_test() ->
+    ?assertEqual(<<"user@example.com">>, pw_util:normalize_email(<<" User@Example.COM ">>)),
+    ?assertEqual(<<>>, pw_util:normalize_email(<<"not-an-email">>)),
+    ?assertEqual(<<>>, pw_util:normalize_email(<<"a@b..com">>)),
+    ?assertEqual(<<>>, pw_util:normalize_email(<<>>)).
+
 clean_text_strips_nul_and_keeps_valid_utf8_test() ->
     ?assertEqual(<<"abcdef">>, pw_util:clean_text(<<"abc", 0, "def">>, 20)),
     Clean = pw_util:clean_text(<<"ååå">>, 5),

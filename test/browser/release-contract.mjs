@@ -48,6 +48,13 @@ assert.match(api, /\[<<"onboarding">>, <<"progress">>\]/, 'onboarding progress h
 assert.match(bridge, /const onboardingSteps = \[/, 'the onboarding tour is a real client-side state machine');
 assert.match(bridge, /onboardingBotSay[\s\S]*setSyntheticTyping/, 'welcome messages are delivered live with the shared typing renderer');
 assert.match(bridge, /waitForTourTarget/, 'tour navigation waits for real DOM targets');
+assert.doesNotMatch(bridge, /window\.confirm\('Skip the welcome tour/, 'tour skip does not depend on window.confirm');
+assert.match(bridge, /pw-tour-mask/, 'tour uses a full-screen click mask');
+assert.match(bridge, /Array\.isArray\(messages\)/, 'tour messages cannot iterate a string character by character');
+assert.match(elm, /attribute "data-call-drag-handle" "true"/, 'collapsed and expanded call windows expose a drag handle');
+assert.match(elm, /node "pw-call-timer"/, 'live call duration is a custom element so Elm ticks cannot flicker it');
+assert.match(api, /\[<<"password">>, <<"forgot">>\]/, 'hosted password reset is a public API');
+assert.match(db, /\{52, \[/, 'accounts persist optional email and hashed reset tokens');
 assert.match(bridge, /if \(!target\?\.isConnected\) \{ removeTourSpotlight\(\); return; \}/, 'stale tour spotlights tear down when their target leaves the DOM');
 assert.match(bridge, /closeOnboardingGuide[\s\S]*setSyntheticTyping\(ONBOARDING_SCOPE, ONBOARDING_ACTOR, false\)/, 'pausing/closing the guide clears synthetic typing immediately');
 assert.match(bridge, /prefers-reduced-motion: reduce/, 'reduced-motion preference is consulted by onboarding timing');

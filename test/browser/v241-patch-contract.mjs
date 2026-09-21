@@ -1,0 +1,46 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+
+const read = path => readFileSync(path, 'utf8');
+const version = read('VERSION').trim();
+const db = read('src/pw_db.erl');
+const api = read('src/pw_api.erl');
+const mail = read('src/pw_mail.erl');
+const config = read('src/pw_client_config.erl');
+const bridge = read('priv/static/elm-bridge.js');
+const main = read('priv/static/elm/src/Main.elm');
+const auth = read('priv/static/elm/src/View/Auth.elm');
+const types = read('priv/static/elm/src/Types.elm');
+const env = read('.env.example');
+const appSrc = read('src/plainwire_relay.app.src');
+
+assert.equal(version, '2.4.1');
+assert.match(appSrc, /\{vsn, "2.4.1"\}/);
+assert.doesNotMatch(mail, /41844184/);
+assert.doesNotMatch(env, /41844184/);
+assert.doesNotMatch(mail, /plainwirenoreply@proton\.me/);
+assert.match(mail, /PLAINWIRE_SMTP_PASS/);
+assert.match(mail, /central_host/);
+assert.match(mail, /plainwi\.re/);
+assert.match(config, /password_reset_enabled\(\) ->/);
+assert.match(api, /\[<<"password">>, <<"forgot">>\]/);
+assert.match(api, /\[<<"password">>, <<"reset">>\]/);
+assert.match(api, /\[<<"email">>, <<"verify">>\]/);
+assert.match(db, /\{52, \[[\s\S]*account_tokens/);
+assert.match(db, /email_verified=true/);
+assert.match(bridge, /Array\.isArray\(messages\)/);
+assert.match(bridge, /pw-tour-mask/);
+assert.match(bridge, /confirmSkipTour/);
+assert.doesNotMatch(bridge, /window\.confirm\('Skip the welcome tour/);
+assert.match(bridge, /html\.pw-call-detached|\.classList\.add\('pw-call-detached'\)/);
+assert.match(bridge, /\[data-call-drag-handle="true"\]/);
+assert.match(bridge, /customElements\.define\('pw-call-timer'/);
+assert.match(main, /class "call-bar-drag-area"[\s\S]{0,220}data-call-drag-handle" "true"/);
+assert.match(main, /node "pw-call-timer"/);
+assert.match(auth, /Forgot password/);
+assert.match(types, /passwordResetEnabled : Bool/);
+assert.match(types, /emailVerified : Bool/);
+assert.match(env, /PLAINWIRE_MAIL_ENABLED=/);
+assert.match(env, /PLAINWIRE_SMTP_PASS=/);
+
+console.log('PASS: 2.4.1 tour, call, and hosted password-reset patch contract');

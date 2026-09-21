@@ -18,6 +18,8 @@ Copy `_build/default/rel/plainwire_relay` to a versioned directory such as `/opt
 
 Copy `.env.example` to `/etc/plainwire/plainwire.env`, replace the example values, and restrict the file to root. Set the public URL, database credentials, encryption key, and TURN credentials. Keep this environment file, the database, and uploads when upgrading. Losing or changing the encryption key makes previously encrypted messages unreadable.
 
+SMTP settings for password-reset mail also belong in that private environment file. Do not commit them. Forgot-password sending is enabled automatically only when `PLAINWIRE_PUBLIC_URL` is the official `https://plainwi.re` host and SMTP is configured. Other instances stay silent unless `PLAINWIRE_MAIL_ENABLED=true`.
+
 Install `plainwire.service` in `/etc/systemd/system/`, then run:
 
 ```sh

@@ -29,7 +29,8 @@ init([]) ->
         #{id => pw_webhook_dispatcher, start => {pw_webhook_dispatcher, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_webhook_dispatcher]},
         #{id => pw_app_interaction_dispatcher, start => {pw_app_interaction_dispatcher, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_app_interaction_dispatcher]},
         #{id => pw_ai_bot_dispatcher, start => {pw_ai_bot_dispatcher, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_ai_bot_dispatcher]},
-        #{id => pw_upload_gc, start => {pw_upload_gc, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_upload_gc]}
+        #{id => pw_upload_gc, start => {pw_upload_gc, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_upload_gc]},
+        #{id => pw_mail, start => {pw_mail, start_link, []}, restart => permanent, shutdown => 5000, type => worker, modules => [pw_mail]}
     ],
     %% Both listeners go last; DB/hub and the optional instance-local admin
     %% identity must exist before either surface accepts traffic.

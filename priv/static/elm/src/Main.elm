@@ -216,6 +216,7 @@ handleSyncData val =
 type alias Flags =
     { appName : String
     , registrationEnabled : Bool
+    , passwordResetEnabled : Bool
     , instanceDescription : String
     , defaultTheme : String
     , version : String
@@ -260,6 +261,7 @@ init flags url _ =
     in
     ( { appName = appName
       , registrationEnabled = flags.registrationEnabled
+      , passwordResetEnabled = flags.passwordResetEnabled
       , instanceDescription = String.left 120 (String.trim flags.instanceDescription)
       , clientVersion = String.left 32 (String.trim flags.version)
       , me = Nothing
@@ -338,13 +340,24 @@ init flags url _ =
       , ctxMenu = Nothing
       , threadReply = ""
       , searchQuery = ""
-      , authMode = "login"
+      , authMode =
+            if String.startsWith "reset/" (Maybe.withDefault "" url.fragment) then
+                "reset"
+
+            else if String.startsWith "forgot" (Maybe.withDefault "" url.fragment) then
+                "forgot"
+
+            else
+                "login"
       , authUsername = ""
       , authBusy = False
       , authDisplayName = ""
+      , authEmail = ""
       , authPassword = ""
       , authPasswordConfirm = ""
       , authPasswordVisible = False
+      , authResetToken = authTokenFromFragment (Maybe.withDefault "" url.fragment)
+      , authNotice = ""
       , serverName = ""
       , serverDescription = ""
       , booting = True
@@ -389,10 +402,21 @@ init flags url _ =
       , micMonitoring = False
       }
     , Cmd.batch
-        [ apiSend (encodeApiRequest (ApiGet "/me"))
-        , requestNotifyPermission True
-        , Task.perform GotTimeZone Time.here
-        ]
+        (apiSend (encodeApiRequest (ApiGet "/me"))
+            :: requestNotifyPermission True
+            :: Task.perform GotTimeZone Time.here
+            :: (case verifyTokenFromFragment (Maybe.withDefault "" url.fragment) of
+                    Just token ->
+                        [ apiSend
+                            (encodeApiRequest
+                                (ApiPost "/email/verify" (Just (E.object [ ( "token", E.string token ) ])))
+                            )
+                        ]
+
+                    Nothing ->
+                        []
+               )
+        )
     )
 
 
@@ -519,27 +543,60 @@ update msg model =
 
                         _ ->
                             model.mentionHints
+                , authMode =
+                    if model.me /= Nothing then
+                        model.authMode
+
+                    else if String.startsWith "reset/" route then
+                        "reset"
+
+                    else if route == "forgot" then
+                        "forgot"
+
+                    else
+                        model.authMode
+                , authResetToken =
+                    if String.startsWith "reset/" route then
+                        String.dropLeft 6 route
+
+                    else
+                        model.authResetToken
               }
             , Cmd.batch
-                [ bridgeSend
+                ([ bridgeSend
                     (E.object
                         [ ( "tag", E.string "clear_subs" )
                         , ( "data", E.null )
                         ]
                     )
-                , routeCmd active
-                , routeSubCmd active
-                ]
+                 , routeCmd active
+                 , routeSubCmd active
+                 ]
+                    ++ (case verifyTokenFromFragment route of
+                            Just token ->
+                                [ apiSend
+                                    (encodeApiRequest
+                                        (ApiPost "/email/verify" (Just (E.object [ ( "token", E.string token ) ])))
+                                    )
+                                ]
+
+                            Nothing ->
+                                []
+                       )
+                )
             )
 
         AuthMode m ->
-            ( { model | authMode = m, authPasswordConfirm = "", authPasswordVisible = False }, Cmd.none )
+            ( { model | authMode = m, authPasswordConfirm = "", authPasswordVisible = False, authNotice = "", toast = Nothing }, Cmd.none )
 
         AuthUsername s ->
             ( { model | authUsername = s }, Cmd.none )
 
         AuthDisplayName s ->
             ( { model | authDisplayName = s }, Cmd.none )
+
+        AuthEmail s ->
+            ( { model | authEmail = s }, Cmd.none )
 
         AuthPassword s ->
             ( { model | authPassword = s }, Cmd.none )
@@ -581,6 +638,7 @@ update msg model =
                                 )
                           )
                         , ( "password", E.string model.authPassword )
+                        , ( "email", E.string (String.trim model.authEmail) )
                         ]
                         |> Just
             in
@@ -589,7 +647,47 @@ update msg model =
                     ( { model | toast = Just err }, Cmd.none )
 
                 Nothing ->
-                    ( { model | authBusy = True, toast = Nothing }, apiSend (encodeApiRequest (ApiPost path body)) )
+                    ( { model | authBusy = True, toast = Nothing, authNotice = "" }, apiSend (encodeApiRequest (ApiPost path body)) )
+
+        RequestPasswordReset ->
+            if String.length (String.trim model.authUsername) < 3 then
+                ( { model | toast = Just "Enter the username or email for that account." }, Cmd.none )
+
+            else
+                ( { model | authBusy = True, toast = Nothing, authNotice = "" }
+                , apiSend
+                    (encodeApiRequest
+                        (ApiPost "/password/forgot"
+                            (Just (E.object [ ( "username", E.string (String.trim model.authUsername) ) ]))
+                        )
+                    )
+                )
+
+        ResetPassword ->
+            if String.length model.authPassword < 10 then
+                ( { model | toast = Just "Password must be at least 10 characters." }, Cmd.none )
+
+            else if model.authPassword /= model.authPasswordConfirm then
+                ( { model | toast = Just "Passwords do not match." }, Cmd.none )
+
+            else if String.length model.authResetToken < 16 then
+                ( { model | toast = Just "This reset link is missing or incomplete. Request a new one." }, Cmd.none )
+
+            else
+                ( { model | authBusy = True, toast = Nothing, authNotice = "" }
+                , apiSend
+                    (encodeApiRequest
+                        (ApiPost "/password/reset"
+                            (Just
+                                (E.object
+                                    [ ( "token", E.string model.authResetToken )
+                                    , ( "password", E.string model.authPassword )
+                                    ]
+                                )
+                            )
+                        )
+                    )
+                )
 
         ApiSuccess tag method requestId val ->
             case ( tag, method ) of
@@ -601,6 +699,44 @@ update msg model =
 
                 ( "/register", _ ) ->
                     handleMe val model
+
+                ( "/password/forgot", _ ) ->
+                    ( { model
+                        | authBusy = False
+                        , authNotice = "If that account has a verified email, we sent a reset link. Check your inbox."
+                        , toast = Nothing
+                      }
+                    , Cmd.none
+                    )
+
+                ( "/password/reset", _ ) ->
+                    ( { model
+                        | authBusy = False
+                        , authMode = "login"
+                        , authPassword = ""
+                        , authPasswordConfirm = ""
+                        , authResetToken = ""
+                        , authNotice = "Password updated. Sign in with your new password."
+                        , toast = Nothing
+                      }
+                    , setHash "#"
+                    )
+
+                ( "/email/verify", _ ) ->
+                    ( { model
+                        | authBusy = False
+                        , authNotice = "Email verified. You can use it to reset your password."
+                        , toast = Just "Email verified."
+                      }
+                    , Cmd.batch
+                        [ setHash "#"
+                        , if model.me == Nothing then
+                            Cmd.none
+
+                          else
+                            apiSend (encodeApiRequest (ApiGet "/me"))
+                        ]
+                    )
 
                 ( "/sync?since=0", _ ) ->
                     handleSync val model
@@ -6768,6 +6904,16 @@ renderCallPopup kind popup model =
         ]
 
 
+liveCallTimer : String -> Int -> Html Msg
+liveCallTimer className startTime =
+    node "pw-call-timer"
+        [ class className
+        , attribute "data-call-start" (String.fromInt startTime)
+        , attribute "role" "timer"
+        ]
+        []
+
+
 renderCompactCallBar : ActiveCall -> Model -> Html Msg
 renderCompactCallBar active model =
     let
@@ -6829,13 +6975,25 @@ renderCompactCallBar active model =
             count - 3
     in
     div [ class "call-bar compact" ]
-        [ button
+        [ div
             [ class "call-bar-drag-area"
-            , type_ "button"
-            , attribute "aria-label" "Open call details"
             , attribute "data-call-drag-handle" "true"
-            , title "Open call details"
+            , attribute "role" "button"
+            , attribute "tabindex" "0"
+            , attribute "aria-label" "Open call details"
+            , title "Drag to move · click for details"
             , onClick ToggleCallOverlay
+            , preventDefaultOn "keydown"
+                (D.field "key" D.string
+                    |> D.andThen
+                        (\key ->
+                            if key == "Enter" || key == " " then
+                                D.succeed ( ToggleCallOverlay, True )
+
+                            else
+                                D.fail "ignore"
+                        )
+                )
             ]
             [ div [ class "call-bar-icon" ] [ callIcon "audio" ]
             , div [ class "call-bar-info" ]
@@ -6942,12 +7100,6 @@ callIcon kind =
 renderExpandedCallOverlay : ActiveCall -> Model -> Html Msg
 renderExpandedCallOverlay active model =
     let
-        duration =
-            Basics.max 0 (floor (toFloat (model.serverTime - active.startTime) / 1000))
-
-        timerText =
-            String.fromInt (duration // 60) ++ ":" ++ (String.fromInt (modBy 60 duration) |> String.padLeft 2 '0')
-
         remoteUsers =
             List.filter (\u -> Just u.userId /= Maybe.map .id model.me) active.users
 
@@ -7036,7 +7188,7 @@ renderExpandedCallOverlay active model =
                         []
                     , span [] [ text statusText ]
                     , span [ attribute "aria-hidden" "true" ] [ text "·" ]
-                    , span [ class "call-overlay-timer pw-live-call-timer", attribute "data-call-start" (String.fromInt active.startTime) ] [ text timerText ]
+                    , liveCallTimer "call-overlay-timer pw-live-call-timer" active.startTime
                     ]
                 ]
             , button [ class "btn icon-btn call-minimize", title "Minimize call", onClick ToggleCallOverlay ]
@@ -7356,7 +7508,7 @@ presenceAvatar statuses userId url name cls =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "2.4.0", attribute "data-ui-revision" "interface-5" ]
+    div [ class "layout", attribute "data-ui-version" "2.4.1", attribute "data-ui-revision" "interface-5" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -10369,9 +10521,50 @@ renderAccountSettings user model =
                 ]
             , span [ class "pill" ] [ text "Signed in" ]
             ]
+        , div [ class "setting-row" ]
+            [ div []
+                [ b [] [ text "Email" ]
+                , small [ class "muted" ]
+                    [ text
+                        (if String.isEmpty (String.trim user.email) then
+                            "No email on this account. Password reset needs a verified address."
+
+                         else if user.emailVerified then
+                            user.email ++ " · verified"
+
+                         else
+                            user.email ++ " · waiting for verification"
+                        )
+                    ]
+                ]
+            , span
+                [ class
+                    ("pill"
+                        ++ (if user.emailVerified then
+                                ""
+
+                            else
+                                " warn"
+                           )
+                    )
+                ]
+                [ text
+                    (if String.isEmpty (String.trim user.email) then
+                        "Not set"
+
+                     else if user.emailVerified then
+                        "Verified"
+
+                     else
+                        "Unverified"
+                    )
+                ]
+            ]
         , div [ class "account-action-grid" ]
             [ button [ class "settings-action-card", onClick (BridgeEvent "account_change_username" (E.string user.username)) ]
                 [ b [] [ text "Change username" ], small [ class "muted" ] [ text "Change your global @handle without changing your account identity, servers, roles, or DMs." ] ]
+            , button [ class "settings-action-card", onClick (BridgeEvent "account_change_email" (E.string user.email)) ]
+                [ b [] [ text "Email and verification" ], small [ class "muted" ] [ text "Add or change the address used for password reset. Unverified addresses cannot reset a password." ] ]
             , button [ class "settings-action-card", onClick (BridgeEvent "account_change_password" E.null) ]
                 [ b [] [ text "Change password" ], small [ class "muted" ] [ text "Update your password and sign out other sessions." ] ]
             , button [ class "settings-action-card", onClick (BridgeEvent "account_sessions" E.null) ]
@@ -11472,15 +11665,6 @@ renderDmCallBar active model =
                 connectedText
             )
                 ++ remoteSeatStatus
-
-        duration =
-            floor (toFloat (model.serverTime - active.startTime) / 1000)
-
-        minutes =
-            String.fromInt (duration // 60)
-
-        seconds =
-            String.fromInt (modBy 60 duration) |> String.padLeft 2 '0'
     in
     div [ class "dm-call-bar" ]
         [ div [ class "dm-call-bar-main" ]
@@ -11494,30 +11678,13 @@ renderDmCallBar active model =
                         "Call active"
                     )
                 ]
-            , span
-                ([ class
-                    ("dm-call-bar-timer"
-                        ++ (if joinedCall then
-                                " pw-live-call-timer"
+            , if joinedCall then
+                liveCallTimer "dm-call-bar-timer pw-live-call-timer" active.startTime
 
-                            else
-                                ""
-                           )
-                    )
-                 ]
-                    ++ (if joinedCall then
-                            [ attribute "data-call-start" (String.fromInt active.startTime) ]
-
-                        else
-                            []
-                       )
-                )
-                [ text
-                    (if joinedCall then
-                        minutes ++ ":" ++ seconds
-
-                     else
-                        case selfPresence of
+              else
+                span [ class "dm-call-bar-timer" ]
+                    [ text
+                        (case selfPresence of
                             Just user ->
                                 if user.reconnecting then
                                     "Ready to rejoin"
@@ -11527,8 +11694,8 @@ renderDmCallBar active model =
 
                             Nothing ->
                                 "Ready to join"
-                    )
-                ]
+                        )
+                    ]
             , span [ class "dm-call-bar-count" ] [ text countText ]
             ]
         , div [ class "dm-call-bar-controls" ]
@@ -12329,6 +12496,48 @@ parseRoute raw =
         Home
 
 
+authTokenFromFragment : String -> String
+authTokenFromFragment raw =
+    let
+        s =
+            if String.startsWith "/" raw then
+                String.dropLeft 1 raw
+
+            else
+                raw
+    in
+    if String.startsWith "reset/" s then
+        String.dropLeft 6 s
+
+    else
+        ""
+
+
+verifyTokenFromFragment : String -> Maybe String
+verifyTokenFromFragment raw =
+    let
+        s =
+            if String.startsWith "/" raw then
+                String.dropLeft 1 raw
+
+            else
+                raw
+    in
+    if String.startsWith "verify-email/" s then
+        let
+            token =
+                String.dropLeft 13 s
+        in
+        if String.length token >= 16 then
+            Just token
+
+        else
+            Nothing
+
+    else
+        Nothing
+
+
 parseInt : String -> Int
 parseInt s =
     case String.toInt s of
@@ -12393,6 +12602,24 @@ fmtErr err =
 
         "bad_login" ->
             "Username or password is incorrect."
+
+        "invalid_token" ->
+            "That link is invalid or has expired. Request a new one."
+
+        "invalid_email" ->
+            "Enter a valid email address, or leave it blank."
+
+        "email_taken" ->
+            "That email is already verified on another account."
+
+        "email_required" ->
+            "Add an email address before requesting a verification message."
+
+        "weak_password" ->
+            "Password must be at least 10 characters."
+
+        "mail_disabled" ->
+            "This instance is not sending email right now."
 
         "registration_disabled" ->
             "Registration is disabled on this server."

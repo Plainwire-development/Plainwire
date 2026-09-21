@@ -119,6 +119,8 @@ type alias User =
     , lastSeen : Int
     , createdAt : Int
     , isBot : Bool
+    , email : String
+    , emailVerified : Bool
     }
 
 
@@ -483,6 +485,7 @@ type alias Drafts =
 type alias Model =
     { appName : String
     , registrationEnabled : Bool
+    , passwordResetEnabled : Bool
     , instanceDescription : String
     , clientVersion : String
     , me : Maybe User
@@ -554,9 +557,12 @@ type alias Model =
     , authUsername : String
     , authBusy : Bool
     , authDisplayName : String
+    , authEmail : String
     , authPassword : String
     , authPasswordConfirm : String
     , authPasswordVisible : Bool
+    , authResetToken : String
+    , authNotice : String
     , profileDisplayName : String
     , profileBio : String
     , profileAvatarUrl : String
@@ -637,10 +643,13 @@ type Msg
     | AuthMode String
     | AuthUsername String
     | AuthDisplayName String
+    | AuthEmail String
     | AuthPassword String
     | AuthPasswordConfirm String
     | ToggleAuthPasswordVisibility
     | DoAuth
+    | RequestPasswordReset
+    | ResetPassword
     | ApiSuccess String String (Maybe Int) E.Value
     | ApiError String String (Maybe Int) String
     | WsEvent E.Value
@@ -803,6 +812,8 @@ decodeUser =
         |> andMap (D.field "last_seen" D.int)
         |> andMap (D.field "created_at" D.int)
         |> andMap (D.field "is_bot" D.bool |> defaultValue False)
+        |> andMap (D.field "email" D.string |> defaultValue "")
+        |> andMap (D.field "email_verified" D.bool |> defaultValue False)
 
 
 decodeConversation : D.Decoder Conversation

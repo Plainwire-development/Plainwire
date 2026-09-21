@@ -126,6 +126,21 @@ PLAINWIRE_REGISTRATION_ENABLED=true
 
 See `.env.example` for the full list.
 
+### Password reset and email verification
+
+Forgot-password email is **off on self-hosted instances** unless you set `PLAINWIRE_MAIL_ENABLED=true` and SMTP settings. On the official `plainwi.re` host it turns on automatically when SMTP is configured.
+
+Reset links are sent only to a **verified** email. Accounts without an email cannot reset a password. Put SMTP credentials in the server environment file, never in the repository. Proton Mail requires an SMTP token from Proton settings.
+
+```sh
+PLAINWIRE_PUBLIC_URL=https://plainwi.re
+PLAINWIRE_SMTP_HOST=smtp.protonmail.ch
+PLAINWIRE_SMTP_PORT=587
+PLAINWIRE_SMTP_USER=
+PLAINWIRE_SMTP_PASS=
+PLAINWIRE_SMTP_FROM=
+```
+
 ### First-run guide and source link
 
 Fresh accounts receive Plainwire's interactive first-run guide. Existing accounts are not forced back through onboarding after an upgrade. Set the repository URL shown by Help/onboarding with:
@@ -282,10 +297,11 @@ Deployment and update instructions are kept in [deploy/README.md](deploy/README.
 
 ## Version
 
-Current release: **2.4.0**
+Current release: **2.4.1**
 
 Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history.
 
+* [2.4.1 release notes](RELEASE_NOTES_2.4.1.md)
 * [2.4.0 release notes](RELEASE_NOTES_2.4.0.md)
 * [2.3.0 release notes](RELEASE_NOTES_2.3.0.md)
 * [2.2.0 release notes](RELEASE_NOTES_2.2.0.md)

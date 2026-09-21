@@ -23,7 +23,7 @@ route_bucket([First | _]) ->
         <<"register">>, <<"login">>, <<"system">>, <<"webhooks">>, <<"bot">>,
         <<"health">>, <<"version">>, <<"apps">>, <<"me">>, <<"rtc-config">>,
         <<"voice-processing-config">>, <<"logout">>, <<"sessions">>, <<"password">>,
-        <<"account">>, <<"sync">>, <<"profile">>, <<"notifications">>, <<"forums">>,
+        <<"email">>, <<"account">>, <<"sync">>, <<"profile">>, <<"notifications">>, <<"forums">>,
         <<"forum">>, <<"servers">>, <<"server">>, <<"channels">>, <<"messages">>,
         <<"conversation">>, <<"search">>, <<"friends">>, <<"friend">>, <<"users">>,
         <<"uploads">>, <<"files">>, <<"github">>, <<"klipy">>, <<"developer">>
@@ -53,17 +53,20 @@ handle(<<"POST">>, [<<"register">>], Req0, _) ->
                 U = maps:get(<<"username">>, M, <<>>),
                 D = maps:get(<<"display_name">>, M, U),
                 P = maps:get(<<"password">>, M, <<>>),
+                Email = maps:get(<<"email">>, M, <<>>),
                 case auth_attempt_allowed(register, Req, U) of
                     false ->
                         pw_util:err_json(Req, 429, <<"rate_limited">>);
                     true ->
-                        case pw_db:register(U, D, P) of
+                        case pw_db:register(U, D, P, Email) of
                             {ok, #{token := Token} = Data} ->
+                                Public = maps:remove(token, maybe_dispatch_mail(Data)),
                                 pw_util:ok_json(
                                     pw_util:set_cookie(Req, <<"pw_session">>, Token),
-                                    #{ok => true, data => maps:remove(token, Data)}
+                                    #{ok => true, data => Public}
                                 );
                             {error, username_taken} -> pw_util:err_json(Req, 409, <<"username_taken">>);
+                            {error, invalid_email} -> pw_util:err_json(Req, 400, <<"invalid_email">>);
                             {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
                             {error, database_busy} -> pw_util:err_json(Req, 503, <<"database_busy">>);
                             {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
@@ -87,6 +90,60 @@ handle(<<"POST">>, [<<"login">>], Req0, _) ->
                     {error, {account_restricted, Restriction}} ->
                         pw_util:json_reply(Req, 403, #{ok => false, error => <<"account_restricted">>, data => Restriction});
                     {error,E} -> pw_util:err_json(Req, 401, atom_to_binary(E, utf8))
+                end
+        end
+    end);
+handle(<<"POST">>, [<<"password">>, <<"forgot">>], Req0, _) ->
+    with_json_public(Req0, fun(M, Req) ->
+        Identity = maps:get(<<"username">>, M, maps:get(<<"email">>, M, maps:get(<<"identity">>, M, <<>>))),
+        IdentityKey = case pw_util:normalize_email(Identity) of
+            <<>> -> pw_util:normalize_username(Identity);
+            NormalizedEmail -> NormalizedEmail
+        end,
+        case pw_rate:allow_shared({password_forgot, ip, pw_util:ip(Req)}, 8, 600000) andalso
+             pw_rate:allow_shared({password_forgot, identity, IdentityKey}, 4, 600000) of
+            false -> pw_util:err_json(Req, 429, <<"rate_limited">>);
+            true ->
+                case pw_db:request_password_reset(Identity) of
+                    {ok, Data} ->
+                        Public = maybe_dispatch_mail(Data),
+                        pw_util:ok_json(Req, #{ok => true, data => maps:with([accepted], Public#{accepted => true})});
+                    {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+                    {error, database_busy} -> pw_util:err_json(Req, 503, <<"database_busy">>);
+                    {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
+                    {error, _} -> pw_util:ok_json(Req, #{ok => true, data => #{accepted => true}})
+                end
+        end
+    end);
+handle(<<"POST">>, [<<"password">>, <<"reset">>], Req0, _) ->
+    with_json_public(Req0, fun(M, Req) ->
+        case pw_rate:allow_shared({password_reset, ip, pw_util:ip(Req)}, 12, 600000) of
+            false -> pw_util:err_json(Req, 429, <<"rate_limited">>);
+            true ->
+                case pw_db:reset_password(maps:get(<<"token">>, M, <<>>), maps:get(<<"password">>, M, maps:get(<<"new_password">>, M, <<>>))) of
+                    {ok, Data} -> pw_util:ok_json(Req, #{ok => true, data => Data});
+                    {error, invalid_token} -> pw_util:err_json(Req, 400, <<"invalid_token">>);
+                    {error, weak_password} -> pw_util:err_json(Req, 400, <<"weak_password">>);
+                    {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+                    {error, database_busy} -> pw_util:err_json(Req, 503, <<"database_busy">>);
+                    {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
+                    {error, E} -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8))
+                end
+        end
+    end);
+handle(<<"POST">>, [<<"email">>, <<"verify">>], Req0, _) ->
+    with_json_public(Req0, fun(M, Req) ->
+        case pw_rate:allow_shared({email_verify, ip, pw_util:ip(Req)}, 20, 600000) of
+            false -> pw_util:err_json(Req, 429, <<"rate_limited">>);
+            true ->
+                case pw_db:verify_email_token(maps:get(<<"token">>, M, <<>>)) of
+                    {ok, Data} -> pw_util:ok_json(Req, #{ok => true, data => Data});
+                    {error, invalid_token} -> pw_util:err_json(Req, 400, <<"invalid_token">>);
+                    {error, email_taken} -> pw_util:err_json(Req, 409, <<"email_taken">>);
+                    {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
+                    {error, database_busy} -> pw_util:err_json(Req, 503, <<"database_busy">>);
+                    {error, timeout} -> pw_util:err_json(Req, 503, <<"database_timeout">>);
+                    {error, E} -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8))
                 end
         end
     end);
@@ -255,6 +312,37 @@ authed(<<"POST">>, [<<"password">>], Req0, Session, _) ->
             Token = pw_util:cookie_value(Req0, <<"pw_session">>),
             with_json(Req0, fun(M, Req) ->
                 result(Req, pw_db:change_password(Uid, Token, maps:get(<<"current_password">>, M, <<>>), maps:get(<<"new_password">>, M, <<>>)))
+            end)
+    end;
+authed(<<"POST">>, [<<"email">>], Req0, Session, _) ->
+    Uid = uid(Session),
+    case pw_rate:allow({account_email, Uid}, 8, 600000) of
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+        true ->
+            with_json(Req0, fun(M, Req) ->
+                case pw_db:set_account_email(Uid, maps:get(<<"email">>, M, <<>>), maps:get(<<"password">>, M, maps:get(<<"current_password">>, M, <<>>))) of
+                    {ok, Data} -> result(Req, {ok, maybe_dispatch_mail(Data)});
+                    Other -> result(Req, Other)
+                end
+            end)
+    end;
+authed(<<"POST">>, [<<"email">>, <<"resend">>], Req0, Session, _) ->
+    Uid = uid(Session),
+    case pw_rate:allow({account_email_resend, Uid}, 4, 600000) of
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+        true ->
+            case pw_db:resend_email_verification(Uid) of
+                {ok, Data} -> result(Req0, {ok, maybe_dispatch_mail(Data)});
+                Other -> result(Req0, Other)
+            end
+    end;
+authed(<<"POST">>, [<<"email">>, <<"remove">>], Req0, Session, _) ->
+    Uid = uid(Session),
+    case pw_rate:allow({account_email_remove, Uid}, 6, 600000) of
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+        true ->
+            with_json(Req0, fun(M, Req) ->
+                result(Req, pw_db:remove_account_email(Uid, maps:get(<<"password">>, M, maps:get(<<"current_password">>, M, <<>>))))
             end)
     end;
 authed(<<"POST">>, [<<"account">>, <<"disable">>], Req0, Session, _) ->
@@ -960,8 +1048,19 @@ result(Req, {error, timeout}) -> pw_util:err_json(Req, 503, <<"database_timeout"
 result(Req, {error, internal_error}) -> pw_util:err_json(Req, 500, <<"internal_error">>);
 result(Req, {error, forbidden}) -> pw_util:err_json(Req, 403, <<"forbidden">>);
 result(Req, {error, username_changed_elsewhere}) -> pw_util:err_json(Req, 409, <<"username_changed_elsewhere">>);
+result(Req, {error, email_taken}) -> pw_util:err_json(Req, 409, <<"email_taken">>);
+result(Req, {error, bad_password}) -> pw_util:err_json(Req, 401, <<"bad_password">>);
 result(Req, {error, not_found}) -> pw_util:err_json(Req, 404, <<"not_found">>);
 result(Req, {error, {slowmode, Retry}}) -> pw_util:json_reply(Req, 429, #{ok => false, error => <<"slowmode">>, data => #{retry_after_seconds => Retry}});
 result(Req, {error, E}) when is_atom(E) -> pw_util:err_json(Req, 400, atom_to_binary(E, utf8));
 result(Req, {error, E}) -> pw_util:err_json(Req, 400, pw_util:bin(E));
 result(Req, Other) -> pw_util:ok_json(Req, #{ok=>true,data=>Other}).
+
+maybe_dispatch_mail(Data) when is_map(Data) ->
+    case maps:take(mail, Data) of
+        {Mail, Rest} ->
+            _ = pw_mail:send(Mail),
+            Rest#{email_delivery => true};
+        error -> Data
+    end;
+maybe_dispatch_mail(Data) -> Data.

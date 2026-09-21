@@ -1176,6 +1176,19 @@ button, a { touch-action: manipulation; }
   pointer-events: none;
 }
 
+html.pw-call-detached .call-layer {
+  left: var(--pw-call-left) !important;
+  top: var(--pw-call-top) !important;
+  right: auto !important;
+  bottom: auto !important;
+}
+
+pw-call-timer {
+  display: inline;
+  font: inherit;
+  color: inherit;
+}
+
 .call-popup {
   pointer-events: auto;
   width: Min(340px, calc(100vw - 32px));
@@ -4045,6 +4058,19 @@ img { max-width: 100%; }
 .auth-password-bar.strength-strong::after { width: 100%; background: #3d8f59; }
 .auth-error { padding: 10px 12px; border: 1px solid color-mix(in srgb, #d34f55, transparent 55%); border-radius: 9px; background: color-mix(in srgb, #d34f55, transparent 90%); }
 .auth-footnote { margin: 22px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; text-align: center; }
+.auth-extra-links { display: flex; flex-wrap: wrap; gap: 10px 16px; justify-content: center; margin-top: 14px; }
+.auth-text-link {
+  border: 0; background: none; color: var(--accent); font: inherit; font-size: 13px; cursor: pointer; padding: 0;
+  &:hover { text-decoration: underline; }
+}
+.auth-notice {
+  border: 1px solid color-mix(in srgb, var(--ok), transparent 55%);
+  background: color-mix(in srgb, var(--ok), transparent 90%);
+  color: var(--text1);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+}
 
 .account-action-grid {
   display: grid;
@@ -9049,6 +9075,18 @@ pw-typing-indicator {
 
 .pw-tour-source-actions { display: flex; flex-wrap: wrap; gap: 7px; justify-content: flex-end; }
 
+.pw-tour-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 219;
+  background: transparent;
+  pointer-events: auto;
+}
+.pw-tour-target {
+  position: relative;
+  z-index: 225;
+  pointer-events: auto;
+}
 .pw-tour-spotlight {
   position: fixed;
   z-index: 220;

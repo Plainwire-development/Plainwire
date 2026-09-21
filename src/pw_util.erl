@@ -2,7 +2,7 @@
 -export([
     env_int/2, env_int_cached/2, env_bool/2, env_bool_cached/2, env_str/2, now_ms/0, random_token/1, sha256_hex/1,
     base64url/1, base64url_decode/1, pbkdf2/2, verify_password/3, password_needs_rehash/1,
-    normalize_username/1, clean_text/2, int/1, bool/1, bin/1, json/1,
+    normalize_username/1, normalize_email/1, clean_text/2, int/1, bool/1, bin/1, json/1,
     read_json/1, read_json/2, ok_json/2, err_json/3, json_reply/3, set_cookie/3, clear_cookie/1, cookie_value/2,
     require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1, hex_binary/1,
     constant_time/2
@@ -144,6 +144,21 @@ normalize_username(U0) ->
     U1 = string:lowercase(binary_to_list(clean_text(U0, 40))),
     Allowed = [C || C <- U1, (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse C =:= $_ orelse C =:= $-],
     bin(Allowed).
+
+normalize_email(Raw) ->
+    Clean = string:lowercase(string:trim(clean_text(Raw, 254))),
+    case byte_size(Clean) >= 6 andalso byte_size(Clean) =< 254 of
+        false -> <<>>;
+        true ->
+            case re:run(Clean, <<"^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,24}$">>, [{capture, none}]) of
+                match ->
+                    case binary:match(Clean, <<"..">>) of
+                        nomatch -> Clean;
+                        _ -> <<>>
+                    end;
+                _ -> <<>>
+            end
+    end.
 
 clean_text(T0, Max) ->
     T1 = bin(T0),

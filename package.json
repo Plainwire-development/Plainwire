@@ -25,6 +25,7 @@
     "test:v21-app-contract": "node test/browser/v21-app-contract.mjs",
     "test:v22-bot-contract": "node test/browser/v22-bot-contract.mjs",
     "test:v24-bot-contract": "node test/browser/v24-bot-contract.mjs",
+    "test:v241-patch-contract": "node test/browser/v241-patch-contract.mjs",
     "test:scalability-contract": "node test/browser/scalability-contract.mjs"
   },
   "devDependencies": {

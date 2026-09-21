@@ -3,7 +3,8 @@
 -export([
     start_link/0,
     health/0, message_id_claim_node/3, message_id_renew_node/3, message_id_release_node/2,
-    register/3, login/2, session/1, session_fast/1, logout/1, sessions/2, logout_other_sessions/2, change_password/4, change_username/4, disable_account/2, delete_account/2, me/1, update_profile/3, update_theme/2,
+    register/3, register/4, login/2, session/1, session_fast/1, logout/1, sessions/2, logout_other_sessions/2, change_password/4, change_username/4, disable_account/2, delete_account/2, me/1, update_profile/3, update_theme/2,
+    request_password_reset/1, reset_password/2, verify_email_token/1, set_account_email/3, resend_email_verification/1, remove_account_email/2,
     onboarding/1, start_onboarding/1, update_onboarding/2, complete_onboarding/1, dismiss_onboarding/1, replay_onboarding/1,
     sync/2, users/1, profile/2, profile_by_username/2,
     friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friend_unblock/2, friends/1,
@@ -246,8 +247,15 @@ pool_conn(Idx, FallbackConns) ->
         [] -> element(Idx, FallbackConns)
     end.
 
-register(U, D, P) -> call({register, U, D, P}).
+register(U, D, P) -> register(U, D, P, <<>>).
+register(U, D, P, Email) -> call({register, U, D, P, Email}).
 login(U, P) -> call({login, U, P}).
+request_password_reset(Identity) -> call({request_password_reset, Identity}).
+reset_password(Token, NewPassword) -> call({reset_password, Token, NewPassword}).
+verify_email_token(Token) -> call({verify_email_token, Token}).
+set_account_email(Uid, Email, Password) -> call({set_account_email, Uid, Email, Password}).
+resend_email_verification(Uid) -> call({resend_email_verification, Uid}).
+remove_account_email(Uid, Password) -> call({remove_account_email, Uid, Password}).
 session(T) -> call({session, T}).
 logout(T) -> call({logout, T}).
 sessions(Uid, Token) -> call({sessions, Uid, Token}).
@@ -1566,23 +1574,28 @@ route({admin_set_registration_mode, ActorUid, Mode0}, Conn) ->
             end
         end)
     end;
-route({register, U0, D0, P0}, Conn) ->
+route({register, U0, D0, P0, Email0}, Conn) ->
     U = pw_util:normalize_username(U0),
     D0b = pw_util:clean_text(D0, 48),
     P = pw_util:clean_text(P0, 256),
+    Email = pw_util:normalize_email(Email0),
+    RequestedEmail = string:trim(pw_util:clean_text(Email0, 254)),
     D = case D0b of <<>> -> U; _ -> D0b end,
-    case {byte_size(U) >= 3, byte_size(U) =< 24, byte_size(P) >= 10} of
-        {true, true, true} ->
+    case {byte_size(U) >= 3, byte_size(U) =< 24, byte_size(P) >= 10, RequestedEmail =:= <<>> orelse Email =/= <<>>} of
+        {true, true, true, false} -> {error, invalid_email};
+        {true, true, true, true} ->
             Salt = pw_util:random_token(18),
             Hash = pw_util:pbkdf2(P, Salt),
             Now = pw_util:now_ms(),
             %% Let PostgreSQL arbitrate the unique username. A SELECT followed by
             %% INSERT races under simultaneous registrations for the same name.
             case rows(Conn,
-                "INSERT INTO users(username,display_name,password_hash,password_salt,bio,avatar_url,banner_url,status,theme,created_at,updated_at,last_seen,onboarding_state,onboarding_step,onboarding_updated_at) "
-                "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (username) DO NOTHING RETURNING id",
-                [U, D, Hash, Salt, <<>>, <<>>, <<>>, <<>>, <<"system">>, Now, Now, Now, <<"pending">>, 0, Now]) of
-                {ok, [[Id]]} -> {ok, make_session(Conn, Id)};
+                "INSERT INTO users(username,display_name,password_hash,password_salt,bio,avatar_url,banner_url,status,theme,created_at,updated_at,last_seen,onboarding_state,onboarding_step,onboarding_updated_at,email,email_verified,email_verified_at) "
+                "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) ON CONFLICT (username) DO NOTHING RETURNING id",
+                [U, D, Hash, Salt, <<>>, <<>>, <<>>, <<>>, <<"system">>, Now, Now, Now, <<"pending">>, 0, Now, Email, false, 0]) of
+                {ok, [[Id]]} ->
+                    Session = make_session(Conn, Id),
+                    {ok, maybe_attach_email_mail(Conn, Id, U, Email, Session)};
                 {ok, []} -> {error, username_taken};
                 {error, Reason} -> erlang:error({sql_error, Reason})
             end;
@@ -1640,6 +1653,10 @@ route({prune_sessions, Now}, Conn) ->
         "DELETE FROM admin_enrollments WHERE token_hash IN "
         "(SELECT token_hash FROM admin_enrollments WHERE expires_at <= $1 OR used_at IS NOT NULL LIMIT 10000)",
         [Now]),
+    ok = exec(Conn,
+        "DELETE FROM account_tokens WHERE token_hash IN "
+        "(SELECT token_hash FROM account_tokens WHERE expires_at <= $1 OR used_at IS NOT NULL LIMIT 10000)",
+        [Now]),
     {ok, pruned};
 route({session, Token}, Conn) ->
     case Token of
@@ -1649,15 +1666,16 @@ route({session, Token}, Conn) ->
             H = pw_util:sha256_hex(Token),
             Now = pw_util:now_ms(),
             Sql = "SELECT s.user_id, s.csrf, u.username, u.display_name, u.bio, u.avatar_url, "
-                  "u.banner_url, u.status, u.theme, u.created_at, u.last_seen, s.expires_at "
+                  "u.banner_url, u.status, u.theme, u.created_at, u.last_seen, s.expires_at, "
+                  "u.email, u.email_verified "
                   "FROM sessions s JOIN users u ON u.id = s.user_id "
                   "WHERE s.token_hash = $1 AND s.expires_at > $2 AND u.account_state = 'active'",
             case one(Conn, Sql, [H, Now]) of
-                {ok, [Uid, Csrf, Un, Dn, Bio, Av, Ban, St, Th, Cr, Ls, ExpiresAt]} ->
+                {ok, [Uid, Csrf, Un, Dn, Bio, Av, Ban, St, Th, Cr, Ls, ExpiresAt, Email, EmailVerified]} ->
                     Cutoff = Now - 60000,
                     _ = exec(Conn, "UPDATE sessions SET last_seen = $1 WHERE token_hash = $2 AND last_seen < $3", [Now, H, Cutoff]),
                     _ = exec(Conn, "UPDATE users SET last_seen = $1 WHERE id = $2 AND last_seen < $3", [Now, Uid, Cutoff]),
-                    Session = #{user => user_map_full([Uid, Un, Dn, Bio, Av, Ban, St, Th, Cr, Ls]),
+                    Session = #{user => user_map_me([Uid, Un, Dn, Bio, Av, Ban, St, Th, Cr, Ls, Email, EmailVerified]),
                            csrf => Csrf, server_time => Now},
                     ets:insert(?SESSION_CACHE, {H, Session, session_cache_expiry(Now, ExpiresAt)}),
                     {ok, Session};
@@ -1902,10 +1920,139 @@ route({delete_account, Uid, Password0}, Conn) ->
     end;
 route({me, Uid}, Conn) ->
     case one(Conn,
-        "SELECT id, username, display_name, bio, avatar_url, banner_url, status, theme, created_at, last_seen, is_bot "
+        "SELECT id, username, display_name, bio, avatar_url, banner_url, status, theme, created_at, last_seen, is_bot, "
+        "email, email_verified "
         "FROM users WHERE id = $1", [Uid]) of
-        {ok, [Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen, IsBot]} ->
-            {ok, (user_map_full([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen]))#{is_bot => IsBot =:= true}};
+        {ok, [Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen, IsBot, Email, EmailVerified]} ->
+            {ok, (user_map_me([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen, Email, EmailVerified]))#{is_bot => IsBot =:= true}};
+        _ -> {error, not_found}
+    end;
+route({request_password_reset, Identity0}, Conn) ->
+    Identity = string:trim(pw_util:clean_text(Identity0, 254)),
+    Username = pw_util:normalize_username(Identity),
+    Email = pw_util:normalize_email(Identity),
+    LooksLikeEmail = binary:match(Identity, <<"@">>) =/= nomatch,
+    User = case (not LooksLikeEmail) andalso byte_size(Username) >= 3 of
+        true ->
+            case one(Conn,
+                "SELECT id, username, email, email_verified, account_state, is_bot FROM users WHERE username=$1",
+                [Username]) of
+                {ok, UsernameRow} -> {ok, UsernameRow};
+                _ -> not_found
+            end;
+        false -> not_found
+    end,
+    Found = case User of
+        {ok, _} -> User;
+        not_found when Email =/= <<>> ->
+            case one(Conn,
+                "SELECT id, username, email, email_verified, account_state, is_bot FROM users "
+                "WHERE email_verified=true AND lower(email)=$1 LIMIT 1", [Email]) of
+                {ok, EmailRow} -> {ok, EmailRow};
+                _ -> not_found
+            end;
+        _ -> not_found
+    end,
+    Reply = #{accepted => true},
+    case Found of
+        {ok, [Uid, Un, StoredEmail, true, <<"active">>, false]} when StoredEmail =/= <<>> ->
+            {ok, maps:merge(Reply, issue_account_mail(Conn, Uid, Un, StoredEmail, password_reset, 3600000))};
+        _ ->
+            _ = pw_util:pbkdf2(<<"plainwire-reset-timing-pad">>, <<"plainwire-reset-timing-pad">>),
+            {ok, Reply}
+    end;
+route({reset_password, Token0, New0}, Conn) ->
+    New = pw_util:clean_text(New0, 256),
+    case consume_account_token(Conn, Token0, password_reset) of
+        {ok, #{user_id := Uid}} ->
+            case byte_size(New) >= 10 andalso byte_size(New) =< 256 of
+                false -> {error, weak_password};
+                true ->
+                    NewSalt = pw_util:random_token(18),
+                    NewHash = pw_util:pbkdf2(New, NewSalt),
+                    Now = pw_util:now_ms(),
+                    ok = exec(Conn, "UPDATE users SET password_hash=$1, password_salt=$2, updated_at=$3 WHERE id=$4",
+                        [NewHash, NewSalt, Now, Uid]),
+                    {ok, Existing} = rows(Conn, "DELETE FROM sessions WHERE user_id=$1 RETURNING token_hash", [Uid]),
+                    [ets:delete(?SESSION_CACHE, Hash) || [Hash] <- Existing],
+                    {ok, #{reset => true, revoked_sessions => length(Existing)}}
+            end;
+        {error, _} -> {error, invalid_token}
+    end;
+route({verify_email_token, Token0}, Conn) ->
+    case peek_account_token(Conn, Token0, email_verify) of
+        {ok, #{id := Id, user_id := Uid, email := Email}} ->
+            Now = pw_util:now_ms(),
+            case one(Conn, "SELECT id FROM users WHERE email_verified=true AND lower(email)=$1 AND id<>$2 LIMIT 1", [Email, Uid]) of
+                {ok, [_]} -> {error, email_taken};
+                _ ->
+                    case rows(Conn,
+                        "UPDATE account_tokens SET used_at=$2 WHERE id=$1 AND used_at IS NULL AND expires_at > $2 RETURNING id",
+                        [Id, Now]) of
+                        {ok, [[_]]} ->
+                            case rows(Conn,
+                                "UPDATE users SET email=$1, email_verified=true, email_verified_at=$2, updated_at=$2 "
+                                "WHERE id=$3 RETURNING username", [Email, Now, Uid]) of
+                                {ok, [[_Username]]} ->
+                                    invalidate_session_cache(Uid),
+                                    {ok, #{verified => true}};
+                                _ -> {error, invalid_token}
+                            end;
+                        _ -> {error, invalid_token}
+                    end
+            end;
+        {error, _} -> {error, invalid_token}
+    end;
+route({set_account_email, Uid, Email0, Password0}, Conn) ->
+    Email = pw_util:normalize_email(Email0),
+    Password = pw_util:clean_text(Password0, 256),
+    case Email of
+        <<>> -> {error, invalid_email};
+        _ ->
+            case one(Conn, "SELECT username, password_hash, password_salt, email, email_verified FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+                {ok, [Username, Hash, Salt, CurrentEmail, Verified]} ->
+                    case pw_util:verify_password(Password, Salt, Hash) of
+                        false -> {error, bad_password};
+                        true ->
+                            case one(Conn, "SELECT id FROM users WHERE email_verified=true AND lower(email)=$1 AND id<>$2 LIMIT 1", [Email, Uid]) of
+                                {ok, [_]} -> {error, email_taken};
+                                _ when CurrentEmail =:= Email andalso Verified =:= true ->
+                                    {ok, #{unchanged => true, email => Email, email_verified => true}};
+                                _ ->
+                                    Now = pw_util:now_ms(),
+                                    ok = exec(Conn,
+                                        "UPDATE users SET email=$1, email_verified=false, email_verified_at=0, updated_at=$2 WHERE id=$3",
+                                        [Email, Now, Uid]),
+                                    invalidate_session_cache(Uid),
+                                    {ok, maybe_attach_email_mail(Conn, Uid, Username, Email, #{updated => true, email => Email, email_verified => false})}
+                            end
+                    end;
+                _ -> {error, not_found}
+            end
+    end;
+route({resend_email_verification, Uid}, Conn) ->
+    case one(Conn, "SELECT username, email, email_verified FROM users WHERE id=$1", [Uid]) of
+        {ok, [_Username, <<>>, _]} -> {error, email_required};
+        {ok, [_Username, _Email, true]} -> {ok, #{already_verified => true}};
+        {ok, [Username, Email, _]} ->
+            {ok, maybe_attach_email_mail(Conn, Uid, Username, Email, #{sent => true})};
+        _ -> {error, not_found}
+    end;
+route({remove_account_email, Uid, Password0}, Conn) ->
+    Password = pw_util:clean_text(Password0, 256),
+    case one(Conn, "SELECT password_hash, password_salt FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+        {ok, [Hash, Salt]} ->
+            case pw_util:verify_password(Password, Salt, Hash) of
+                false -> {error, bad_password};
+                true ->
+                    Now = pw_util:now_ms(),
+                    ok = exec(Conn,
+                        "UPDATE users SET email='', email_verified=false, email_verified_at=0, updated_at=$1 WHERE id=$2",
+                        [Now, Uid]),
+                    ok = exec(Conn, "DELETE FROM account_tokens WHERE user_id=$1 AND purpose='email_verify'", [Uid]),
+                    invalidate_session_cache(Uid),
+                    {ok, #{removed => true}}
+            end;
         _ -> {error, not_found}
     end;
 route({update_profile, Uid, Display0, Patch}, Conn) ->
@@ -6515,6 +6662,25 @@ migrations() -> [
         "ALTER TABLE developer_applications ADD CONSTRAINT developer_applications_ai_chat_trigger_check CHECK(ai_chat_trigger IN ('mention','mention_or_reply'))",
         "CREATE INDEX IF NOT EXISTS idx_bot_command_invocations_developer_activity ON bot_command_invocations(command_id,id DESC)"
     ]}
+    ,{52, [
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email text NOT NULL DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified boolean NOT NULL DEFAULT false",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at bigint NOT NULL DEFAULT 0",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_verified_email ON users (lower(email)) WHERE email <> '' AND email_verified = true",
+        "CREATE TABLE IF NOT EXISTS account_tokens("
+        "id bigserial PRIMARY KEY, "
+        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+        "purpose text NOT NULL, "
+        "token_hash text NOT NULL, "
+        "email text NOT NULL, "
+        "expires_at bigint NOT NULL, "
+        "used_at bigint, "
+        "created_at bigint NOT NULL)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_account_tokens_hash ON account_tokens(token_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_account_tokens_user_purpose ON account_tokens(user_id, purpose, created_at DESC)",
+        "ALTER TABLE account_tokens DROP CONSTRAINT IF EXISTS account_tokens_purpose_check",
+        "ALTER TABLE account_tokens ADD CONSTRAINT account_tokens_purpose_check CHECK(purpose IN ('password_reset','email_verify'))"
+    ]}
 ].
 
 
@@ -8237,6 +8403,59 @@ user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen, IsBot
 user_map_full([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen]) ->
     (user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen])) #{
       avatar_source_url => Avatar, banner_source_url => Banner}.
+
+user_map_me([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen, Email, EmailVerified]) ->
+    (user_map_full([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, LastSeen])) #{
+      email => case Email of null -> <<>>; _ -> Email end,
+      email_verified => EmailVerified =:= true}.
+
+maybe_attach_email_mail(_Conn, _Uid, _Username, <<>>, Acc) -> Acc;
+maybe_attach_email_mail(Conn, Uid, Username, Email, Acc) ->
+    maps:merge(Acc, issue_account_mail(Conn, Uid, Username, Email, email_verify, 86400000)).
+
+issue_account_mail(Conn, Uid, Username, Email, Purpose, TtlMs) ->
+    Token = pw_util:random_token(32),
+    Hash = pw_util:sha256_hex(Token),
+    Now = pw_util:now_ms(),
+    PurposeBin = atom_to_binary(Purpose, utf8),
+    ok = exec(Conn, "DELETE FROM account_tokens WHERE user_id=$1 AND purpose=$2 AND used_at IS NULL", [Uid, PurposeBin]),
+    ok = exec(Conn,
+        "INSERT INTO account_tokens(user_id, purpose, token_hash, email, expires_at, created_at) "
+        "VALUES($1,$2,$3,$4,$5,$6)",
+        [Uid, PurposeBin, Hash, Email, Now + TtlMs, Now]),
+    AppName = pw_util:clean_text(pw_util:env_str("PLAINWIRE_APP_NAME", <<"Plainwire">>), 48),
+    #{mail => #{kind => Purpose, to => Email, username => Username, token => Token,
+                app_name => case AppName of <<>> -> <<"Plainwire">>; _ -> AppName end}}.
+
+consume_account_token(Conn, Token0, Purpose) ->
+    case peek_account_token(Conn, Token0, Purpose) of
+        {ok, #{id := Id, user_id := Uid, email := Email}} ->
+            Now = pw_util:now_ms(),
+            case rows(Conn,
+                "UPDATE account_tokens SET used_at=$2 WHERE id=$1 AND used_at IS NULL AND expires_at > $2 RETURNING id",
+                [Id, Now]) of
+                {ok, [[_]]} -> {ok, #{user_id => Uid, email => Email}};
+                _ -> {error, invalid_token}
+            end;
+        Error -> Error
+    end.
+
+peek_account_token(Conn, Token0, Purpose) ->
+    Token = pw_util:clean_text(Token0, 128),
+    case byte_size(Token) < 16 of
+        true -> {error, invalid_token};
+        false ->
+            Hash = pw_util:sha256_hex(Token),
+            PurposeBin = atom_to_binary(Purpose, utf8),
+            Now = pw_util:now_ms(),
+            case one(Conn,
+                "SELECT id, user_id, email, expires_at, used_at FROM account_tokens "
+                "WHERE token_hash=$1 AND purpose=$2", [Hash, PurposeBin]) of
+                {ok, [Id, Uid, Email, ExpiresAt, null]} when ExpiresAt > Now ->
+                    {ok, #{id => Id, user_id => Uid, email => Email}};
+                _ -> {error, invalid_token}
+            end
+    end.
 
 forum_map([Id, Slug, Name, Desc, Pos, Owner, Tc, Rc, Last, Members, Joined]) ->
     #{id => pw_util:int(Id), slug => Slug, name => Name, description => Desc, position => pw_util:int(Pos),

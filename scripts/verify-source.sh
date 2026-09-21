@@ -20,6 +20,7 @@ npm run test:v21-contract
 npm run test:v21-app-contract
 npm run test:v22-bot-contract
 npm run test:v24-bot-contract
+npm run test:v241-patch-contract
 npm run test:scalability-contract
 npm run test:release-contract
 for script in scripts/*.sh; do bash -n "${script}"; done

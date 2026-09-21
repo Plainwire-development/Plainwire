@@ -25,6 +25,7 @@
     defaultTheme: ['light', 'dark', 'system'].includes(rawClientConfig.default_theme)
       ? rawClientConfig.default_theme : 'system',
     registrationEnabled: rawClientConfig.registration_enabled !== false,
+    passwordResetEnabled: rawClientConfig.password_reset_enabled === true,
     gifSearchEnabled: rawClientConfig.gif_search_enabled === true,
     gifProvider: typeof rawClientConfig.gif_provider === 'string' ? rawClientConfig.gif_provider.trim().slice(0, 24) : '',
     sourceRepository: typeof rawClientConfig.source_repository === 'string' && /^https:\/\//i.test(rawClientConfig.source_repository)
@@ -1322,6 +1323,7 @@
     flags: {
       appName: clientConfig.appName,
       registrationEnabled: clientConfig.registrationEnabled,
+      passwordResetEnabled: clientConfig.passwordResetEnabled,
       instanceDescription: clientConfig.instanceDescription,
       defaultTheme: clientConfig.defaultTheme,
       version: clientConfig.version
@@ -2342,15 +2344,44 @@
     historyObserver.observe(sentinel);
   };
 
+  class PwCallTimer extends HTMLElement {
+    constructor() {
+      super();
+      this._root = this.attachShadow({ mode: 'open' });
+      this._text = document.createTextNode('0:00');
+      this._root.append(this._text);
+    }
+    connectedCallback() { this.sync(); }
+    static get observedAttributes() { return ['data-call-start']; }
+    attributeChangedCallback() { this.sync(); }
+    sync() {
+      const started = Number(this.getAttribute('data-call-start') || 0);
+      if (!Number.isFinite(started) || started <= 0) {
+        this._text.nodeValue = '0:00';
+        return;
+      }
+      const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
+      this._text.nodeValue = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+    }
+  }
+  if (!customElements.get('pw-call-timer')) customElements.define('pw-call-timer', PwCallTimer);
+
   let callTimerId = null;
   const updateCallTimers = () => {
-    const timers = Array.from(document.querySelectorAll('.pw-live-call-timer[data-call-start]'));
+    const timers = [
+      ...document.querySelectorAll('pw-call-timer'),
+      ...document.querySelectorAll('.pw-live-call-timer[data-call-start]:not(pw-call-timer)')
+    ];
     if (!timers.length) {
       if (callTimerId) clearInterval(callTimerId);
       callTimerId = null;
       return;
     }
     timers.forEach((timer) => {
+      if (typeof timer.sync === 'function') {
+        timer.sync();
+        return;
+      }
       const started = Number(timer.dataset.callStart || 0);
       const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
       timer.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
@@ -2420,7 +2451,7 @@
     for (const record of records) {
       for (const node of [...record.addedNodes, ...record.removedNodes]) {
         if (node.nodeType !== Node.ELEMENT_NODE) continue;
-        if (contains(node, '.pw-live-call-timer')) timersChanged = true;
+        if (contains(node, 'pw-call-timer, .pw-live-call-timer')) timersChanged = true;
         if (contains(node, '.invite-manager')) invitesChanged = true;
         if (contains(node, '#compose')) composerChanged = true;
         if (node.isConnected && contains(node, '.message-edit-input')) editorChanged = true;
@@ -2617,7 +2648,7 @@
   };
 
   const debugApiBody = (path, body) => {
-    if (path === '/login' || path === '/register' || path === '/password') return '[redacted]';
+    if (path === '/login' || path === '/register' || path === '/password' || path === '/password/forgot' || path === '/password/reset' || path === '/email' || path === '/email/verify' || path === '/email/resend' || path === '/email/remove') return '[redacted]';
     return body;
   };
 
@@ -2719,7 +2750,7 @@
       const succeeded = res.ok && json.ok === true;
       debug('API', 'response', { method, path, status: res.status, ok: succeeded, duration_ms: Math.round(performance.now() - requestStarted), error: json.error });
       if (!succeeded && path === '/login' && json.error === 'account_restricted' && json.data) showAccountRestriction(json.data);
-      if (res.status === 401 && json.error === 'not_authenticated' && !['/me', '/login', '/register'].includes(path)) {
+      if (res.status === 401 && json.error === 'not_authenticated' && !['/me', '/login', '/register', '/password/forgot', '/password/reset', '/email/verify'].includes(path)) {
         // A retry loop cannot repair an expired authenticated session. Reload
         // once so /me can render the signed-out shell instead of hammering
         // every recovery path. The unauthenticated boot /me request is excluded
@@ -3075,6 +3106,8 @@
   let onboardingSpotlightRaf = 0;
   let onboardingEpoch = 0;
   let onboardingGuideActive = false;
+  let onboardingTourLock = false;
+  let onboardingMaskNode = null;
 
   const onboardingSteps = [
     {
@@ -3220,20 +3253,42 @@
         description.textContent = 'A short interactive tour that moves with you and explains Plainwire as you use it.';
         copy.append(description);
       }
-      button.addEventListener('click', () => openOnboardingChat().catch((error) => {
-        send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not open the welcome tour: ${error.message}` });
-      }));
+      button.addEventListener('click', () => {
+        if (onboardingTourLock || onboardingChatNode) return;
+        onboardingTourLock = true;
+        openOnboardingChat().catch((error) => {
+          send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not open the welcome tour: ${error.message}` });
+        }).finally(() => { onboardingTourLock = false; });
+      });
       this.append(button);
     }
   }
   if (!customElements.get('pw-onboarding-entry')) customElements.define('pw-onboarding-entry', PlainwireOnboardingEntry);
 
+  const clearTourTarget = () => {
+    document.querySelectorAll('.pw-tour-target').forEach((node) => node.classList.remove('pw-tour-target'));
+  };
+  const removeTourMask = () => {
+    onboardingMaskNode?.remove();
+    onboardingMaskNode = null;
+  };
+  const ensureTourMask = () => {
+    if (onboardingMaskNode?.isConnected) return onboardingMaskNode;
+    const mask = document.createElement('div');
+    mask.className = 'pw-tour-mask';
+    mask.setAttribute('aria-hidden', 'true');
+    document.body.append(mask);
+    onboardingMaskNode = mask;
+    return mask;
+  };
   const removeTourSpotlight = () => {
     if (onboardingSpotlightRaf) cancelAnimationFrame(onboardingSpotlightRaf);
     onboardingSpotlightRaf = 0;
     onboardingSpotlightTarget = null;
     onboardingSpotlightNode?.remove();
     onboardingSpotlightNode = null;
+    clearTourTarget();
+    if (!onboardingGuideActive && !onboardingChatNode) removeTourMask();
   };
   const positionTourSpotlight = () => {
     onboardingSpotlightRaf = 0;
@@ -3256,6 +3311,7 @@
   };
   const spotlightTourTarget = (target) => {
     removeTourSpotlight();
+    ensureTourMask();
     if (!target) return;
     const node = document.createElement('div');
     node.className = 'pw-tour-spotlight';
@@ -3263,6 +3319,7 @@
     document.body.append(node);
     onboardingSpotlightNode = node;
     onboardingSpotlightTarget = target;
+    target.classList.add('pw-tour-target');
     target.scrollIntoView?.({ block: 'nearest', inline: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' });
     requestTourSpotlightPosition();
   };
@@ -3286,21 +3343,31 @@
   const tourSelector = (step) => window.matchMedia?.('(max-width: 760px)').matches
     ? (step.mobileSelector || step.selector)
     : step.selector;
-  const waitForTourTarget = (selector, timeoutMs = 6500) => new Promise((resolve) => {
+  const waitForTourTarget = (selector, timeoutMs = 4000) => new Promise((resolve) => {
     const immediate = usableTourTarget(selector);
     if (immediate) return resolve(immediate);
+    if (!selector) return resolve(null);
     let done = false;
-    const observer = new MutationObserver(() => {
-      const found = usableTourTarget(selector);
-      if (found && !done) { done = true; clearTimeout(timeout); observer.disconnect(); resolve(found); }
-    });
-    const timeout = setTimeout(() => {
+    let checks = 0;
+    const finish = (node) => {
       if (done) return;
       done = true;
+      clearTimeout(timeout);
+      clearInterval(poll);
       observer.disconnect();
-      resolve(usableTourTarget(selector));
-    }, timeoutMs);
-    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
+      resolve(node || usableTourTarget(selector));
+    };
+    const observer = new MutationObserver(() => {
+      const found = usableTourTarget(selector);
+      if (found) finish(found);
+    });
+    const poll = setInterval(() => {
+      checks += 1;
+      const found = usableTourTarget(selector);
+      if (found || checks >= 20) finish(found);
+    }, 200);
+    const timeout = setTimeout(() => finish(usableTourTarget(selector)), timeoutMs);
+    observer.observe(document.getElementById('app') || document.body, { childList: true, subtree: true });
   });
 
   const closeOnboardingChat = ({ resumeHop = true } = {}) => {
@@ -3308,6 +3375,10 @@
     setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, false);
     onboardingChatNode?.remove();
     onboardingChatNode = null;
+    if (!onboardingGuideActive) {
+      removeTourSpotlight();
+      removeTourMask();
+    }
     if (resumeHop) scheduleOnboardingHop();
   };
   const closeOnboardingGuide = () => {
@@ -3316,13 +3387,21 @@
     onboardingGuideNode = null;
     onboardingGuideActive = false;
     removeTourSpotlight();
+    removeTourMask();
   };
 
   const onboardingBotSay = async (messages, { container, epoch, typingMs = 900 } = {}) => {
-    for (const item of messages) {
+    const lines = (Array.isArray(messages) ? messages : [messages])
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
+      .slice(0, 8);
+    for (const item of lines) {
       if (epoch !== onboardingEpoch || !container?.isConnected) return false;
       setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, true);
-      await sleep(reducedMotion() ? Math.min(typingMs, 300) : typingMs + Math.min(650, String(item).length * 9));
+      const pause = reducedMotion()
+        ? Math.min(220, 80 + Math.min(120, item.length * 2))
+        : typingMs + Math.min(650, item.length * 9);
+      await sleep(pause);
       if (epoch !== onboardingEpoch || !container?.isConnected) return false;
       setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, false);
       const row = document.createElement('div'); row.className = 'pw-tour-message';
@@ -3331,22 +3410,29 @@
       const name = document.createElement('strong'); name.textContent = 'Plainwire';
       const bubble = document.createElement('p'); bubble.textContent = item;
       body.append(name, bubble); row.append(avatar, body); container.append(row);
-      playSound('tourMessage');
+      try { playSound('tourMessage'); } catch (_) {}
       container.scrollTo?.({ top: container.scrollHeight, behavior: reducedMotion() ? 'auto' : 'smooth' });
-      await sleep(reducedMotion() ? 80 : 260);
+      await sleep(reducedMotion() ? 90 : 260);
     }
-    return true;
+    return epoch === onboardingEpoch && !!container?.isConnected;
   };
 
   const makeTourAction = (label, className, handler) => {
     const button = document.createElement('button');
     button.type = 'button'; button.className = className; button.textContent = label;
-    button.addEventListener('click', handler);
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (button.disabled) return;
+      button.disabled = true;
+      Promise.resolve(handler(event)).catch(() => {}).finally(() => {
+        if (button.isConnected) button.disabled = false;
+      });
+    });
     return button;
   };
 
   const dismissOnboarding = async () => {
-    if (!window.confirm('Skip the welcome tour? You can replay it later from Settings → Account.')) return;
     try {
       await mutateOnboarding('dismiss');
       closeOnboardingChat({ resumeHop: false });
@@ -3355,6 +3441,19 @@
     } catch (error) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not save that choice: ${error.message}` });
     }
+  };
+
+  const confirmSkipTour = (host, restore) => {
+    if (!host) return dismissOnboarding();
+    host.replaceChildren();
+    const note = document.createElement('p');
+    note.className = 'pw-tour-guide-hint';
+    note.textContent = 'Skip the welcome tour? You can replay it later from Settings → Account.';
+    host.append(
+      note,
+      makeTourAction('Keep going', 'btn', () => { if (typeof restore === 'function') restore(); else openOnboardingChat().catch(() => {}); }),
+      makeTourAction('Skip tour', 'btn ghost', dismissOnboarding)
+    );
   };
 
   const renderOnboardingSourceCard = (container) => {
@@ -3403,11 +3502,13 @@
   };
 
   const renderTourGuide = async (stepNumber, step, target, epoch) => {
+    if (epoch !== onboardingEpoch) return;
     closeOnboardingGuide();
     if (epoch !== onboardingEpoch) return;
     onboardingGuideActive = true;
     clearOnboardingHop();
-    spotlightTourTarget(target);
+    ensureTourMask();
+    spotlightTourTarget(target && target.isConnected ? target : null);
     const guide = document.createElement('aside'); guide.className = 'pw-tour-guide'; guide.setAttribute('role', 'dialog'); guide.setAttribute('aria-label', 'Plainwire tour guide'); guide.tabIndex = -1;
     const head = document.createElement('div'); head.className = 'pw-tour-guide-head';
     const mark = document.createElement('span'); mark.className = 'pw-onboarding-mark compact'; mark.textContent = 'P'; mark.setAttribute('aria-hidden', 'true');
@@ -3417,63 +3518,62 @@
     pause.addEventListener('click', () => { closeOnboardingGuide(); scheduleOnboardingHop(); });
     head.append(mark, headCopy, pause);
     const body = document.createElement('div'); body.className = 'pw-tour-guide-body';
-    const typing = document.createElement('pw-typing-indicator'); typing.setAttribute('data-scope', ONBOARDING_SCOPE); body.append(typing);
+    const title = document.createElement('h3'); title.textContent = step.title;
+    const message = document.createElement('p'); message.textContent = step.body;
+    const hint = document.createElement('small'); hint.className = 'pw-tour-guide-hint';
+    hint.textContent = target ? step.hint : (step.hint + ' This control was not visible, so the guide stayed on screen instead of waiting.');
+    body.append(title, message, hint);
     const footer = document.createElement('div'); footer.className = 'pw-tour-guide-actions';
+    const mountActions = () => {
+      footer.replaceChildren();
+      if (stepNumber > 1) footer.append(makeTourAction('Back', 'btn secondary', () => showTourStep(stepNumber - 1)));
+      footer.append(
+        makeTourAction('Skip tour', 'btn ghost', () => confirmSkipTour(footer, mountActions)),
+        makeTourAction(stepNumber === onboardingSteps.length ? 'Back to Plainwire' : 'Next', 'btn', () => {
+          if (stepNumber === onboardingSteps.length) finishOnboarding(); else showTourStep(stepNumber + 1);
+        })
+      );
+    };
+    mountActions();
     const progressBar = document.createElement('div'); progressBar.className = 'pw-tour-progress';
     progressBar.setAttribute('role', 'progressbar'); progressBar.setAttribute('aria-label', 'Tour progress');
     progressBar.setAttribute('aria-valuemin', '0'); progressBar.setAttribute('aria-valuemax', String(onboardingSteps.length)); progressBar.setAttribute('aria-valuenow', String(stepNumber));
     onboardingSteps.forEach((_, index) => { const segment = document.createElement('span'); segment.classList.toggle('is-complete', index < stepNumber); progressBar.append(segment); });
     guide.append(head, progressBar, body, footer); document.body.append(guide); onboardingGuideNode = guide;
-    guide.classList.add('is-visible'); guide.focus({ preventScroll: true });
-    guide.addEventListener('keydown', event => {
-      if (event.key === 'Escape') { event.preventDefault(); closeOnboardingGuide(); scheduleOnboardingHop(); }
-    });
     if (window.matchMedia?.('(max-width: 760px)').matches && target) {
       const targetRect = target.getBoundingClientRect();
       const viewportHeight = window.visualViewport?.height || window.innerHeight;
       guide.classList.toggle('is-top', targetRect.top + targetRect.height / 2 > viewportHeight * 0.58);
     }
-    setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, true);
-    await sleep(reducedMotion() ? 0 : 180);
-    if (epoch !== onboardingEpoch || onboardingGuideNode !== guide) return;
-    setSyntheticTyping(ONBOARDING_SCOPE, ONBOARDING_ACTOR, false);
-    typing.remove();
-    const title = document.createElement('h3'); title.textContent = step.title;
-    const message = document.createElement('p'); message.textContent = step.body;
-    const hint = document.createElement('small'); hint.className = 'pw-tour-guide-hint'; hint.textContent = step.hint;
-    body.append(title, message, hint); playSound('tourMessage');
-    if (stepNumber > 1) footer.append(makeTourAction('Back', 'btn secondary', () => showTourStep(stepNumber - 1)));
-    const skip = makeTourAction('Skip tour', 'btn ghost', dismissOnboarding);
-    const next = makeTourAction(stepNumber === onboardingSteps.length ? 'Back to Plainwire' : 'Next', 'btn', () => {
-      if (stepNumber === onboardingSteps.length) finishOnboarding(); else showTourStep(stepNumber + 1);
-    });
-    footer.append(skip, next);
     guide.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') { event.preventDefault(); closeOnboardingGuide(); scheduleOnboardingHop(); }
     });
+    try { playSound('tourMessage'); } catch (_) {}
     requestAnimationFrame(() => { guide.classList.add('is-visible'); guide.focus({ preventScroll: true }); });
   };
 
   const showTourStep = async (stepNumber) => {
     const step = onboardingSteps[stepNumber - 1];
     if (!step) return finishOnboarding();
+    if (onboardingTourLock) return;
+    onboardingTourLock = true;
     closeOnboardingChat({ resumeHop: false });
-    closeOnboardingGuide();
     clearOnboardingHop();
     const epoch = ++onboardingEpoch;
     try {
       await mutateOnboarding('progress', { step: stepNumber });
       clearOnboardingHop();
+      if (epoch !== onboardingEpoch) return;
+      if (location.hash !== step.route) location.hash = step.route;
+      const target = await waitForTourTarget(tourSelector(step));
+      if (epoch !== onboardingEpoch) return;
+      await renderTourGuide(stepNumber, step, target, epoch);
     } catch (error) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not save tour progress: ${error.message}` });
-      scheduleOnboardingHop();
-      return;
+      if (epoch === onboardingEpoch) scheduleOnboardingHop();
+    } finally {
+      onboardingTourLock = false;
     }
-    if (epoch !== onboardingEpoch) return;
-    if (location.hash !== step.route) location.hash = step.route;
-    const target = await waitForTourTarget(tourSelector(step));
-    if (epoch !== onboardingEpoch) return;
-    await renderTourGuide(stepNumber, step, target, epoch);
   };
 
   const openOnboardingChat = async ({ final = false, skipStart = false } = {}) => {
@@ -3495,11 +3595,23 @@
     const messages = document.createElement('div'); messages.className = 'pw-onboarding-messages'; messages.setAttribute('aria-live', 'polite');
     const typing = document.createElement('pw-typing-indicator'); typing.setAttribute('data-scope', ONBOARDING_SCOPE); messages.append(typing);
     const actions = document.createElement('div'); actions.className = 'pw-onboarding-actions';
+    const resumeAt = Math.max(0, Number(state.step) || 0);
+    const mountChatActions = () => {
+      if (epoch !== onboardingEpoch || !actions.isConnected) return;
+      actions.replaceChildren();
+      if (final) return;
+      const startLabel = resumeAt > 0 ? 'Resume tour' : 'Show me around';
+      actions.append(
+        makeTourAction(startLabel, 'btn', () => showTourStep(Math.max(1, Math.min(resumeAt || 1, onboardingSteps.length)))),
+        makeTourAction('Maybe later', 'btn secondary', () => closeOnboardingChat()),
+        makeTourAction('Skip tour', 'btn ghost', () => confirmSkipTour(actions, mountChatActions))
+      );
+    };
+    mountChatActions();
     layer.append(header, messages, actions); main.append(layer); onboardingChatNode = layer;
     requestAnimationFrame(() => layer.classList.add('is-open'));
     if (final) return layer;
 
-    const resumeAt = Math.max(0, Number(state.step) || 0);
     const intro = resumeAt > 0
       ? [
           'Welcome back. Your tour progress is still here — no need to start over.',
@@ -3510,15 +3622,8 @@
           'I can show you around without dumping a wall of tooltips on the screen.',
           'When we leave this chat, I’ll move into a small guide in the corner, highlight the real controls, and walk with you page by page.'
         ];
-    const ok = await onboardingBotSay(intro, { container: messages, epoch, typingMs: 760 });
-    if (!ok || epoch !== onboardingEpoch) return layer;
-    actions.replaceChildren();
-    const startLabel = resumeAt > 0 ? 'Resume tour' : 'Show me around';
-    actions.append(
-      makeTourAction(startLabel, 'btn', () => showTourStep(Math.max(1, Math.min(resumeAt || 1, onboardingSteps.length)))),
-      makeTourAction('Maybe later', 'btn secondary', () => closeOnboardingChat()),
-      makeTourAction('Skip tour', 'btn ghost', dismissOnboarding)
-    );
+    await onboardingBotSay(intro, { container: messages, epoch, typingMs: 760 });
+    mountChatActions();
     return layer;
   };
 
@@ -5676,6 +5781,17 @@
     sendWs({ type: signalType(), to_user_id: to, signal });
   };
 
+  const remoteAudioHost = () => {
+    let host = document.getElementById('pw-remote-audio-host');
+    if (!host) {
+      host = document.createElement('div');
+      host.id = 'pw-remote-audio-host';
+      host.setAttribute('aria-hidden', 'true');
+      host.style.cssText = 'position:fixed;left:0;bottom:0;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;';
+      document.body.appendChild(host);
+    }
+    return host;
+  };
   const remoteAudio = (uid) => {
     let el = document.getElementById('remote-audio-' + uid);
     if (!el) {
@@ -5683,45 +5799,62 @@
       el.id = 'remote-audio-' + uid;
       el.autoplay = true;
       el.playsInline = true;
+      el.setAttribute('playsinline', '');
+      el.setAttribute('webkit-playsinline', '');
+      el.setAttribute('autoplay', '');
       el.controls = false;
+      el.preload = 'auto';
       el.volume = readVolume(peerVolumeKey(uid), 100) / 100;
-      el.style.position = 'fixed';
-      el.style.left = '-9999px';
-      el.style.top = '0';
-      el.style.width = '1px';
-      el.style.height = '1px';
-      el.style.opacity = '0';
-      el.style.pointerEvents = 'none';
-      document.body.appendChild(el);
+      remoteAudioHost().appendChild(el);
     }
     return el;
   };
 
   const playAllRemoteAudio = () => {
-    audioContext()?.resume?.();
+    audioContext()?.resume?.().catch(() => {});
     document.querySelectorAll('audio[id^="remote-audio-"]').forEach((audio) => {
-      audio.play().then(() => { audioUnlockToastShown = false; }).catch(() => false);
+      audio.muted = deafened;
+      const play = audio.play();
+      if (play && typeof play.then === 'function') {
+        play.then(() => { audioUnlockToastShown = false; }).catch(() => false);
+      }
     });
   };
 
   const playRemoteAudio = (audio) => {
-    audio.play().then(() => { audioUnlockToastShown = false; }).catch(() => {
-      audioContext()?.resume?.();
-      audio.play().catch(() => {
-        if (!audioUnlockToastShown) {
-          audioUnlockToastShown = true;
-          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Tap Enable audio to hear the call.' });
-        }
-      });
+    if (!audio) return;
+    audio.muted = deafened;
+    audioContext()?.resume?.().catch(() => {});
+    const tryPlay = () => audio.play().then(() => { audioUnlockToastShown = false; }).catch(() => false);
+    tryPlay().then((ok) => {
+      if (ok === false) {
+        audioContext()?.resume?.().catch(() => {});
+        tryPlay().then((retryOk) => {
+          if (retryOk === false && !audioUnlockToastShown && room?.joined && !deafened) {
+            audioUnlockToastShown = true;
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Tap Enable audio to hear the call.' });
+          }
+        });
+      }
     });
     if (!remoteAudioUnlockInstalled) {
       remoteAudioUnlockInstalled = true;
+      let lastUnlock = 0;
+      const unlock = () => {
+        const now = Date.now();
+        if (now - lastUnlock < 400) return;
+        lastUnlock = now;
+        audioContext()?.resume?.().catch(() => {});
+        playAllRemoteAudio();
+        applySpeaker().catch(() => {});
+      };
       ['click', 'touchend', 'keydown', 'pointerdown'].forEach((ev) => {
-        document.addEventListener(ev, () => {
-          audioContext()?.resume?.();
-          playAllRemoteAudio();
-        }, { passive: true });
+        document.addEventListener(ev, unlock, { passive: true });
       });
+      document.addEventListener('visibilitychange', () => {
+        lastUnlock = 0;
+        if (!document.hidden && room?.joined) unlock();
+      }, { passive: true });
     }
   };
 
@@ -6907,6 +7040,9 @@
     const setLayerPosition = (node, pos, persist = false) => {
       if (!node || !desktop() || !pos) return;
       const next = clamp(node, pos.x, pos.y);
+      document.documentElement.classList.add('pw-call-detached');
+      document.documentElement.style.setProperty('--pw-call-left', next.x + 'px');
+      document.documentElement.style.setProperty('--pw-call-top', next.y + 'px');
       node.style.left = next.x + 'px';
       node.style.top = next.y + 'px';
       node.style.right = 'auto';
@@ -6920,6 +7056,9 @@
 
     const resetLayerPosition = (node, persist = true) => {
       if (!node) return;
+      document.documentElement.classList.remove('pw-call-detached');
+      document.documentElement.style.removeProperty('--pw-call-left');
+      document.documentElement.style.removeProperty('--pw-call-top');
       node.style.removeProperty('left');
       node.style.removeProperty('top');
       node.style.removeProperty('right');
@@ -6948,6 +7087,14 @@
       classFrame = requestAnimationFrame(() => { classFrame = 0; applySaved(); });
     });
 
+    const keepLayerOnScreen = (target) => {
+      if (!target || !desktop() || drag || resizing) return;
+      const rect = target.getBoundingClientRect();
+      if (rect.width < 8 || rect.height < 8) return;
+      if (rect.top >= 10 && rect.left >= 10 && rect.bottom <= innerHeight - 10 && rect.right <= innerWidth - 10) return;
+      setLayerPosition(target, clamp(target, rect.left, rect.top), false);
+    };
+
     const applySaved = () => {
       const node = layer();
       if (node !== observedLayer) {
@@ -6969,7 +7116,7 @@
         resetLayerPosition(node, false);
         return;
       }
-      if (saved) requestAnimationFrame(() => setLayerPosition(node, saved, false));
+      if (saved) requestAnimationFrame(() => { setLayerPosition(node, saved, false); keepLayerOnScreen(node); });
     };
 
     document.addEventListener('pointerdown', (ev) => {
@@ -6984,18 +7131,17 @@
         grip.setPointerCapture(ev.pointerId); ev.preventDefault(); return;
       }
       const handle = ev.target.closest?.('[data-call-drag-handle="true"]');
-      if (!handle || ev.target.closest('button, input, select, a')) return;
+      if (!handle) return;
+      if (ev.target.closest('.call-bar-controls, .call-overlay-controls, .call-popup-actions, .call-minimize')) return;
+      const blocking = ev.target.closest('input, select, a, textarea');
+      if (blocking) return;
       const node = handle.closest('.call-layer') || layer();
       if (!node) return;
       const rect = node.getBoundingClientRect();
-      node.style.left = rect.left + 'px';
-      node.style.top = rect.top + 'px';
-      node.style.right = 'auto';
-      node.style.bottom = 'auto';
-      node.classList.add('detached');
       drag = {
         node,
         pointerId: ev.pointerId,
+        handle,
         startX: ev.clientX,
         startY: ev.clientY,
         originX: rect.left,
@@ -7004,8 +7150,6 @@
         nextY: rect.top,
         moved: false
       };
-      handle.setPointerCapture?.(ev.pointerId);
-      ev.preventDefault();
     });
 
     document.addEventListener('pointermove', (ev) => {
@@ -7019,8 +7163,11 @@
       if (!drag || drag.pointerId !== ev.pointerId) return;
       const dx = ev.clientX - drag.startX;
       const dy = ev.clientY - drag.startY;
-      if (!drag.moved && Math.hypot(dx, dy) < 4) return;
-      drag.moved = true;
+      if (!drag.moved && Math.hypot(dx, dy) < 10) return;
+      if (!drag.moved) {
+        drag.moved = true;
+        drag.handle?.setPointerCapture?.(ev.pointerId);
+      }
       const next = clamp(drag.node, drag.originX + dx, drag.originY + dy);
       drag.nextX = next.x;
       drag.nextY = next.y;
@@ -7064,7 +7211,8 @@
     document.addEventListener('dblclick', (ev) => {
       if (!desktop()) return;
       const handle = ev.target.closest?.('[data-call-drag-handle="true"]');
-      if (!handle || ev.target.closest('button, input, select, a')) return;
+      if (!handle) return;
+      if (ev.target.closest('.call-bar-controls, .call-overlay-controls, .call-popup-actions, .call-minimize, input, select, a')) return;
       const node = handle.closest('.call-layer') || layer();
       preferredSize = null; storage.removeItem(sizeKey); applySaved();
       resetLayerPosition(node, true);
@@ -7097,7 +7245,7 @@
       if (!changed || positionFrame || drag) return;
       positionFrame = requestAnimationFrame(() => { positionFrame = 0; applySaved(); });
     });
-    observer.observe(document.body, { childList: true, subtree: true });
+    observer.observe(root || document.body, { childList: true, subtree: true });
     applySaved();
   };
 
@@ -7726,6 +7874,79 @@
           } finally { button.disabled = false; }
         } }
       ]
+    });
+  };
+
+  const openEmailDialog = (currentEmail = '') => {
+    const content = document.createElement('div');
+    content.className = 'account-password-fields';
+    const intro = document.createElement('p');
+    intro.className = 'muted';
+    intro.textContent = currentEmail
+      ? 'A verified email is required to reset a forgotten password. Changing it sends a new verification link.'
+      : 'Password reset is unavailable until this account has a verified email.';
+    const emailField = document.createElement('label'); emailField.className = 'field';
+    const emailLabel = document.createElement('span'); emailLabel.textContent = 'Email';
+    const email = document.createElement('input'); email.type = 'email'; email.autocomplete = 'email'; email.maxLength = 254; email.value = currentEmail;
+    emailField.append(emailLabel, email);
+    const passwordField = document.createElement('label'); passwordField.className = 'field';
+    const passwordLabel = document.createElement('span'); passwordLabel.textContent = 'Current password';
+    const password = document.createElement('input'); password.type = 'password'; password.autocomplete = 'current-password'; password.maxLength = 256;
+    passwordField.append(passwordLabel, password);
+    const status = document.createElement('div'); status.className = 'account-dialog-status';
+    content.append(intro, emailField, passwordField, status);
+    const actions = [
+      { label: 'Cancel', onClick: closeAccountDialog },
+      { label: 'Save email', className: 'btn', onClick: async (button) => {
+        status.textContent = '';
+        const next = email.value.trim();
+        if (!next || !next.includes('@') || !next.includes('.')) { status.textContent = 'Enter a valid email address.'; return; }
+        button.disabled = true;
+        try {
+          await accountApi('POST', '/email', { email: next, password: password.value });
+          closeAccountDialog();
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Check your inbox to verify this email.' });
+          api({ method: 'GET', path: '/me' });
+        } catch (error) {
+          status.textContent = error.message === 'bad_password' ? 'Current password is incorrect.'
+            : error.message === 'email_taken' ? 'That email is already verified on another account.'
+            : error.message === 'invalid_email' ? 'Enter a valid email address.'
+            : 'Could not save the email.';
+        } finally { button.disabled = false; }
+      } }
+    ];
+    if (currentEmail) {
+      actions.splice(1, 0, {
+        label: 'Resend verification', className: 'btn secondary', onClick: async (button) => {
+          button.disabled = true; status.textContent = '';
+          try {
+            await accountApi('POST', '/email/resend', {});
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Verification email sent, if this instance can send mail.' });
+          } catch (error) {
+            status.textContent = error.message === 'email_required' ? 'Add an email first.' : 'Could not resend verification.';
+          } finally { button.disabled = false; }
+        }
+      });
+      actions.splice(1, 0, {
+        label: 'Remove email', className: 'btn ghost', onClick: async (button) => {
+          if (!password.value) { status.textContent = 'Enter your current password to remove the email.'; return; }
+          button.disabled = true; status.textContent = '';
+          try {
+            await accountApi('POST', '/email/remove', { password: password.value });
+            closeAccountDialog();
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Email removed. Password reset is unavailable until you add a verified address.' });
+            api({ method: 'GET', path: '/me' });
+          } catch (error) {
+            status.textContent = error.message === 'bad_password' ? 'Current password is incorrect.' : 'Could not remove the email.';
+          } finally { button.disabled = false; }
+        }
+      });
+    }
+    showAccountDialog({
+      title: 'Email and verification',
+      subtitle: 'Reset links are only sent to a verified address.',
+      content,
+      actions
     });
   };
 
@@ -8711,6 +8932,9 @@
         break;
       case 'account_change_password':
         openPasswordDialog();
+        break;
+      case 'account_change_email':
+        openEmailDialog(String(data || ''));
         break;
       case 'account_disable':
         openAccountLifecycleDialog('disable');

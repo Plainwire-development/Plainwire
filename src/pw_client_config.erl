@@ -1,5 +1,5 @@
 -module(pw_client_config).
--export([public/0, version/0, asset_version/0, default_theme/0, upload_max_bytes/0, profile_image_max_bytes/0, registration_enabled/0]).
+-export([public/0, version/0, asset_version/0, default_theme/0, upload_max_bytes/0, profile_image_max_bytes/0, registration_enabled/0, password_reset_enabled/0]).
 
 -define(MAX_UPLOAD_BYTES, 262144000).
 -define(MIN_UPLOAD_BYTES, 1048576).
@@ -13,6 +13,7 @@ public() ->
       app_name => clean_app_name(pw_util:env_str("PLAINWIRE_APP_NAME", <<"Plainwire">>)),
       default_theme => default_theme(),
       registration_enabled => registration_enabled(),
+      password_reset_enabled => password_reset_enabled(),
       gif_search_enabled => pw_klipy:enabled(),
       gif_provider => case pw_klipy:enabled() of true -> <<"KLIPY">>; false -> <<>> end,
       source_repository => source_repository(),
@@ -38,7 +39,7 @@ source_repository() ->
 version() ->
     case application:get_key(plainwire_relay, vsn) of
         {ok, Vsn} -> pw_util:bin(Vsn);
-        _ -> <<"2.4.0">>
+        _ -> <<"2.4.1">>
     end.
 
 asset_version() ->
@@ -80,6 +81,11 @@ read_asset_parts(Static, [Name | Rest], Acc) ->
     case file:read_file(filename:join(Static, Name)) of
         {ok, Bin} -> read_asset_parts(Static, Rest, [Bin | Acc]);
         _ -> error
+    end.
+
+password_reset_enabled() ->
+    try pw_mail:enabled()
+    catch _:_ -> false
     end.
 
 registration_enabled() ->
