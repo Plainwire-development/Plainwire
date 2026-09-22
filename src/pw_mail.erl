@@ -3,7 +3,7 @@
 -export([start_link/0, enabled/0, public_host/0, send/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -ifdef(TEST).
--export([central_host/1, smtp_configured/0, compose/1, public_url/0, rfc822/4]).
+-export([central_host/1, smtp_configured/0, compose/1, public_url/0, rfc822/4, smtp_send/1]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -179,6 +179,7 @@ deliver(Mail) ->
     end.
 
 redact_reason({smtp_auth, _}) -> smtp_auth_failed;
+redact_reason({smtp, 535, _}) -> smtp_auth_failed;
 redact_reason(Reason) -> Reason.
 
 smtp_send(#{from := From, to := To, subject := Subject, text := Text}) ->
@@ -261,10 +262,16 @@ smtp_auth(Sock, User, Pass) ->
     Plain = base64:encode(<<0, User/binary, 0, Pass/binary>>),
     case command(Sock, [<<"AUTH PLAIN ">>, Plain], 235) of
         {ok, Sock1} -> {ok, Sock1};
-        {error, {smtp, 504, _}} -> smtp_auth_login(Sock, User, Pass);
-        {error, {smtp, 534, _}} -> smtp_auth_login(Sock, User, Pass);
+        %% 535 means the credentials were read and rejected. Retrying AUTH LOGIN
+        %% with the same secret spends a second failed attempt per mail against
+        %% the provider's lockout counter, so stop here.
         {error, {smtp, 535, _}} = Error -> Error;
-        _ -> smtp_auth_login(Sock, User, Pass)
+        %% Any other refusal (504, 534, ...) means PLAIN was not usable on this
+        %% connection; LOGIN is worth a try.
+        {error, {smtp, _, _}} -> smtp_auth_login(Sock, User, Pass);
+        %% A transport error is not an auth problem. Propagate it unchanged so
+        %% the log names the real fault.
+        {error, _} = Error -> Error
     end.
 
 smtp_auth_login(Sock, User, Pass) ->
@@ -350,10 +357,10 @@ command(Sock, Line, Expected) when is_list(Expected) ->
     case send_line(Sock, Line) of
         ok ->
             case recv_reply(Sock) of
-                {ok, Code, _} ->
+                {ok, Code, Lines} ->
                     case lists:member(Code, Expected) of
                         true -> {ok, Sock};
-                        false -> {error, {smtp, Code}}
+                        false -> {error, {smtp, Code, Lines}}
                     end;
                 Error -> Error
             end;
