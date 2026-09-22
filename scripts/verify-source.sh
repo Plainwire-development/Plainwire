@@ -33,7 +33,11 @@ version = Path('VERSION').read_text().strip()
 assert re.fullmatch(r'\d+\.\d+\.\d+(?:-\d+)?', version)
 assert f'{{vsn, "{version}"}}' in Path('src/plainwire_relay.app.src').read_text()
 assert f'{{release, {{plainwire_relay, "{version}"}}' in Path('rebar.config').read_text()
-assert f'attribute "data-ui-version" "{version}"' in Path('priv/static/elm/src/Main.elm').read_text()
+# The fingerprint moves between Elm modules as the UI is refactored (it left
+# Main.elm for View/App.elm in 2.5.0), so search the whole UI source tree
+# rather than one file that can silently stop containing it.
+ui_sources = '\n'.join(p.read_text() for p in sorted(Path('priv/static/elm/src').rglob('*.elm')))
+assert f'attribute "data-ui-version" "{version}"' in ui_sources, f'Elm UI fingerprint does not match VERSION {version}'
 assert f'_ -> <<"{version}">>' in Path('src/pw_client_config.erl').read_text()
 assert f'?assertEqual(<<"{version}">>, maps:get(version, Config))' in Path('test/pw_client_config_tests.erl').read_text()
 assert Path(f'RELEASE_NOTES_{version}.md').is_file()
@@ -148,7 +152,9 @@ unfinished = re.compile(r'(?i)\b(?:TODO|FIXME|XXX|unimplemented|stubbed|placehol
 for source in authored_sources:
     hit = unfinished.search(source.read_text())
     assert not hit, f'unfinished marker in authored source {source}: {hit.group(0)}'
-db_source = Path('src/pw_db.erl').read_text()
+# 2.5.0 split the schema out of pw_db.erl; guard both halves as one corpus so a
+# future move cannot silently empty these checks (the .mjs contracts do the same).
+db_source = Path('src/pw_db.erl').read_text() + '\n' + Path('src/pw_db_schema.erl').read_text()
 # Guard known Erlang single-assignment regressions that were caught by erlc in
 # the 1.8.0 admin paths. These checks are intentionally exact enough to avoid
 # pretending to be a compiler while still preventing the same unsafe bindings
@@ -160,7 +166,10 @@ assert 'LimitI -> LimitI end' in db_source
 assert 'BeforeI -> max(1, BeforeI) end' in db_source
 assert not re.search(r'\{ok, \[Role\]\} -> Role[\s\S]{0,260}Role = case ExistingRole', db_source), 'unsafe Erlang Role binding regression in admin enrollment'
 assert not re.search(r'case pw_util:int\(Limit0\)[\s\S]{0,120}; I -> I end[\s\S]{0,180}case pw_util:int\(BeforeId0\)[\s\S]{0,120}; I ->', db_source), 'unsafe reused Erlang I binding regression in admin audit pagination'
-migration_ids = [int(v) for v in re.findall(r'(?m)^\s*\{(\d+), \[', db_source)]
+# Migration entries are written both as `{N, [` and comma-first as `,{N, [`;
+# matching only the first form silently skipped half the list.
+migration_ids = [int(v) for v in re.findall(r'(?m)^\s*,?\s*\{(\d+), \[', db_source)]
+assert migration_ids, 'no DB migrations found - the migration guard is looking at the wrong source'
 assert migration_ids == list(range(1, max(migration_ids) + 1)), f'non-contiguous or duplicate DB migrations: {migration_ids}'
 # Scalability hardening must remain operator-visible and source-verifiable.
 env_example = Path('.env.example').read_text()

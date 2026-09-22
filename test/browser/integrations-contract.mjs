@@ -52,7 +52,11 @@ assert.match(redis, /normalize_presence\(_\)\s*->\s*\<\<\"online\"\>\>/, 'Redis 
 assert.match(redis, /cache_bump_version/, 'Redis cache has constant-time generation invalidation');
 assert.match(redis, /PLAINWIRE_REDIS_USERNAME/, 'Redis supports Redis 6+ ACL usernames');
 assert.match(redis, /\[<<\"AUTH\">>, unicode:characters_to_binary\(U\), unicode:characters_to_binary\(P\)\]/, 'Redis ACL auth sends username and password together');
-assert.match(redisDoc, /PostgreSQL is still the source of truth/, 'Redis docs preserve PostgreSQL durability semantics');
+// Assert the durability contract itself, not one exact sentence: the prose is
+// reworded between releases, but Redis must never be described as durable and
+// PostgreSQL must stay the relational source of truth.
+assert.match(redisDoc, /Redis is never the durable authority/, 'Redis docs keep Redis out of the durable authority path');
+assert.match(redisDoc, /PostgreSQL is still[^.\n]*source of truth/, 'Redis docs preserve PostgreSQL durability semantics');
 assert.match(ws, /pw_rate:allow_shared\(\{ws_typing, Uid\}/, 'typing abuse gate can coordinate through the shared Redis limiter');
 
 // Real integration permissions only: no UI-only permission switches.
