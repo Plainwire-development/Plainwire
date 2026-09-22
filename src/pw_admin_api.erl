@@ -389,8 +389,15 @@ account_action_gate(M, Id) ->
 reply_account_action(Req, {ok, Data}, State) when is_map(Data) ->
     case maps:take(mail, Data) of
         {Mail, Rest} ->
-            Delivered = pw_mail:deliver_now(Mail) =:= ok,
-            reply_ok(Req, Rest#{email_delivery => Delivered}, State);
+            case pw_mail:deliver_now(Mail) of
+                ok -> reply_ok(Req, Rest#{email_delivery => true}, State);
+                {error, Reason} when is_atom(Reason) ->
+                    Delivered = false,
+                    reply_ok(Req, Rest#{email_delivery => Delivered, email_error => Reason}, State);
+                {error, _} ->
+                    Delivered = false,
+                    reply_ok(Req, Rest#{email_delivery => Delivered, email_error => mail_rejected}, State)
+            end;
         error -> reply_ok(Req, Data, State)
     end;
 reply_account_action(Req, Other, State) -> reply_result(Req, Other, State).

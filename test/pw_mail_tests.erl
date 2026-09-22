@@ -60,6 +60,12 @@ smtp_body_stuffs_lf_dot_lines_test() ->
     ?assertEqual(nomatch, binary:match(Msg, <<"\r\n.\r\n">>)),
     ?assertNotEqual(nomatch, binary:match(Msg, <<"\r\n..\r\nthere">>)).
 
+starttls_socket_stays_passive_and_binary_test() ->
+    Opts = pw_mail:tls_opts("smtp.example.com"),
+    ?assertEqual(false, proplists:get_value(active, Opts)),
+    ?assertEqual(binary, proplists:get_value(mode, Opts)),
+    ?assertEqual(verify_peer, proplists:get_value(verify, Opts)).
+
 smtp_headers_reject_injected_breaks_test() ->
     Msg = pw_mail:rfc822(<<"from@example.com\r\nBcc: evil@example.com">>, <<"user@example.com">>, <<"Hi\r\nBcc: evil@example.com">>, <<"ok">>),
     ?assertEqual(nomatch, binary:match(Msg, <<"\r\nBcc:">>)).

@@ -3,7 +3,7 @@
 -export([start_link/0, enabled/0, public_host/0, send/1, deliver_now/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -ifdef(TEST).
--export([central_host/1, smtp_configured/0, compose/1, public_url/0, rfc822/4, smtp_send/1]).
+-export([central_host/1, smtp_configured/0, compose/1, public_url/0, rfc822/4, smtp_send/1, tls_opts/1]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -119,7 +119,15 @@ client_result(ok) -> ok;
 client_result({error, mail_disabled}) -> {error, mail_disabled};
 client_result({error, mail_unavailable}) -> {error, mail_unavailable};
 client_result({error, mail_busy}) -> {error, mail_busy};
+client_result({error, mail_timeout}) -> {error, mail_timeout};
 client_result({error, invalid_mail}) -> {error, invalid_mail};
+client_result({error, tls_required}) -> {error, mail_tls};
+client_result({error, {tls, _}}) -> {error, mail_tls};
+client_result({error, {smtp, 535, _}}) -> {error, mail_auth};
+client_result({error, {smtp_auth, _}}) -> {error, mail_auth};
+client_result({error, timeout}) -> {error, mail_timeout};
+client_result({error, closed}) -> {error, mail_unavailable};
+client_result({error, {connect, _}}) -> {error, mail_unavailable};
 client_result({error, _}) -> {error, mail_rejected}.
 
 sanitize_mail(Mail) ->
@@ -429,6 +437,12 @@ smtp_host_list() ->
 
 tls_opts(Host) ->
     [
+        %% ssl:connect defaults to an active, list-mode socket. The SMTP reader
+        %% uses a passive binary recv. On port 587 the socket is upgraded with
+        %% these options alone, so leaving the defaults makes the first read
+        %% after STARTTLS fail and the message is never submitted.
+        {active, false},
+        {mode, binary},
         {verify, verify_peer},
         {cacerts, public_key:cacerts_get()},
         {server_name_indication, Host},

@@ -8116,6 +8116,16 @@
     });
   };
 
+  const mailFailureText = (reason, saved) => {
+    const lead = saved ? 'The address was saved, but ' : '';
+    if (reason === 'mail_disabled') return `${lead}mail is not enabled on this server.`;
+    if (reason === 'mail_auth') return `${lead}the mail server rejected the login.`;
+    if (reason === 'mail_tls') return `${lead}a secure connection to the mail server could not be started.`;
+    if (reason === 'mail_timeout') return `${lead}the mail server did not answer in time.`;
+    if (reason === 'mail_unavailable') return `${lead}the mail server could not be reached.`;
+    return `${lead}the mail server did not accept the verification message.`;
+  };
+
   const openEmailDialog = (currentEmail = '') => {
     const content = document.createElement('div');
     content.className = 'account-password-fields';
@@ -8145,7 +8155,7 @@
           const saved = await accountApi('POST', '/email', { email: next, password: password.value });
           api({ method: 'GET', path: '/me' });
           if (saved.email_delivery === false) {
-            status.textContent = 'The address was saved, but the mail server did not accept the verification message.';
+            status.textContent = mailFailureText(saved.email_error, true);
             return;
           }
           closeAccountDialog();
@@ -8167,7 +8177,7 @@
             if (sent.already_verified) {
               send(app.ports.bridgeReceive, { tag: 'toast', data: 'This email is already verified.' });
             } else if (sent.email_delivery === false) {
-              status.textContent = 'The mail server did not accept the verification message.';
+              status.textContent = mailFailureText(sent.email_error, false);
             } else {
               send(app.ports.bridgeReceive, { tag: 'toast', data: 'Verification email sent.' });
             }

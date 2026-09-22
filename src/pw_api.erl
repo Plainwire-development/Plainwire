@@ -1060,11 +1060,18 @@ maybe_dispatch_mail(Data) -> maybe_dispatch_mail(Data, await).
 maybe_dispatch_mail(Data, Mode) when is_map(Data), (Mode =:= await orelse Mode =:= async) ->
     case maps:take(mail, Data) of
         {Mail, Rest} ->
-            Delivered = case Mode of
-                async -> pw_mail:send(Mail) =:= ok;
-                await -> pw_mail:deliver_now(Mail) =:= ok
+            {Delivered, Error} = case Mode of
+                async -> {pw_mail:send(Mail) =:= ok, undefined};
+                await -> mail_outcome(pw_mail:deliver_now(Mail))
             end,
-            Rest#{email_delivery => Delivered};
+            case Error of
+                undefined -> Rest#{email_delivery => Delivered};
+                _ -> Rest#{email_delivery => Delivered, email_error => Error}
+            end;
         error -> Data
     end;
 maybe_dispatch_mail(Data, _) -> Data.
+
+mail_outcome(ok) -> {true, undefined};
+mail_outcome({error, Reason}) when is_atom(Reason) -> {false, Reason};
+mail_outcome({error, _}) -> {false, mail_rejected}.

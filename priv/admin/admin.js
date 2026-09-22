@@ -913,7 +913,13 @@ function confirmAccountAction(
         resend_verification: data.already_verified
           ? "Email is already verified."
           : data.email_delivery === false
-            ? "The mail server did not accept the verification message."
+            ? data.email_error === "mail_auth"
+              ? "The mail server rejected the login."
+              : data.email_error === "mail_tls"
+                ? "A secure connection to the mail server could not be started."
+                : data.email_error === "mail_disabled"
+                  ? "Mail is not enabled on this server."
+                  : "The mail server did not accept the verification message."
             : "Verification email sent.",
       };
       toast(messages[action] || "Account updated.");
