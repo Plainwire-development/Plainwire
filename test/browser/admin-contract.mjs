@@ -113,7 +113,7 @@ assert.match(db,/<<"disable">>[\s\S]*<<"revoke_sessions">>[\s\S]*<<"clear_displa
 assert.match(db,/\(u\.email <> ''\),u\.email_verified/,'account lookup reports whether email exists without selecting the address');
 assert.match(db,/account_state='disabled',disabled_at=\$2/,'operator disable is distinct from self-service disable and records disabled_at');
 assert.match(db,/<<"disabled">> when is_binary\(Reason\), Reason =\/=\s*<<>>/,'an operator disable does not reactivate on the next correct password');
-assert.match(api,/maps:take\(mail, Data\)[\s\S]*pw_mail:send\(Mail\)/,'verification resend sends mail on the server and strips the token from the operator response');
+assert.match(api,/maps:take\(mail, Data\)[\s\S]*pw_mail:deliver_now\(Mail\)[\s\S]*email_delivery => Delivered/,'verification resend waits for SMTP acceptance and strips the token from the operator response');
 assert.match(api,/admin_resend_verification[\s\S]*4, 600000[\s\S]*pw_mail:enabled/,'verification resend is operator-rate-limited and refuses when mail is off');
 assert.match(js,/Sign out everywhere[\s\S]*Reset display name[\s\S]*Remove email[\s\S]*Resend verification[\s\S]*Disable account/,'account controls are real labeled actions, not placeholder toasts');
 assert.match(clusterWire,/sessions_revoked/,'forced logout is allowed across cluster nodes');
