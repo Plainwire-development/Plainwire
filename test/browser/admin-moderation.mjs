@@ -39,7 +39,7 @@ try {
       else if(action==='ban')accountState='banned';
       else if(action==='suspend')accountState='suspended';
       else if(action==='disable')accountState='disabled';
-      return route.fulfill(json({...moderation(),changed:action==='clear_display_name',revoked:action==='revoke_sessions'?1:0,removed:action==='remove_email',sent:action==='resend_verification'}));
+      return route.fulfill(json({...moderation(),changed:action==='clear_display_name',revoked:action==='revoke_sessions'?1:0,removed:action==='remove_email',sent:action==='resend_verification',email_delivery:action==='resend_verification'}));
     }
     if(path==='/api/banners' && method==='GET')return route.fulfill(json([]));
     if(path==='/api/banners' && method==='POST')return route.fulfill(json({id:1,title:'',body:'hello',severity:'info',enabled:true,dismissible:true,starts_at:Date.now(),ends_at:0,updated_at:Date.now()}));
@@ -104,7 +104,7 @@ try {
 
   await page.getByRole('button',{name:'Resend verification'}).click();
   await page.getByRole('dialog').getByRole('button',{name:'Resend verification'}).click();
-  await page.locator('.toast',{hasText:'Verification email queued'}).waitFor();
+  await page.locator('.toast',{hasText:'Verification email sent'}).waitFor();
   assert.ok(posts.some(p=>p.path==='/api/users/7/moderation'&&p.body.action==='resend_verification'),'Resend verification must POST');
 
   await page.locator('#modal-close').click();
