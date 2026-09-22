@@ -133,6 +133,39 @@ smtp_auth_rejection_is_not_retried_test() ->
     ?assertMatch({error, _}, Result),
     ?assertEqual(1, length(auth_lines(fake_smtp_transcript(Server)))).
 
+smtp_strips_quotes_and_breaks_from_credentials_test() ->
+    {Server, Port} = start_fake_smtp(#{}),
+    Result = with_env([{"PLAINWIRE_SMTP_HOST", "127.0.0.1"},
+                       {"PLAINWIRE_SMTP_PORT", integer_to_list(Port)},
+                       {"PLAINWIRE_SMTP_USER", "\"mailer\""},
+                       {"PLAINWIRE_SMTP_PASS", "\"sec\rret\""},
+                       {"PLAINWIRE_SMTP_TLS", "false"},
+                       {"PLAINWIRE_PUBLIC_URL", "https://plainwi.re"}], fun() ->
+        pw_mail:smtp_send(sample_message(<<"body">>))
+    end),
+    ?assertEqual(ok, Result),
+    ?assertEqual([<<"AUTH PLAIN ", (base64:encode(<<0, "mailer", 0, "secret">>))/binary>>],
+                 auth_lines(fake_smtp_transcript(Server))).
+
+%% The SMTP username is often a label, while the From address is the mailbox
+%% the token was created for. A 535 on the label must not block that mailbox.
+smtp_retries_auth_as_mailbox_from_address_test() ->
+    {Server, Port} = start_fake_smtp(#{reject_first_auth => true}),
+    Result = with_env([{"PLAINWIRE_SMTP_HOST", "127.0.0.1"},
+                       {"PLAINWIRE_SMTP_PORT", integer_to_list(Port)},
+                       {"PLAINWIRE_SMTP_USER", "mailer"},
+                       {"PLAINWIRE_SMTP_PASS", "secret"},
+                       {"PLAINWIRE_SMTP_FROM", "mailer@example.com"},
+                       {"PLAINWIRE_SMTP_TLS", "false"},
+                       {"PLAINWIRE_PUBLIC_URL", "https://plainwi.re"}], fun() ->
+        pw_mail:smtp_send(sample_message(<<"body">>))
+    end),
+    ?assertEqual(ok, Result),
+    Lines = fake_smtp_transcript(Server),
+    ?assertEqual(2, length(auth_lines(Lines))),
+    ?assert(lists:member(<<"AUTH PLAIN ", (base64:encode(<<0, "mailer@example.com", 0, "secret">>))/binary>>, Lines)),
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(lists:join(<<"\n">>, Lines)), <<"AUTH LOGIN">>)).
+
 smtp_auth_falls_back_to_login_when_plain_unsupported_test() ->
     {Server, Port} = start_fake_smtp(#{auth_plain => <<"504 5.5.4 Unrecognized authentication type">>}),
     Result = with_smtp_env(Port, fun() -> pw_mail:smtp_send(sample_message(<<"body">>)) end),
@@ -211,6 +244,7 @@ with_smtp_env(Port, Fun) ->
               {"PLAINWIRE_SMTP_PORT", integer_to_list(Port)},
               {"PLAINWIRE_SMTP_USER", "mailer"},
               {"PLAINWIRE_SMTP_PASS", "secret"},
+              {"PLAINWIRE_SMTP_FROM", ""},
               {"PLAINWIRE_SMTP_TLS", "false"},
               {"PLAINWIRE_PUBLIC_URL", "https://plainwi.re"}], Fun).
 
@@ -295,8 +329,16 @@ dispatch(Sock, Opts, <<"AUTH">>, Line) ->
             reply(Sock, Opts, auth_plain_challenge, <<"334 ">>),
             {continue, plain_payload};
         false ->
-            reply(Sock, Opts, auth_plain, <<"235 2.7.0 Authentication succeeded">>),
-            {continue, none}
+            N = case get(auth_n) of undefined -> 0; C -> C end,
+            put(auth_n, N + 1),
+            case maps:get(reject_first_auth, Opts, false) andalso N =:= 0 of
+                true ->
+                    gen_tcp:send(Sock, <<"535 5.7.8 authentication failed\r\n">>),
+                    {continue, none};
+                false ->
+                    reply(Sock, Opts, auth_plain, <<"235 2.7.0 Authentication succeeded">>),
+                    {continue, none}
+            end
     end;
 dispatch(Sock, Opts, <<"MAIL">>, _Line) ->
     N = case get(mail_count) of undefined -> 0; C -> C end,

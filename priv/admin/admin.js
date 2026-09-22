@@ -914,7 +914,7 @@ function confirmAccountAction(
           ? "Email is already verified."
           : data.email_delivery === false
             ? data.email_error === "mail_auth"
-              ? "The mail server rejected the login."
+              ? "The mail server rejected the SMTP username or password."
               : data.email_error === "mail_tls"
                 ? "A secure connection to the mail server could not be started."
                 : data.email_error === "mail_disabled"

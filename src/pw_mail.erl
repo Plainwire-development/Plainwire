@@ -152,15 +152,35 @@ explicit_mail_flag() ->
 
 smtp_configured() ->
     Host = string:trim(pw_util:env_str("PLAINWIRE_SMTP_HOST", <<>>)),
-    User = string:trim(pw_util:env_str("PLAINWIRE_SMTP_USER", <<>>)),
+    User = smtp_user(),
     Pass = smtp_password(),
     Host =/= <<>> andalso User =/= <<>> andalso Pass =/= <<>>.
 
-smtp_password() ->
-    case os:getenv("PLAINWIRE_SMTP_PASS") of
+smtp_user() -> smtp_secret("PLAINWIRE_SMTP_USER").
+
+smtp_password() -> smtp_secret("PLAINWIRE_SMTP_PASS").
+
+%% Trim, drop CR/LF so the AUTH line cannot be split, and remove one pair of
+%% surrounding quotes. Environment files often keep those quotes as part of
+%% the value, and a quoted token is rejected as a bad password.
+smtp_secret(Name) ->
+    case os:getenv(Name) of
         false -> <<>>;
-        Value -> iolist_to_binary(string:trim(Value))
+        Value ->
+            case unicode:characters_to_binary(string:trim(Value)) of
+                Bin when is_binary(Bin) -> unquote(header_safe(Bin));
+                _ -> <<>>
+            end
     end.
+
+unquote(Bin) when is_binary(Bin), byte_size(Bin) >= 2 ->
+    Size = byte_size(Bin) - 2,
+    case Bin of
+        <<$", Inside:Size/binary, $">> -> Inside;
+        <<$', Inside:Size/binary, $'>> -> Inside;
+        _ -> Bin
+    end;
+unquote(Bin) -> Bin.
 
 public_url() ->
     trim_slash(string:trim(pw_util:env_str("PLAINWIRE_PUBLIC_URL", <<>>))).
@@ -220,8 +240,8 @@ compose(#{kind := Kind, to := To0, token := Token0} = Mail) when Kind =:= passwo
 compose(_) -> {error, invalid_mail}.
 
 from_address() ->
-    case string:trim(pw_util:env_str("PLAINWIRE_SMTP_FROM", <<>>)) of
-        <<>> -> string:trim(pw_util:env_str("PLAINWIRE_SMTP_USER", <<>>));
+    case smtp_secret("PLAINWIRE_SMTP_FROM") of
+        <<>> -> smtp_user();
         From -> From
     end.
 
@@ -266,7 +286,7 @@ smtp_send(Message, Attempt) ->
 smtp_once(#{from := From, to := To, subject := Subject, text := Text}) ->
     Host = binary_to_list(string:trim(pw_util:env_str("PLAINWIRE_SMTP_HOST", <<>>))),
     Port = pw_util:env_int("PLAINWIRE_SMTP_PORT", 587),
-    User = header_safe(string:trim(pw_util:env_str("PLAINWIRE_SMTP_USER", <<>>))),
+    User = smtp_user(),
     Pass = smtp_password(),
     case smtp_connect(Host, Port) of
         {ok, Io} ->
@@ -336,7 +356,26 @@ smtp_authenticated(Io, User, Pass, From, To, Subject, Text) ->
 smtp_mail(Io, User, Pass, From, To, Subject, Text) ->
     case smtp_auth(Io, User, Pass) of
         {ok, Io1} -> submit(Io1, User, From, To, Subject, Text);
+        {error, {smtp, 535, _}} = Error ->
+            case alternate_identity(User) of
+                undefined -> Error;
+                Alt ->
+                    case smtp_auth(live(Io), Alt, Pass) of
+                        {ok, Io1} -> submit(Io1, Alt, From, To, Subject, Text);
+                        Error2 -> Error2
+                    end
+            end;
         Error -> Error
+    end.
+
+%% A username with no @ is not a mailbox. If the From address is one, try that
+%% identity once. The same username and password are not sent twice.
+alternate_identity(User) ->
+    From = from_address(),
+    case binary:match(User, <<"@">>) =:= nomatch andalso
+         binary:match(From, <<"@">>) =/= nomatch andalso From =/= User of
+        true -> From;
+        false -> undefined
     end.
 
 %% Some providers reject MAIL FROM when it is not the authenticated address.
