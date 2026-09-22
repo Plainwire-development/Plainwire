@@ -1,6 +1,6 @@
 {application, plainwire_relay,
  [{description, "Plainwire Relay"},
-  {vsn, "2.5.3"},
+  {vsn, "2.5.4"},
   {registered, [pw_sup, pw_db, pw_hub, pw_realtime_registry, pw_async_pool, pw_rate, pw_redis, pw_github_cache, pw_media, pw_cluster, pw_media_quality, pw_cf_turn, pw_webhook_dispatcher, pw_app_interaction_dispatcher, pw_ai_bot_dispatcher, pw_storage_metrics, pw_scylla_gate, pw_scylla, pw_message_id, pw_storage_outbox, pw_storage_reconciler, pw_search_index, pw_mail]},
   {mod, {pw_app, []}},
   {applications, [kernel, stdlib, crypto, public_key, ssl, inets, ranch, cowlib, cowboy, gun, jsx, epgsql]},
