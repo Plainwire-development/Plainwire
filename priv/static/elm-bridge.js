@@ -8119,6 +8119,7 @@
   const mailFailureText = (reason, saved) => {
     const lead = saved ? 'The address was saved, but ' : '';
     if (reason === 'mail_disabled') return `${lead}mail is not enabled on this server.`;
+    if (reason === 'mail_auth_proton') return `${lead}Proton's mail server does not accept a proton.me address. The SMTP username has to be the custom-domain address the token was created for.`;
     if (reason === 'mail_auth') return `${lead}the mail server rejected the SMTP username or password. The username has to be the mailbox the token was created for, and the password has to be that token.`;
     if (reason === 'mail_tls') return `${lead}a secure connection to the mail server could not be started.`;
     if (reason === 'mail_timeout') return `${lead}the mail server did not answer in time.`;

@@ -123,8 +123,8 @@ client_result({error, mail_timeout}) -> {error, mail_timeout};
 client_result({error, invalid_mail}) -> {error, invalid_mail};
 client_result({error, tls_required}) -> {error, mail_tls};
 client_result({error, {tls, _}}) -> {error, mail_tls};
-client_result({error, {smtp, 535, _}}) -> {error, mail_auth};
-client_result({error, {smtp_auth, _}}) -> {error, mail_auth};
+client_result({error, {smtp, 535, _}}) -> auth_failure();
+client_result({error, {smtp_auth, _}}) -> auth_failure();
 client_result({error, timeout}) -> {error, mail_timeout};
 client_result({error, closed}) -> {error, mail_unavailable};
 client_result({error, {connect, _}}) -> {error, mail_unavailable};
@@ -156,31 +156,90 @@ smtp_configured() ->
     Pass = smtp_password(),
     Host =/= <<>> andalso User =/= <<>> andalso Pass =/= <<>>.
 
-smtp_user() -> smtp_secret("PLAINWIRE_SMTP_USER").
+smtp_user() -> mailbox(smtp_secret("PLAINWIRE_SMTP_USER")).
 
 smtp_password() -> smtp_secret("PLAINWIRE_SMTP_PASS").
 
-%% Trim, drop CR/LF so the AUTH line cannot be split, and remove one pair of
-%% surrounding quotes. Environment files often keep those quotes as part of
-%% the value, and a quoted token is rejected as a bad password.
+%% Trim, drop CR/LF so the AUTH line cannot be split, drop characters that a
+%% copy from a web page leaves on a token, and remove surrounding quotes.
+%% Environment files often keep those quotes as part of the value.
 smtp_secret(Name) ->
     case os:getenv(Name) of
         false -> <<>>;
         Value ->
             case unicode:characters_to_binary(string:trim(Value)) of
-                Bin when is_binary(Bin) -> unquote(header_safe(Bin));
+                Bin when is_binary(Bin) -> unquote(strip_invisible(header_safe(Bin)));
                 _ -> <<>>
             end
     end.
 
-unquote(Bin) when is_binary(Bin), byte_size(Bin) >= 2 ->
-    Size = byte_size(Bin) - 2,
-    case Bin of
-        <<$", Inside:Size/binary, $">> -> Inside;
-        <<$', Inside:Size/binary, $'>> -> Inside;
+unquote(Bin) ->
+    case unicode:characters_to_list(Bin) of
+        List when is_list(List) ->
+            case peel_quotes(List) of
+                List -> Bin;
+                Peeled -> unquote(unicode:characters_to_binary(Peeled))
+            end;
         _ -> Bin
-    end;
-unquote(Bin) -> Bin.
+    end.
+
+peel_quotes([$" | Rest] = List) -> peel_matching($", List, Rest);
+peel_quotes([$' | Rest] = List) -> peel_matching($', List, Rest);
+peel_quotes([16#201C | Rest] = List) -> peel_matching(16#201D, List, Rest);
+peel_quotes([16#2018 | Rest] = List) -> peel_matching(16#2019, List, Rest);
+peel_quotes(List) -> List.
+
+peel_matching(Close, Original, Rest) ->
+    case lists:reverse(Rest) of
+        [Close | Rev] -> lists:reverse(Rev);
+        _ -> Original
+    end.
+
+strip_invisible(Bin) ->
+    case unicode:characters_to_list(Bin) of
+        List when is_list(List) ->
+            unicode:characters_to_binary([C || C <- List, not invisible_char(C)]);
+        _ -> Bin
+    end.
+
+invisible_char(16#FEFF) -> true;
+invisible_char(C) when C >= 16#200B, C =< 16#200F -> true;
+invisible_char(C) when C >= 16#202A, C =< 16#202E -> true;
+invisible_char(16#2060) -> true;
+invisible_char(C) when C >= 16#2066, C =< 16#2069 -> true;
+invisible_char(_) -> false.
+
+%% "Name <box@example.com>" is not a username a mail server will accept.
+mailbox(Bin) ->
+    case binary:match(Bin, <<"<">>) of
+        {Pos, _} ->
+            Rest = binary:part(Bin, Pos + 1, byte_size(Bin) - Pos - 1),
+            case binary:split(Rest, <<">">>) of
+                [Addr, _] -> string:trim(Addr);
+                _ -> string:trim(Bin)
+            end;
+        nomatch ->
+            case Bin of
+                <<"mailto:", Addr/binary>> -> string:trim(Addr);
+                _ -> string:trim(Bin)
+            end
+    end.
+
+%% Proton submission refuses every @proton.me address. The token only works
+%% for the custom-domain address it was created for.
+auth_failure() ->
+    case proton_address(smtp_user()) andalso proton_address(from_address()) of
+        true -> {error, mail_auth_proton};
+        false -> {error, mail_auth}
+    end.
+
+proton_address(Addr) ->
+    case binary:split(mailbox(Addr), <<"@">>) of
+        [_, Domain] ->
+            lists:member(string:lowercase(Domain),
+                         [<<"proton.me">>, <<"pm.me">>, <<"protonmail.com">>, <<"protonmail.ch">>]);
+        _ -> false
+    end.
 
 public_url() ->
     trim_slash(string:trim(pw_util:env_str("PLAINWIRE_PUBLIC_URL", <<>>))).
@@ -240,7 +299,7 @@ compose(#{kind := Kind, to := To0, token := Token0} = Mail) when Kind =:= passwo
 compose(_) -> {error, invalid_mail}.
 
 from_address() ->
-    case smtp_secret("PLAINWIRE_SMTP_FROM") of
+    case mailbox(smtp_secret("PLAINWIRE_SMTP_FROM")) of
         <<>> -> smtp_user();
         From -> From
     end.
@@ -356,26 +415,51 @@ smtp_authenticated(Io, User, Pass, From, To, Subject, Text) ->
 smtp_mail(Io, User, Pass, From, To, Subject, Text) ->
     case smtp_auth(Io, User, Pass) of
         {ok, Io1} -> submit(Io1, User, From, To, Subject, Text);
-        {error, {smtp, 535, _}} = Error ->
+        {error, {smtp, 535, Lines}} = Error ->
             case alternate_identity(User) of
-                undefined -> Error;
+                undefined ->
+                    log_auth_rejection(Lines),
+                    Error;
                 Alt ->
                     case smtp_auth(live(Io), Alt, Pass) of
                         {ok, Io1} -> submit(Io1, Alt, From, To, Subject, Text);
+                        {error, {smtp, 535, Lines2}} = Error2 ->
+                            log_auth_rejection(Lines2),
+                            Error2;
                         Error2 -> Error2
                     end
             end;
         Error -> Error
     end.
 
-%% A username with no @ is not a mailbox. If the From address is one, try that
-%% identity once. The same username and password are not sent twice.
+%% The username and the From address are often different mailboxes. Proton
+%% accepts the login only for the mailbox the token was created for, including
+%% when the username is a proton.me address and From is the custom domain.
+%% The same identity is not sent twice.
 alternate_identity(User) ->
     From = from_address(),
-    case binary:match(User, <<"@">>) =:= nomatch andalso
-         binary:match(From, <<"@">>) =/= nomatch andalso From =/= User of
+    case binary:match(From, <<"@">>) =/= nomatch andalso From =/= User of
         true -> From;
         false -> undefined
+    end.
+
+log_auth_rejection(Lines) ->
+    Text = case Lines of
+        [_ | _] ->
+            {_Code, T} = lists:last(Lines),
+            case T of
+                <<Kept:120/binary, _/binary>> -> Kept;
+                Kept -> Kept
+            end;
+        _ -> <<>>
+    end,
+    logger:warning("[plainwire:mail] auth_rejected domain=~s detail=~s",
+                   [sender_domain(smtp_user()), Text]).
+
+sender_domain(Addr) ->
+    case binary:split(mailbox(Addr), <<"@">>) of
+        [_, Domain] -> Domain;
+        _ -> <<"none">>
     end.
 
 %% Some providers reject MAIL FROM when it is not the authenticated address.

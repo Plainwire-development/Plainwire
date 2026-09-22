@@ -913,7 +913,9 @@ function confirmAccountAction(
         resend_verification: data.already_verified
           ? "Email is already verified."
           : data.email_delivery === false
-            ? data.email_error === "mail_auth"
+            ? data.email_error === "mail_auth_proton"
+              ? "Proton's mail server does not accept a proton.me address."
+              : data.email_error === "mail_auth"
               ? "The mail server rejected the SMTP username or password."
               : data.email_error === "mail_tls"
                 ? "A secure connection to the mail server could not be started."

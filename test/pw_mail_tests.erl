@@ -166,6 +166,42 @@ smtp_retries_auth_as_mailbox_from_address_test() ->
     ?assert(lists:member(<<"AUTH PLAIN ", (base64:encode(<<0, "mailer@example.com", 0, "secret">>))/binary>>, Lines)),
     ?assertEqual(nomatch, binary:match(iolist_to_binary(lists:join(<<"\n">>, Lines)), <<"AUTH LOGIN">>)).
 
+%% "Display Name <box@domain>" is not a login a server will accept. The
+%% address inside the brackets is the username.
+smtp_sends_bracketed_username_as_the_mailbox_test() ->
+    {Server, Port} = start_fake_smtp(#{}),
+    Result = with_env([{"PLAINWIRE_SMTP_HOST", "127.0.0.1"},
+                       {"PLAINWIRE_SMTP_PORT", integer_to_list(Port)},
+                       {"PLAINWIRE_SMTP_USER", "Mailer <mailer@example.com>"},
+                       {"PLAINWIRE_SMTP_PASS", "secret"},
+                       {"PLAINWIRE_SMTP_FROM", ""},
+                       {"PLAINWIRE_SMTP_TLS", "false"},
+                       {"PLAINWIRE_PUBLIC_URL", "https://plainwi.re"}], fun() ->
+        pw_mail:smtp_send(sample_message(<<"body">>))
+    end),
+    ?assertEqual(ok, Result),
+    ?assertEqual([<<"AUTH PLAIN ", (base64:encode(<<0, "mailer@example.com", 0, "secret">>))/binary>>],
+                 auth_lines(fake_smtp_transcript(Server))).
+
+%% A proton.me username is refused. The From address is the mailbox the token
+%% was created for, so the second login uses that address.
+smtp_retries_auth_as_custom_domain_from_address_test() ->
+    {Server, Port} = start_fake_smtp(#{reject_first_auth => true}),
+    Result = with_env([{"PLAINWIRE_SMTP_HOST", "127.0.0.1"},
+                       {"PLAINWIRE_SMTP_PORT", integer_to_list(Port)},
+                       {"PLAINWIRE_SMTP_USER", "person@proton.me"},
+                       {"PLAINWIRE_SMTP_PASS", "secret"},
+                       {"PLAINWIRE_SMTP_FROM", "Mailer <mailer@example.com>"},
+                       {"PLAINWIRE_SMTP_TLS", "false"},
+                       {"PLAINWIRE_PUBLIC_URL", "https://plainwi.re"}], fun() ->
+        pw_mail:smtp_send(sample_message(<<"body">>))
+    end),
+    ?assertEqual(ok, Result),
+    Lines = fake_smtp_transcript(Server),
+    ?assertEqual(2, length(auth_lines(Lines))),
+    ?assert(lists:member(<<"AUTH PLAIN ", (base64:encode(<<0, "mailer@example.com", 0, "secret">>))/binary>>, Lines)),
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(lists:join(<<"\n">>, Lines)), <<"AUTH LOGIN">>)).
+
 smtp_auth_falls_back_to_login_when_plain_unsupported_test() ->
     {Server, Port} = start_fake_smtp(#{auth_plain => <<"504 5.5.4 Unrecognized authentication type">>}),
     Result = with_smtp_env(Port, fun() -> pw_mail:smtp_send(sample_message(<<"body">>)) end),
