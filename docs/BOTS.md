@@ -1,6 +1,6 @@
 # Bots
 
-Plainwire 2.4 has server-scoped bot accounts, Discord-style slash commands, and a stable language-neutral Bot API v1. A bot is a real server member with its own user id, role assignments and permission checks. Creating a bot does not grant administrator access.
+Plainwire 2.5.0 has server-scoped bot accounts, slash commands, and a stable language-neutral Bot API v1. A bot is a real server member with its own user id, role assignments and permission checks. Creating a bot does not grant administrator access, and the host control plane cannot impersonate a bot or a user.
 
 You can run a bot three ways:
 

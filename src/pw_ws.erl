@@ -374,6 +374,10 @@ websocket_info({hub_json, Event=#{type := account_restricted}}, State=#{uid:=Uid
     %% without racing the UI event off the wire.
     self() ! close_restricted_session,
     deliver_hub_payload(pw_util:json(Event), account_restricted, Uid, State#{last_auth_check => 0});
+websocket_info({hub_json, Event=#{type := Type}}, State=#{uid:=Uid, auth_kind:=user})
+  when Type =:= account_disabled; Type =:= sessions_revoked ->
+    self() ! close_restricted_session,
+    deliver_hub_payload(pw_util:json(Event), Type, Uid, State#{last_auth_check => 0});
 websocket_info(close_restricted_session, State) ->
     {stop, State};
 websocket_info({hub_json, Event}, State=#{uid:=Uid}) ->

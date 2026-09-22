@@ -60,22 +60,28 @@ decrypt(Bin0) when is_binary(Bin0) ->
         <<$e, $1, $:, Enc/binary>> ->
             case safe_base64_decode(Enc) of
                 <<IV:12/binary, Tag:16/binary, Cipher/binary>> ->
-                    decrypt_with_keys(all_decryption_keys(), IV, Cipher, Tag, Bin0);
+                    case decrypt_with_keys(all_decryption_keys(), IV, Cipher, Tag) of
+                        {ok, Plain} -> Plain;
+                        %% A well-formed envelope that fails authentication is not
+                        %% plaintext. Returning it would publish ciphertext and
+                        %% could be reused as a webhook secret or API key.
+                        error -> <<>>
+                    end;
                 _ -> Bin0
             end;
         _ -> Bin0
     end;
 decrypt(X) -> decrypt(pw_util:bin(X)).
 
-decrypt_with_keys({ok, Keys}, IV, Cipher, Tag, Fallback) ->
-    decrypt_with_key_list(Keys, IV, Cipher, Tag, Fallback);
-decrypt_with_keys(_, _IV, _Cipher, _Tag, Fallback) -> Fallback.
+decrypt_with_keys({ok, Keys}, IV, Cipher, Tag) ->
+    decrypt_with_key_list(Keys, IV, Cipher, Tag);
+decrypt_with_keys(_, _IV, _Cipher, _Tag) -> error.
 
-decrypt_with_key_list([], _IV, _Cipher, _Tag, Fallback) -> Fallback;
-decrypt_with_key_list([Key | Rest], IV, Cipher, Tag, Fallback) ->
+decrypt_with_key_list([], _IV, _Cipher, _Tag) -> error;
+decrypt_with_key_list([Key | Rest], IV, Cipher, Tag) ->
     case safe_decrypt(Key, IV, Cipher, <<>>, Tag) of
-        Plain when is_binary(Plain) -> Plain;
-        _ -> decrypt_with_key_list(Rest, IV, Cipher, Tag, Fallback)
+        Plain when is_binary(Plain) -> {ok, Plain};
+        _ -> decrypt_with_key_list(Rest, IV, Cipher, Tag)
     end.
 
 search_enabled() ->

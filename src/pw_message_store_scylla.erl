@@ -124,7 +124,7 @@ write_message_row(Msg, Scope, ScopeId, Bucket) ->
     Params = [Scope, ScopeId, Bucket, Id, maps:get(user_id, Msg), maps:get(body, Msg),
               nz(maps:get(reply_to_id, Msg, 0)), Created, nz(maps:get(edited_at, Msg, 0)),
               nz(maps:get(deleted_at, Msg, 0)), maps:get(kind, Msg, <<"text">>),
-              nz(maps:get(forwarded_from_id, Msg, 0))],
+              nz(maps:get(forwarded_from_id, Msg, 0)), message_version_us(Msg)],
     pw_scylla:execute({Scope, ScopeId, Bucket}, pw_msg_insert, Params).
 
 get(Id) when is_integer(Id), Id > 0 ->
@@ -200,7 +200,7 @@ edit(Id, Body, EditedAt) when is_integer(Id), Id > 0, is_binary(Body), is_intege
         {ok, #{deleted_at := Deleted}} when Deleted =/= undefined, Deleted =/= 0 -> {error, not_found};
         {ok, #{scope := Scope, scope_id := ScopeId, bucket := Bucket}} ->
             pw_scylla:execute({Scope, ScopeId, Bucket}, pw_msg_edit,
-                              [Body, EditedAt, Scope, ScopeId, Bucket, Id]);
+                              [mutation_us(EditedAt), Body, EditedAt, Scope, ScopeId, Bucket, Id]);
         Error -> Error
     end;
 edit(_, _, _) -> {error, bad_request}.
@@ -212,7 +212,7 @@ delete(Id, ActorId) when is_integer(Id), Id > 0 ->
             Now = pw_util:now_ms(),
             _ = ActorId,
             pw_scylla:execute({Scope, ScopeId, Bucket}, pw_msg_delete,
-                              [Now, Scope, ScopeId, Bucket, Id]);
+                              [mutation_us(Now), Now, Scope, ScopeId, Bucket, Id]);
         Error -> Error
     end;
 delete(_, _) -> {error, bad_request}.
@@ -221,7 +221,7 @@ hard_delete(Id) when is_integer(Id), Id > 0 ->
     case locator(Id) of
         {ok, #{scope := Scope, scope_id := ScopeId, bucket := Bucket}} ->
             case pw_scylla:execute({Scope, ScopeId, Bucket}, pw_msg_hard_delete,
-                                   [Scope, ScopeId, Bucket, Id]) of
+                                   [erase_timestamp_us(), Scope, ScopeId, Bucket, Id]) of
                 ok -> pw_scylla:execute({locator, Id}, pw_msg_locator_delete, [Id]);
                 Error -> Error
             end;
@@ -267,7 +267,7 @@ hard_delete_known_targets(Targets, Id) ->
 hard_delete_targets([], _Id) -> ok;
 hard_delete_targets([{Scope, ScopeId, Bucket} | Rest], Id) ->
     case pw_scylla:execute({Scope, ScopeId, Bucket}, pw_msg_hard_delete,
-                           [Scope, ScopeId, Bucket, Id]) of
+                           [erase_timestamp_us(), Scope, ScopeId, Bucket, Id]) of
         ok -> hard_delete_targets(Rest, Id);
         Error -> Error
     end.
@@ -276,7 +276,7 @@ hard_delete_at(Scope, ScopeId, Bucket, Id)
   when is_binary(Scope), is_integer(ScopeId), ScopeId > 0, is_integer(Bucket), Bucket >= 0,
        is_integer(Id), Id > 0 ->
     case pw_scylla:execute({Scope, ScopeId, Bucket}, pw_msg_hard_delete,
-                           [Scope, ScopeId, Bucket, Id]) of
+                           [erase_timestamp_us(), Scope, ScopeId, Bucket, Id]) of
         ok -> pw_scylla:execute({locator, Id}, pw_msg_locator_delete, [Id]);
         Error -> Error
     end;
@@ -615,6 +615,20 @@ message_visible(_) -> false.
 -ifdef(TEST).
 test_message_visible(Msg) -> message_visible(Msg).
 -endif.
+
+%% Client timestamps make a late retry of an older payload lose to a newer
+%% edit, and a privacy erase uses a timestamp no later upsert can beat.
+message_version_us(Msg) ->
+    lists:max([
+        nz(maps:get(created_at, Msg, 0)),
+        nz(maps:get(edited_at, Msg, 0)),
+        nz(maps:get(deleted_at, Msg, 0))
+    ]) * 1000.
+
+mutation_us(Ms) when is_integer(Ms), Ms > 0 -> Ms * 1000 + 1;
+mutation_us(_) -> pw_util:now_ms() * 1000 + 1.
+
+erase_timestamp_us() -> 16#3fffffffffffffff.
 
 nz(null) -> 0;
 nz(undefined) -> 0;

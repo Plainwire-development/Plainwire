@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 
 const [bridge, elm, api, db, ws, cluster, clusterWire, clusterLocal, klipy, config, media, mediaHdl, util, uploadGc, uploadHdl, makefile, indexHaml, themeHooks, adminHtml, adminCss, sup, markSvg] = await Promise.all([
   readFile('priv/static/elm-bridge.js', 'utf8'),
-  readFile('priv/static/elm/src/Main.elm', 'utf8'),
+  Promise.all(['priv/static/elm/src/Main.elm','priv/static/elm/src/View/Ui.elm','priv/static/elm/src/View/App.elm','priv/static/elm/src/View/Messages.elm','priv/static/elm/src/View/Settings.elm'].map((path) => readFile(path, 'utf8'))).then((parts) => parts.join('\n')),
   readFile('src/pw_api.erl', 'utf8'),
-  readFile('src/pw_db.erl', 'utf8'),
+  readFile('src/pw_db.erl', 'utf8').then(async (text) => text + '\n' + await readFile('src/pw_db_schema.erl', 'utf8')),
   readFile('src/pw_ws.erl', 'utf8'),
   readFile('src/pw_cluster.erl', 'utf8'),
   readFile('src/pw_cluster_wire.erl', 'utf8'),
@@ -75,7 +75,8 @@ assert.match(ws, /pw_hub:voice_join\(Cid, Uid, self\(\), VoiceProfile\)/, 'serve
 assert.match(db, /channel_message_access\(Conn, Uid, Cid\)[\s\S]*channel_text_server_member[\s\S]*<<"view_channels">>[\s\S]*<<"send_messages">>/, 'channel posting requires a text channel plus view and send permission');
 assert.match(db, /route\(\{post_channel_message[\s\S]*channel_message_access\(Conn, Uid, Cid\)/, 'channel message creation uses the shared send-access guard');
 assert.match(db, /<<"channel">>\s*->\s*channel_message_access\(Conn, Uid, TargetId\)/, 'channel forwarding uses the shared send-access guard');
-assert.match(elm, /List\.map \(managedChannelRow canManageChannels data\.categories\) channels/, 'server channel manager uses the in-scope capability variable');
+assert.match(elm, /List\.map \(managedChannelRow model canManageChannels data\.categories\) channels/, 'server channel manager uses the in-scope capability variable');
+assert.match(elm, /managedChannelRow model canManage categories channel =[\s\S]*notificationBadge \(channelNotificationCount model channel\.id\)/, 'categorized channel rows show the same notification badge as uncategorized rows');
 
 // Roles/moderation remain backend-authoritative and hierarchy-aware.
 assert.match(db, /has_server_permission\(Conn, Uid, Sid, <<"manage_roles">>\)[\s\S]*can_moderate_server_member\(Conn, Uid, Sid, Target\)/, 'role assignment still requires Manage Roles and hierarchy for ordinary targets');

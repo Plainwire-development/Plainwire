@@ -1,6 +1,6 @@
 # ScyllaDB storage
 
-Plainwire 2.0 can split storage by workload instead of forcing every kind of state into one database.
+ScyllaDB is optional. Plainwire can split storage by workload instead of forcing every kind of state into one database. Leave it off (`PLAINWIRE_SCYLLA_ENABLED=false`, `PLAINWIRE_MESSAGE_BACKEND=postgres`) unless you are deliberately moving message history.
 
 ```text
 Plainwire

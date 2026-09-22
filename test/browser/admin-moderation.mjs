@@ -12,7 +12,7 @@ await mkdir('test-results',{recursive:true});
 
 const posts=[];
 let accountState='active';
-const user={id:7,username:'ada',display_name:'Ada Lovelace',is_bot:false,account_state:'active',created_at:Date.now()-86400000,last_seen:Date.now(),server_count:2,owned_server_count:1,conversation_count:3,message_count:40,upload_count:1,upload_bytes:1024,active_sessions:1};
+const user={id:7,username:'ada',display_name:'Ada Lovelace',is_bot:false,account_state:'active',created_at:Date.now()-86400000,updated_at:Date.now(),last_seen:Date.now(),disabled_at:0,email_set:true,email_verified:false,server_count:2,owned_server_count:1,conversation_count:3,message_count:40,upload_count:1,upload_bytes:1024,active_sessions:1};
 const json=(data,status=200)=>({status,contentType:'application/json',body:JSON.stringify({ok:status<400,data,...(status>=400?{error:'failed'}:{})})});
 const moderation=()=>({account_state:accountState,moderation:accountState==='active'?null:{title:accountState==='banned'?'Access revoked':'Account suspended',reason:'policy',severity:accountState==='banned'?'critical':'warning',expires_at:0}});
 
@@ -35,8 +35,11 @@ try {
     if(path==='/api/users/7/moderation/history')return route.fulfill(json([]));
     if(path==='/api/users/7/moderation' && method==='POST'){
       const action=String(route.request().postDataJSON()?.action||'');
-      accountState=action==='restore'?'active':action==='ban'?'banned':action==='suspend'?'suspended':accountState;
-      return route.fulfill(json(moderation()));
+      if(action==='restore')accountState='active';
+      else if(action==='ban')accountState='banned';
+      else if(action==='suspend')accountState='suspended';
+      else if(action==='disable')accountState='disabled';
+      return route.fulfill(json({...moderation(),changed:action==='clear_display_name',revoked:action==='revoke_sessions'?1:0,removed:action==='remove_email',sent:action==='resend_verification'}));
     }
     if(path==='/api/banners' && method==='GET')return route.fulfill(json([]));
     if(path==='/api/banners' && method==='POST')return route.fulfill(json({id:1,title:'',body:'hello',severity:'info',enabled:true,dismissible:true,starts_at:Date.now(),ends_at:0,updated_at:Date.now()}));
@@ -75,6 +78,35 @@ try {
   assert.ok(suspend,'Suspend account must POST /api/users/:id/moderation');
   assert.equal(suspend.body.reason,'cooldown');
 
+  await page.getByRole('button',{name:'Disable',exact:true}).click();
+  await page.locator('#account-moderation-form input[name="reason"]').fill('operator hold');
+  await page.getByRole('button',{name:'Disable account'}).click();
+  await page.locator('.toast',{hasText:'Account disabled'}).waitFor();
+  const disable=posts.find(p=>p.path==='/api/users/7/moderation'&&p.body.action==='disable');
+  assert.ok(disable,'Disable account must POST /api/users/:id/moderation');
+  assert.equal(disable.body.reason,'operator hold');
+  assert.equal(disable.csrf,'csrf-test');
+
+  await page.getByRole('button',{name:'Sign out everywhere',exact:true}).click();
+  await page.getByRole('dialog').getByRole('button',{name:'Sign out everywhere'}).click();
+  await page.locator('.toast',{hasText:'Sessions revoked'}).waitFor();
+  assert.ok(posts.some(p=>p.path==='/api/users/7/moderation'&&p.body.action==='revoke_sessions'),'Sign out everywhere must revoke sessions');
+
+  await page.getByRole('button',{name:'Reset display name'}).click();
+  await page.getByRole('dialog').getByRole('button',{name:'Reset display name'}).click();
+  await page.locator('.toast',{hasText:'Display name reset'}).waitFor();
+  assert.ok(posts.some(p=>p.path==='/api/users/7/moderation'&&p.body.action==='clear_display_name'),'Reset display name must POST');
+
+  await page.getByRole('button',{name:'Remove email'}).click();
+  await page.getByRole('dialog').getByRole('button',{name:'Remove email'}).click();
+  await page.locator('.toast',{hasText:'Email removed'}).waitFor();
+  assert.ok(posts.some(p=>p.path==='/api/users/7/moderation'&&p.body.action==='remove_email'),'Remove email must POST');
+
+  await page.getByRole('button',{name:'Resend verification'}).click();
+  await page.getByRole('dialog').getByRole('button',{name:'Resend verification'}).click();
+  await page.locator('.toast',{hasText:'Verification email queued'}).waitFor();
+  assert.ok(posts.some(p=>p.path==='/api/users/7/moderation'&&p.body.action==='resend_verification'),'Resend verification must POST');
+
   await page.locator('#modal-close').click();
   await page.locator('[data-view="control"]').click();
   await page.getByRole('button',{name:'Reconcile clients'}).click();
@@ -92,7 +124,7 @@ try {
   assert.ok(posts.some(p=>p.path==='/api/banners'&&p.method==='POST'),'Publish banner must POST');
 
   assert.deepEqual(errors,[]);
-  console.log('PASS: control-plane ban/suspend/restore, reconcile, registration, and banner actions send API requests');
+  console.log('PASS: control-plane ban/suspend/disable/restore, session revoke, profile and email actions, reconcile, registration, and banner actions send API requests');
 } finally {
   await browser.close();
   await new Promise(r=>server.close(r));

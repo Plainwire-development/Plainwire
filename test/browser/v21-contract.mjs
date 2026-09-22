@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {readFileSync, existsSync} from 'node:fs';
 const read=p=>readFileSync(p,'utf8');
-const db=read('src/pw_db.erl');
+const db=read('src/pw_db_schema.erl')+'\n'+read('src/pw_db.erl');
 const api=read('src/pw_api.erl');
 const crypto=read('src/pw_crypto.erl');
 const search=read('src/pw_search_index.erl');
@@ -9,7 +9,7 @@ const admin=read('src/pw_admin_api.erl');
 const ws=read('src/pw_ws.erl');
 const adminJs=read('priv/admin/admin.js');
 const bridge=read('priv/static/elm-bridge.js');
-const main=read('priv/static/elm/src/Main.elm');
+const main=['priv/static/elm/src/Main.elm','priv/static/elm/src/View/App.elm','priv/static/elm/src/View/Messages.elm','priv/static/elm/src/View/Settings.elm','priv/static/elm/src/View/Ui.elm'].map(read).join('\n');
 const types=read('priv/static/elm/src/Types.elm');
 const composer=read('priv/static/elm/src/View/Composer.elm');
 const markdown=read('priv/static/elm/src/View/Markdown.elm');

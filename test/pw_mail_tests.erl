@@ -45,6 +45,25 @@ compose_reset_mail_does_not_echo_smtp_password_test() ->
         ?assertEqual(nomatch, binary:match(jsx:encode(Mail), <<"41844184">>))
     end).
 
+compose_strips_header_breaks_from_app_name_test() ->
+    with_env([{"PLAINWIRE_PUBLIC_URL", "https://plainwi.re"}], fun() ->
+        Mail = pw_mail:compose(#{kind => password_reset, to => <<"user@example.com">>,
+                                 username => <<"ada">>, token => <<"reset-token-value">>,
+                                 app_name => <<"Plainwire\r\nBcc: evil@example.com">>}),
+        Subject = maps:get(subject, Mail),
+        ?assertEqual(nomatch, binary:match(Subject, <<"\r">>)),
+        ?assertEqual(nomatch, binary:match(Subject, <<"\n">>))
+    end).
+
+smtp_body_stuffs_lf_dot_lines_test() ->
+    Msg = pw_mail:rfc822(<<"from@example.com">>, <<"user@example.com">>, <<"Hi">>, <<"hello\n.\nthere">>),
+    ?assertEqual(nomatch, binary:match(Msg, <<"\r\n.\r\n">>)),
+    ?assertNotEqual(nomatch, binary:match(Msg, <<"\r\n..\r\nthere">>)).
+
+smtp_headers_reject_injected_breaks_test() ->
+    Msg = pw_mail:rfc822(<<"from@example.com\r\nBcc: evil@example.com">>, <<"user@example.com">>, <<"Hi\r\nBcc: evil@example.com">>, <<"ok">>),
+    ?assertEqual(nomatch, binary:match(Msg, <<"\r\nBcc:">>)).
+
 compose_verify_mail_uses_verify_fragment_test() ->
     with_env([{"PLAINWIRE_PUBLIC_URL", "https://plainwi.re"}], fun() ->
         Mail = pw_mail:compose(#{kind => email_verify, to => <<"user@example.com">>,

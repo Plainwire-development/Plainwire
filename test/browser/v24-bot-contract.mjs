@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 
 const read = path => readFileSync(path, 'utf8');
-const db = read('src/pw_db.erl');
+const db = read('src/pw_db.erl')+'\n'+read('src/pw_db_schema.erl');
 const api = read('src/pw_api.erl');
 const ai = read('src/pw_ai_bot_dispatcher.erl');
 const interaction = read('src/pw_app_interaction_dispatcher.erl');

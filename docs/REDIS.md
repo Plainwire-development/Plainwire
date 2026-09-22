@@ -1,6 +1,6 @@
 # Redis in Plainwire
 
-Plainwire 2.4.0 can use Redis as an optional realtime accelerator. Redis is never the durable authority. PostgreSQL is still the source of truth for accounts, relationships, memberships, permissions, uploads and other relational state; message-history durability follows `PLAINWIRE_MESSAGE_BACKEND`.
+Redis is optional. Plainwire 2.5.0 can use it as a realtime accelerator. Redis is never the durable authority. PostgreSQL is still required and remains the source of truth for accounts, relationships, memberships, permissions, uploads and other relational state; message-history durability follows `PLAINWIRE_MESSAGE_BACKEND`. Leave `PLAINWIRE_REDIS_ENABLED=false` on a normal single-node install.
 
 Redis is used for work that benefits from shared short-lived state:
 

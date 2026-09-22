@@ -8,7 +8,7 @@ function read(path) {
 
 const [api, db, ws, redis, webhook, perms, bridge, sdk, redisDoc, util, uploadGc] = await Promise.all([
   readFile('src/pw_api.erl', 'utf8'),
-  readFile('src/pw_db.erl', 'utf8'),
+  readFile('src/pw_db.erl', 'utf8').then(async (text) => text + '\n' + await readFile('src/pw_db_schema.erl', 'utf8')),
   readFile('src/pw_ws.erl', 'utf8'),
   readFile('src/pw_redis.erl', 'utf8'),
   readFile('src/pw_webhook_dispatcher.erl', 'utf8'),

@@ -1,6 +1,6 @@
 -module(pw_media).
 -behaviour(gen_server).
--export([start_link/0, proxy_url/1, fetch/2, fetch_page/2, validate_url/1, cache_data_url/1, stats/0]).
+-export([start_link/0, proxy_url/1, fetch/2, fetch_head/1, fetch_page/2, validate_url/1, cache_data_url/1, stats/0]).
 -ifdef(TEST).
 -export([resolve_redirect/2]).
 -endif.
@@ -95,6 +95,38 @@ fetch(Uid, Token) ->
     catch C:R:S ->
         error_logger:error_msg("media fetch failed ~p:~p ~p~n", [C, R, S]),
         {error, fetch_failed}
+    end.
+
+%% HEAD must not download the origin. A cache hit returns the stored
+%% representation so ETag checks still work; a miss only checks the token
+%% and URL policy.
+fetch_head(Token) ->
+    try
+        Url = decode_token(Token),
+        Key = cache_key(Url),
+        Now = pw_util:now_ms(),
+        case cache_lookup(Key) of
+            [{Key, <<"error">>, <<"error">>, Expires}] when Expires > Now ->
+                {error, upstream_error};
+            [{Key, <<"error">>, Reason, Expires}] when Expires > Now, is_atom(Reason) ->
+                {error, Reason};
+            [{Key, Body, Type, Expires}] when Expires > Now, is_binary(Body), byte_size(Body) =< ?MAX_SERVE_BYTES ->
+                {ok, Body, Type};
+            [{Key, _, _, Expires}] when Expires > Now ->
+                {error, too_large};
+            _ ->
+                case Url of
+                    <<"data-proxy:", _/binary>> -> uncached;
+                    _ ->
+                        case validate_url(Url) of
+                            ok -> uncached;
+                            Error -> Error
+                        end
+                end
+        end
+    catch
+        error:invalid_token -> {error, invalid_url};
+        _:_ -> {error, invalid_url}
     end.
 
 init([]) ->

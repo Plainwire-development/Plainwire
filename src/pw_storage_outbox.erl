@@ -149,7 +149,8 @@ safe_deliver_and_finish(Item) ->
 
 deliver_and_finish(#{id := Id} = Item) ->
     Delivery = deliver(Item),
-    case pw_db:storage_outbox_finish(Id, normalize_result(Delivery)) of
+    LockedAt = maps:get(locked_at, Item, 0),
+    case pw_db:storage_outbox_finish(Id, LockedAt, normalize_result(Delivery)) of
         {ok, _} -> Delivery;
         ok -> Delivery;
         FinishError ->

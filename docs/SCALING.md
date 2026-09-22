@@ -1,6 +1,6 @@
 # Scaling Plainwire
 
-Plainwire 2.4.0 is designed to stay simple on a small self-hosted instance while keeping the hot paths bounded enough to grow. This document describes the actual 2.4.0 architecture, what scales horizontally today, which limits are intentional, and how to test a host before raising them.
+Plainwire 2.5.0 stays simple on a small self-hosted instance while keeping the hot paths bounded enough to grow. PostgreSQL is required. Redis and ScyllaDB remain optional. This document describes the architecture, what scales horizontally today, which limits are intentional, and how to test a host before raising them.
 
 Capacity is workload- and hardware-dependent. The numbers in configuration are ceilings and starting points, not a promise that a particular host can sustain that many active users. Measure the real deployment with the load tools in `tools/load/` and watch the health/metrics surfaces while increasing load.
 

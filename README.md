@@ -59,13 +59,15 @@ Plainwire is self-hostable, but expect a little setup.
 
 You will need:
 
-* Erlang/OTP 27+
+* Erlang/OTP 27, 28, or 29
 * PostgreSQL 13+
 * rebar3
-* Node.js 22+
+* Node.js 22+ (20.19+ is the minimum the frontend toolchain accepts)
 * npm
 * GNU Make
 * Python 3.9+
+
+PostgreSQL is required. It is the durable store for accounts, memberships, permissions, uploads, and, unless you later opt into Scylla, message history. Redis and ScyllaDB are optional. A single-node install does not need either of them.
 
 Elm is installed through the locked npm dependencies.
 
@@ -231,6 +233,10 @@ Portable source archives intentionally omit generated `app.js`, `app.css`, `inde
 
 Plainwire has a few optional backend components that are not required for a normal installation.
 
+* [Host control plane](docs/ADMIN.md)
+* [Redis](docs/REDIS.md) — optional; off unless `PLAINWIRE_REDIS_ENABLED=true`
+* [ScyllaDB](docs/SCYLLA.md) — optional message history; PostgreSQL remains mandatory
+* [Bots](docs/BOTS.md)
 * [Scaling and load testing](docs/SCALING.md)
 * [Partisan clustering](docs/CLUSTERING.md)
 * [Native call-health analysis](docs/CALL_HEALTH.md)
@@ -266,7 +272,9 @@ Caddy, nginx, and similar reverse proxies work well in front of Plainwire.
 
 Plainwire 1.9.0 includes an optional host-level operator console. It administers the configured Plainwire service instance itself; it is not a per-server moderation panel. The control plane is disabled by default and runs on a separate Cowboy listener when enabled.
 
-The console is intentionally private-content blind. It can inspect service health, runtime/build information, database and realtime health, aggregate message/upload/call statistics, registered accounts, hosted server metadata, resource usage, operators, and operator audit history. It has no message-body, DM-text, attachment-content, message-search, or verification-secret endpoint.
+The console is intentionally private-content blind. It can inspect service health, runtime/build information, database and realtime health, aggregate message/upload/call statistics, registered accounts, hosted server metadata, resource usage, operators, and operator audit history. It has no message-body, DM-text, attachment-content, message-search, email-address, or verification-secret endpoint.
+
+Owners and operators can also change account access. Suspend, ban, and disable require a user-facing reason and revoke that account's sessions. Restore returns the account to active. Separate confirmed actions sign an account out everywhere without changing its state, set the display name back to the username, remove an email without showing the address, and resend verification when mail is enabled on that host. Viewers cannot use those actions. There is no password reveal and no impersonation control. See [docs/ADMIN.md](docs/ADMIN.md).
 
 Operator access is instance-bound:
 
@@ -297,10 +305,11 @@ Deployment and update instructions are kept in [deploy/README.md](deploy/README.
 
 ## Version
 
-Current release: **2.4.1**
+Current release: **2.5.0**
 
 Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history.
 
+* [2.5.0 release notes](RELEASE_NOTES_2.5.0.md)
 * [2.4.1 release notes](RELEASE_NOTES_2.4.1.md)
 * [2.4.0 release notes](RELEASE_NOTES_2.4.0.md)
 * [2.3.0 release notes](RELEASE_NOTES_2.3.0.md)

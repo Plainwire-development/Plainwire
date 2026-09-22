@@ -3,19 +3,19 @@ import {readFileSync} from 'node:fs';
 
 const read = path => readFileSync(path, 'utf8');
 const version = read('VERSION').trim();
-const db = read('src/pw_db.erl');
+const db = read('src/pw_db.erl')+'\n'+read('src/pw_db_schema.erl');
 const api = read('src/pw_api.erl');
 const mail = read('src/pw_mail.erl');
 const config = read('src/pw_client_config.erl');
 const bridge = read('priv/static/elm-bridge.js');
-const main = read('priv/static/elm/src/Main.elm');
+const main = ['priv/static/elm/src/Main.elm','priv/static/elm/src/View/App.elm','priv/static/elm/src/View/Messages.elm','priv/static/elm/src/View/Settings.elm','priv/static/elm/src/View/Ui.elm'].map(read).join('\n');
 const auth = read('priv/static/elm/src/View/Auth.elm');
 const types = read('priv/static/elm/src/Types.elm');
 const env = read('.env.example');
 const appSrc = read('src/plainwire_relay.app.src');
 
-assert.equal(version, '2.4.1');
-assert.match(appSrc, /\{vsn, "2.4.1"\}/);
+assert.equal(version, '2.5.0');
+assert.match(appSrc, /\{vsn, "2.5.0"\}/);
 assert.doesNotMatch(mail, /41844184/);
 assert.doesNotMatch(env, /41844184/);
 assert.doesNotMatch(mail, /plainwirenoreply@proton\.me/);
@@ -43,4 +43,4 @@ assert.match(types, /emailVerified : Bool/);
 assert.match(env, /PLAINWIRE_MAIL_ENABLED=/);
 assert.match(env, /PLAINWIRE_SMTP_PASS=/);
 
-console.log('PASS: 2.4.1 tour, call, and hosted password-reset patch contract');
+console.log('PASS: 2.4.1 tour, call, and hosted password-reset behavior still holds on 2.5.0');

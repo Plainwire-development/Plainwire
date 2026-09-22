@@ -120,7 +120,17 @@ const observer = 'IntersectionObserver' in globalThis ? new IntersectionObserver
    EMBED_LIMIT cards per rendered chunk, and compact (inbox preview) rendering
    never embeds. */
 const EMBED_LIMIT = 5;
+const EMBED_CACHE_LIMIT = 256;
 const embedCache = new Map();
+
+function rememberEmbed(key, promise) {
+  if (embedCache.has(key)) embedCache.delete(key);
+  embedCache.set(key, promise);
+  while (embedCache.size > EMBED_CACHE_LIMIT) {
+    const oldest = embedCache.keys().next().value;
+    embedCache.delete(oldest);
+  }
+}
 
 function wireCodeForUrl(href) {
   let url;
@@ -421,7 +431,7 @@ function embedFetch(href) {
         return wireCode ? { type: 'plainwire_wire', url: href, code: wireCode, ...j.data } : j.data;
       });
     p = started.catch(err => { embedCache.delete(key); throw err; });
-    embedCache.set(key, p);
+    rememberEmbed(key, p);
   }
   return p;
 }

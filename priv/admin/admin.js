@@ -1,216 +1,1916 @@
-'use strict';
+"use strict";
 
-const state={me:null,csrf:'',view:'overview',status:null,refreshTimer:null,usersOffset:0,serversOffset:0,usersQuery:'',serversQuery:'',modalLocked:false,modalOnClose:null};
-const $=s=>document.querySelector(s);
-const content=$('#content');
+const state = {
+  me: null,
+  csrf: "",
+  view: "overview",
+  status: null,
+  refreshTimer: null,
+  usersOffset: 0,
+  serversOffset: 0,
+  usersQuery: "",
+  serversQuery: "",
+  modalLocked: false,
+  modalOnClose: null,
+};
+const $ = (s) => document.querySelector(s);
+const content = $("#content");
 
-function el(tag,cls,text){const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined&&text!==null)n.textContent=String(text);return n;}
-function clear(node){while(node.firstChild)node.removeChild(node.firstChild);}
-function fmtNum(v){const n=Number(v||0);return Number.isFinite(n)?new Intl.NumberFormat().format(n):'—';}
-function fmtBytes(v){let n=Number(v||0);if(!Number.isFinite(n))return'—';const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return`${n>=10||i===0?n.toFixed(0):n.toFixed(1)} ${u[i]}`;}
-function fmtTime(v){const n=Number(v);if(!n)return'Never';try{return new Date(n).toLocaleString();}catch{return'—';}}
-function fmtDuration(ms){let s=Math.max(0,Math.floor(Number(ms||0)/1000));const d=Math.floor(s/86400);s%=86400;const h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);return d?`${d}d ${h}h`:h?`${h}h ${m}m`:`${m}m`;}
-function titleCase(s){return String(s||'').replaceAll('_',' ').replace(/\b\w/g,c=>c.toUpperCase());}
-function inputValue(form,name){return new FormData(form).get(name)?.toString()||'';}
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+function clear(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
+}
+function fmtNum(v) {
+  const n = Number(v || 0);
+  return Number.isFinite(n) ? new Intl.NumberFormat().format(n) : "—";
+}
+function fmtBytes(v) {
+  let n = Number(v || 0);
+  if (!Number.isFinite(n)) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${n >= 10 || i === 0 ? n.toFixed(0) : n.toFixed(1)} ${u[i]}`;
+}
+function fmtTime(v) {
+  const n = Number(v);
+  if (!n) return "Never";
+  try {
+    return new Date(n).toLocaleString();
+  } catch {
+    return "—";
+  }
+}
+function fmtDuration(ms) {
+  let s = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+  const d = Math.floor(s / 86400);
+  s %= 86400;
+  const h = Math.floor(s / 3600);
+  s %= 3600;
+  const m = Math.floor(s / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+}
+function titleCase(s) {
+  return String(s || "")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+function inputValue(form, name) {
+  return new FormData(form).get(name)?.toString() || "";
+}
 
-async function api(path,opts={}){
-  const headers={accept:'application/json',...(opts.headers||{})};
-  if(opts.body!==undefined){headers['content-type']='application/json';opts.body=JSON.stringify(opts.body);}
-  if(state.csrf&&opts.method&&opts.method!=='GET')headers['x-csrf-token']=state.csrf;
-  const res=await fetch(`/api${path}`,{credentials:'same-origin',...opts,headers});
-  let payload;try{payload=await res.json();}catch{throw new Error(`HTTP ${res.status}`);}
-  if(res.status===401&&!['/login','/enroll','/bootstrap','/recover'].includes(path)){showAuth();throw new Error('Session expired');}
-  if(!res.ok||!payload.ok){const code=payload.error||`HTTP ${res.status}`,err=new Error(errorText(code));err.code=code;throw err;}
+async function api(path, opts = {}) {
+  const headers = { accept: "application/json", ...(opts.headers || {}) };
+  if (opts.body !== undefined) {
+    headers["content-type"] = "application/json";
+    opts.body = JSON.stringify(opts.body);
+  }
+  if (state.csrf && opts.method && opts.method !== "GET")
+    headers["x-csrf-token"] = state.csrf;
+  const res = await fetch(`/api${path}`, {
+    credentials: "same-origin",
+    ...opts,
+    headers,
+  });
+  let payload;
+  try {
+    payload = await res.json();
+  } catch {
+    throw new Error(`HTTP ${res.status}`);
+  }
+  if (
+    res.status === 401 &&
+    !["/login", "/enroll", "/bootstrap", "/recover"].includes(path)
+  ) {
+    showAuth();
+    throw new Error("Session expired");
+  }
+  if (!res.ok || !payload.ok) {
+    const code = payload.error || `HTTP ${res.status}`,
+      err = new Error(errorText(code));
+    err.code = code;
+    throw err;
+  }
   return payload.data;
 }
-function errorText(code){const known={bad_login:'Username, password, or verification key was not accepted.',bad_bootstrap:'That startup bootstrap token is not valid.',bootstrap_unavailable:'First-owner bootstrap is no longer available.',bad_recovery:'That local recovery token is not valid.',recovery_unavailable:'Host-local recovery is not active for this startup.',invalid_enrollment:'That enrollment/recovery code is invalid or expired.',last_owner:'The final service owner cannot be demoted or removed.',forbidden:'Your operator role does not allow that action.',rate_limited:'Too many attempts. Try again shortly.',database_busy:'The database is busy. Try again.',database_unavailable:'The database is temporarily unavailable.',invalid_role:'That operator role is invalid.',user_not_found:'That Plainwire account does not exist.',invalid_banner:'Banner text and severity are required.',invalid_banner_window:'The banner end time must be after its start time.',invalid_banner_link:'Banner links must be HTTPS or a local Plainwire path.',banner_conflict:'This banner changed in another operator session. The latest version has been reloaded.',invalid_registration_mode:'That registration mode is not valid.',invalid_action:'That moderation action is not valid.',invalid_moderation:'That moderation request is not valid.',invalid_severity:'Choose a valid moderation severity.',invalid_expiry:'The moderation expiry is invalid.',moderation_reason_required:'A reason is required for bans and suspensions.',cannot_moderate_self:'You cannot restrict your own account.',owner_protected:'Service owners are protected from instance moderation.',operator_protected:'Your operator role cannot restrict that service operator.'};return known[code]||titleCase(code||'Request failed');}
-function toast(msg,error=false){const n=el('div',`toast${error?' error':''}`,msg);$('#toast-region').append(n);setTimeout(()=>n.remove(),4200);}
-function showLoading(){clear(content);content.append(el('div','loading','Loading service data…'));}
-
-async function boot(){
-  try{state.status=await api('/status');$('#instance-label').textContent=`Instance ${state.status.instance_id||'unknown'}`;$('#bootstrap-tab').hidden=!state.status.bootstrap_available;$('#recovery-tab').hidden=!state.status.recovery_available;}catch(e){$('#auth-error').hidden=false;$('#auth-error').textContent=e.message;}
-  try{const me=await api('/me');enterApp(me);}catch{showAuth();}
+function errorText(code) {
+  const known = {
+    bad_login: "Username, password, or verification key was not accepted.",
+    bad_bootstrap: "That startup bootstrap token is not valid.",
+    bootstrap_unavailable: "First-owner bootstrap is no longer available.",
+    bad_recovery: "That local recovery token is not valid.",
+    recovery_unavailable: "Host-local recovery is not active for this startup.",
+    invalid_enrollment: "That enrollment/recovery code is invalid or expired.",
+    last_owner: "The final service owner cannot be demoted or removed.",
+    forbidden: "Your operator role does not allow that action.",
+    rate_limited: "Too many attempts. Try again shortly.",
+    database_busy: "The database is busy. Try again.",
+    database_unavailable: "The database is temporarily unavailable.",
+    invalid_role: "That operator role is invalid.",
+    user_not_found: "That Plainwire account does not exist.",
+    invalid_banner: "Banner text and severity are required.",
+    invalid_banner_window: "The banner end time must be after its start time.",
+    invalid_banner_link:
+      "Banner links must be HTTPS or a local Plainwire path.",
+    banner_conflict:
+      "This banner changed in another operator session. The latest version has been reloaded.",
+    invalid_registration_mode: "That registration mode is not valid.",
+    invalid_action: "That moderation action is not valid.",
+    invalid_moderation: "That moderation request is not valid.",
+    invalid_severity: "Choose a valid moderation severity.",
+    invalid_expiry: "The moderation expiry is invalid.",
+    moderation_reason_required:
+      "A reason is required for bans, suspensions, and disables.",
+    cannot_moderate_self: "You cannot restrict your own account.",
+    owner_protected: "Service owners are protected from instance moderation.",
+    operator_protected:
+      "Your operator role cannot restrict that service operator.",
+    mail_disabled:
+      "Mail is not enabled on this host, so verification cannot be sent.",
+    email_required: "That account has no email on file.",
+  };
+  return known[code] || titleCase(code || "Request failed");
 }
-function showAuth(){state.me=null;state.csrf='';stopRefresh();$('#app').hidden=true;$('#auth').hidden=false;document.body.classList.remove('nav-open');}
-function enterApp(me){state.me=me;state.csrf=me.csrf||'';$('#auth').hidden=true;$('#app').hidden=false;$('#operator-name').textContent=me.display_name||me.username;$('#operator-role').textContent=me.role;$('#sidebar-instance').textContent=`Instance ${me.instance_id||state.status?.instance_id||'unknown'}`;applyRoleUi();const requested=state.view||'overview';selectView(me.role==='viewer'&&['users','servers','operators','audit'].includes(requested)?'overview':requested);}
-
-function applyRoleUi(){const viewer=state.me?.role==='viewer';['users','servers','operators','audit'].forEach(v=>{const b=document.querySelector(`[data-view="${v}"]`);if(b)b.hidden=viewer;});}
-
-function setAuthTab(name){document.querySelectorAll('[data-auth-tab]').forEach(b=>b.classList.toggle('active',b.dataset.authTab===name));['login','enroll','bootstrap','recovery'].forEach(x=>{$(`#${x}-form`).hidden=x!==name;});$('#auth-error').hidden=true;}
-document.querySelectorAll('[data-auth-tab]').forEach(b=>b.addEventListener('click',()=>setAuthTab(b.dataset.authTab)));
-
-$('#login-form').addEventListener('submit',async e=>{e.preventDefault();authError('');const f=e.currentTarget;try{const me=await api('/login',{method:'POST',body:{username:inputValue(f,'username'),password:inputValue(f,'password'),verification_key:inputValue(f,'verification_key')}});f.reset();enterApp(me);}catch(err){authError(err.message);}});
-$('#enroll-form').addEventListener('submit',async e=>{e.preventDefault();authError('');const f=e.currentTarget;try{const data=await api('/enroll',{method:'POST',body:{username:inputValue(f,'username'),password:inputValue(f,'password'),enrollment_code:inputValue(f,'enrollment_code')}});f.reset();state.me=data;state.csrf=data.csrf||'';await showSecret('Operator verification key',data.verification_key,'Save this key now. Plainwire stores only an instance-bound verification hash and cannot show this key again.');const me=await api('/me');enterApp(me);}catch(err){authError(err.message);}});
-$('#bootstrap-form').addEventListener('submit',async e=>{e.preventDefault();authError('');const f=e.currentTarget;try{const data=await api('/bootstrap',{method:'POST',body:{username:inputValue(f,'username'),password:inputValue(f,'password'),bootstrap_code:inputValue(f,'bootstrap_code')}});f.reset();state.status.bootstrap_available=false;$('#bootstrap-tab').hidden=true;await showSecret('First owner verification key',data.verification_key,'This is the permanent operator key for this account on this instance. Save it, then sign in with it.');setAuthTab('login');const lf=$('#login-form');lf.elements.username.value=data.username||'';lf.elements.verification_key.value=data.verification_key||'';toast('First service owner created.');}catch(err){authError(err.message);}});
-$('#recovery-form').addEventListener('submit',async e=>{e.preventDefault();authError('');const f=e.currentTarget;try{const data=await api('/recover',{method:'POST',body:{username:inputValue(f,'username'),password:inputValue(f,'password'),recovery_code:inputValue(f,'recovery_code')}});f.reset();state.status.recovery_available=false;$('#recovery-tab').hidden=true;await showSecret('Recovered owner verification key',data.verification_key,'Emergency recovery revoked every existing admin session and unused enrollment code. Save this new key now, then disable PLAINWIRE_ADMIN_LOCAL_RECOVERY before the next restart.');setAuthTab('login');const lf=$('#login-form');lf.elements.username.value=data.username||'';lf.elements.verification_key.value=data.verification_key||'';toast('Service owner recovered. Disable local recovery before restarting.');}catch(err){authError(err.message);}});
-function authError(msg){const n=$('#auth-error');n.hidden=!msg;n.textContent=msg;}
-
-$('#logout-btn').addEventListener('click',async()=>{try{await api('/logout',{method:'POST'});}catch{}showAuth();});
-$('#security-btn').addEventListener('click',showSecurityModal);
-$('#refresh-btn').addEventListener('click',()=>loadView(true));
-$('#menu-btn').addEventListener('click',()=>document.body.classList.toggle('nav-open'));
-$('#nav').addEventListener('click',e=>{const b=e.target.closest('[data-view]');if(!b)return;selectView(b.dataset.view);document.body.classList.remove('nav-open');});
-
-function selectView(view){state.view=view;document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===view));const meta={overview:['Overview','Live service health without private-content access.'],users:['Users','Account activity and resource metadata across this Plainwire host.'],servers:['Servers','Hosted server metadata, ownership, and aggregate activity.'],control:['Service controls','Global announcements and safe runtime controls for this hosted Plainwire instance.'],host:['Host','Runtime, database, realtime, media, upload, and deployment health.'],operators:['Operators','Instance-local service operator access and verification.'],audit:['Audit','Content-free operator security and control-plane history.']}[view]||['Overview','Live service health without private-content access.'];$('#view-title').textContent=meta[0];$('#view-subtitle').textContent=meta[1];loadView();scheduleRefresh();}
-async function loadView(manual=false){if(!state.me)return;showLoading();try{if(state.view==='overview')await renderOverview();else if(state.view==='users')await renderUsers();else if(state.view==='servers')await renderServers();else if(state.view==='control')await renderControl();else if(state.view==='host')await renderHost();else if(state.view==='operators')await renderOperators();else if(state.view==='audit')await renderAudit();$('#last-refresh').textContent=`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`;if(manual)toast('Refreshed.');}catch(e){clear(content);const box=el('div','panel');box.append(el('strong','', 'Could not load this view'));box.append(el('p','muted',e.message));content.append(box);}}
-function scheduleRefresh(){stopRefresh();const ms=state.view==='control'?30000:15000;if(['overview','host','control'].includes(state.view))state.refreshTimer=setInterval(()=>{if(!document.hidden&&state.me)loadView();},ms);}
-function stopRefresh(){if(state.refreshTimer){clearInterval(state.refreshTimer);state.refreshTimer=null;}}
-document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.me&&['overview','host','control'].includes(state.view))loadView();});
-
-function metric(label,value,hint=''){const c=el('div','metric-card');c.append(el('small','',label),el('strong','',value));if(hint)c.append(el('span','',hint));return c;}
-function panelTitle(title,subtitle){const h=el('div','section-head'),d=el('div');d.append(el('h2','',title));if(subtitle)d.append(el('p','',subtitle));h.append(d);return h;}
-function statusRow(label,value,kind=''){const r=el('div','status-row');r.append(el('span','',label),el('span',`status-value ${kind}`,value));return r;}
-function boolKind(v){return v?'good':'bad';}
-function okLabel(v){return v?'Healthy':'Unavailable';}
-
-async function renderOverview(){const d=await api('/overview');clear(content);const g=el('div','metric-grid');g.append(metric('Users · approx.',fmtNum(d.users),`${fmtNum(d.active_users_24h)} active in 24h`),metric('Servers · approx.',fmtNum(d.servers),`${fmtNum(d.channels)} approx. channels`),metric('Messages · approx.',fmtNum(d.messages),`${fmtNum(d.messages_24h)} exact in 24h`),metric('Stored uploads',fmtBytes(d.upload_bytes),`${fmtNum(d.ready_uploads)} ready files`),metric('Online now',fmtNum(d.runtime?.realtime?.online_users),`${fmtNum(d.runtime?.realtime?.websocket_connections)} sockets`),metric('Calls + voice',fmtNum((Number(d.runtime?.realtime?.call_participants||0)+Number(d.runtime?.realtime?.voice_participants||0))),`${fmtNum(d.runtime?.realtime?.call_rooms)} calls · ${fmtNum(d.runtime?.realtime?.voice_rooms)} voice rooms`),metric('Active sessions',fmtNum(d.active_sessions),`${fmtNum(d.admin_sessions)} admin`),metric('Uptime',fmtDuration(d.runtime?.uptime_ms),`OTP ${d.runtime?.otp_release||'—'}`));content.append(g);
-  const dg=el('div','dashboard-grid');const health=el('div','panel');health.append(panelTitle('Service health','Current node and critical subsystems'));const list=el('div','status-list');const db=d.runtime?.database||{};list.append(statusRow('Database',db.available?`Healthy · pool ${db.pool_size||'—'}`:'Unavailable',boolKind(db.available)),statusRow('Realtime hub',okLabel(d.runtime?.realtime?.available),boolKind(d.runtime?.realtime?.available)),statusRow('Native call analysis',d.runtime?.native_media_quality?.available?'Available':'Fallback mode',d.runtime?.native_media_quality?.available?'good':'warn'),statusRow('TURN',d.runtime?.turn?.cloudflare_configured?'Cloudflare configured':d.runtime?.turn?.static_turn_configured?'Static configured':'Not configured',d.runtime?.turn?.cloudflare_configured||d.runtime?.turn?.static_turn_configured?'good':'warn'),statusRow('Cluster',String(d.runtime?.cluster?.backend||'local'),d.runtime?.cluster?.ready===false&&d.runtime?.cluster?.backend!=='local'?'warn':'good'));health.append(list);
-  const privacy=el('div','panel');privacy.append(panelTitle('Privacy boundary','What this control plane deliberately cannot inspect'));const pb=el('div','privacy-boundary');pb.append(el('h3','', 'Communication content stays out'));pb.append(el('p','', 'No message bodies, DM text, attachment contents, message search, or verification secrets are returned by the admin APIs. Counts and operational metadata are available instead.'));privacy.append(pb);dg.append(health,privacy);content.append(dg);
+function toast(msg, error = false) {
+  const n = el("div", `toast${error ? " error" : ""}`, msg);
+  $("#toast-region").append(n);
+  setTimeout(() => n.remove(), 4200);
 }
-
-function toolbar(searchValue,placeholder,onInput){const t=el('div','toolbar');const input=el('input','search-input');input.type='search';input.placeholder=placeholder;input.value=searchValue;let timer;input.addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(()=>onInput(input.value),250);});t.append(input);return t;}
-function table(headers){const wrap=el('div','table-wrap'),tbl=el('table'),thead=el('thead'),tr=el('tr');headers.forEach(x=>tr.append(el('th','',x)));thead.append(tr);tbl.append(thead,el('tbody'));wrap.append(tbl);return{wrap,body:tbl.querySelector('tbody')};}
-function identityCell(primary,secondary){const td=el('td'),d=el('div','identity-cell');d.append(el('strong','',primary),el('span','',secondary));td.append(d);return td;}
-function td(text,cls=''){return el('td',cls,text);}
-function tdNode(node,cls=''){const c=el('td',cls);c.append(node);return c;}
-function clickableRow(body,cells,onClick){const tr=el('tr');tr.dataset.clickable='true';cells.forEach(c=>tr.append(c));tr.addEventListener('click',onClick);body.append(tr);}
-
-async function renderUsers(){
-  const q=encodeURIComponent(state.usersQuery),d=await api(`/users?q=${q}&limit=50&offset=${state.usersOffset}`);
+function showLoading() {
   clear(content);
-  content.append(panelTitle('Accounts','Content-free account metadata and instance moderation. Plainwire messages and attachment contents are not exposed here.'));
-  content.append(toolbar(state.usersQuery,'Search username or display name…',v=>{state.usersQuery=v;state.usersOffset=0;renderUsers().catch(e=>toast(e.message,true));}));
-  const t=table(['User','Account state','Last seen','Servers','DMs','Sessions','Uploads']);
-  d.forEach(u=>{
-    const accountState=String(u.account_state||'active');
-    const stateLabel=accountState==='active'&&Number(u.active_sessions||0)>0?'Online':titleCase(accountState);
-    const ident=identityCell(u.display_name||u.username,`@${u.username} · #${u.id}${u.is_bot?' · bot':''}`);
-    clickableRow(t.body,[ident,tdNode(el('span',`pill account-state ${accountState}`,stateLabel)),td(fmtTime(u.last_seen)),td(fmtNum(u.server_count)),td(fmtNum(u.conversation_count)),td(fmtNum(u.active_sessions)),td(fmtBytes(u.upload_bytes))],()=>showUser(u.id));
-  });
-  if(!d.length){const tr=el('tr');const c=td('No matching users.','empty');c.colSpan=7;tr.append(c);t.body.append(tr);}
-  content.append(t.wrap,pager('users',d.length));
+  content.append(el("div", "loading", "Loading service data…"));
 }
 
-async function showUser(id){
-  const [u,m,h]=await Promise.all([api(`/users/${id}`),api(`/users/${id}/moderation`),api(`/users/${id}/moderation/history`)]);
-  const wrap=el('div','account-detail-stack');
-  const body=el('div','kv-grid');
-  [['Account',`${u.display_name} (@${u.username})${u.is_bot?' · BOT':''}`],['User ID',u.id],['Account state',titleCase(u.account_state||'active')],['Created',fmtTime(u.created_at)],['Last seen',fmtTime(u.last_seen)],['Servers',fmtNum(u.server_count)],['Owned servers',fmtNum(u.owned_server_count)],['DM threads',fmtNum(u.conversation_count)],['Messages sent',fmtNum(u.message_count)],['Stored uploads',`${fmtNum(u.upload_count)} · ${fmtBytes(u.upload_bytes)}`],['Active sessions',fmtNum(u.active_sessions)]].forEach(([k,v])=>body.append(kv(k,v)));
+async function boot() {
+  try {
+    state.status = await api("/status");
+    $("#instance-label").textContent =
+      `Instance ${state.status.instance_id || "unknown"}`;
+    $("#bootstrap-tab").hidden = !state.status.bootstrap_available;
+    $("#recovery-tab").hidden = !state.status.recovery_available;
+  } catch (e) {
+    $("#auth-error").hidden = false;
+    $("#auth-error").textContent = e.message;
+  }
+  try {
+    const me = await api("/me");
+    enterApp(me);
+  } catch {
+    showAuth();
+  }
+}
+function showAuth() {
+  state.me = null;
+  state.csrf = "";
+  stopRefresh();
+  $("#app").hidden = true;
+  $("#auth").hidden = false;
+  document.body.classList.remove("nav-open");
+}
+function enterApp(me) {
+  state.me = me;
+  state.csrf = me.csrf || "";
+  $("#auth").hidden = true;
+  $("#app").hidden = false;
+  $("#operator-name").textContent = me.display_name || me.username;
+  $("#operator-role").textContent = me.role;
+  $("#sidebar-instance").textContent =
+    `Instance ${me.instance_id || state.status?.instance_id || "unknown"}`;
+  applyRoleUi();
+  const requested = state.view || "overview";
+  selectView(
+    me.role === "viewer" &&
+      ["users", "servers", "operators", "audit"].includes(requested)
+      ? "overview"
+      : requested,
+  );
+}
+
+function applyRoleUi() {
+  const viewer = state.me?.role === "viewer";
+  ["users", "servers", "operators", "audit"].forEach((v) => {
+    const b = document.querySelector(`[data-view="${v}"]`);
+    if (b) b.hidden = viewer;
+  });
+}
+
+function setAuthTab(name) {
+  document
+    .querySelectorAll("[data-auth-tab]")
+    .forEach((b) => b.classList.toggle("active", b.dataset.authTab === name));
+  ["login", "enroll", "bootstrap", "recovery"].forEach((x) => {
+    $(`#${x}-form`).hidden = x !== name;
+  });
+  $("#auth-error").hidden = true;
+}
+document
+  .querySelectorAll("[data-auth-tab]")
+  .forEach((b) =>
+    b.addEventListener("click", () => setAuthTab(b.dataset.authTab)),
+  );
+
+$("#login-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  authError("");
+  const f = e.currentTarget;
+  try {
+    const me = await api("/login", {
+      method: "POST",
+      body: {
+        username: inputValue(f, "username"),
+        password: inputValue(f, "password"),
+        verification_key: inputValue(f, "verification_key"),
+      },
+    });
+    f.reset();
+    enterApp(me);
+  } catch (err) {
+    authError(err.message);
+  }
+});
+$("#enroll-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  authError("");
+  const f = e.currentTarget;
+  try {
+    const data = await api("/enroll", {
+      method: "POST",
+      body: {
+        username: inputValue(f, "username"),
+        password: inputValue(f, "password"),
+        enrollment_code: inputValue(f, "enrollment_code"),
+      },
+    });
+    f.reset();
+    state.me = data;
+    state.csrf = data.csrf || "";
+    await showSecret(
+      "Operator verification key",
+      data.verification_key,
+      "Save this key now. Plainwire stores only an instance-bound verification hash and cannot show this key again.",
+    );
+    const me = await api("/me");
+    enterApp(me);
+  } catch (err) {
+    authError(err.message);
+  }
+});
+$("#bootstrap-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  authError("");
+  const f = e.currentTarget;
+  try {
+    const data = await api("/bootstrap", {
+      method: "POST",
+      body: {
+        username: inputValue(f, "username"),
+        password: inputValue(f, "password"),
+        bootstrap_code: inputValue(f, "bootstrap_code"),
+      },
+    });
+    f.reset();
+    state.status.bootstrap_available = false;
+    $("#bootstrap-tab").hidden = true;
+    await showSecret(
+      "First owner verification key",
+      data.verification_key,
+      "This is the permanent operator key for this account on this instance. Save it, then sign in with it.",
+    );
+    setAuthTab("login");
+    const lf = $("#login-form");
+    lf.elements.username.value = data.username || "";
+    lf.elements.verification_key.value = data.verification_key || "";
+    toast("First service owner created.");
+  } catch (err) {
+    authError(err.message);
+  }
+});
+$("#recovery-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  authError("");
+  const f = e.currentTarget;
+  try {
+    const data = await api("/recover", {
+      method: "POST",
+      body: {
+        username: inputValue(f, "username"),
+        password: inputValue(f, "password"),
+        recovery_code: inputValue(f, "recovery_code"),
+      },
+    });
+    f.reset();
+    state.status.recovery_available = false;
+    $("#recovery-tab").hidden = true;
+    await showSecret(
+      "Recovered owner verification key",
+      data.verification_key,
+      "Emergency recovery revoked every existing admin session and unused enrollment code. Save this new key now, then disable PLAINWIRE_ADMIN_LOCAL_RECOVERY before the next restart.",
+    );
+    setAuthTab("login");
+    const lf = $("#login-form");
+    lf.elements.username.value = data.username || "";
+    lf.elements.verification_key.value = data.verification_key || "";
+    toast("Service owner recovered. Disable local recovery before restarting.");
+  } catch (err) {
+    authError(err.message);
+  }
+});
+function authError(msg) {
+  const n = $("#auth-error");
+  n.hidden = !msg;
+  n.textContent = msg;
+}
+
+$("#logout-btn").addEventListener("click", async () => {
+  try {
+    await api("/logout", { method: "POST" });
+  } catch {}
+  showAuth();
+});
+$("#security-btn").addEventListener("click", showSecurityModal);
+$("#refresh-btn").addEventListener("click", () => loadView(true));
+$("#menu-btn").addEventListener("click", () =>
+  document.body.classList.toggle("nav-open"),
+);
+$("#nav").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-view]");
+  if (!b) return;
+  selectView(b.dataset.view);
+  document.body.classList.remove("nav-open");
+});
+
+function selectView(view) {
+  state.view = view;
+  document
+    .querySelectorAll("[data-view]")
+    .forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+  const meta = {
+    overview: [
+      "Overview",
+      "Live service health without private-content access.",
+    ],
+    users: [
+      "Users",
+      "Account activity and resource metadata across this Plainwire host.",
+    ],
+    servers: [
+      "Servers",
+      "Hosted server metadata, ownership, and aggregate activity.",
+    ],
+    control: [
+      "Service controls",
+      "Global announcements and safe runtime controls for this hosted Plainwire instance.",
+    ],
+    host: [
+      "Host",
+      "Runtime, database, realtime, media, upload, and deployment health.",
+    ],
+    operators: [
+      "Operators",
+      "Instance-local service operator access and verification.",
+    ],
+    audit: [
+      "Audit",
+      "Content-free operator security and control-plane history.",
+    ],
+  }[view] || [
+    "Overview",
+    "Live service health without private-content access.",
+  ];
+  $("#view-title").textContent = meta[0];
+  $("#view-subtitle").textContent = meta[1];
+  loadView();
+  scheduleRefresh();
+}
+async function loadView(manual = false) {
+  if (!state.me) return;
+  showLoading();
+  try {
+    if (state.view === "overview") await renderOverview();
+    else if (state.view === "users") await renderUsers();
+    else if (state.view === "servers") await renderServers();
+    else if (state.view === "control") await renderControl();
+    else if (state.view === "host") await renderHost();
+    else if (state.view === "operators") await renderOperators();
+    else if (state.view === "audit") await renderAudit();
+    $("#last-refresh").textContent =
+      `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+    if (manual) toast("Refreshed.");
+  } catch (e) {
+    clear(content);
+    const box = el("div", "panel");
+    box.append(el("strong", "", "Could not load this view"));
+    box.append(el("p", "muted", e.message));
+    content.append(box);
+  }
+}
+function scheduleRefresh() {
+  stopRefresh();
+  const ms = state.view === "control" ? 30000 : 15000;
+  if (["overview", "host", "control"].includes(state.view))
+    state.refreshTimer = setInterval(() => {
+      if (!document.hidden && state.me) loadView();
+    }, ms);
+}
+function stopRefresh() {
+  if (state.refreshTimer) {
+    clearInterval(state.refreshTimer);
+    state.refreshTimer = null;
+  }
+}
+document.addEventListener("visibilitychange", () => {
+  if (
+    !document.hidden &&
+    state.me &&
+    ["overview", "host", "control"].includes(state.view)
+  )
+    loadView();
+});
+
+function metric(label, value, hint = "") {
+  const c = el("div", "metric-card");
+  c.append(el("small", "", label), el("strong", "", value));
+  if (hint) c.append(el("span", "", hint));
+  return c;
+}
+function panelTitle(title, subtitle) {
+  const h = el("div", "section-head"),
+    d = el("div");
+  d.append(el("h2", "", title));
+  if (subtitle) d.append(el("p", "", subtitle));
+  h.append(d);
+  return h;
+}
+function statusRow(label, value, kind = "") {
+  const r = el("div", "status-row");
+  r.append(el("span", "", label), el("span", `status-value ${kind}`, value));
+  return r;
+}
+function boolKind(v) {
+  return v ? "good" : "bad";
+}
+function okLabel(v) {
+  return v ? "Healthy" : "Unavailable";
+}
+
+async function renderOverview() {
+  const d = await api("/overview");
+  clear(content);
+  const g = el("div", "metric-grid");
+  g.append(
+    metric(
+      "Users · approx.",
+      fmtNum(d.users),
+      `${fmtNum(d.active_users_24h)} active in 24h`,
+    ),
+    metric(
+      "Servers · approx.",
+      fmtNum(d.servers),
+      `${fmtNum(d.channels)} approx. channels`,
+    ),
+    metric(
+      "Messages · approx.",
+      fmtNum(d.messages),
+      `${fmtNum(d.messages_24h)} exact in 24h`,
+    ),
+    metric(
+      "Stored uploads",
+      fmtBytes(d.upload_bytes),
+      `${fmtNum(d.ready_uploads)} ready files`,
+    ),
+    metric(
+      "Online now",
+      fmtNum(d.runtime?.realtime?.online_users),
+      `${fmtNum(d.runtime?.realtime?.websocket_connections)} sockets`,
+    ),
+    metric(
+      "Calls + voice",
+      fmtNum(
+        Number(d.runtime?.realtime?.call_participants || 0) +
+          Number(d.runtime?.realtime?.voice_participants || 0),
+      ),
+      `${fmtNum(d.runtime?.realtime?.call_rooms)} calls · ${fmtNum(d.runtime?.realtime?.voice_rooms)} voice rooms`,
+    ),
+    metric(
+      "Active sessions",
+      fmtNum(d.active_sessions),
+      `${fmtNum(d.admin_sessions)} admin`,
+    ),
+    metric(
+      "Uptime",
+      fmtDuration(d.runtime?.uptime_ms),
+      `OTP ${d.runtime?.otp_release || "—"}`,
+    ),
+  );
+  content.append(g);
+  const dg = el("div", "dashboard-grid");
+  const health = el("div", "panel");
+  health.append(
+    panelTitle("Service health", "Current node and critical subsystems"),
+  );
+  const list = el("div", "status-list");
+  const db = d.runtime?.database || {};
+  list.append(
+    statusRow(
+      "Database",
+      db.available ? `Healthy · pool ${db.pool_size || "—"}` : "Unavailable",
+      boolKind(db.available),
+    ),
+    statusRow(
+      "Realtime hub",
+      okLabel(d.runtime?.realtime?.available),
+      boolKind(d.runtime?.realtime?.available),
+    ),
+    statusRow(
+      "Native call analysis",
+      d.runtime?.native_media_quality?.available
+        ? "Available"
+        : "Fallback mode",
+      d.runtime?.native_media_quality?.available ? "good" : "warn",
+    ),
+    statusRow(
+      "TURN",
+      d.runtime?.turn?.cloudflare_configured
+        ? "Cloudflare configured"
+        : d.runtime?.turn?.static_turn_configured
+          ? "Static configured"
+          : "Not configured",
+      d.runtime?.turn?.cloudflare_configured ||
+        d.runtime?.turn?.static_turn_configured
+        ? "good"
+        : "warn",
+    ),
+    statusRow(
+      "Cluster",
+      String(d.runtime?.cluster?.backend || "local"),
+      d.runtime?.cluster?.ready === false &&
+        d.runtime?.cluster?.backend !== "local"
+        ? "warn"
+        : "good",
+    ),
+  );
+  health.append(list);
+  const privacy = el("div", "panel");
+  privacy.append(
+    panelTitle(
+      "Privacy boundary",
+      "What this control plane deliberately cannot inspect",
+    ),
+  );
+  const pb = el("div", "privacy-boundary");
+  pb.append(el("h3", "", "Communication content stays out"));
+  pb.append(
+    el(
+      "p",
+      "",
+      "No message bodies, DM text, attachment contents, message search, or verification secrets are returned by the admin APIs. Counts and operational metadata are available instead.",
+    ),
+  );
+  privacy.append(pb);
+  dg.append(health, privacy);
+  content.append(dg);
+}
+
+function toolbar(searchValue, placeholder, onInput) {
+  const t = el("div", "toolbar");
+  const input = el("input", "search-input");
+  input.type = "search";
+  input.placeholder = placeholder;
+  input.value = searchValue;
+  let timer;
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => onInput(input.value), 250);
+  });
+  t.append(input);
+  return t;
+}
+function table(headers) {
+  const wrap = el("div", "table-wrap"),
+    tbl = el("table"),
+    thead = el("thead"),
+    tr = el("tr");
+  headers.forEach((x) => tr.append(el("th", "", x)));
+  thead.append(tr);
+  tbl.append(thead, el("tbody"));
+  wrap.append(tbl);
+  return { wrap, body: tbl.querySelector("tbody") };
+}
+function identityCell(primary, secondary) {
+  const td = el("td"),
+    d = el("div", "identity-cell");
+  d.append(el("strong", "", primary), el("span", "", secondary));
+  td.append(d);
+  return td;
+}
+function td(text, cls = "") {
+  return el("td", cls, text);
+}
+function tdNode(node, cls = "") {
+  const c = el("td", cls);
+  c.append(node);
+  return c;
+}
+function clickableRow(body, cells, onClick) {
+  const tr = el("tr");
+  tr.dataset.clickable = "true";
+  cells.forEach((c) => tr.append(c));
+  tr.addEventListener("click", onClick);
+  body.append(tr);
+}
+
+async function renderUsers() {
+  const q = encodeURIComponent(state.usersQuery),
+    d = await api(`/users?q=${q}&limit=50&offset=${state.usersOffset}`);
+  clear(content);
+  content.append(
+    panelTitle(
+      "Accounts",
+      "Content-free account metadata and instance moderation. Plainwire messages and attachment contents are not exposed here.",
+    ),
+  );
+  content.append(
+    toolbar(state.usersQuery, "Search username or display name…", (v) => {
+      state.usersQuery = v;
+      state.usersOffset = 0;
+      renderUsers().catch((e) => toast(e.message, true));
+    }),
+  );
+  const t = table([
+    "User",
+    "Account state",
+    "Last seen",
+    "Servers",
+    "DMs",
+    "Sessions",
+    "Uploads",
+  ]);
+  d.forEach((u) => {
+    const accountState = String(u.account_state || "active");
+    const stateLabel =
+      accountState === "active" && Number(u.active_sessions || 0) > 0
+        ? "Online"
+        : titleCase(accountState);
+    const ident = identityCell(
+      u.display_name || u.username,
+      `@${u.username} · #${u.id}${u.is_bot ? " · bot" : ""}`,
+    );
+    clickableRow(
+      t.body,
+      [
+        ident,
+        tdNode(el("span", `pill account-state ${accountState}`, stateLabel)),
+        td(fmtTime(u.last_seen)),
+        td(fmtNum(u.server_count)),
+        td(fmtNum(u.conversation_count)),
+        td(fmtNum(u.active_sessions)),
+        td(fmtBytes(u.upload_bytes)),
+      ],
+      () => showUser(u.id),
+    );
+  });
+  if (!d.length) {
+    const tr = el("tr");
+    const c = td("No matching users.", "empty");
+    c.colSpan = 7;
+    tr.append(c);
+    t.body.append(tr);
+  }
+  content.append(t.wrap, pager("users", d.length));
+}
+
+async function showUser(id) {
+  const [u, m, h] = await Promise.all([
+    api(`/users/${id}`),
+    api(`/users/${id}/moderation`),
+    api(`/users/${id}/moderation/history`),
+  ]);
+  const wrap = el("div", "account-detail-stack");
+  const body = el("div", "kv-grid");
+  const emailSet = u.email_set === true,
+    emailVerified = u.email_verified === true;
+  [
+    [
+      "Account",
+      `${u.display_name} (@${u.username})${u.is_bot ? " · BOT" : ""}`,
+    ],
+    ["User ID", u.id],
+    ["Account state", titleCase(u.account_state || "active")],
+    ["Created", fmtTime(u.created_at)],
+    ["Updated", fmtTime(u.updated_at)],
+    ["Last seen", fmtTime(u.last_seen)],
+    [
+      "Disabled at",
+      Number(u.disabled_at || 0) > 0 ? fmtTime(u.disabled_at) : "—",
+    ],
+    ["Email on file", emailSet ? "Yes" : "No"],
+    ["Email verified", emailVerified ? "Yes" : "No"],
+    ["Servers", fmtNum(u.server_count)],
+    ["Owned servers", fmtNum(u.owned_server_count)],
+    ["DM threads", fmtNum(u.conversation_count)],
+    ["Messages sent", fmtNum(u.message_count)],
+    [
+      "Stored uploads",
+      `${fmtNum(u.upload_count)} · ${fmtBytes(u.upload_bytes)}`,
+    ],
+    ["Active sessions", fmtNum(u.active_sessions)],
+  ].forEach(([k, v]) => body.append(kv(k, v)));
+  wrap.append(
+    el(
+      "p",
+      "form-help",
+      "Recent account state is metadata only. Message text, attachment contents, and the email address are not loaded here.",
+    ),
+  );
   wrap.append(body);
 
-  const mod=el('section','moderation-card');
-  const mh=el('div','moderation-card-head');mh.append(el('div','',null));mh.firstChild.append(el('h3','', 'Instance moderation'),el('p','muted','Account access only. This control plane cannot read private messages or attachment contents.'));
-  const statePill=el('span',`pill account-state ${m.account_state||'active'}`,titleCase(m.account_state||'active'));mh.append(statePill);mod.append(mh);
-  if(m.account_state==='suspended'||m.account_state==='banned'){
-    const notice=el('div',`moderation-preview ${m.moderation?.severity||'warning'}`);
-    notice.append(el('strong','',m.moderation?.title||titleCase(m.account_state)),el('p','',m.moderation?.reason||'No user-facing reason set.'));
-    if(Number(m.moderation?.expires_at||0)>0)notice.append(el('small','muted',`Expires ${fmtTime(m.moderation.expires_at)}`));
+  const mod = el("section", "moderation-card");
+  const mh = el("div", "moderation-card-head");
+  mh.append(el("div", "", null));
+  mh.firstChild.append(
+    el("h3", "", "Instance moderation"),
+    el(
+      "p",
+      "muted",
+      "Account access only. This control plane cannot read private messages or attachment contents.",
+    ),
+  );
+  const statePill = el(
+    "span",
+    `pill account-state ${m.account_state || "active"}`,
+    titleCase(m.account_state || "active"),
+  );
+  mh.append(statePill);
+  mod.append(mh);
+  if (
+    m.account_state === "suspended" ||
+    m.account_state === "banned" ||
+    (m.account_state === "disabled" &&
+      (m.moderation?.reason || m.moderation?.title))
+  ) {
+    const notice = el(
+      "div",
+      `moderation-preview ${m.moderation?.severity || "warning"}`,
+    );
+    notice.append(
+      el("strong", "", m.moderation?.title || titleCase(m.account_state)),
+      el("p", "", m.moderation?.reason || "No user-facing reason set."),
+    );
+    if (Number(m.moderation?.expires_at || 0) > 0)
+      notice.append(
+        el("small", "muted", `Expires ${fmtTime(m.moderation.expires_at)}`),
+      );
     mod.append(notice);
   }
-  if(canOperate()){
-    const actions=el('div','moderation-actions');
-    const suspend=el('button','secondary','Suspend'),ban=el('button','danger','Ban'),restore=el('button','secondary','Restore access');
-    suspend.type='button';ban.type='button';restore.type='button';
-    suspend.disabled=m.account_state==='suspended';ban.disabled=m.account_state==='banned';restore.disabled=m.account_state==='active';
-    suspend.addEventListener('click',()=>showModerationAction(u,m,'suspend'));
-    ban.addEventListener('click',()=>showModerationAction(u,m,'ban'));
-    restore.addEventListener('click',()=>showModerationAction(u,m,'restore'));
-    actions.append(suspend,ban,restore);mod.append(actions);
+  if (canOperate()) {
+    const actions = el("div", "moderation-actions");
+    const suspend = el("button", "secondary", "Suspend"),
+      ban = el("button", "danger", "Ban"),
+      disable = el("button", "secondary", "Disable"),
+      restore = el("button", "secondary", "Restore access");
+    suspend.type = "button";
+    ban.type = "button";
+    disable.type = "button";
+    restore.type = "button";
+    suspend.disabled = m.account_state === "suspended";
+    ban.disabled = m.account_state === "banned";
+    disable.disabled = m.account_state === "disabled";
+    restore.disabled = m.account_state === "active";
+    suspend.addEventListener("click", () =>
+      showModerationAction(u, m, "suspend"),
+    );
+    ban.addEventListener("click", () => showModerationAction(u, m, "ban"));
+    disable.addEventListener("click", () =>
+      showModerationAction(u, m, "disable"),
+    );
+    restore.addEventListener("click", () =>
+      showModerationAction(u, m, "restore"),
+    );
+    actions.append(suspend, ban, disable, restore);
+    mod.append(actions);
+    const maintenance = el("div", "moderation-actions");
+    const logout = el("button", "secondary", "Sign out everywhere"),
+      resetName = el("button", "secondary", "Reset display name");
+    logout.type = "button";
+    resetName.type = "button";
+    logout.addEventListener("click", () =>
+      confirmAccountAction(
+        u,
+        "revoke_sessions",
+        "Sign out everywhere?",
+        `${u.display_name || u.username} will be signed out of Plainwire and the control plane. The account state does not change.`,
+        "Sign out everywhere",
+      ),
+    );
+    resetName.addEventListener("click", () =>
+      confirmAccountAction(
+        u,
+        "clear_display_name",
+        "Reset display name?",
+        `The display name becomes @${u.username}. The password and username stay the same.`,
+        "Reset display name",
+      ),
+    );
+    maintenance.append(logout, resetName);
+    if (emailSet) {
+      const removeEmail = el("button", "danger", "Remove email");
+      removeEmail.type = "button";
+      removeEmail.addEventListener("click", () =>
+        confirmAccountAction(
+          u,
+          "remove_email",
+          "Remove account email?",
+          `The address on file for @${u.username} will be removed. This panel never shows the address.`,
+          "Remove email",
+          true,
+        ),
+      );
+      maintenance.append(removeEmail);
+      if (!emailVerified) {
+        const resend = el("button", "secondary", "Resend verification");
+        resend.type = "button";
+        resend.addEventListener("click", () =>
+          confirmAccountAction(
+            u,
+            "resend_verification",
+            "Resend verification email?",
+            "Plainwire sends a new verification message when mail is enabled on this host. The address is not shown here.",
+            "Resend verification",
+          ),
+        );
+        maintenance.append(resend);
+      }
+    }
+    mod.append(maintenance);
   }
   wrap.append(mod);
 
-  const history=el('section','moderation-history');history.append(el('h3','', 'Moderation history'));
-  const list=el('div','audit-list');
-  h.forEach(a=>{const item=el('div','audit-item');item.append(el('time','',fmtTime(a.created_at)));const copy=el('div');copy.append(el('strong','',`${titleCase(a.action)} · ${a.title||'Account action'}`),el('p','',a.reason||'No reason'));item.append(copy,el('small','',a.actor_username?`@${a.actor_username}`:'system'));list.append(item);});
-  if(!h.length)list.append(el('div','empty','No instance moderation actions for this account.'));
-  history.append(list);wrap.append(history);
-  showModal('Account moderation',`@${u.username} · user ${u.id}`,wrap,[]);
+  const history = el("section", "moderation-history");
+  history.append(el("h3", "", "Moderation history"));
+  const list = el("div", "audit-list");
+  h.forEach((a) => {
+    const item = el("div", "audit-item");
+    item.append(el("time", "", fmtTime(a.created_at)));
+    const copy = el("div");
+    copy.append(
+      el(
+        "strong",
+        "",
+        `${titleCase(a.action)} · ${a.title || "Account action"}`,
+      ),
+      el("p", "", a.reason || "No reason"),
+    );
+    item.append(
+      copy,
+      el("small", "", a.actor_username ? `@${a.actor_username}` : "system"),
+    );
+    list.append(item);
+  });
+  if (!h.length)
+    list.append(
+      el("div", "empty", "No instance moderation actions for this account."),
+    );
+  history.append(list);
+  wrap.append(history);
+  showModal("Account moderation", `@${u.username} · user ${u.id}`, wrap, []);
 }
 
-function showModerationAction(user,current,action){
-  if(action==='restore'){
-    confirmAction('Restore account access?',`${user.display_name||user.username} will be able to sign in again. This is recorded in the operator audit trail.`,'Restore access').then(async ok=>{if(!ok)return;try{await api(`/users/${user.id}/moderation`,{method:'POST',body:{action:'restore'}});toast('Account access restored.');await showUser(user.id);}catch(e){toast(e.message,true);}});return;
+function confirmAccountAction(
+  user,
+  action,
+  title,
+  text,
+  buttonText,
+  danger = false,
+) {
+  confirmAction(
+    title,
+    `${text} This is recorded in the operator audit trail.`,
+    buttonText,
+    danger,
+  ).then(async (ok) => {
+    if (!ok) return;
+    try {
+      const data = await api(`/users/${user.id}/moderation`, {
+        method: "POST",
+        body: { action },
+      });
+      const messages = {
+        revoke_sessions: "Sessions revoked.",
+        clear_display_name:
+          data.changed === false
+            ? "Display name already matches the username."
+            : "Display name reset.",
+        remove_email: "Email removed.",
+        resend_verification: data.already_verified
+          ? "Email is already verified."
+          : "Verification email queued.",
+      };
+      toast(messages[action] || "Account updated.");
+      await showUser(user.id);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  });
+}
+function showModerationAction(user, current, action) {
+  if (action === "restore") {
+    confirmAction(
+      "Restore account access?",
+      `${user.display_name || user.username} will be able to sign in again. This is recorded in the operator audit trail.`,
+      "Restore access",
+    ).then(async (ok) => {
+      if (!ok) return;
+      try {
+        await api(`/users/${user.id}/moderation`, {
+          method: "POST",
+          body: { action: "restore" },
+        });
+        toast("Account access restored.");
+        await showUser(user.id);
+      } catch (e) {
+        toast(e.message, true);
+      }
+    });
+    return;
   }
-  const form=el('form','auth-form moderation-form');form.id='account-moderation-form';
-  const titleField=field('User-facing title','title','text'),reasonField=field('Reason shown to this user','reason','text'),severity=fieldSelect('Notice style','severity',['warning','critical','info']),expiry=field('Expires at (optional)','expires_at','datetime-local');
-  titleField.querySelector('input').value=action==='ban'?'Access revoked':'Account suspended';
-  reasonField.querySelector('input').required=true;reasonField.querySelector('input').maxLength=1000;
-  severity.querySelector('select').value=action==='ban'?'critical':'warning';
-  form.append(titleField,reasonField,severity,expiry,el('p','form-help','The action revokes normal and control-plane sessions immediately. Leave expiry blank for an indefinite restriction.'));
-  const cancel=el('button','secondary','Cancel'),apply=el('button',action==='ban'?'danger':'primary',action==='ban'?'Ban account':'Suspend account');
-  cancel.type='button';apply.type='submit';apply.setAttribute('form',form.id);cancel.addEventListener('click',()=>showUser(user.id).catch(e=>toast(e.message,true)));
-  form.addEventListener('submit',async e=>{e.preventDefault();apply.disabled=true;const rawExpiry=expiry.querySelector('input').value;const expiresAt=rawExpiry?new Date(rawExpiry).getTime():0;try{await api(`/users/${user.id}/moderation`,{method:'POST',body:{action,title:titleField.querySelector('input').value,reason:reasonField.querySelector('input').value,severity:severity.querySelector('select').value,expires_at:Number.isFinite(expiresAt)?expiresAt:0}});toast(action==='ban'?'Account banned.':'Account suspended.');await showUser(user.id);}catch(err){toast(err.message,true);apply.disabled=false;}});
-  showModal(action==='ban'?'Ban Plainwire account':'Suspend Plainwire account',`This affects the entire hosted Plainwire instance, not one server.`,form,[cancel,apply]);
+  const copy = {
+    ban: {
+      title: "Access revoked",
+      button: "Ban account",
+      toast: "Account banned.",
+      modal: "Ban Plainwire account",
+      help: "The action revokes normal and control-plane sessions immediately. Leave expiry blank for an indefinite restriction.",
+      note: "This affects the entire hosted Plainwire instance, not one server.",
+    },
+    suspend: {
+      title: "Account suspended",
+      button: "Suspend account",
+      toast: "Account suspended.",
+      modal: "Suspend Plainwire account",
+      help: "The action revokes normal and control-plane sessions immediately. Leave expiry blank for an indefinite restriction.",
+      note: "This affects the entire hosted Plainwire instance, not one server.",
+    },
+    disable: {
+      title: "Account disabled",
+      button: "Disable account",
+      toast: "Account disabled.",
+      modal: "Disable Plainwire account",
+      help: "The account stays disabled until an operator restores it. Sessions are revoked immediately. Leave expiry blank for an indefinite disable.",
+      note: "A correct password does not turn an operator disable back on. Self-service disable is separate and still reactivates on the next correct password.",
+    },
+  };
+  const spec = copy[action] || copy.suspend;
+  const form = el("form", "auth-form moderation-form");
+  form.id = "account-moderation-form";
+  const titleField = field("User-facing title", "title", "text"),
+    reasonField = field("Reason shown to this user", "reason", "text"),
+    severity = fieldSelect("Notice style", "severity", [
+      "warning",
+      "critical",
+      "info",
+    ]),
+    expiry = field("Expires at (optional)", "expires_at", "datetime-local");
+  titleField.querySelector("input").value = spec.title;
+  reasonField.querySelector("input").required = true;
+  reasonField.querySelector("input").maxLength = 1000;
+  severity.querySelector("select").value =
+    action === "ban" ? "critical" : "warning";
+  form.append(
+    titleField,
+    reasonField,
+    severity,
+    expiry,
+    el("p", "form-help", spec.help),
+  );
+  const cancel = el("button", "secondary", "Cancel"),
+    apply = el(
+      "button",
+      action === "ban" || action === "disable" ? "danger" : "primary",
+      spec.button,
+    );
+  cancel.type = "button";
+  apply.type = "submit";
+  apply.setAttribute("form", form.id);
+  cancel.addEventListener("click", () =>
+    showUser(user.id).catch((e) => toast(e.message, true)),
+  );
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    apply.disabled = true;
+    const rawExpiry = expiry.querySelector("input").value;
+    const expiresAt = rawExpiry ? new Date(rawExpiry).getTime() : 0;
+    try {
+      await api(`/users/${user.id}/moderation`, {
+        method: "POST",
+        body: {
+          action,
+          title: titleField.querySelector("input").value,
+          reason: reasonField.querySelector("input").value,
+          severity: severity.querySelector("select").value,
+          expires_at: Number.isFinite(expiresAt) ? expiresAt : 0,
+        },
+      });
+      toast(spec.toast);
+      await showUser(user.id);
+    } catch (err) {
+      toast(err.message, true);
+      apply.disabled = false;
+    }
+  });
+  showModal(spec.modal, spec.note, form, [cancel, apply]);
 }
 
-async function renderServers(){const q=encodeURIComponent(state.serversQuery),d=await api(`/servers?q=${q}&limit=50&offset=${state.serversOffset}`);clear(content);content.append(panelTitle('Hosted servers','Ownership and aggregate service metadata; no channel message contents.'));content.append(toolbar(state.serversQuery,'Search server or owner…',v=>{state.serversQuery=v;state.serversOffset=0;renderServers().catch(e=>toast(e.message,true));}));const t=table(['Server','Owner','Members','Channels','Updated']);d.forEach(s=>clickableRow(t.body,[identityCell(s.name,`#${s.id}`),identityCell(s.owner.display_name||s.owner.username,`@${s.owner.username}`),td(fmtNum(s.member_count)),td(fmtNum(s.channel_count)),td(fmtTime(s.updated_at))],()=>showServer(s.id)));if(!d.length){const tr=el('tr');const c=td('No matching servers.','empty');c.colSpan=5;tr.append(c);t.body.append(tr);}content.append(t.wrap,pager('servers',d.length));}
-async function showServer(id){const s=await api(`/servers/${id}`);const body=el('div','kv-grid');[['Server',s.name],['Server ID',s.id],['Owner',`${s.owner.display_name} (@${s.owner.username})`],['Created',fmtTime(s.created_at)],['Updated',fmtTime(s.updated_at)],['Members',fmtNum(s.member_count)],['Channels',fmtNum(s.channel_count)],['Roles',fmtNum(s.role_count)],['Active invites',fmtNum(s.active_invite_count)],['Messages',fmtNum(s.message_count)],['Last message time',fmtTime(s.last_message_at)]].forEach(([k,v])=>body.append(kv(k,v)));showModal('Server metadata','Operational metadata only; channel contents are not available to this panel.',body,[]);}
-function pager(kind,count){const p=el('div','pagination'),prev=el('button','secondary','Previous'),next=el('button','secondary','Next');const key=kind==='users'?'usersOffset':'serversOffset';prev.disabled=state[key]<=0;next.disabled=count<50;prev.addEventListener('click',()=>{state[key]=Math.max(0,state[key]-50);kind==='users'?renderUsers():renderServers();});next.addEventListener('click',()=>{state[key]+=50;kind==='users'?renderUsers():renderServers();});p.append(prev,next);return p;}
-
-function canOperate(){return state.me?.role==='owner'||state.me?.role==='operator';}
-function localDateTime(ms){const n=Number(ms||0);if(!n)return'';const d=new Date(n);if(Number.isNaN(d.getTime()))return'';const shifted=new Date(d.getTime()-d.getTimezoneOffset()*60000);return shifted.toISOString().slice(0,16);}
-function parseLocalDateTime(value){if(!value)return null;const n=Date.parse(value);return Number.isFinite(n)?n:null;}
-function bannerStatus(b){const now=Date.now(),start=Number(b.starts_at||0),end=Number(b.ends_at||0);if(b.enabled===false)return['paused','Paused'];if(end>0&&end<=now)return['expired','Expired'];if(start>now)return['scheduled','Scheduled'];return['live',end>0?'Live':'Permanent'];}
-function bannerSchedule(b){const start=Number(b.starts_at||0),end=Number(b.ends_at||0);if(start>Date.now())return`Starts ${fmtTime(start)}${end?` · ends ${fmtTime(end)}`:''}`;if(end)return`Ends ${fmtTime(end)}`;return'No automatic expiry';}
-function textareaField(label,name,value='',maxLength=500){const l=el('label','field',label),t=el('textarea');t.name=name;t.value=value||'';t.maxLength=maxLength;t.required=name==='body';l.append(t);return l;}
-function datetimeField(label,name,value=0){const l=el('label','field',label),i=el('input');i.name=name;i.type='datetime-local';i.value=localDateTime(value);l.append(i);return l;}
-function checkboxField(label,name,checked=true){const l=el('label','check-field'),i=el('input');i.name=name;i.type='checkbox';i.checked=checked;l.append(i,document.createTextNode(label));return l;}
-
-async function renderControl(){
-  const [banners,controls]=await Promise.all([api('/banners'),api('/controls')]);
+async function renderServers() {
+  const q = encodeURIComponent(state.serversQuery),
+    d = await api(`/servers?q=${q}&limit=50&offset=${state.serversOffset}`);
   clear(content);
-  const operate=canOperate();
-  const head=panelTitle('Hosted service controls','Changes here apply to this Plainwire instance, not to an individual community server.');
-  if(operate){const add=el('button','primary','New global banner');add.addEventListener('click',()=>showBannerEditor());head.append(add);}content.append(head);
-  const controlsGrid=el('div','control-grid');
-  const registrations=el('section','control-card');registrations.append(el('h3','', 'Account registration'),el('p','', 'Override the deployment default without restarting Plainwire. Existing accounts are unaffected.'));
-  const registrationRow=el('div','control-row'),select=el('select');['inherit','enabled','disabled'].forEach(mode=>{const o=el('option','',mode==='inherit'?'Use deployment setting':mode==='enabled'?'Force enabled':'Force disabled');o.value=mode;o.selected=mode===controls.registration_mode;select.append(o);});select.disabled=!operate;registrationRow.append(select,el('span',`pill ${controls.registration_enabled?'active':'inactive'}`,controls.registration_enabled?'Currently open':'Currently closed'));
-  if(operate){const save=el('button','secondary','Apply');save.addEventListener('click',async()=>{save.disabled=true;try{const d=await api('/controls/registration',{method:'POST',body:{mode:select.value}});toast(d.registration_enabled?'Registration enabled.':'Registration disabled.');renderControl();}catch(e){toast(e.message,true);save.disabled=false;}});registrationRow.append(save);}registrations.append(registrationRow);
-  const reconcile=el('section','control-card');reconcile.append(el('h3','', 'Connected clients'),el('p','', 'Ask every connected client to reconcile server state and the active screen. This does not disconnect calls or force a page reload.'));
-  const reconcileRow=el('div','control-row');reconcileRow.append(el('span','pill active','Realtime-safe'));
-  if(operate){const button=el('button','secondary','Reconcile clients');button.addEventListener('click',async()=>{button.disabled=true;try{await api('/controls/reconcile',{method:'POST'});toast('Connected clients were asked to reconcile.');}catch(e){toast(e.message,true);}finally{button.disabled=false;}});reconcileRow.append(button);}reconcile.append(reconcileRow);controlsGrid.append(registrations,reconcile);content.append(controlsGrid);
-  const listHead=panelTitle('Global banners','Temporary or permanent service announcements update connected clients in realtime. Clients show up to three at once, prioritizing critical and newer announcements.');content.append(listHead);
-  const list=el('div','banner-admin-list');
-  banners.forEach(b=>{const card=el('article','banner-admin-card');card.dataset.severity=['info','success','warning','critical'].includes(b.severity)?b.severity:'info';const marker=el('span','banner-admin-marker');const copy=el('div','banner-admin-copy');copy.append(el('strong','',b.title||'Untitled announcement'),el('p','',b.body||''));const [statusKey,statusText]=bannerStatus(b),meta=el('div','banner-admin-meta');meta.append(el('span',`pill status-${statusKey}`,statusText),el('span','',titleCase(b.severity)),el('span','',bannerSchedule(b)),el('span','',b.dismissible?'Dismissible':'Required'));if(b.link_url)meta.append(el('span','',`Link: ${b.link_label||b.link_url}`));copy.append(meta);card.append(marker,copy);if(operate){const actions=el('div','banner-admin-actions'),edit=el('button','secondary','Edit'),toggle=el('button','secondary',b.enabled===false?'Resume':'Pause'),remove=el('button','danger','Delete');edit.addEventListener('click',()=>showBannerEditor(b));toggle.addEventListener('click',async()=>{toggle.disabled=true;try{await api(`/banners/${b.id}`,{method:'POST',body:{enabled:b.enabled===false,expected_updated_at:b.updated_at}});toast(b.enabled===false?'Banner resumed.':'Banner paused.');renderControl();}catch(e){toast(e.message,true);if(e.code==='banner_conflict')renderControl();else toggle.disabled=false;}});remove.addEventListener('click',async()=>{const ok=await confirmAction('Delete global banner?',`“${b.title||b.body.slice(0,50)}” will disappear from connected clients immediately.`,'Delete banner',true);if(!ok)return;try{await api(`/banners/${b.id}?expected_updated_at=${encodeURIComponent(b.updated_at)}`,{method:'DELETE'});toast('Banner deleted.');renderControl();}catch(e){toast(e.message,true);if(e.code==='banner_conflict')renderControl();}});actions.append(edit,toggle,remove);card.append(actions);}list.append(card);});
-  if(!banners.length)list.append(el('div','empty','No global banners have been created.'));
+  content.append(
+    panelTitle(
+      "Hosted servers",
+      "Ownership and aggregate service metadata; no channel message contents.",
+    ),
+  );
+  content.append(
+    toolbar(state.serversQuery, "Search server or owner…", (v) => {
+      state.serversQuery = v;
+      state.serversOffset = 0;
+      renderServers().catch((e) => toast(e.message, true));
+    }),
+  );
+  const t = table(["Server", "Owner", "Members", "Channels", "Updated"]);
+  d.forEach((s) =>
+    clickableRow(
+      t.body,
+      [
+        identityCell(s.name, `#${s.id}`),
+        identityCell(
+          s.owner.display_name || s.owner.username,
+          `@${s.owner.username}`,
+        ),
+        td(fmtNum(s.member_count)),
+        td(fmtNum(s.channel_count)),
+        td(fmtTime(s.updated_at)),
+      ],
+      () => showServer(s.id),
+    ),
+  );
+  if (!d.length) {
+    const tr = el("tr");
+    const c = td("No matching servers.", "empty");
+    c.colSpan = 5;
+    tr.append(c);
+    t.body.append(tr);
+  }
+  content.append(t.wrap, pager("servers", d.length));
+}
+async function showServer(id) {
+  const s = await api(`/servers/${id}`);
+  const body = el("div", "kv-grid");
+  [
+    ["Server", s.name],
+    ["Server ID", s.id],
+    ["Owner", `${s.owner.display_name} (@${s.owner.username})`],
+    ["Created", fmtTime(s.created_at)],
+    ["Updated", fmtTime(s.updated_at)],
+    ["Members", fmtNum(s.member_count)],
+    ["Channels", fmtNum(s.channel_count)],
+    ["Roles", fmtNum(s.role_count)],
+    ["Active invites", fmtNum(s.active_invite_count)],
+    ["Messages", fmtNum(s.message_count)],
+    ["Last message time", fmtTime(s.last_message_at)],
+  ].forEach(([k, v]) => body.append(kv(k, v)));
+  showModal(
+    "Server metadata",
+    "Operational metadata only; channel contents are not available to this panel.",
+    body,
+    [],
+  );
+}
+function pager(kind, count) {
+  const p = el("div", "pagination"),
+    prev = el("button", "secondary", "Previous"),
+    next = el("button", "secondary", "Next");
+  const key = kind === "users" ? "usersOffset" : "serversOffset";
+  prev.disabled = state[key] <= 0;
+  next.disabled = count < 50;
+  prev.addEventListener("click", () => {
+    state[key] = Math.max(0, state[key] - 50);
+    kind === "users" ? renderUsers() : renderServers();
+  });
+  next.addEventListener("click", () => {
+    state[key] += 50;
+    kind === "users" ? renderUsers() : renderServers();
+  });
+  p.append(prev, next);
+  return p;
+}
+
+function canOperate() {
+  return state.me?.role === "owner" || state.me?.role === "operator";
+}
+function localDateTime(ms) {
+  const n = Number(ms || 0);
+  if (!n) return "";
+  const d = new Date(n);
+  if (Number.isNaN(d.getTime())) return "";
+  const shifted = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return shifted.toISOString().slice(0, 16);
+}
+function parseLocalDateTime(value) {
+  if (!value) return null;
+  const n = Date.parse(value);
+  return Number.isFinite(n) ? n : null;
+}
+function bannerStatus(b) {
+  const now = Date.now(),
+    start = Number(b.starts_at || 0),
+    end = Number(b.ends_at || 0);
+  if (b.enabled === false) return ["paused", "Paused"];
+  if (end > 0 && end <= now) return ["expired", "Expired"];
+  if (start > now) return ["scheduled", "Scheduled"];
+  return ["live", end > 0 ? "Live" : "Permanent"];
+}
+function bannerSchedule(b) {
+  const start = Number(b.starts_at || 0),
+    end = Number(b.ends_at || 0);
+  if (start > Date.now())
+    return `Starts ${fmtTime(start)}${end ? ` · ends ${fmtTime(end)}` : ""}`;
+  if (end) return `Ends ${fmtTime(end)}`;
+  return "No automatic expiry";
+}
+function textareaField(label, name, value = "", maxLength = 500) {
+  const l = el("label", "field", label),
+    t = el("textarea");
+  t.name = name;
+  t.value = value || "";
+  t.maxLength = maxLength;
+  t.required = name === "body";
+  l.append(t);
+  return l;
+}
+function datetimeField(label, name, value = 0) {
+  const l = el("label", "field", label),
+    i = el("input");
+  i.name = name;
+  i.type = "datetime-local";
+  i.value = localDateTime(value);
+  l.append(i);
+  return l;
+}
+function checkboxField(label, name, checked = true) {
+  const l = el("label", "check-field"),
+    i = el("input");
+  i.name = name;
+  i.type = "checkbox";
+  i.checked = checked;
+  l.append(i, document.createTextNode(label));
+  return l;
+}
+
+async function renderControl() {
+  const [banners, controls] = await Promise.all([
+    api("/banners"),
+    api("/controls"),
+  ]);
+  clear(content);
+  const operate = canOperate();
+  const head = panelTitle(
+    "Hosted service controls",
+    "Changes here apply to this Plainwire instance, not to an individual community server.",
+  );
+  if (operate) {
+    const add = el("button", "primary", "New global banner");
+    add.addEventListener("click", () => showBannerEditor());
+    head.append(add);
+  }
+  content.append(head);
+  const controlsGrid = el("div", "control-grid");
+  const registrations = el("section", "control-card");
+  registrations.append(
+    el("h3", "", "Account registration"),
+    el(
+      "p",
+      "",
+      "Override the deployment default without restarting Plainwire. Existing accounts are unaffected.",
+    ),
+  );
+  const registrationRow = el("div", "control-row"),
+    select = el("select");
+  ["inherit", "enabled", "disabled"].forEach((mode) => {
+    const o = el(
+      "option",
+      "",
+      mode === "inherit"
+        ? "Use deployment setting"
+        : mode === "enabled"
+          ? "Force enabled"
+          : "Force disabled",
+    );
+    o.value = mode;
+    o.selected = mode === controls.registration_mode;
+    select.append(o);
+  });
+  select.disabled = !operate;
+  registrationRow.append(
+    select,
+    el(
+      "span",
+      `pill ${controls.registration_enabled ? "active" : "inactive"}`,
+      controls.registration_enabled ? "Currently open" : "Currently closed",
+    ),
+  );
+  if (operate) {
+    const save = el("button", "secondary", "Apply");
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        const d = await api("/controls/registration", {
+          method: "POST",
+          body: { mode: select.value },
+        });
+        toast(
+          d.registration_enabled
+            ? "Registration enabled."
+            : "Registration disabled.",
+        );
+        renderControl();
+      } catch (e) {
+        toast(e.message, true);
+        save.disabled = false;
+      }
+    });
+    registrationRow.append(save);
+  }
+  registrations.append(registrationRow);
+  const reconcile = el("section", "control-card");
+  reconcile.append(
+    el("h3", "", "Connected clients"),
+    el(
+      "p",
+      "",
+      "Ask every connected client to reconcile server state and the active screen. This does not disconnect calls or force a page reload.",
+    ),
+  );
+  const reconcileRow = el("div", "control-row");
+  reconcileRow.append(el("span", "pill active", "Realtime-safe"));
+  if (operate) {
+    const button = el("button", "secondary", "Reconcile clients");
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await api("/controls/reconcile", { method: "POST" });
+        toast("Connected clients were asked to reconcile.");
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+    reconcileRow.append(button);
+  }
+  reconcile.append(reconcileRow);
+  controlsGrid.append(registrations, reconcile);
+  content.append(controlsGrid);
+  const listHead = panelTitle(
+    "Global banners",
+    "Temporary or permanent service announcements update connected clients in realtime. Clients show up to three at once, prioritizing critical and newer announcements.",
+  );
+  content.append(listHead);
+  const list = el("div", "banner-admin-list");
+  banners.forEach((b) => {
+    const card = el("article", "banner-admin-card");
+    card.dataset.severity = ["info", "success", "warning", "critical"].includes(
+      b.severity,
+    )
+      ? b.severity
+      : "info";
+    const marker = el("span", "banner-admin-marker");
+    const copy = el("div", "banner-admin-copy");
+    copy.append(
+      el("strong", "", b.title || "Untitled announcement"),
+      el("p", "", b.body || ""),
+    );
+    const [statusKey, statusText] = bannerStatus(b),
+      meta = el("div", "banner-admin-meta");
+    meta.append(
+      el("span", `pill status-${statusKey}`, statusText),
+      el("span", "", titleCase(b.severity)),
+      el("span", "", bannerSchedule(b)),
+      el("span", "", b.dismissible ? "Dismissible" : "Required"),
+    );
+    if (b.link_url)
+      meta.append(el("span", "", `Link: ${b.link_label || b.link_url}`));
+    copy.append(meta);
+    card.append(marker, copy);
+    if (operate) {
+      const actions = el("div", "banner-admin-actions"),
+        edit = el("button", "secondary", "Edit"),
+        toggle = el(
+          "button",
+          "secondary",
+          b.enabled === false ? "Resume" : "Pause",
+        ),
+        remove = el("button", "danger", "Delete");
+      edit.addEventListener("click", () => showBannerEditor(b));
+      toggle.addEventListener("click", async () => {
+        toggle.disabled = true;
+        try {
+          await api(`/banners/${b.id}`, {
+            method: "POST",
+            body: {
+              enabled: b.enabled === false,
+              expected_updated_at: b.updated_at,
+            },
+          });
+          toast(b.enabled === false ? "Banner resumed." : "Banner paused.");
+          renderControl();
+        } catch (e) {
+          toast(e.message, true);
+          if (e.code === "banner_conflict") renderControl();
+          else toggle.disabled = false;
+        }
+      });
+      remove.addEventListener("click", async () => {
+        const ok = await confirmAction(
+          "Delete global banner?",
+          `“${b.title || b.body.slice(0, 50)}” will disappear from connected clients immediately.`,
+          "Delete banner",
+          true,
+        );
+        if (!ok) return;
+        try {
+          await api(
+            `/banners/${b.id}?expected_updated_at=${encodeURIComponent(b.updated_at)}`,
+            { method: "DELETE" },
+          );
+          toast("Banner deleted.");
+          renderControl();
+        } catch (e) {
+          toast(e.message, true);
+          if (e.code === "banner_conflict") renderControl();
+        }
+      });
+      actions.append(edit, toggle, remove);
+      card.append(actions);
+    }
+    list.append(card);
+  });
+  if (!banners.length)
+    list.append(el("div", "empty", "No global banners have been created."));
   content.append(list);
 }
 
-function showBannerEditor(existing=null){
-  const form=el('form','banner-form-grid');form.id='banner-editor-form';
-  const title=field('Title (optional)','title','text');title.querySelector('input').maxLength=80;title.querySelector('input').value=existing?.title||'';
-  const severity=fieldSelect('Style','severity',['info','success','warning','critical']);severity.querySelector('select').value=existing?.severity||'info';
-  const body=textareaField('Message','body',existing?.body||'',500);body.classList.add('wide');
-  const start=datetimeField('Starts', 'starts_at', existing?.starts_at||Date.now());
-  const end=datetimeField('Ends (blank = permanent)', 'ends_at', existing?.ends_at||0);
-  const linkLabel=field('Link label (optional)','link_label','text');linkLabel.querySelector('input').maxLength=40;linkLabel.querySelector('input').value=existing?.link_label||'';
-  const linkUrl=field('HTTPS or local link (optional)','link_url','text');linkUrl.querySelector('input').maxLength=512;linkUrl.querySelector('input').value=existing?.link_url||'';
-  const dismissible=checkboxField('Users may dismiss this banner','dismissible',existing?.dismissible!==false);dismissible.classList.add('wide');
-  form.append(title,severity,body,start,end,linkLabel,linkUrl,dismissible);
-  const cancel=el('button','secondary','Cancel'),save=el('button','primary',existing?'Save banner':'Publish banner');save.type='submit';save.setAttribute('form',form.id);cancel.type='button';cancel.addEventListener('click',()=>closeModal());
-  form.addEventListener('submit',async e=>{e.preventDefault();const startRaw=start.querySelector('input').value,endRaw=end.querySelector('input').value,startValue=parseLocalDateTime(startRaw),endValue=endRaw?parseLocalDateTime(endRaw):0;if(startValue===null){toast('Choose a valid banner start time.',true);start.querySelector('input').focus();return;}if(endRaw&&endValue===null){toast('Choose a valid banner end time or leave it blank for a permanent banner.',true);end.querySelector('input').focus();return;}if(endValue>0&&endValue<=startValue){toast('The banner end time must be after its start time.',true);end.querySelector('input').focus();return;}const patch={title:title.querySelector('input').value,body:body.querySelector('textarea').value,severity:severity.querySelector('select').value,starts_at:startValue,ends_at:endValue,dismissible:dismissible.querySelector('input').checked,link_label:linkLabel.querySelector('input').value,link_url:linkUrl.querySelector('input').value,enabled:existing?.enabled!==false,...(existing?{expected_updated_at:existing.updated_at}:{})};save.disabled=true;try{await api(existing?`/banners/${existing.id}`:'/banners',{method:'POST',body:patch});closeModal();toast(existing?'Banner updated.':'Banner published.');renderControl();}catch(err){toast(err.message,true);if(existing&&err.code==='banner_conflict'){closeModal();renderControl();}else{save.disabled=false;}}});
-  showModal(existing?'Edit global banner':'New global banner',existing?'Changes update connected Plainwire clients without a page refresh.':'Schedule it, leave the end blank for a permanent banner, or pause it later from this panel.',form,[cancel,save]);
+function showBannerEditor(existing = null) {
+  const form = el("form", "banner-form-grid");
+  form.id = "banner-editor-form";
+  const title = field("Title (optional)", "title", "text");
+  title.querySelector("input").maxLength = 80;
+  title.querySelector("input").value = existing?.title || "";
+  const severity = fieldSelect("Style", "severity", [
+    "info",
+    "success",
+    "warning",
+    "critical",
+  ]);
+  severity.querySelector("select").value = existing?.severity || "info";
+  const body = textareaField("Message", "body", existing?.body || "", 500);
+  body.classList.add("wide");
+  const start = datetimeField(
+    "Starts",
+    "starts_at",
+    existing?.starts_at || Date.now(),
+  );
+  const end = datetimeField(
+    "Ends (blank = permanent)",
+    "ends_at",
+    existing?.ends_at || 0,
+  );
+  const linkLabel = field("Link label (optional)", "link_label", "text");
+  linkLabel.querySelector("input").maxLength = 40;
+  linkLabel.querySelector("input").value = existing?.link_label || "";
+  const linkUrl = field("HTTPS or local link (optional)", "link_url", "text");
+  linkUrl.querySelector("input").maxLength = 512;
+  linkUrl.querySelector("input").value = existing?.link_url || "";
+  const dismissible = checkboxField(
+    "Users may dismiss this banner",
+    "dismissible",
+    existing?.dismissible !== false,
+  );
+  dismissible.classList.add("wide");
+  form.append(
+    title,
+    severity,
+    body,
+    start,
+    end,
+    linkLabel,
+    linkUrl,
+    dismissible,
+  );
+  const cancel = el("button", "secondary", "Cancel"),
+    save = el("button", "primary", existing ? "Save banner" : "Publish banner");
+  save.type = "submit";
+  save.setAttribute("form", form.id);
+  cancel.type = "button";
+  cancel.addEventListener("click", () => closeModal());
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const startRaw = start.querySelector("input").value,
+      endRaw = end.querySelector("input").value,
+      startValue = parseLocalDateTime(startRaw),
+      endValue = endRaw ? parseLocalDateTime(endRaw) : 0;
+    if (startValue === null) {
+      toast("Choose a valid banner start time.", true);
+      start.querySelector("input").focus();
+      return;
+    }
+    if (endRaw && endValue === null) {
+      toast(
+        "Choose a valid banner end time or leave it blank for a permanent banner.",
+        true,
+      );
+      end.querySelector("input").focus();
+      return;
+    }
+    if (endValue > 0 && endValue <= startValue) {
+      toast("The banner end time must be after its start time.", true);
+      end.querySelector("input").focus();
+      return;
+    }
+    const patch = {
+      title: title.querySelector("input").value,
+      body: body.querySelector("textarea").value,
+      severity: severity.querySelector("select").value,
+      starts_at: startValue,
+      ends_at: endValue,
+      dismissible: dismissible.querySelector("input").checked,
+      link_label: linkLabel.querySelector("input").value,
+      link_url: linkUrl.querySelector("input").value,
+      enabled: existing?.enabled !== false,
+      ...(existing ? { expected_updated_at: existing.updated_at } : {}),
+    };
+    save.disabled = true;
+    try {
+      await api(existing ? `/banners/${existing.id}` : "/banners", {
+        method: "POST",
+        body: patch,
+      });
+      closeModal();
+      toast(existing ? "Banner updated." : "Banner published.");
+      renderControl();
+    } catch (err) {
+      toast(err.message, true);
+      if (existing && err.code === "banner_conflict") {
+        closeModal();
+        renderControl();
+      } else {
+        save.disabled = false;
+      }
+    }
+  });
+  showModal(
+    existing ? "Edit global banner" : "New global banner",
+    existing
+      ? "Changes update connected Plainwire clients without a page refresh."
+      : "Schedule it, leave the end blank for a permanent banner, or pause it later from this panel.",
+    form,
+    [cancel, save],
+  );
 }
 
-async function renderHost(){const d=await api('/host');clear(content);const g=el('div','metric-grid');g.append(metric('Node uptime',fmtDuration(d.uptime_ms),d.node||''),metric('BEAM memory',fmtBytes(d.memory?.total),`${fmtBytes(d.memory?.processes)} processes`),metric('Processes',fmtNum(d.process_count),`limit ${fmtNum(d.process_limit)}`),metric('Schedulers',fmtNum(d.schedulers_online),`${fmtNum(d.logical_processors)} logical CPUs`),metric('WebSockets',fmtNum(d.realtime?.websocket_connections),`${fmtNum(d.realtime?.online_users)} users online`),metric('Media cache',fmtNum(d.media?.cache_entries),`${fmtNum(d.media?.active_fetches)} fetches`),metric('Upload inflight',fmtBytes(d.uploads?.inflight_bytes),`${fmtNum(d.uploads?.active_uploads)} uploads`),metric('DB queue peak',fmtNum(d.database?.max_connection_queue),`pool ${fmtNum(d.database?.pool_size)}`));content.append(g);
-  const dg=el('div','dashboard-grid');const runtime=el('div','panel');runtime.append(panelTitle('Runtime','Non-secret deployment and VM details'));const kvs=el('div','kv-grid');[['Release',d.release],['Instance ID',d.instance_id],['OTP',d.otp_release],['Architecture',d.system_architecture],['Host OS',`${d.os_type||'—'} · ${d.os_version||'—'}`],['Run queue',fmtNum(d.run_queue)],['ETS tables',fmtNum(d.ets_table_count)],['Atom table',`${fmtNum(d.atom_count)} / ${fmtNum(d.atom_limit)}`],['Ports',fmtNum(d.port_count)],['Rate-limit entries',fmtNum(d.rate_limiter?.entries)],['Cluster backend',d.cluster?.backend||'local']].forEach(([k,v])=>kvs.append(kv(k,v)));runtime.append(kvs);
-  const cfg=el('div','panel');cfg.append(panelTitle('Safe configuration','Allowlisted settings only; secrets are never returned'));const cg=el('div','kv-grid');Object.entries(d.config||{}).forEach(([k,v])=>cg.append(kv(titleCase(k),typeof v==='boolean'?(v?'Enabled':'Disabled'):v)));cfg.append(cg);dg.append(runtime,cfg);content.append(dg);
+async function renderHost() {
+  const d = await api("/host");
+  clear(content);
+  const g = el("div", "metric-grid");
+  g.append(
+    metric("Node uptime", fmtDuration(d.uptime_ms), d.node || ""),
+    metric(
+      "BEAM memory",
+      fmtBytes(d.memory?.total),
+      `${fmtBytes(d.memory?.processes)} processes`,
+    ),
+    metric(
+      "Processes",
+      fmtNum(d.process_count),
+      `limit ${fmtNum(d.process_limit)}`,
+    ),
+    metric(
+      "Schedulers",
+      fmtNum(d.schedulers_online),
+      `${fmtNum(d.logical_processors)} logical CPUs`,
+    ),
+    metric(
+      "WebSockets",
+      fmtNum(d.realtime?.websocket_connections),
+      `${fmtNum(d.realtime?.online_users)} users online`,
+    ),
+    metric(
+      "Media cache",
+      fmtNum(d.media?.cache_entries),
+      `${fmtNum(d.media?.active_fetches)} fetches`,
+    ),
+    metric(
+      "Upload inflight",
+      fmtBytes(d.uploads?.inflight_bytes),
+      `${fmtNum(d.uploads?.active_uploads)} uploads`,
+    ),
+    metric(
+      "DB queue peak",
+      fmtNum(d.database?.max_connection_queue),
+      `pool ${fmtNum(d.database?.pool_size)}`,
+    ),
+  );
+  content.append(g);
+  const dg = el("div", "dashboard-grid");
+  const runtime = el("div", "panel");
+  runtime.append(panelTitle("Runtime", "Non-secret deployment and VM details"));
+  const kvs = el("div", "kv-grid");
+  [
+    ["Release", d.release],
+    ["Instance ID", d.instance_id],
+    ["OTP", d.otp_release],
+    ["Architecture", d.system_architecture],
+    ["Host OS", `${d.os_type || "—"} · ${d.os_version || "—"}`],
+    ["Run queue", fmtNum(d.run_queue)],
+    ["ETS tables", fmtNum(d.ets_table_count)],
+    ["Atom table", `${fmtNum(d.atom_count)} / ${fmtNum(d.atom_limit)}`],
+    ["Ports", fmtNum(d.port_count)],
+    ["Rate-limit entries", fmtNum(d.rate_limiter?.entries)],
+    ["Cluster backend", d.cluster?.backend || "local"],
+  ].forEach(([k, v]) => kvs.append(kv(k, v)));
+  runtime.append(kvs);
+  const cfg = el("div", "panel");
+  cfg.append(
+    panelTitle(
+      "Safe configuration",
+      "Allowlisted settings only; secrets are never returned",
+    ),
+  );
+  const cg = el("div", "kv-grid");
+  Object.entries(d.config || {}).forEach(([k, v]) =>
+    cg.append(
+      kv(
+        titleCase(k),
+        typeof v === "boolean" ? (v ? "Enabled" : "Disabled") : v,
+      ),
+    ),
+  );
+  cfg.append(cg);
+  dg.append(runtime, cfg);
+  content.append(dg);
 }
-function kv(k,v){const n=el('div','kv');n.append(el('small','',k),el('strong','',v===null||v===undefined?'—':v));return n;}
+function kv(k, v) {
+  const n = el("div", "kv");
+  n.append(
+    el("small", "", k),
+    el("strong", "", v === null || v === undefined ? "—" : v),
+  );
+  return n;
+}
 
-async function renderOperators(){const ops=await api('/operators');clear(content);const head=panelTitle('Service operators','Access belongs to Plainwire accounts on this instance, not to source-code possession.');if(state.me.role==='owner'){const b=el('button','primary','Issue enrollment / recovery code');b.addEventListener('click',showEnrollmentModal);head.append(b);}content.append(head);const p=el('div','panel');ops.forEach(o=>{const r=el('div','operator-row'),ident=el('div','identity-cell');ident.append(el('strong','',o.display_name||o.username),el('span','',`@${o.username} · last admin activity ${fmtTime(o.last_admin_seen)}`));r.append(ident);const badge=el('span',`pill ${o.role}`,o.role);r.append(badge);if(state.me.role==='owner'){const acts=el('div','inline-actions'),sel=el('select');['owner','operator','viewer'].forEach(role=>{const op=el('option','',role);op.value=role;op.selected=role===o.role;sel.append(op);});sel.addEventListener('change',async()=>{const role=sel.value;const ok=await confirmAction('Change operator role?',`${o.display_name||o.username} will become ${role}. Their current admin sessions will be revoked.`,'Change role');if(!ok){sel.value=o.role;return;}try{await api(`/operators/${o.user_id}/role`,{method:'POST',body:{role}});toast('Operator role updated.');renderOperators();}catch(e){toast(e.message,true);sel.value=o.role;}});const rm=el('button','danger','Remove');rm.addEventListener('click',async()=>{const ok=await confirmAction('Remove service operator?',`${o.display_name||o.username} will lose control-plane access. This does not delete their Plainwire account.`,'Remove operator',true);if(!ok)return;try{await api(`/operators/${o.user_id}`,{method:'DELETE'});toast('Operator removed.');renderOperators();}catch(e){toast(e.message,true);}});acts.append(sel,rm);r.append(acts);}p.append(r);});if(!ops.length)p.append(el('div','empty','No service operators configured.'));content.append(p);}
-function showEnrollmentModal(){const body=el('form','auth-form');body.id='operator-enroll-create';const user=field('Plainwire username','username','text'),role=fieldSelect('Role','role',['viewer','operator','owner']),note=field('Reason / note','note','text');body.append(user,role,note);const create=el('button','primary','Create one-time code');create.type='submit';body.append(create);body.addEventListener('submit',async e=>{e.preventDefault();try{const d=await api('/operators/enrollment',{method:'POST',body:{username:user.querySelector('input').value,role:role.querySelector('select').value,note:note.querySelector('input').value}});closeModal();await showSecret('One-time enrollment / recovery code',d.enrollment_code,`Give this only to @${d.username}. It expires automatically and can be redeemed once.`);renderOperators();}catch(err){toast(err.message,true);}});showModal('Issue operator access','New operators redeem this using their own Plainwire password. Existing operators use it as account-bound recovery.',body,[]);}
+async function renderOperators() {
+  const ops = await api("/operators");
+  clear(content);
+  const head = panelTitle(
+    "Service operators",
+    "Access belongs to Plainwire accounts on this instance, not to source-code possession.",
+  );
+  if (state.me.role === "owner") {
+    const b = el("button", "primary", "Issue enrollment / recovery code");
+    b.addEventListener("click", showEnrollmentModal);
+    head.append(b);
+  }
+  content.append(head);
+  const p = el("div", "panel");
+  ops.forEach((o) => {
+    const r = el("div", "operator-row"),
+      ident = el("div", "identity-cell");
+    ident.append(
+      el("strong", "", o.display_name || o.username),
+      el(
+        "span",
+        "",
+        `@${o.username} · last admin activity ${fmtTime(o.last_admin_seen)}`,
+      ),
+    );
+    r.append(ident);
+    const badge = el("span", `pill ${o.role}`, o.role);
+    r.append(badge);
+    if (state.me.role === "owner") {
+      const acts = el("div", "inline-actions"),
+        sel = el("select");
+      ["owner", "operator", "viewer"].forEach((role) => {
+        const op = el("option", "", role);
+        op.value = role;
+        op.selected = role === o.role;
+        sel.append(op);
+      });
+      sel.addEventListener("change", async () => {
+        const role = sel.value;
+        const ok = await confirmAction(
+          "Change operator role?",
+          `${o.display_name || o.username} will become ${role}. Their current admin sessions will be revoked.`,
+          "Change role",
+        );
+        if (!ok) {
+          sel.value = o.role;
+          return;
+        }
+        try {
+          await api(`/operators/${o.user_id}/role`, {
+            method: "POST",
+            body: { role },
+          });
+          toast("Operator role updated.");
+          renderOperators();
+        } catch (e) {
+          toast(e.message, true);
+          sel.value = o.role;
+        }
+      });
+      const rm = el("button", "danger", "Remove");
+      rm.addEventListener("click", async () => {
+        const ok = await confirmAction(
+          "Remove service operator?",
+          `${o.display_name || o.username} will lose control-plane access. This does not delete their Plainwire account.`,
+          "Remove operator",
+          true,
+        );
+        if (!ok) return;
+        try {
+          await api(`/operators/${o.user_id}`, { method: "DELETE" });
+          toast("Operator removed.");
+          renderOperators();
+        } catch (e) {
+          toast(e.message, true);
+        }
+      });
+      acts.append(sel, rm);
+      r.append(acts);
+    }
+    p.append(r);
+  });
+  if (!ops.length)
+    p.append(el("div", "empty", "No service operators configured."));
+  content.append(p);
+}
+function showEnrollmentModal() {
+  const body = el("form", "auth-form");
+  body.id = "operator-enroll-create";
+  const user = field("Plainwire username", "username", "text"),
+    role = fieldSelect("Role", "role", ["viewer", "operator", "owner"]),
+    note = field("Reason / note", "note", "text");
+  body.append(user, role, note);
+  const create = el("button", "primary", "Create one-time code");
+  create.type = "submit";
+  body.append(create);
+  body.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      const d = await api("/operators/enrollment", {
+        method: "POST",
+        body: {
+          username: user.querySelector("input").value,
+          role: role.querySelector("select").value,
+          note: note.querySelector("input").value,
+        },
+      });
+      closeModal();
+      await showSecret(
+        "One-time enrollment / recovery code",
+        d.enrollment_code,
+        `Give this only to @${d.username}. It expires automatically and can be redeemed once.`,
+      );
+      renderOperators();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+  showModal(
+    "Issue operator access",
+    "New operators redeem this using their own Plainwire password. Existing operators use it as account-bound recovery.",
+    body,
+    [],
+  );
+}
 
-async function renderAudit(){const rows=await api('/audit?limit=100');clear(content);content.append(panelTitle('Operator audit','Security and administrative actions only. Communication contents are never logged here.'));const list=el('div','audit-list');rows.forEach(a=>{const item=el('div','audit-item');item.append(el('time','',fmtTime(a.created_at)));const d=el('div');d.append(el('strong','',titleCase(a.action)));const target=[a.actor_username?`by @${a.actor_username}`:'system',a.target_type&&a.target_id?`· ${a.target_type} ${a.target_id}`:''].filter(Boolean).join(' ');d.append(el('p','',target));item.append(d,el('small','',a.detail||''));list.append(item);});if(!rows.length)list.append(el('div','empty','No operator actions recorded yet.'));content.append(list);}
+async function renderAudit() {
+  const rows = await api("/audit?limit=100");
+  clear(content);
+  content.append(
+    panelTitle(
+      "Operator audit",
+      "Security and administrative actions only. Communication contents are never logged here.",
+    ),
+  );
+  const list = el("div", "audit-list");
+  rows.forEach((a) => {
+    const item = el("div", "audit-item");
+    item.append(el("time", "", fmtTime(a.created_at)));
+    const d = el("div");
+    d.append(el("strong", "", titleCase(a.action)));
+    const target = [
+      a.actor_username ? `by @${a.actor_username}` : "system",
+      a.target_type && a.target_id ? `· ${a.target_type} ${a.target_id}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    d.append(el("p", "", target));
+    item.append(d, el("small", "", a.detail || ""));
+    list.append(item);
+  });
+  if (!rows.length)
+    list.append(el("div", "empty", "No operator actions recorded yet."));
+  content.append(list);
+}
 
-function field(label,name,type='text'){const l=el('label','field',label),i=el('input');i.name=name;i.type=type;i.autocomplete='off';i.maxLength=256;l.append(i);return l;}
-function fieldSelect(label,name,values){const l=el('label','field',label),s=el('select');s.name=name;values.forEach(v=>{const o=el('option','',v);o.value=v;s.append(o);});l.append(s);return l;}
-async function showSecurityModal(){const body=el('form','auth-form');const pass=field('Plainwire password','password','password'),key=field('Current operator verification key','current_verification_key','password');body.append(el('p','form-help','Rotating your key revokes every current admin session for this operator, including this one.'),pass,key);const rotate=el('button','danger','Rotate verification key');rotate.type='submit';body.append(rotate);body.addEventListener('submit',async e=>{e.preventDefault();const ok=await confirmAction('Rotate operator key?','You will be signed out everywhere. The replacement key is shown exactly once.','Rotate key',true);if(!ok)return;try{const d=await api('/security/rotate-key',{method:'POST',body:{password:pass.querySelector('input').value,current_verification_key:key.querySelector('input').value}});closeModal();await showSecret('New operator verification key',d.verification_key,'Save this key before closing. Your old key and all prior admin sessions are now invalid.');showAuth();setAuthTab('login');}catch(err){toast(err.message,true);}});showModal('Operator security','Verification keys are instance-bound and are never stored in plaintext.',body,[]);}
+function field(label, name, type = "text") {
+  const l = el("label", "field", label),
+    i = el("input");
+  i.name = name;
+  i.type = type;
+  i.autocomplete = "off";
+  i.maxLength = 256;
+  l.append(i);
+  return l;
+}
+function fieldSelect(label, name, values) {
+  const l = el("label", "field", label),
+    s = el("select");
+  s.name = name;
+  values.forEach((v) => {
+    const o = el("option", "", v);
+    o.value = v;
+    s.append(o);
+  });
+  l.append(s);
+  return l;
+}
+async function showSecurityModal() {
+  const body = el("form", "auth-form");
+  const pass = field("Plainwire password", "password", "password"),
+    key = field(
+      "Current operator verification key",
+      "current_verification_key",
+      "password",
+    );
+  body.append(
+    el(
+      "p",
+      "form-help",
+      "Rotating your key revokes every current admin session for this operator, including this one.",
+    ),
+    pass,
+    key,
+  );
+  const rotate = el("button", "danger", "Rotate verification key");
+  rotate.type = "submit";
+  body.append(rotate);
+  body.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const ok = await confirmAction(
+      "Rotate operator key?",
+      "You will be signed out everywhere. The replacement key is shown exactly once.",
+      "Rotate key",
+      true,
+    );
+    if (!ok) return;
+    try {
+      const d = await api("/security/rotate-key", {
+        method: "POST",
+        body: {
+          password: pass.querySelector("input").value,
+          current_verification_key: key.querySelector("input").value,
+        },
+      });
+      closeModal();
+      await showSecret(
+        "New operator verification key",
+        d.verification_key,
+        "Save this key before closing. Your old key and all prior admin sessions are now invalid.",
+      );
+      showAuth();
+      setAuthTab("login");
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+  showModal(
+    "Operator security",
+    "Verification keys are instance-bound and are never stored in plaintext.",
+    body,
+    [],
+  );
+}
 
-function showModal(title,subtitle,body,actions=[],locked=false){state.modalLocked=locked;state.modalOnClose=null;$('#modal-title').textContent=title;$('#modal-subtitle').textContent=subtitle||'';clear($('#modal-body'));$('#modal-body').append(body);if(body instanceof HTMLFormElement&&!body.id)body.id='pw-admin-modal-form';clear($('#modal-actions'));actions.forEach(a=>{if(body instanceof HTMLFormElement&&a.tagName==='BUTTON'&&a.type==='submit')a.setAttribute('form',body.id);$('#modal-actions').append(a);});$('#modal-close').hidden=locked;$('#modal-backdrop').hidden=false;setTimeout(()=>{const target=locked?$('#modal-actions button:last-child'):$('#modal-close');target?.focus();},0);}
-function closeModal(force=false){if(state.modalLocked&&!force)return false;if(!$('#modal-backdrop').hidden){$('#modal-backdrop').hidden=true;state.modalLocked=false;$('#modal-close').hidden=false;clear($('#modal-body'));clear($('#modal-actions'));const onClose=state.modalOnClose;state.modalOnClose=null;onClose?.();}return true;}
-$('#modal-close').addEventListener('click',()=>closeModal());$('#modal-backdrop').addEventListener('click',e=>{if(e.target===$('#modal-backdrop'))closeModal();});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
-function showSecret(title,secret,note){return new Promise(resolve=>{const body=el('div','secret-box'),code=el('code','code-value',secret),p=el('p','',note);body.append(code,p);const copy=el('button','secondary','Copy key'),done=el('button','primary','I saved it');copy.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(secret);toast('Copied.');}catch{toast('Could not access clipboard.',true);}});done.addEventListener('click',()=>{closeModal(true);resolve();});showModal(title,'Plainwire cannot recover this plaintext secret later.',body,[copy,done],true);});}
-function confirmAction(title,text,buttonText,danger=false){return new Promise(resolve=>{const body=el('p','muted',text),cancel=el('button','secondary','Cancel'),go=el('button',danger?'danger':'primary',buttonText);cancel.type='button';go.type='button';cancel.addEventListener('click',()=>closeModal());go.addEventListener('click',()=>{state.modalOnClose=null;closeModal();resolve(true);});showModal(title,'Review this service-level action before continuing.',body,[cancel,go]);state.modalOnClose=()=>resolve(false);});}
+function showModal(title, subtitle, body, actions = [], locked = false) {
+  state.modalLocked = locked;
+  state.modalOnClose = null;
+  $("#modal-title").textContent = title;
+  $("#modal-subtitle").textContent = subtitle || "";
+  clear($("#modal-body"));
+  $("#modal-body").append(body);
+  if (body instanceof HTMLFormElement && !body.id)
+    body.id = "pw-admin-modal-form";
+  clear($("#modal-actions"));
+  actions.forEach((a) => {
+    if (
+      body instanceof HTMLFormElement &&
+      a.tagName === "BUTTON" &&
+      a.type === "submit"
+    )
+      a.setAttribute("form", body.id);
+    $("#modal-actions").append(a);
+  });
+  $("#modal-close").hidden = locked;
+  $("#modal-backdrop").hidden = false;
+  setTimeout(() => {
+    const target = locked
+      ? $("#modal-actions button:last-child")
+      : $("#modal-close");
+    target?.focus();
+  }, 0);
+}
+function closeModal(force = false) {
+  if (state.modalLocked && !force) return false;
+  if (!$("#modal-backdrop").hidden) {
+    $("#modal-backdrop").hidden = true;
+    state.modalLocked = false;
+    $("#modal-close").hidden = false;
+    clear($("#modal-body"));
+    clear($("#modal-actions"));
+    const onClose = state.modalOnClose;
+    state.modalOnClose = null;
+    onClose?.();
+  }
+  return true;
+}
+$("#modal-close").addEventListener("click", () => closeModal());
+$("#modal-backdrop").addEventListener("click", (e) => {
+  if (e.target === $("#modal-backdrop")) closeModal();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeModal();
+});
+function showSecret(title, secret, note) {
+  return new Promise((resolve) => {
+    const body = el("div", "secret-box"),
+      code = el("code", "code-value", secret),
+      p = el("p", "", note);
+    body.append(code, p);
+    const copy = el("button", "secondary", "Copy key"),
+      done = el("button", "primary", "I saved it");
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(secret);
+        toast("Copied.");
+      } catch {
+        toast("Could not access clipboard.", true);
+      }
+    });
+    done.addEventListener("click", () => {
+      closeModal(true);
+      resolve();
+    });
+    showModal(
+      title,
+      "Plainwire cannot recover this plaintext secret later.",
+      body,
+      [copy, done],
+      true,
+    );
+  });
+}
+function confirmAction(title, text, buttonText, danger = false) {
+  return new Promise((resolve) => {
+    const body = el("p", "muted", text),
+      cancel = el("button", "secondary", "Cancel"),
+      go = el("button", danger ? "danger" : "primary", buttonText);
+    cancel.type = "button";
+    go.type = "button";
+    cancel.addEventListener("click", () => closeModal());
+    go.addEventListener("click", () => {
+      state.modalOnClose = null;
+      closeModal();
+      resolve(true);
+    });
+    showModal(
+      title,
+      "Review this service-level action before continuing.",
+      body,
+      [cancel, go],
+    );
+    state.modalOnClose = () => resolve(false);
+  });
+}
 
 boot();

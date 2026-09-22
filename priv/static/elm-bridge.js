@@ -1344,6 +1344,11 @@
   let microphoneRequest = null;
   let microphoneEpoch = 0;
   let room = null;
+  // Set while this client is tearing down a room it had joined, so a peer-left
+  // echo of that departure cannot also play the "someone else left" cue.
+  let rtcLocalDeparture = false;
+  let callAwaitingFirstGuest = false;
+  const joinCueIds = new Set();
   let roomEpoch = 0;
   let callHealth = null;
   const RTC_RESUME_KEY = 'plainwire_rtc_room';
@@ -1427,12 +1432,20 @@
   let audioUnlockToastShown = false;
   const peers = new Map();
   let screenStream = null;
+  let screenShareSession = 0;
+  let screenWatchTimer = null;
+  const screenWatchAnnounced = new Set();
   let screenAudioMixer = null;
   let screenAudioSource = 'none';
   let screenSenders = new Map(); // uid -> RTCRtpSender for video
   const displayMediaSupported = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
   const peerPromises = new Map();
   const signalQueues = new Map();
+  // Candidates can leave the browser before the offer or answer is queued.
+  // Holding them here, instead of dropping them, is what lets a pair connect
+  // without both people reloading.
+  const earlyCandidates = new Map();
+  const identityRetries = new Map();
   // Bumped whenever a participant's session is replaced, so queued signals from
   // the old session cannot resurrect a peer connection.
   const peerGenerations = new Map();
@@ -2328,6 +2341,19 @@
     }
   };
 
+  // Put a Discord-style unread divider near the top when it is above the last
+  // screen of history. A short unread tail stays pinned to the latest message.
+  const revealUnreadMarker = (list) => {
+    const marker = list.querySelector('.unread-marker');
+    if (!marker || !list.isConnected) return false;
+    const top = marker.getBoundingClientRect().top - list.getBoundingClientRect().top + list.scrollTop;
+    if (list.scrollHeight - top <= list.clientHeight + 48) return false;
+    cancelForcedMessageScroll();
+    messagesPinnedToBottom = false;
+    list.scrollTop = Math.max(0, top - 8);
+    return true;
+  };
+
   const observeMessageHistory = () => {
     const list = trackMessageScroll();
     const sentinel = document.getElementById('message-history-sentinel');
@@ -2465,7 +2491,7 @@
       const list = trackMessageScroll();
       if (list && pendingForcedMessageRoute === location.hash) {
         pendingForcedMessageRoute = null;
-        scrollMessageListToBottom(true);
+        if (!revealUnreadMarker(list)) scrollMessageListToBottom(true);
       } else if (pendingForcedMessageRoute && pendingForcedMessageRoute !== location.hash) {
         pendingForcedMessageRoute = null;
       }
@@ -2596,7 +2622,14 @@
     incoming: [[523.25, 0, 430, 0.038], [659.25, 160, 430, 0.033], [783.99, 320, 540, 0.028]],
     outgoing: [[392, 0, 300, 0.025], [523.25, 240, 380, 0.022]],
     tour: [[659.25, 0, 130, 0.024], [783.99, 75, 170, 0.026], [987.77, 165, 230, 0.021]],
-    tourMessage: [[783.99, 0, 150, 0.021], [1046.5, 95, 220, 0.019]]
+    tourMessage: [[783.99, 0, 150, 0.021], [1046.5, 95, 220, 0.019]],
+    // Call cues stay short and quiet. Each shape is different: a falling pair
+    // when you leave, one low note when someone else leaves, a rising pair when
+    // someone joins, and a brief high pair when a viewer starts receiving your screen.
+    selfLeave: [[523.25, 0, 130, 0.028], [349.23, 100, 190, 0.022]],
+    peerLeave: [[196, 0, 170, 0.034]],
+    peerJoin: [[659.25, 0, 90, 0.026], [880, 70, 140, 0.022]],
+    screenWatch: [[1567.98, 0, 55, 0.016], [2093, 42, 75, 0.013]]
   };
   let lastMentionAt = 0;
   const playSound = (name, { preview = false } = {}) => {
@@ -5740,10 +5773,74 @@
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Shared system audio stopped; screen video and microphone are still live.' });
     });
     debug('MEDIA', 'screen_share_started', { tracks: captured.getTracks().length, shared_audio: hasScreenAudio, audio_source: capturedAudioSource });
+    if (!screenWatchTimer) startScreenWatchMonitor();
+  };
+
+  const stopScreenWatchMonitor = () => {
+    screenShareSession += 1;
+    if (screenWatchTimer) clearInterval(screenWatchTimer);
+    screenWatchTimer = null;
+    screenWatchAnnounced.clear();
+  };
+
+  const readOutboundVideo = async (sender) => {
+    const stats = await sender.getStats();
+    let sample = null;
+    stats.forEach((report) => {
+      if (report.type !== 'outbound-rtp' || report.isRemote) return;
+      if (report.kind !== 'video' && report.mediaType !== 'video') return;
+      sample = { bytes: Number(report.bytesSent || 0), frames: Number(report.framesSent || 0) };
+    });
+    return sample;
+  };
+
+  // One cue per remote viewer per share. A stats poll only notices the edge
+  // where outbound screen video starts flowing; renegotiation rebases the
+  // counter instead of dinging again.
+  const noteScreenViewer = async (uid, pc, session) => {
+    if (!screenStream || session !== screenShareSession || screenWatchAnnounced.has(uid)) return;
+    const track = screenStream.getVideoTracks()[0];
+    const sender = pc?._videoSender;
+    if (!track || track.readyState !== 'live' || !sender || sender.track !== track) return;
+    const transportUp = pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
+    if (!transportUp) return;
+    let sample = null;
+    try { sample = await readOutboundVideo(sender); }
+    catch (_) { return; }
+    if (!sample || session !== screenShareSession || !screenStream || screenWatchAnnounced.has(uid) || sender.track !== track) return;
+    const slot = `_screenWatchBase${session}`;
+    const baseline = pc[slot];
+    if (!baseline) {
+      pc[slot] = sample;
+      return;
+    }
+    if (sample.frames < baseline.frames || sample.bytes + 200 < baseline.bytes) {
+      pc[slot] = sample;
+      return;
+    }
+    const advanced = sample.frames > baseline.frames || sample.bytes > baseline.bytes + 2500;
+    if (!advanced) return;
+    screenWatchAnnounced.add(uid);
+    playSound('screenWatch');
+  };
+
+  const startScreenWatchMonitor = () => {
+    stopScreenWatchMonitor();
+    const session = screenShareSession;
+    const poll = () => {
+      if (!screenStream || session !== screenShareSession || !room?.joined) return;
+      peers.forEach((pc, uid) => {
+        if (!uid || Number(uid) === Number(meId) || pc.signalingState === 'closed') return;
+        noteScreenViewer(Number(uid), pc, session).catch(() => {});
+      });
+    };
+    screenWatchTimer = setInterval(poll, 1000);
+    poll();
   };
 
   const stopScreenShare = () => {
     if (!screenStream) return;
+    stopScreenWatchMonitor();
     const stoppedStream = screenStream;
     const stoppedMixer = screenAudioMixer;
     screenStream = null;
@@ -5940,6 +6037,7 @@
   // peer creation from the old session become stale.
   const replacePeerSession = (uid) => {
     peerGenerations.set(uid, (peerGenerations.get(uid) || 0) + 1);
+    earlyCandidates.delete(`${room?.epoch || 0}:${Number(uid)}`);
     closePeer(uid);
   };
 
@@ -6131,8 +6229,18 @@
     return true;
   };
 
+  const playPeerJoin = (uid) => {
+    const id = Number(uid);
+    if (!id || id === Number(meId) || rtcLocalDeparture || joinCueIds.has(id)) return;
+    joinCueIds.add(id);
+    playSound('peerJoin');
+  };
+
   const leaveRtcRoom = ({ notifyServer = false, preserveResume = false } = {}) => {
     const previous = room ? { ...room } : null;
+    joinCueIds.clear();
+    callAwaitingFirstGuest = false;
+    if (previous?.joined) rtcLocalDeparture = true;
     debug('RTC', 'room_leaving', { room: previous, peers: peers.size, notify_server: notifyServer, preserve_resume: preserveResume });
     if (preserveResume) persistRtcIntent();
     else clearRtcIntent();
@@ -6151,6 +6259,8 @@
     signalQueues.clear();
     peerRepairPromises.clear();
     peerRepairHistory.clear();
+    earlyCandidates.clear();
+    identityRetries.clear();
     if (screenStream) {
       screenStream.getTracks().forEach((t) => t.stop());
       screenStream = null;
@@ -6161,6 +6271,7 @@
     screenSenders.clear();
     cleanupAllFloatWindows();
     screenSharers.clear();
+    stopScreenWatchMonitor();
     room = null;
     resumeInFlight = false;
     releaseCurrentMicrophone();
@@ -6174,6 +6285,10 @@
     }
     publishAudioState();
     stopRingtones();
+    // After this function returns, some callers stop ringtones again. Defer the
+    // cue so that epoch bump cannot swallow it, and so a peer-left echo of this
+    // same departure is not what plays the "you left" sound.
+    if (previous?.joined && !preserveResume) queueMicrotask(() => playSound('selfLeave'));
   };
 
   const switchRtcRoom = (kind, id) => {
@@ -6255,6 +6370,8 @@
       pc._offerSentAt = Date.now();
       debug('RTC', 'offer_ready', { peer_user_id: uid });
       sendSignal(uid, { kind: 'offer', sdp: pc.localDescription });
+      // Candidates gathered during setLocalDescription stay behind the offer.
+      pc._releaseLocalCandidates?.();
     } finally {
       pc._makingOffer = false;
     }
@@ -6287,8 +6404,10 @@
           sendSignal(uid, { kind: 'renegotiate' });
           return;
         }
-        if (pc.signalingState === 'have-local-offer' && Date.now() - (pc._offerSentAt || 0) >= 4500) {
-          // probably lost an offer/answer. send the pending one again.
+        if (pc.signalingState === 'have-local-offer' && pc.localDescription && !pc.remoteDescription) {
+          // The other side asked again, or the first answer never arrived.
+          // Send the pending offer now. Resending the same description lets
+          // them repeat the answer they already created.
           pc._offerSentAt = Date.now();
           sendSignal(uid, { kind: 'offer', sdp: pc.localDescription });
           return;
@@ -6304,7 +6423,7 @@
   };
 
   const ensurePeer = async (uid) => {
-    if (!uid || uid === meId) return null;
+    if (!uid || Number(uid) === Number(meId)) return null;
     const epoch = room?.epoch;
     if (!epoch) return null;
     const existing = peers.get(uid);
@@ -6323,12 +6442,19 @@
     }
   };
 
+  const transceiverKind = (transceiver) => transceiver?.receiver?.track?.kind || transceiver?.sender?.track?.kind || '';
+
   const bindPeerMedia = async (pc, stream) => {
-    const active = pc.getTransceivers().filter((t) => !t.stopped);
-    const audio = active.find((t) => t.receiver.track.kind === 'audio');
-    const video = active.find((t) => t.receiver.track.kind === 'video');
+    const active = pc.getTransceivers().filter((t) => t && !t.stopped);
+    // receiver.track can still be null immediately after setRemoteDescription.
+    // Throwing there used to abort the answer, so neither side ever heard the other.
+    const audio = active.find((t) => transceiverKind(t) === 'audio') || active[0];
+    const video = active.find((t) => transceiverKind(t) === 'video');
     const track = outgoingAudioTrack(stream);
-    if (!audio || !track) throw new Error('No negotiated microphone channel');
+    if (!audio || !track || transceiverKind(audio) === 'video') {
+      debug('RTC', 'microphone_bind_deferred', { has_audio_transceiver: !!audio && transceiverKind(audio) !== 'video', has_track: !!track }, 'warn');
+      return;
+    }
     stream?.getAudioTracks().forEach((microphoneTrack) => { microphoneTrack.enabled = !micMuted; });
     audio.direction = 'sendrecv';
     await audio.sender.replaceTrack(track);
@@ -6357,7 +6483,25 @@
     const stream = await ensureMedia();
     if (stale()) return null;
     if (peers.has(uid)) return peers.get(uid);
-    const offerer = Number(meId) > Number(uid);
+    const mine = Number(meId);
+    if (!Number.isInteger(mine) || mine <= 0) {
+      // Guessing the offerer before we know our own id makes both sides wait
+      // for an offer that nobody sends.
+      const attempts = identityRetries.get(uid) || 0;
+      if (attempts < 8) {
+        identityRetries.set(uid, attempts + 1);
+        debug('RTC', 'peer_waiting_for_identity', { peer_user_id: uid, attempt: attempts + 1 }, 'warn');
+        setTimeout(() => {
+          if (stale()) return;
+          ensurePeer(uid).then((pc) => {
+            if (pc?._offerer && !pc._negotiated) makeOffer(uid, pc).catch(() => {});
+          }).catch(() => {});
+        }, 400);
+      }
+      return null;
+    }
+    identityRetries.delete(uid);
+    const offerer = mine > Number(uid);
     const polite = !offerer;
     const peerConfig = {
       ...rtcConfig,
@@ -6388,6 +6532,13 @@
     pc._createdAt = Date.now();
     pc._lastNegotiationAt = 0;
     pc._turnValidUntil = rtcHasTurn() ? rtcConfigValidUntil : 0;
+    pc._holdLocalCandidates = true;
+    pc._heldLocalCandidates = [];
+    pc._releaseLocalCandidates = () => {
+      pc._holdLocalCandidates = false;
+      const queued = pc._heldLocalCandidates.splice(0);
+      queued.forEach((candidate) => sendSignal(uid, { kind: 'candidate', candidate }));
+    };
     // Only the offerer creates m-lines. An answerer must bind its microphone to
     // the offered transceiver; pre-created addTransceiver senders stay unassociated.
     if (offerer) {
@@ -6406,7 +6557,8 @@
     pc.onicecandidate = (ev) => {
       if (ev.candidate) {
         debug('RTC', 'ice_candidate', { peer_user_id: uid, protocol: ev.candidate.protocol, type: ev.candidate.type });
-        sendSignal(uid, { kind: 'candidate', candidate: ev.candidate });
+        if (pc._holdLocalCandidates) pc._heldLocalCandidates.push(ev.candidate);
+        else sendSignal(uid, { kind: 'candidate', candidate: ev.candidate });
       } else debug('RTC', 'ice_gathering_complete', { peer_user_id: uid });
     };
     const transportConnected = () => pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
@@ -6695,6 +6847,21 @@
     }
   };
 
+  const earlyCandidateKey = (uid) => `${room?.epoch || 0}:${Number(uid)}`;
+  const rememberEarlyCandidate = (uid, candidate) => {
+    if (!candidate || !room) return;
+    const key = earlyCandidateKey(uid);
+    const queued = earlyCandidates.get(key) || [];
+    queued.push(candidate);
+    if (queued.length > 64) queued.shift();
+    earlyCandidates.set(key, queued);
+  };
+  const takeEarlyCandidates = (uid, pc) => {
+    const queued = earlyCandidates.get(earlyCandidateKey(uid)) || [];
+    earlyCandidates.delete(earlyCandidateKey(uid));
+    queued.forEach((candidate) => pc._pendingCandidates.push(candidate));
+  };
+
   const existingPeer = async (uid) => {
     const epoch = room?.epoch;
     const pc = peers.get(uid);
@@ -6714,7 +6881,18 @@
     // candidate or answer from someone who already left must not create a
     // zombie peer that retries and then reports failure.
     const pc = signal.kind === 'offer' || signal.kind === 'renegotiate' ? await ensurePeer(uid) : await existingPeer(uid);
-    if (!pc) return;
+    if (!pc) {
+      // The offer that creates the peer may still be behind this candidate.
+      if (signal.kind === 'candidate' && signal.candidate) rememberEarlyCandidate(uid, signal.candidate);
+      else if (signal.kind === 'offer' && (identityRetries.get(uid) || 0) > 0 && (identityRetries.get(uid) || 0) < 8) {
+        setTimeout(() => {
+          if ((peerGenerations.get(uid) || 0) === generation) handleSignal(msg).catch(() => {});
+        }, 450);
+      }
+      return;
+    }
+    takeEarlyCandidates(uid, pc);
+    if (pc.remoteDescription) await drainPendingCandidates(uid, pc);
     try {
       if (signal.kind === 'renegotiate') {
         if (pc._offerer) {
@@ -6740,6 +6918,13 @@
         try {
           await pc.setRemoteDescription(signal.sdp);
         } catch (error) {
+          // The offerer missed our answer and sent the same description again.
+          if (pc.signalingState === 'stable' && pc.localDescription?.type === 'answer') {
+            debug('RTC', 'offer_already_answered', { peer_user_id: uid });
+            sendSignal(uid, { kind: 'answer', sdp: pc.localDescription });
+            pc._releaseLocalCandidates?.();
+            return;
+          }
           // fallback for browsers that can't roll ICE back for us.
           if (!offerCollision) throw error;
           await pc.setLocalDescription({ type: 'rollback' });
@@ -6749,7 +6934,11 @@
         pc._failureReported = false;
         reportPeerFailure(uid, pc, false);
         debug('RTC', 'remote_offer_applied', { peer_user_id: uid });
-        await bindPeerMedia(pc, await ensureMedia());
+        try {
+          await bindPeerMedia(pc, await ensureMedia());
+        } catch (error) {
+          debug('RTC', 'microphone_bind_failed', { peer_user_id: uid, error: error.message }, 'warn');
+        }
         if (!room || room.epoch !== pc._roomEpoch || pc.signalingState === 'closed') return;
         await drainPendingCandidates(uid, pc);
         const answer = await pc.createAnswer();
@@ -6757,6 +6946,7 @@
         markNegotiated(pc);
         debug('RTC', 'answer_ready', { peer_user_id: uid });
         sendSignal(uid, { kind: 'answer', sdp: pc.localDescription });
+        pc._releaseLocalCandidates?.();
       } else if (signal.kind === 'answer') {
         if (pc.signalingState === 'have-local-offer') {
           pc._isSettingRemoteAnswerPending = true;
@@ -6769,6 +6959,14 @@
           markNegotiated(pc);
           debug('RTC', 'remote_answer_applied', { peer_user_id: uid });
           await drainPendingCandidates(uid, pc);
+        } else if (!pc.remoteDescription) {
+          // An answer for a description we no longer have cannot be applied.
+          // Ask again with a fresh offer instead of waiting for a page reload.
+          debug('RTC', 'answer_dropped', { peer_user_id: uid, signaling: pc.signalingState }, 'warn');
+          if (pc._offerer) {
+            pc._lastRecoveryAt = 0;
+            restartPeerIce(uid, pc, 'answer_dropped', { force: true });
+          }
         }
       } else if (signal.kind === 'candidate' && signal.candidate) {
         if (pc.remoteDescription) {
@@ -6811,6 +7009,7 @@
     debug('RTC', 'room_joined', { kind, id, participant_count: users.length });
     await ensureMedia();
     if (!room || room.epoch !== epoch) return;
+    rtcLocalDeparture = false;
     if (!room.stateSynced) {
       // The server forgets seat state across a fresh join or reconnect and drops
       // changes made while ringing. Tell it what this client is actually doing.
@@ -6818,18 +7017,41 @@
       sendWs({ type: kind === 'voice' ? 'voice_state' : 'call_state', patch: { muted: micMuted, deafened, screen: !!screenStream, screen_audio: !!screenStream && screenAudioSource !== 'none' } });
     }
     const userId = (u) => Number(u.user_id || u.userId || u.profile?.id || 0);
-    const roster = new Set(users.map(userId).filter((uid) => uid && uid !== meId));
+    const mine = Number(meId);
+    const roster = new Set(users.map(userId).filter((uid) => uid && uid !== mine));
     room.roster = roster;
+    if (!room.joinRosterSeeded) {
+      room.joinRosterSeeded = true;
+      const liveIds = users.filter((user) => !user.reconnecting).map(userId).filter((uid) => uid && uid !== mine);
+      // The caller is already seated when the other person accepts, and that
+      // accept is not delivered as peer-joined. People already in the room
+      // when we enter are not new joins. Reconnecting seats are not seeded,
+      // so their later rejoin still dings.
+      if (callAwaitingFirstGuest) {
+        callAwaitingFirstGuest = false;
+        liveIds.forEach(playPeerJoin);
+      } else {
+        liveIds.forEach((uid) => joinCueIds.add(uid));
+      }
+    }
     // A reconnecting participant has no socket, so offers to them are dropped.
     // Their rejoin announces a fresh session and the connection starts then.
-    const ids = users.filter((u) => !u.reconnecting).map(userId).filter((uid) => uid && uid !== meId);
+    const ids = users.filter((u) => !u.reconnecting).map(userId).filter((uid) => uid && uid !== mine);
     Array.from(peers.keys()).forEach((uid) => { if (!roster.has(uid)) closePeer(uid); });
     ids.forEach((uid) => {
-      const shouldOffer = meId > uid;
+      const shouldOffer = Number(meId) > Number(uid);
       ensurePeer(uid).then((pc) => {
-        if (shouldOffer && pc && !pc._negotiated) callPeer(uid).catch(() => {});
+        if (!pc) return;
+        if (shouldOffer && !pc._negotiated) callPeer(uid).catch(() => {});
+        else if (!shouldOffer && pc.signalingState === 'stable' && !pc.remoteDescription) {
+          // We cannot invent the offer. Asking immediately covers an offer that
+          // was relayed before this client had joined the room.
+          sendSignal(uid, { kind: 'renegotiate' });
+        } else if (shouldOffer && pc.signalingState === 'have-local-offer' && pc.localDescription && !pc.remoteDescription) {
+          sendSignal(uid, { kind: 'offer', sdp: pc.localDescription });
+        }
         // roster wins; remind Elm what RTC already decided.
-        pc?._publishConnectionState?.(true);
+        pc._publishConnectionState?.(true);
       }).catch(() => {});
     });
   };
@@ -6858,6 +7080,16 @@
     }
     if (msg.type === 'account_restored') {
       document.getElementById('plainwire-account-restriction')?.remove();
+      return true;
+    }
+    if (msg.type === 'account_disabled') {
+      const moderation = msg.moderation || {};
+      if (moderation.reason || moderation.title) showAccountRestriction({ ...moderation, state: msg.account_state || 'disabled' });
+      else scheduleAuthReload();
+      return true;
+    }
+    if (msg.type === 'sessions_revoked') {
+      scheduleAuthReload();
       return true;
     }
     if (msg.type === 'system_banners_changed') {
@@ -6917,11 +7149,12 @@
     }
     if ((msg.type === 'call_peer_joined' || msg.type === 'voice_peer_joined') && msg.user_id && eventMatchesRoom(msg)) {
       const peerUid = Number(msg.user_id);
-      if (peerUid && peerUid !== meId) {
+      if (peerUid && peerUid !== Number(meId)) {
+        playPeerJoin(peerUid);
         // A join is always a fresh session on their side (new tab, reload or new
         // socket). Pairing it with our old connection's ICE/DTLS state never connects.
         replacePeerSession(peerUid);
-        const shouldOffer = meId > peerUid;
+        const shouldOffer = Number(meId) > Number(peerUid);
         ensurePeer(peerUid).then((pc) => {
           if (shouldOffer && pc) callPeer(peerUid).catch(() => {});
           pc?._publishConnectionState?.(true);
@@ -6932,6 +7165,12 @@
       const leftUid = Number(msg.user_id);
       screenSharers.delete(leftUid);
       replacePeerSession(leftUid);
+      // Own id, or any leave that arrives while this client is itself departing,
+      // is the echo of us leaving — not someone else leaving.
+      if (leftUid && leftUid !== Number(meId) && !rtcLocalDeparture) {
+        joinCueIds.delete(leftUid);
+        playSound('peerLeave');
+      }
     }
     if ((msg.type === 'voice_signal' || msg.type === 'call_signal') && eventMatchesRoom(msg)) handleSignal(msg).catch(() => {});
     if (['call_declined', 'call_cancelled', 'call_missed', 'call_ended'].includes(msg.type) && eventMatchesRoom(msg)) leaveRtcRoom();
@@ -8565,7 +8804,13 @@
             if (data === true) pendingForcedMessageRoute = location.hash;
             break;
           }
-          pendingForcedMessageRoute = null;
+          const marker = list.querySelector('.unread-marker');
+          if (data === true && !marker) pendingForcedMessageRoute = location.hash;
+          else pendingForcedMessageRoute = null;
+          if (data === true && marker && revealUnreadMarker(list)) {
+            observeMessageHistory();
+            break;
+          }
           if (!messagesPinnedToBottom && data !== true) break;
           scrollMessageListToBottom(data === true);
           list.querySelectorAll('img, video').forEach((media) => {
@@ -8717,9 +8962,10 @@
             rtcAction('start', 'call', res.id, epoch);
             ensureMedia()
               .then(() => {
-                if (!room || room.epoch !== epoch) return;
-                startRingtone('outgoing');
-                sendWs({ type: 'call_ring', conversation_id: res.id });
+            if (!room || room.epoch !== epoch) return;
+            startRingtone('outgoing');
+            callAwaitingFirstGuest = true;
+            sendWs({ type: 'call_ring', conversation_id: res.id });
               })
               .catch(() => {
                 if (room?.epoch === epoch) leaveRtcRoom();
@@ -8736,9 +8982,10 @@
         rtcAction('start', 'call', data, epoch);
         ensureMedia()
           .then(() => {
-            if (!room || room.epoch !== epoch) return;
-            startRingtone('outgoing');
-            sendWs({ type: 'call_ring', conversation_id: data });
+          if (!room || room.epoch !== epoch) return;
+          startRingtone('outgoing');
+          callAwaitingFirstGuest = true;
+          sendWs({ type: 'call_ring', conversation_id: data });
           })
           .catch(() => {
             if (room?.epoch === epoch) leaveRtcRoom();

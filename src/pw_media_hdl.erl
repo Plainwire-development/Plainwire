@@ -41,7 +41,16 @@ serve(Req0, Uid, Token, HeadOnly) ->
     %% actual representation so a remote avatar changed in-place can refresh.
     %% Responses are private because this endpoint is authenticated; a shared
     %% reverse proxy must never replay one user's media response anonymously.
-    case pw_media:fetch(Uid, Token) of
+    %% HEAD never pulls the origin: a cache miss answers from the token alone.
+    Result = case HeadOnly of
+        true -> pw_media:fetch_head(Token);
+        false -> pw_media:fetch(Uid, Token)
+    end,
+    case Result of
+        uncached ->
+            Headers = maps:without([<<"content-length">>, <<"etag">>],
+                media_headers(<<"application/octet-stream">>, <<>>, 0)),
+            {ok, cowboy_req:reply(200, Headers, <<>>, Req0), undefined};
         {ok, Body, Type} ->
             ETag = <<"\"", (pw_util:sha256_hex(Body))/binary, "\"">>,
             Headers = media_headers(Type, ETag, byte_size(Body)),

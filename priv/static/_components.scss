@@ -634,8 +634,8 @@ button, a { touch-action: manipulation; }
   .avatar { width: 42px; height: 42px; }
   .grow { flex: 1; min-width: 0; }
   h2 { margin: 0; font-size: 16px; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  small { display: block; margin-top: 2px; }
-  .btn { min-height: 34px; padding: 0 12px; }
+  small { display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+  .btn { min-height: 34px; padding: 0 12px; flex-shrink: 0; }
 }
 
 .live-dot {
@@ -805,7 +805,7 @@ button, a { touch-action: manipulation; }
 .msg-actions {
   position: absolute;
   right: 8px;
-  top: -8px;
+  top: 4px;
   display: none;
   gap: 0;
   background: var(--bg3);
@@ -901,6 +901,8 @@ button, a { touch-action: manipulation; }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  row-gap: 8px;
   gap: 12px;
   .btn:disabled {
     opacity: .55;
@@ -2979,6 +2981,25 @@ img { max-width: 100%; }
 .rail { gap: 8px; padding-block: 10px; }
 .rail-btn, .rail-btn .server-icon { width: 46px; height: 46px; }
 .rail-btn { overflow: visible; }
+.rail-btn .rail-count, .channel-link .rail-count {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  z-index: 1;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  font-size: 10px;
+  line-height: 16px;
+  pointer-events: none;
+  box-shadow: 0 0 0 2px var(--bg4);
+}
+.channel-link { position: relative; }
+.channel-link .rail-count {
+  position: static;
+  box-shadow: none;
+  flex-shrink: 0;
+}
 .rail-btn::before { left: -13px; }
 .rail-btn.active::before { height: 32px; }
 .rail-btn .server-icon { overflow: hidden; }
@@ -3130,6 +3151,12 @@ img { max-width: 100%; }
   min-height: 86px;
   padding: 18px 0;
   border-bottom: 1px solid color-mix(in srgb, var(--line), transparent 28%);
+  @media (max-width: 720px) {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 12px;
+    min-height: 0;
+  }
 }
 .setting-copy { display: flex; align-items: center; gap: 14px; min-width: 0; }
 .setting-icon { display: grid; flex: 0 0 38px; width: 38px; height: 38px; place-items: center; border: 1px solid color-mix(in srgb, var(--accent), transparent 68%); border-radius: 10px; color: #aeb5ff; background: rgba(88,101,242,.1); font-size: 16px; }
@@ -3138,6 +3165,9 @@ img { max-width: 100%; }
 .settings-switch-knob { position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,.35); transition: transform .16s ease; }
 .settings-switch.active .settings-switch-knob { transform: translateX(20px); }
 .settings-action { min-width: 130px; }
+@media (max-width: 720px) {
+  .settings-action { min-width: 0; width: 100%; }
+}
 .setting-row:last-child { border-bottom: 0; }
 .setting-row b, .setting-row small { display: block; }
 .setting-row small { margin-top: 3px; line-height: 1.35; }
@@ -3283,7 +3313,13 @@ img { max-width: 100%; }
   font-size: 12px;
   font-style: italic;
 }
+.server-channel-list .row .badge,
+.server-channel-card .row .badge {
+  flex: 0 0 auto;
+  margin-left: 0;
+}
 .channel-category-select {
+  flex: 0 1 92px;
   width: 92px;
   min-width: 72px;
   max-width: 92px;

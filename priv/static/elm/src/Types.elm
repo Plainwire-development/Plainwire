@@ -351,6 +351,7 @@ type alias Notification =
     , url : String
     , seen : Bool
     , createdAt : Int
+    , serverId : Maybe Int
     }
 
 
@@ -605,6 +606,8 @@ type alias Model =
     , micTesting : Bool
     , micTestLevel : Int
     , micMonitoring : Bool
+    , entryReadId : Maybe Int
+    , entryReadCaptured : Bool
     }
 
 
@@ -1057,13 +1060,14 @@ decodeFriend =
 
 decodeNotification : D.Decoder Notification
 decodeNotification =
-    D.map6 Notification
+    D.map7 Notification
         (D.field "id" D.int)
         (D.field "kind" D.string)
         (D.field "body" D.string)
         (D.field "url" D.string |> defaultValue "#")
         (D.field "seen" D.bool)
         (D.field "created_at" D.int)
+        (D.field "server_id" (D.nullable D.int) |> defaultValue Nothing)
 
 
 decodeSyncData : D.Decoder { notifications : List Notification, conversations : List Conversation, servers : List Server, friends : List Friend, now : Int, syncWarnings : List String }

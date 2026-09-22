@@ -112,8 +112,9 @@ droppable(presence_state) -> true;
 droppable(presence_online) -> true;
 droppable(presence_offline) -> true;
 droppable(presence_status) -> true;
-droppable(voice_state) -> true;
-droppable(call_state) -> true;
+%% Roster snapshots are how a call learns who to connect to. Dropping one
+%% leaves a pair silent until somebody reloads. Mute and join updates are
+%% rare; speaking indicators stay droppable below.
 droppable(voice_activity) -> true;
 droppable(call_activity) -> true;
 droppable(typing) -> true;

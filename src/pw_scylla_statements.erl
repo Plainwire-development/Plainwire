@@ -3,7 +3,7 @@
 
 all() ->
     [{pw_msg_insert,
-      <<"INSERT INTO messages_by_scope_bucket (scope,scope_id,bucket_start,message_id,user_id,body,reply_to_id,created_at,edited_at,deleted_at,kind,forwarded_from_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)">>},
+      <<"INSERT INTO messages_by_scope_bucket (scope,scope_id,bucket_start,message_id,user_id,body,reply_to_id,created_at,edited_at,deleted_at,kind,forwarded_from_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) USING TIMESTAMP ?">>},
      {pw_msg_locator_insert,
       <<"INSERT INTO message_locator_by_id (message_id,scope,scope_id,bucket_start,created_at) VALUES (?,?,?,?,?)">>},
      {pw_msg_locator_get,
@@ -25,11 +25,11 @@ all() ->
      {pw_msg_after,
       <<"SELECT message_id,user_id,body,reply_to_id,created_at,edited_at,deleted_at,kind,forwarded_from_id FROM messages_by_scope_bucket WHERE scope=? AND scope_id=? AND bucket_start=? AND message_id>? ORDER BY message_id ASC LIMIT ?">>},
      {pw_msg_edit,
-      <<"UPDATE messages_by_scope_bucket SET body=?,edited_at=? WHERE scope=? AND scope_id=? AND bucket_start=? AND message_id=?">>},
+      <<"UPDATE messages_by_scope_bucket USING TIMESTAMP ? SET body=?,edited_at=? WHERE scope=? AND scope_id=? AND bucket_start=? AND message_id=?">>},
      {pw_msg_delete,
-      <<"UPDATE messages_by_scope_bucket SET body='',deleted_at=? WHERE scope=? AND scope_id=? AND bucket_start=? AND message_id=?">>},
+      <<"UPDATE messages_by_scope_bucket USING TIMESTAMP ? SET body='',deleted_at=? WHERE scope=? AND scope_id=? AND bucket_start=? AND message_id=?">>},
      {pw_msg_hard_delete,
-      <<"DELETE FROM messages_by_scope_bucket WHERE scope=? AND scope_id=? AND bucket_start=? AND message_id=?">>},
+      <<"DELETE FROM messages_by_scope_bucket USING TIMESTAMP ? WHERE scope=? AND scope_id=? AND bucket_start=? AND message_id=?">>},
      {pw_msg_locator_delete,
       <<"DELETE FROM message_locator_by_id WHERE message_id=?">>},
      {pw_write_intent_bucket_touch,

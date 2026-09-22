@@ -3,7 +3,7 @@
 -export([start_link/0, enabled/0, public_host/0, send/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -ifdef(TEST).
--export([central_host/1, smtp_configured/0, compose/1, public_url/0]).
+-export([central_host/1, smtp_configured/0, compose/1, public_url/0, rfc822/4]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -128,7 +128,7 @@ central_host(Host) ->
     Host =:= <<"plainwi.re">> orelse Host =:= <<"www.plainwi.re">>.
 
 compose(#{kind := Kind, to := To, token := Token} = Mail) when Kind =:= password_reset; Kind =:= email_verify ->
-    App = case maps:get(app_name, Mail, <<>>) of
+    App = case header_safe(maps:get(app_name, Mail, <<>>)) of
         <<>> -> <<"Plainwire">>;
         Name -> Name
     end,
@@ -397,10 +397,29 @@ close_sock({ssl, Sock}) ->
     try ssl:close(Sock) catch _:_ -> ok end;
 close_sock(_) -> ok.
 
-rfc822(From, To, Subject, Text) ->
+header_safe(Value) ->
+    Bin = pw_util:bin(Value),
+    binary:replace(binary:replace(Bin, <<"\r">>, <<>>, [global]), <<"\n">>, <<>>, [global]).
+
+%% Body lines are built with LF. Stuff any line that starts with a dot, then
+%% emit CRLF so a lone "." cannot be read as the end of DATA.
+smtp_dot_stuff(Text0) ->
+    Text1 = binary:replace(pw_util:bin(Text0), <<"\r\n">>, <<"\n">>, [global]),
+    Text = binary:replace(Text1, <<"\r">>, <<"\n">>, [global]),
+    Lines = binary:split(Text, <<"\n">>, [global]),
+    Stuffed = [case Line of
+        <<".", _/binary>> -> <<".", Line/binary>>;
+        Line -> Line
+    end || Line <- Lines],
+    iolist_to_binary(lists:join(<<"\r\n">>, Stuffed)).
+
+rfc822(From0, To0, Subject0, Text) ->
+    From = header_safe(From0),
+    To = header_safe(To0),
+    Subject = header_safe(Subject0),
     Date = iolist_to_binary(httpd_util:rfc1123_date()),
     Id = iolist_to_binary([pw_util:random_token(12), "@plainwire"]),
-    SafeText = binary:replace(Text, <<"\r\n.">>, <<"\r\n..">>, [global]),
+    SafeText = smtp_dot_stuff(Text),
     iolist_to_binary([
         "From: Plainwire <", From, ">\r\n",
         "To: <", To, ">\r\n",

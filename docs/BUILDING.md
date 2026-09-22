@@ -1,6 +1,6 @@
 # Building Plainwire
 
-Use GNU Make 4.3 or newer (`gmake` on FreeBSD). Node.js 20.19+ (22+ recommended), npm, Python 3.9+, Erlang/OTP 27+ and rebar3 are required for the standard build. Native call health additionally needs a C11 compiler, gfortran and the matching libgfortran runtime on the deployment host. The optional cluster profile requires OTP 27+ and installed OTP sources.
+Use GNU Make 4.3 or newer (`gmake` on FreeBSD). Node.js 20.19+ (22+ recommended), npm, Python 3.9+, Erlang/OTP 27, 28, or 29, and rebar3 are required for the standard build. OTP 29 needs the repository's erlcass compile hook (`scripts/compile-erlcass.sh`, wired from `rebar.config`); that hook also works on OTP 27 and 28. A missing Scylla native driver does not block the PostgreSQL build. Native call health additionally needs a C11 compiler, gfortran and the matching libgfortran runtime on the deployment host. The optional cluster profile requires OTP 27+ and installed OTP sources. PostgreSQL is required to run the server. Redis and ScyllaDB are optional.
 
 ```sh
 make help

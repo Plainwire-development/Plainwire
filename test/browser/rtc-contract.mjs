@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
 const [elm, bridge, hub, ws] = await Promise.all([
-  readFile('priv/static/elm/src/Main.elm', 'utf8'),
+  Promise.all(['priv/static/elm/src/Main.elm','priv/static/elm/src/View/App.elm','priv/static/elm/src/View/Messages.elm','priv/static/elm/src/View/Settings.elm','priv/static/elm/src/View/Ui.elm'].map((path) => readFile(path, 'utf8'))).then((parts) => parts.join('\n')),
   readFile('priv/static/elm-bridge.js', 'utf8'),
   readFile('src/pw_hub.erl', 'utf8'),
   readFile('src/pw_ws.erl', 'utf8')

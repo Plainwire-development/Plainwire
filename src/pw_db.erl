@@ -16,7 +16,7 @@
     incoming_webhooks/2, create_incoming_webhook/4, rotate_incoming_webhook/3, delete_incoming_webhook/3, execute_incoming_webhook/4,
     server_webhook_deliveries/4, retry_server_webhook_delivery/4,
     webhook_claim_due/1, webhook_finish/2, webhook_prune/0,
-    storage_outbox_claim/1, storage_outbox_finish/2, storage_outbox_prune/0, storage_status/0, storage_migration_page/2, storage_migration_checkpoint/0, storage_migration_set_checkpoint/2, storage_reconcile_page/1,
+    storage_outbox_claim/1, storage_outbox_finish/3, storage_outbox_prune/0, storage_status/0, storage_migration_page/2, storage_migration_checkpoint/0, storage_migration_set_checkpoint/2, storage_reconcile_page/1,
     storage_pg_message_get/1, storage_pg_message_recent/3, storage_pg_message_before/4, storage_pg_message_after/4, storage_pg_message_bulk/1, storage_pg_message_edit/3, storage_pg_message_delete/2,
     server_bots/2, create_server_bot/3, rotate_server_bot/3, delete_server_bot/3, authenticate_bot/1, bot_server/2, bot_members/4, bot_post_channel_message/4,
     developer_apps/1, developer_app/2, create_developer_app/2, update_developer_app/3, delete_developer_app/2,
@@ -336,7 +336,7 @@ webhook_claim_due(Limit) -> call({webhook_claim_due, Limit}).
 webhook_finish(Id, Result) -> call({webhook_finish, Id, Result}).
 webhook_prune() -> call(webhook_prune).
 storage_outbox_claim(Limit) -> call({storage_outbox_claim, Limit}).
-storage_outbox_finish(Id, Result) -> call({storage_outbox_finish, Id, Result}).
+storage_outbox_finish(Id, LockedAt, Result) -> call({storage_outbox_finish, Id, LockedAt, Result}).
 storage_outbox_prune() -> call(storage_outbox_prune).
 storage_status() -> call(storage_status).
 storage_migration_page(AfterId, Limit) -> call({storage_migration_page, AfterId, Limit}).
@@ -749,7 +749,7 @@ read_msg({webhook_claim_due, _}) -> false;
 read_msg({webhook_finish, _, _}) -> false;
 read_msg(webhook_prune) -> false;
 read_msg({storage_outbox_claim, _}) -> false;
-read_msg({storage_outbox_finish, _, _}) -> false;
+read_msg({storage_outbox_finish, _, _, _}) -> false;
 read_msg(storage_outbox_prune) -> false;
 read_msg({storage_migration_set_checkpoint, _, _}) -> false;
 read_msg({storage_pg_message_edit, _, _, _}) -> false;
@@ -1305,7 +1305,8 @@ route({admin_user, Uid}, Conn) ->
         "(SELECT count(*) FROM uploads up WHERE up.user_id=u.id AND up.status='ready'),"
         "COALESCE((SELECT sum(size) FROM uploads up WHERE up.user_id=u.id AND up.status='ready'),0),"
         "(SELECT count(*) FROM sessions s WHERE s.user_id=u.id AND s.expires_at>$2),"
-        "u.account_state,u.is_bot,u.moderation_title,u.moderation_reason,u.moderation_severity,u.moderation_expires_at,u.moderated_by,u.moderated_at "
+        "u.account_state,u.is_bot,u.moderation_title,u.moderation_reason,u.moderation_severity,u.moderation_expires_at,u.moderated_by,u.moderated_at,"
+        "u.disabled_at,(u.email <> ''),u.email_verified "
         "FROM users u WHERE u.id=$1", [Uid, pw_util:now_ms()]) of
         {ok, Row} when is_list(Row) -> {ok, admin_user_detail(Row)};
         _ -> {error, not_found}
@@ -1340,62 +1341,14 @@ route({admin_user_moderation_history, ActorUid, TargetUid0}, Conn) ->
                   || [Id, Action, Title, Reason, Severity, ExpiresAt, CreatedAt, Actor, ActorUsername] <- Rows]}
     end;
 route({admin_apply_user_moderation, ActorUid, TargetUid0, Action0, Patch0}, Conn) ->
-    TargetUid = pw_util:int(TargetUid0), Action = normalize_instance_moderation_action(Action0),
-    Patch = normalize_instance_moderation_patch(Patch0, Action),
-    case {Action, Patch, TargetUid} of
-        {invalid, _, _} -> {error, invalid_action};
-        {_, {error, Reason}, _} -> {error, Reason};
-        {_, _, Uid} when not is_integer(Uid); Uid =< 0 -> {error, not_found};
-        {_, {ok, Moderation}, Uid} ->
-            Result = with_tx(Conn, fun() ->
-                %% Serialize operator-role checks with the action so demotion and
-                %% moderation cannot race each other across admin nodes.
-                ok = exec(Conn, "LOCK TABLE admin_operators IN SHARE MODE", []),
-                case moderation_actor_allowed(Conn, ActorUid, Uid) of
-                    {error, Reason} -> {error, Reason};
-                    ok ->
-                        case one(Conn, "SELECT id,account_state FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
-                            {ok, [_Id, _OldState]} ->
-                                Now = pw_util:now_ms(),
-                                NewState = moderation_action_state(Action),
-                                Title = maps:get(title, Moderation), ReasonText = maps:get(reason, Moderation),
-                                Severity = maps:get(severity, Moderation), ExpiresAt = maps:get(expires_at, Moderation),
-                                case Action of
-                                    restore ->
-                                        ok = exec(Conn,
-                                            "UPDATE users SET account_state='active',moderation_title='',moderation_reason='',moderation_severity='warning',moderation_expires_at=0,moderated_by=$2,moderated_at=$3,updated_at=$3 WHERE id=$1",
-                                            [Uid, ActorUid, Now]);
-                                    _ ->
-                                        ok = exec(Conn,
-                                            "UPDATE users SET account_state=$2,moderation_title=$3,moderation_reason=$4,moderation_severity=$5,moderation_expires_at=$6,moderated_by=$7,moderated_at=$8,updated_at=$8 WHERE id=$1",
-                                            [Uid, NewState, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now])
-                                end,
-                                {ok, SessionRows} = rows(Conn, "DELETE FROM sessions WHERE user_id=$1 RETURNING token_hash", [Uid]),
-                                ok = exec(Conn, "DELETE FROM admin_sessions WHERE user_id=$1", [Uid]),
-                                ok = exec(Conn,
-                                    "INSERT INTO instance_account_actions(user_id,actor_user_id,action,title,reason,severity,expires_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
-                                    [Uid, ActorUid, atom_to_binary(Action, utf8), Title, ReasonText, Severity, ExpiresAt, Now]),
-                                Detail = moderation_audit_detail(Action, Title, ReasonText, Severity, ExpiresAt),
-                                admin_audit_insert(Conn, ActorUid, <<"account.", (atom_to_binary(Action, utf8))/binary>>, <<"user">>, integer_to_binary(Uid), Detail, <<>>, Now),
-                                {ok, #{user_id => Uid, account_state => NewState,
-                                    moderation => moderation_public_map(NewState, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now),
-                                    session_hashes => [only_id(R) || R <- SessionRows]}};
-                            _ -> {error, not_found}
-                        end
-                end
-            end),
-            case Result of
-                {ok, #{session_hashes := Hashes, user_id := UserId} = Data} ->
-                    [ets:delete(?SESSION_CACHE, H) || H <- Hashes],
-                    invalidate_session_cache(UserId),
-                    pw_redis:presence_delete(UserId),
-                    pw_upload_gc:invalidate_user(UserId),
-                    Public = maps:remove(session_hashes, Data),
-                    EventType = case Action of restore -> account_restored; _ -> account_restricted end,
-                    pw_hub:notify_user(UserId, #{type => EventType, account_state => maps:get(account_state, Public), moderation => maps:get(moderation, Public)}),
-                    {ok, Public};
-                Other -> Other
-            end
+    TargetUid = pw_util:int(TargetUid0),
+    Action = normalize_instance_moderation_action(Action0),
+    case Action of
+        revoke_sessions -> admin_account_maintenance(Conn, ActorUid, TargetUid, Action);
+        clear_display_name -> admin_account_maintenance(Conn, ActorUid, TargetUid, Action);
+        remove_email -> admin_account_maintenance(Conn, ActorUid, TargetUid, Action);
+        resend_verification -> admin_account_maintenance(Conn, ActorUid, TargetUid, Action);
+        _ -> apply_instance_moderation(Conn, ActorUid, TargetUid, Action, Patch0)
     end;
 route({admin_servers, Q0, Limit0, Offset0}, Conn) ->
     Q = pw_util:clean_text(Q0, 100),
@@ -1618,6 +1571,11 @@ route({login, U0, P0}, Conn) ->
                         <<"suspended">> ->
                             {error, {account_restricted, moderation_public_map(AccountState, Title, Reason, Severity, ExpiresAt, null, ModeratedAt)}};
                         <<"banned">> ->
+                            {error, {account_restricted, moderation_public_map(AccountState, Title, Reason, Severity, ExpiresAt, null, ModeratedAt)}};
+                        <<"disabled">> when is_binary(Reason), Reason =/= <<>> ->
+                            %% Self-service disable leaves the moderation reason empty and
+                            %% still reactivates on the next correct password. An operator
+                            %% disable records a reason and stays disabled until restore.
                             {error, {account_restricted, moderation_public_map(AccountState, Title, Reason, Severity, ExpiresAt, null, ModeratedAt)}};
                         _ ->
                             Reactivated = AccountState =:= <<"disabled">>,
@@ -2093,7 +2051,7 @@ route({sync, Uid, Since0}, Conn) ->
     {Notifs, W1} = sync_component(notifications, [], fun() ->
         case Since > 0 of
             true ->
-                case rows(Conn, "SELECT id, kind, body, url, seen, created_at FROM notifications WHERE user_id = $1 AND created_at > $2 ORDER BY id DESC LIMIT 120", [Uid, Since]) of
+                case rows(Conn, notification_select() ++ " WHERE n.user_id = $1 AND n.created_at > $2 ORDER BY n.id DESC LIMIT 120", [Uid, Since]) of
                     {ok, Rows} -> {ok, [notification_map(R) || R <- Rows]};
                     {error, Reason} -> erlang:error({sql_error, Reason})
                 end;
@@ -2127,7 +2085,13 @@ route({profile, Viewer, UserId0}, Conn) ->
         {ok, U} ->
             Rel = friendship_status(Conn, Viewer, UserId),
             %% source URLs are private edit state, and data URLs can be huge.
-            Public = maps:without([avatar_source_url, banner_source_url], U),
+            %% Email belongs on /api/me only. Another member's profile must not
+            %% carry it, verified or not.
+            Public0 = maps:without([avatar_source_url, banner_source_url], U),
+            Public = case Viewer =:= UserId of
+                true -> Public0;
+                false -> maps:without([email, email_verified], Public0)
+            end,
             {ok, #{user => Public, relationship => Rel}};
         E ->
             E
@@ -2148,21 +2112,28 @@ route({friend_request, Uid, Target0}, Conn) ->
             Now = pw_util:now_ms(),
             case one(Conn, "SELECT id FROM users WHERE id = $1", [Target]) of
                 {ok, [_]} ->
-                    case one(Conn, "SELECT status FROM friendships WHERE user_low = $1 AND user_high = $2", [A, B]) of
-                        {ok, [<<"accepted">>]} ->
-                            {ok, #{status => accepted}};
-                        {ok, [<<"blocked">>]} ->
-                            {error, forbidden};
-                        _ ->
-                            Sql = "INSERT INTO friendships(user_low, user_high, requester_id, addressee_id, status, created_at, updated_at) "
-                                  "VALUES($1,$2,$3,$4,$5,$6,$7) "
-                                  "ON CONFLICT (user_low, user_high) DO UPDATE SET "
-                                  "requester_id = EXCLUDED.requester_id, addressee_id = EXCLUDED.addressee_id, "
-                                  "status = 'pending', updated_at = EXCLUDED.updated_at",
-                            ok = exec(Conn, Sql, [A, B, Uid, Target, <<"pending">>, Now, Now]),
+                    %% The conflict predicate is what makes this race-safe. A block
+                    %% or an already-accepted pair that lands between a status read
+                    %% and this write must not be rewritten back to pending.
+                    Sql = "INSERT INTO friendships(user_low, user_high, requester_id, addressee_id, status, created_at, updated_at) "
+                          "VALUES($1,$2,$3,$4,$5,$6,$7) "
+                          "ON CONFLICT (user_low, user_high) DO UPDATE SET "
+                          "requester_id = EXCLUDED.requester_id, addressee_id = EXCLUDED.addressee_id, "
+                          "status = 'pending', updated_at = EXCLUDED.updated_at "
+                          "WHERE friendships.status = 'pending' "
+                          "RETURNING status",
+                    case one(Conn, Sql, [A, B, Uid, Target, <<"pending">>, Now, Now]) of
+                        {ok, [<<"pending">>]} ->
                             best_effort_user_notification(Conn, Target, <<"friend_request">>, <<"New friend request">>, <<"#/friends">>, Now,
                                 #{type => friend_request, from_user_id => Uid}),
-                            {ok, #{status => pending}}
+                            {ok, #{status => pending}};
+                        {ok, undefined} ->
+                            case one(Conn, "SELECT status FROM friendships WHERE user_low = $1 AND user_high = $2", [A, B]) of
+                                {ok, [<<"accepted">>]} -> {ok, #{status => accepted}};
+                                {ok, [<<"pending">>]} -> {ok, #{status => pending}};
+                                _ -> {error, forbidden}
+                            end;
+                        _ -> {error, forbidden}
                     end;
                 _ ->
                     {error, invalid_user}
@@ -3668,16 +3639,23 @@ route({storage_outbox_claim, Limit0}, Conn) ->
             "AND older.kind IN ('message.upsert','message.hard_delete') AND older.status IN ('pending','running'))) "
             "ORDER BY o.id ASC FOR UPDATE OF o SKIP LOCKED LIMIT $2) "
             "UPDATE storage_outbox o SET status='running',attempts=o.attempts+1,locked_at=$1,updated_at=$1 FROM picked p "
-            "WHERE o.id=p.id RETURNING o.id,o.kind,o.entity_id,o.payload,o.attempts,o.entity_scope,o.entity_scope_id,o.entity_created_at", [Now, Limit]),
+            "WHERE o.id=p.id RETURNING o.id,o.kind,o.entity_id,o.payload,o.attempts,o.entity_scope,o.entity_scope_id,o.entity_created_at,o.locked_at", [Now, Limit]),
         {ok, [#{id => Id, kind => Kind, entity_id => EntityId, payload => Payload, attempts => Attempts,
-                entity_scope => EntityScope, entity_scope_id => EntityScopeId, entity_created_at => EntityCreatedAt}
-              || [Id,Kind,EntityId,Payload,Attempts,EntityScope,EntityScopeId,EntityCreatedAt] <- Rows]}
+                entity_scope => EntityScope, entity_scope_id => EntityScopeId, entity_created_at => EntityCreatedAt,
+                locked_at => LockedAt}
+              || [Id,Kind,EntityId,Payload,Attempts,EntityScope,EntityScopeId,EntityCreatedAt,LockedAt] <- Rows]}
     end);
-route({storage_outbox_finish, Id0, Result}, Conn) ->
-    Id = pw_util:int(Id0), Now = pw_util:now_ms(),
+route({storage_outbox_finish, Id0, LockedAt0, Result}, Conn) ->
+    Id = pw_util:int(Id0),
+    LockedAt = case pw_util:int(LockedAt0) of I when is_integer(I) -> I; _ -> -1 end,
+    Now = pw_util:now_ms(),
     with_tx(Conn, fun() ->
-        case one(Conn, "SELECT kind,attempts FROM storage_outbox WHERE id=$1 FOR UPDATE", [Id]) of
-            {ok, [Kind, Attempts]} ->
+        case one(Conn, "SELECT kind,attempts,status,locked_at FROM storage_outbox WHERE id=$1 FOR UPDATE", [Id]) of
+            {ok, [_Kind, _Attempts, Status, DbLocked]} when Status =/= <<"running">> orelse DbLocked =/= LockedAt ->
+                %% The lease was reclaimed and another worker owns this row.
+                %% Touching it would let a late writer mark a newer claim delivered.
+                {ok, #{stale => true}};
+            {ok, [Kind, Attempts, <<"running">>, LockedAt]} ->
                 case Result of
                     ok ->
                         ok = exec(Conn, "UPDATE storage_outbox SET status='delivered',locked_at=0,last_error='',updated_at=$1 WHERE id=$2", [Now, Id]),
@@ -4837,6 +4815,7 @@ route({messages, Uid, Scope0, ScopeId0, Before0, After0}, Conn) ->
     After = pw_util:int(After0),
     case can_read_messages(Conn, Uid, Scope, ScopeId) of
         true ->
+            maybe_dismiss_scope_notifications(Conn, Uid, Scope, ScopeId, Before, After),
             case message_cache_lookup(Uid, Scope, ScopeId, Before, After) of
                 {hit, Cached} -> {ok, Cached};
                 {miss, VersionBefore} ->
@@ -4920,6 +4899,9 @@ route({set_message_pin, Uid, Mid0, Pinned0}, Conn) ->
                                         case one(Conn, "SELECT pinned_at FROM message_pins WHERE message_id=$1 AND channel_id=$2", [I, ChannelId]) of
                                             {ok, [PinnedAt]} -> {ok, #{message_id => I, channel_id => ChannelId, server_id => Sid, pinned => true, pinned_at => PinnedAt}};
                                             _ ->
+                                                %% Serialize the cap on the channel, not on one message row.
+                                                %% Two different messages can otherwise both observe 49.
+                                                ok = exec(Conn, "SELECT pg_advisory_xact_lock($1::int, $2::int)", [ChannelId, 910050]),
                                                 {ok, [Count]} = one(Conn, "SELECT count(*) FROM message_pins WHERE channel_id=$1", [ChannelId]),
                                                 case Count >= 50 of
                                                     true -> {error, pin_limit};
@@ -5220,21 +5202,23 @@ route({conversations, Uid}, Conn) ->
     Sql = "SELECT dt.id, dt.name, dt.avatar_url, dt.owner_id, dt.created_at, dt.updated_at, "
           "dm.last_read_message_id, dm.muted, dm.request_state, dm.group_role, "
           "(SELECT count(*) FROM direct_members WHERE thread_id = dt.id), "
-          "lm.body, lm.id, COALESCE(lm.user_id, 0), COALESCE(lm.display_name, ''), COALESCE(lm.username, ''), "
-          "(SELECT count(*) FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL "
-          "AND id > dm.last_read_message_id AND user_id <> $1), "
-          "COALESCE((SELECT u.id FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
-          "WHERE dm2.thread_id = dt.id AND dm2.user_id <> $1 ORDER BY u.display_name ASC LIMIT 1), 0), "
-          "COALESCE((SELECT u.display_name FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
-          "WHERE dm2.thread_id = dt.id AND dm2.user_id <> $1 ORDER BY u.display_name ASC LIMIT 1), ''), "
-          "COALESCE((SELECT u.avatar_url FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
-          "WHERE dm2.thread_id = dt.id AND dm2.user_id <> $1 ORDER BY u.display_name ASC LIMIT 1), ''), "
-          "COALESCE((SELECT u.username FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
-          "WHERE dm2.thread_id = dt.id AND dm2.user_id <> $1 ORDER BY u.display_name ASC LIMIT 1), '') "
+          "CASE WHEN block.blocked THEN NULL ELSE lm.body END, lm.id, COALESCE(lm.user_id, 0), COALESCE(lm.display_name, ''), COALESCE(lm.username, ''), "
+          "CASE WHEN block.blocked THEN 0 ELSE (SELECT count(*) FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL "
+          "AND id > dm.last_read_message_id AND user_id <> $1) END, "
+          "COALESCE(peer.id, 0), COALESCE(peer.display_name, ''), COALESCE(peer.avatar_url, ''), COALESCE(peer.username, '') "
           "FROM direct_threads dt JOIN direct_members dm ON dm.thread_id = dt.id AND dm.user_id = $1 "
           "LEFT JOIN LATERAL (SELECT m.id, m.body, m.user_id, u.display_name, u.username "
           "FROM messages m JOIN users u ON u.id = m.user_id WHERE m.scope = 'direct' AND m.scope_id = dt.id "
           "AND m.deleted_at IS NULL ORDER BY m.id DESC LIMIT 1) lm ON true "
+          "LEFT JOIN LATERAL (SELECT EXISTS ("
+          "SELECT 1 FROM direct_members other "
+          "JOIN friendships f ON f.user_low = LEAST(dm.user_id, other.user_id) "
+          "AND f.user_high = GREATEST(dm.user_id, other.user_id) AND f.status = 'blocked' "
+          "WHERE other.thread_id = dt.id AND other.user_id <> dm.user_id) AS blocked) block ON true "
+          "LEFT JOIN LATERAL (SELECT u.id, u.display_name, u.avatar_url, u.username "
+          "FROM direct_members dm2 JOIN users u ON u.id = dm2.user_id "
+          "WHERE dm2.thread_id = dt.id AND dm2.user_id <> $1 "
+          "ORDER BY u.display_name ASC LIMIT 1) peer ON true "
           "WHERE dm.hidden = false "
           "ORDER BY dt.updated_at DESC",
     {ok, Rows} = rows(Conn, Sql, [Uid]),
@@ -5518,6 +5502,7 @@ route({mark_conversation_read, Uid, Cid0}, Conn) ->
         true ->
             {ok, [LastId]} = one(Conn, "SELECT COALESCE(max(id), 0) FROM messages WHERE scope = 'direct' AND scope_id = $1", [Cid]),
             ok = exec(Conn, "UPDATE direct_members SET last_read_message_id = $1 WHERE thread_id = $2 AND user_id = $3", [LastId, Cid, Uid]),
+            _ = mark_url_seen0(Conn, Uid, <<"#/dm/", (integer_to_binary(Cid))/binary>>),
             {ok, #{read => true, last_read_message_id => LastId}};
         false ->
             {error, forbidden}
@@ -5606,7 +5591,7 @@ route({record_call_event, Uid, Cid0, Kind, Text}, Conn) ->
         Other -> Other
     end;
 route({notifications, Uid}, Conn) ->
-    {ok, Rows} = rows(Conn, "SELECT id, kind, body, url, seen, created_at FROM notifications WHERE user_id = $1 ORDER BY id DESC LIMIT 120", [Uid]),
+    {ok, Rows} = rows(Conn, notification_select() ++ " WHERE n.user_id = $1 ORDER BY n.id DESC LIMIT 120", [Uid]),
     {ok, [notification_map(R) || R <- Rows]};
 route({mark_notifications_seen, Uid}, Conn) ->
     ok = exec(Conn, "UPDATE notifications SET seen = true WHERE user_id = $1", [Uid]),
@@ -6114,574 +6099,9 @@ migrate_to(Conn, Version, Sqls) ->
         Other -> erlang:error({migration_failed, Version, Other})
     end.
 
-migrations() -> [
-    {1, [
-        "CREATE TABLE IF NOT EXISTS users(id serial PRIMARY KEY, username text UNIQUE NOT NULL, display_name text NOT NULL, "
-        "password_hash text NOT NULL, password_salt text NOT NULL, bio text NOT NULL DEFAULT '', avatar_url text NOT NULL DEFAULT '', "
-        "banner_url text NOT NULL DEFAULT '', status text NOT NULL DEFAULT '', theme text NOT NULL DEFAULT 'system', "
-        "created_at bigint NOT NULL, updated_at bigint NOT NULL, last_seen bigint NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS sessions(token_hash text PRIMARY KEY, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
-        "csrf text NOT NULL, created_at bigint NOT NULL, expires_at bigint NOT NULL, last_seen bigint NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS forums(id serial PRIMARY KEY, slug text UNIQUE NOT NULL, name text NOT NULL, description text NOT NULL, position integer NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS forum_members(forum_id integer NOT NULL REFERENCES forums(id) ON DELETE CASCADE, "
-        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, joined_at bigint NOT NULL, PRIMARY KEY(forum_id, user_id))",
-        "CREATE TABLE IF NOT EXISTS threads(id serial PRIMARY KEY, forum_id integer NOT NULL REFERENCES forums(id) ON DELETE CASCADE, "
-        "user_id integer NOT NULL REFERENCES users(id), title text NOT NULL, body text NOT NULL, created_at bigint NOT NULL, "
-        "updated_at bigint NOT NULL, reply_count integer NOT NULL DEFAULT 0, locked boolean NOT NULL DEFAULT false, "
-        "pinned boolean NOT NULL DEFAULT false, views integer NOT NULL DEFAULT 0, score integer NOT NULL DEFAULT 0, "
-        "upvotes integer NOT NULL DEFAULT 0, downvotes integer NOT NULL DEFAULT 0)",
-        "CREATE TABLE IF NOT EXISTS replies(id serial PRIMARY KEY, thread_id integer NOT NULL REFERENCES threads(id) ON DELETE CASCADE, "
-        "user_id integer NOT NULL REFERENCES users(id), body text NOT NULL, created_at bigint NOT NULL, updated_at bigint NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS friendships(user_low integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
-        "user_high integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, requester_id integer NOT NULL REFERENCES users(id), "
-        "addressee_id integer NOT NULL REFERENCES users(id), status text NOT NULL CHECK(status IN ('pending','accepted','blocked')), "
-        "created_at bigint NOT NULL, updated_at bigint NOT NULL, PRIMARY KEY(user_low, user_high))",
-        "CREATE TABLE IF NOT EXISTS servers(id serial PRIMARY KEY, owner_id integer NOT NULL REFERENCES users(id), name text NOT NULL, "
-        "description text NOT NULL, icon_url text NOT NULL DEFAULT '', created_at bigint NOT NULL, updated_at bigint NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS server_members(server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, "
-        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, role text NOT NULL DEFAULT 'member', "
-        "muted boolean NOT NULL DEFAULT false, joined_at bigint NOT NULL, PRIMARY KEY(server_id, user_id))",
-        "CREATE TABLE IF NOT EXISTS channels(id serial PRIMARY KEY, server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, "
-        "name text NOT NULL, kind text NOT NULL CHECK(kind IN ('text','voice')), position integer NOT NULL, topic text NOT NULL DEFAULT '', "
-        "created_at bigint NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS direct_threads(id serial PRIMARY KEY, name text NOT NULL DEFAULT '', avatar_url text NOT NULL DEFAULT '', "
-        "owner_id integer NOT NULL REFERENCES users(id), created_at bigint NOT NULL, updated_at bigint NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS direct_members(thread_id integer NOT NULL REFERENCES direct_threads(id) ON DELETE CASCADE, "
-        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, last_read_message_id integer NOT NULL DEFAULT 0, "
-        "muted boolean NOT NULL DEFAULT false, nickname text NOT NULL DEFAULT '', joined_at bigint NOT NULL, "
-        "PRIMARY KEY(thread_id, user_id))",
-        "CREATE TABLE IF NOT EXISTS messages(id serial PRIMARY KEY, scope text NOT NULL CHECK(scope IN ('channel','direct')), "
-        "scope_id integer NOT NULL, user_id integer NOT NULL REFERENCES users(id), body text NOT NULL, reply_to_id integer, "
-        "created_at bigint NOT NULL, edited_at bigint, deleted_at bigint)",
-        "CREATE TABLE IF NOT EXISTS notifications(id serial PRIMARY KEY, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
-        "kind text NOT NULL, body text NOT NULL, url text NOT NULL, seen boolean NOT NULL DEFAULT false, created_at bigint NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS server_invites(code text PRIMARY KEY, server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, "
-        "channel_id integer, creator_id integer NOT NULL REFERENCES users(id), max_uses integer NOT NULL DEFAULT 0, uses integer NOT NULL DEFAULT 0, "
-        "created_at bigint NOT NULL, expires_at bigint NOT NULL DEFAULT 0, revoked boolean NOT NULL DEFAULT false)",
-        "CREATE INDEX IF NOT EXISTS idx_threads_forum ON threads(forum_id, updated_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_forum_members_user ON forum_members(user_id, forum_id)",
-        "CREATE INDEX IF NOT EXISTS idx_replies_thread ON replies(thread_id, created_at)",
-        "CREATE INDEX IF NOT EXISTS idx_messages_scope ON messages(scope, scope_id, id DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, seen, id DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_direct_members_user ON direct_members(user_id, thread_id)",
-        "CREATE INDEX IF NOT EXISTS idx_server_members_user ON server_members(user_id, server_id)",
-        "CREATE INDEX IF NOT EXISTS idx_invites_server ON server_invites(server_id, revoked)",
-        "CREATE TABLE IF NOT EXISTS thread_votes(thread_id integer NOT NULL REFERENCES threads(id) ON DELETE CASCADE, "
-        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, value integer NOT NULL CHECK(value IN (-1, 1)), "
-        "created_at bigint NOT NULL, PRIMARY KEY(thread_id, user_id))",
-        "CREATE INDEX IF NOT EXISTS idx_thread_votes_user ON thread_votes(user_id, thread_id)"
-    ]},
-    {2, [
-        "CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(scope, scope_id, created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen DESC)"
-    ]},
-    {3, [
-        "ALTER TABLE threads ADD COLUMN IF NOT EXISTS score integer NOT NULL DEFAULT 0",
-        "ALTER TABLE threads ADD COLUMN IF NOT EXISTS upvotes integer NOT NULL DEFAULT 0",
-        "ALTER TABLE threads ADD COLUMN IF NOT EXISTS downvotes integer NOT NULL DEFAULT 0",
-        "CREATE TABLE IF NOT EXISTS thread_votes(thread_id integer NOT NULL REFERENCES threads(id) ON DELETE CASCADE, "
-        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, value integer NOT NULL CHECK(value IN (-1, 1)), "
-        "created_at bigint NOT NULL, PRIMARY KEY(thread_id, user_id))",
-        "CREATE INDEX IF NOT EXISTS idx_thread_votes_user ON thread_votes(user_id, thread_id)"
-    ]},
-    {4, [
-        "CREATE TABLE IF NOT EXISTS forum_members(forum_id integer NOT NULL REFERENCES forums(id) ON DELETE CASCADE, "
-        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, joined_at bigint NOT NULL, PRIMARY KEY(forum_id, user_id))",
-        "CREATE INDEX IF NOT EXISTS idx_forum_members_user ON forum_members(user_id, forum_id)"
-    ]},
-    {5, [
-        "ALTER TABLE direct_members ADD COLUMN IF NOT EXISTS request_state text NOT NULL DEFAULT 'accepted'",
-        "ALTER TABLE direct_members DROP CONSTRAINT IF EXISTS direct_members_request_state_check",
-        "ALTER TABLE direct_members ADD CONSTRAINT direct_members_request_state_check CHECK(request_state IN ('pending','accepted'))",
-        "CREATE INDEX IF NOT EXISTS idx_direct_members_requests ON direct_members(user_id, request_state, joined_at DESC)"
-    ]},
-    {6, [
-        "CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_id) WHERE reply_to_id IS NOT NULL",
-        "CREATE INDEX IF NOT EXISTS idx_channels_server ON channels(server_id, position ASC, id ASC)"
-    ]},
-    {7, [
-        "CREATE TABLE IF NOT EXISTS uploads(id text PRIMARY KEY, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
-        "name text NOT NULL, content_type text NOT NULL, size bigint NOT NULL CHECK(size > 0 AND size <= 262144000), "
-        "path text NOT NULL, status text NOT NULL CHECK(status IN ('pending','ready')), sha256 text NOT NULL DEFAULT '', created_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_uploads_user_created ON uploads(user_id, created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_uploads_pending ON uploads(created_at) WHERE status = 'pending'"
-    ]},
-    {8, [
-        "ALTER TABLE direct_members ADD COLUMN IF NOT EXISTS hidden boolean NOT NULL DEFAULT false"
-    ]},
-    {9, [
-        "ALTER TABLE forums ADD COLUMN IF NOT EXISTS owner_id integer REFERENCES users(id) ON DELETE SET NULL",
-        "UPDATE forums f SET owner_id = (SELECT fm.user_id FROM forum_members fm WHERE fm.forum_id = f.id ORDER BY fm.joined_at ASC LIMIT 1) "
-        "WHERE f.owner_id IS NULL AND f.slug NOT IN ('general','support','development','security')",
-        "CREATE TABLE IF NOT EXISTS thread_views(thread_id integer NOT NULL REFERENCES threads(id) ON DELETE CASCADE, "
-        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, first_viewed_at bigint NOT NULL, "
-        "PRIMARY KEY(thread_id,user_id))",
-        "CREATE INDEX IF NOT EXISTS idx_thread_views_user ON thread_views(user_id,thread_id)",
-        "UPDATE threads SET views = 0"
-    ]},
-    %% old uploads had no ACL. refs add one without trying to query ciphertext.
-    {10, [
-        "CREATE TABLE IF NOT EXISTS upload_refs(upload_id text NOT NULL REFERENCES uploads(id) ON DELETE CASCADE, "
-        "scope text NOT NULL CHECK(scope IN ('channel','direct','profile')), scope_id integer NOT NULL, "
-        "created_at bigint NOT NULL, PRIMARY KEY(upload_id, scope, scope_id))",
-        "CREATE INDEX IF NOT EXISTS idx_upload_refs_upload ON upload_refs(upload_id)",
-        "CREATE TABLE IF NOT EXISTS upload_ref_backfill(id integer PRIMARY KEY, cursor integer NOT NULL DEFAULT 0, "
-        "done boolean NOT NULL DEFAULT false)",
-        "INSERT INTO upload_ref_backfill(id, cursor, done) VALUES(1, 0, false) ON CONFLICT (id) DO NOTHING",
-        %% profile pictures are public refs.
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'profile', u.id, 0 FROM users u JOIN uploads up ON up.id = substring(u.avatar_url from 12) "
-        "WHERE u.avatar_url LIKE '/api/files/%' ON CONFLICT DO NOTHING",
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'profile', u.id, 0 FROM users u JOIN uploads up ON up.id = substring(u.banner_url from 12) "
-        "WHERE u.banner_url LIKE '/api/files/%' ON CONFLICT DO NOTHING"
-    ]},
-    {11, [
-        "CREATE TABLE IF NOT EXISTS channel_categories(id serial PRIMARY KEY, server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, "
-        "name text NOT NULL, position integer NOT NULL, created_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_channel_categories_server ON channel_categories(server_id, position ASC, id ASC)",
-        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS category_id integer REFERENCES channel_categories(id) ON DELETE SET NULL"
-    ]},
-    {12, [
-        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS banner_url text NOT NULL DEFAULT ''",
-        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS accent_color text NOT NULL DEFAULT '#5865f2'"
-    ]},
-    {13, [
-        "ALTER TABLE upload_refs DROP CONSTRAINT IF EXISTS upload_refs_scope_check",
-        "ALTER TABLE upload_refs ADD CONSTRAINT upload_refs_scope_check CHECK(scope IN ('channel','direct','profile','server'))",
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'server', s.id, 0 FROM servers s JOIN uploads up ON up.id = substring(s.icon_url from 12) "
-        "WHERE s.icon_url LIKE '/api/files/%' ON CONFLICT DO NOTHING",
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'server', s.id, 0 FROM servers s JOIN uploads up ON up.id = substring(s.banner_url from 12) "
-        "WHERE s.banner_url LIKE '/api/files/%' ON CONFLICT DO NOTHING"
-    ]},
-    {14, [
-        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS id bigserial",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_id ON sessions(id)",
-        "CREATE INDEX IF NOT EXISTS idx_sessions_user_last_seen ON sessions(user_id, last_seen DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at)"
-    ]},
-    {15, [
-        "ALTER TABLE users ALTER COLUMN theme SET DEFAULT 'system'"
-    ]},
-    {16, [
-        "CREATE INDEX IF NOT EXISTS idx_friendships_low_updated ON friendships(user_low, updated_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_friendships_high_updated ON friendships(user_high, updated_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_upload_refs_scope_lookup ON upload_refs(scope, scope_id, upload_id)",
-        "CREATE INDEX IF NOT EXISTS idx_direct_members_thread_request ON direct_members(thread_id, request_state, user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_server_members_server_role ON server_members(server_id, role, user_id)"
-    ]},
-    {17, [
-        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS welcome_message text NOT NULL DEFAULT ''"
-    ]},
-    {18, [
-        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'text'",
-        "ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check",
-        "ALTER TABLE messages ADD CONSTRAINT messages_kind_check CHECK(kind IN ('text','missed_call'))"
-    ]},
-    {19, [
-        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_id integer REFERENCES messages(id) ON DELETE SET NULL",
-        "CREATE INDEX IF NOT EXISTS idx_messages_forwarded_from ON messages(forwarded_from_id) WHERE forwarded_from_id IS NOT NULL"
-    ]},
-    {20, [
-        "CREATE TABLE IF NOT EXISTS server_roles(id bigserial PRIMARY KEY, server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, "
-        "name text NOT NULL, color text NOT NULL DEFAULT '#99aab5', permissions bigint NOT NULL DEFAULT 0, position integer NOT NULL DEFAULT 1, "
-        "hoist boolean NOT NULL DEFAULT false, mentionable boolean NOT NULL DEFAULT false, created_at bigint NOT NULL, updated_at bigint NOT NULL)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_server_roles_name_unique ON server_roles(server_id, lower(name))",
-        "CREATE INDEX IF NOT EXISTS idx_server_roles_order ON server_roles(server_id, position DESC, id ASC)",
-        "CREATE TABLE IF NOT EXISTS server_member_roles(server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, "
-        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, role_id bigint NOT NULL REFERENCES server_roles(id) ON DELETE CASCADE, "
-        "assigned_by integer REFERENCES users(id) ON DELETE SET NULL, assigned_at bigint NOT NULL, PRIMARY KEY(server_id,user_id,role_id))",
-        "CREATE INDEX IF NOT EXISTS idx_server_member_roles_user ON server_member_roles(server_id,user_id,role_id)",
-        "ALTER TABLE server_members ADD COLUMN IF NOT EXISTS nickname text NOT NULL DEFAULT ''",
-        "ALTER TABLE server_members ADD COLUMN IF NOT EXISTS avatar_url text NOT NULL DEFAULT ''",
-        "ALTER TABLE server_members ADD COLUMN IF NOT EXISTS bio text NOT NULL DEFAULT ''",
-        "ALTER TABLE direct_members ADD COLUMN IF NOT EXISTS group_role text NOT NULL DEFAULT 'member'",
-        "ALTER TABLE direct_members DROP CONSTRAINT IF EXISTS direct_members_group_role_check",
-        "ALTER TABLE direct_members ADD CONSTRAINT direct_members_group_role_check CHECK(group_role IN ('owner','moderator','member'))",
-        "UPDATE direct_members dm SET group_role = 'owner' FROM direct_threads dt WHERE dm.thread_id = dt.id AND dm.user_id = dt.owner_id",
-        "CREATE INDEX IF NOT EXISTS idx_direct_members_group_role ON direct_members(thread_id,group_role,user_id)"
-    ]},
-    {21, [
-        "ALTER TABLE threads ADD COLUMN IF NOT EXISTS raw_body text NOT NULL DEFAULT ''",
-        "UPDATE threads SET raw_body = body WHERE raw_body = ''",
-        "ALTER TABLE replies ADD COLUMN IF NOT EXISTS raw_body text NOT NULL DEFAULT ''",
-        "UPDATE replies SET raw_body = body WHERE raw_body = ''"
-    ]},
-    {22, [
-        %% Existing accounts have already learned the interface. Only accounts created
-        %% after this migration enter the automatic welcome tour (registration sets pending).
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_state text NOT NULL DEFAULT 'complete'",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_step integer NOT NULL DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_updated_at bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_onboarding_state_check",
-        "ALTER TABLE users ADD CONSTRAINT users_onboarding_state_check CHECK(onboarding_state IN ('pending','active','complete','dismissed'))",
-        "CREATE INDEX IF NOT EXISTS idx_users_onboarding_state ON users(onboarding_state)"
-    ]},
-    {23, [
-        %% 771 is the historical ordinary-member baseline: view channels, send
-        %% messages, create Wires, and connect to voice. Storing it per server lets
-        %% owners tighten that baseline without breaking existing installations.
-        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS default_permissions bigint NOT NULL DEFAULT 771"
-    ]},
-    {24, [
-        %% Thread composers support the same /api/files attachments as chat. Keep
-        %% their ACL references explicit so non-author readers can fetch them.
-        "ALTER TABLE upload_refs DROP CONSTRAINT IF EXISTS upload_refs_scope_check",
-        "ALTER TABLE upload_refs ADD CONSTRAINT upload_refs_scope_check CHECK(scope IN ('channel','direct','profile','server','thread'))",
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'thread', t.id, 0 FROM threads t "
-        "CROSS JOIN LATERAL regexp_matches(COALESCE(NULLIF(t.raw_body,''),t.body), '/api/files/([A-Za-z0-9_-]{24,64})', 'g') AS rx(parts) "
-        "JOIN uploads up ON up.id = rx.parts[1] ON CONFLICT DO NOTHING",
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'thread', r.thread_id, 0 FROM replies r "
-        "CROSS JOIN LATERAL regexp_matches(COALESCE(NULLIF(r.raw_body,''),r.body), '/api/files/([A-Za-z0-9_-]{24,64})', 'g') AS rx(parts) "
-        "JOIN uploads up ON up.id = rx.parts[1] ON CONFLICT DO NOTHING"
-    ]},
-    {25, [
-        %% Rebuild every derived ACL relation once so stale references from profile/
-        %% server image replacement or edited/deleted content cannot survive an
-        %% upgrade. Message bodies may be encrypted, so channel/direct refs are
-        %% rebuilt by the resumable application backfill after this migration.
-        "DELETE FROM upload_refs WHERE scope IN ('channel','direct','profile','server','thread')",
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'profile', u.id, 0 FROM users u JOIN uploads up ON "
-        "(u.avatar_url = '/api/files/' || up.id OR u.banner_url = '/api/files/' || up.id) "
-        "ON CONFLICT DO NOTHING",
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'server', s.id, 0 FROM servers s JOIN uploads up ON "
-        "(s.icon_url = '/api/files/' || up.id OR s.banner_url = '/api/files/' || up.id) "
-        "ON CONFLICT DO NOTHING",
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'thread', t.id, 0 FROM threads t "
-        "CROSS JOIN LATERAL regexp_matches(COALESCE(NULLIF(t.raw_body,''),t.body), '/api/files/([A-Za-z0-9_-]{24,64})', 'g') AS rx(parts) "
-        "JOIN uploads up ON up.id = rx.parts[1] ON CONFLICT DO NOTHING",
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'thread', r.thread_id, 0 FROM replies r "
-        "CROSS JOIN LATERAL regexp_matches(COALESCE(NULLIF(r.raw_body,''),r.body), '/api/files/([A-Za-z0-9_-]{24,64})', 'g') AS rx(parts) "
-        "JOIN uploads up ON up.id = rx.parts[1] ON CONFLICT DO NOTHING",
-        "INSERT INTO upload_ref_backfill(id, cursor, done) VALUES(1, 0, false) ON CONFLICT (id) DO NOTHING",
-        "UPDATE upload_ref_backfill SET cursor = 0, done = false WHERE id = 1"
-    ]},
-    {26, [
-        %% Server-scoped member avatars are private to server members. Group-DM
-        %% avatars reuse the direct scope so all current conversation members can
-        %% fetch them. Backfill both so upgrading does not leave broken images.
-        "ALTER TABLE upload_refs DROP CONSTRAINT IF EXISTS upload_refs_scope_check",
-        "ALTER TABLE upload_refs ADD CONSTRAINT upload_refs_scope_check CHECK(scope IN ('channel','direct','profile','server','thread','server_member'))",
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'server_member', sm.server_id, 0 FROM server_members sm JOIN uploads up ON "
-        "sm.avatar_url = '/api/files/' || up.id ON CONFLICT DO NOTHING",
-        "INSERT INTO upload_refs(upload_id, scope, scope_id, created_at) "
-        "SELECT up.id, 'direct', dt.id, 0 FROM direct_threads dt JOIN uploads up ON "
-        "dt.avatar_url = '/api/files/' || up.id ON CONFLICT DO NOTHING"
-    ]},
-    {27, [
-        %% Compatibility repair for installations that were upgraded by older
-        %% non-transactional migration code. Every statement is idempotent; the
-        %% normal ordered migrations remain authoritative for healthy installs.
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS bio text NOT NULL DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url text NOT NULL DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS banner_url text NOT NULL DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS theme text NOT NULL DEFAULT 'system'",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE friendships ADD COLUMN IF NOT EXISTS created_at bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE friendships ADD COLUMN IF NOT EXISTS updated_at bigint NOT NULL DEFAULT 0",
-        "CREATE INDEX IF NOT EXISTS idx_friendships_low_updated ON friendships(user_low, updated_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_friendships_high_updated ON friendships(user_high, updated_at DESC)",
-        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS banner_url text NOT NULL DEFAULT ''",
-        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS accent_color text NOT NULL DEFAULT '#5865f2'",
-        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS welcome_message text NOT NULL DEFAULT ''",
-        "ALTER TABLE servers ADD COLUMN IF NOT EXISTS default_permissions bigint NOT NULL DEFAULT 771",
-        "ALTER TABLE server_members ADD COLUMN IF NOT EXISTS nickname text NOT NULL DEFAULT ''",
-        "ALTER TABLE server_members ADD COLUMN IF NOT EXISTS avatar_url text NOT NULL DEFAULT ''",
-        "ALTER TABLE server_members ADD COLUMN IF NOT EXISTS bio text NOT NULL DEFAULT ''",
-        "CREATE TABLE IF NOT EXISTS channel_categories(id serial PRIMARY KEY, server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, name text NOT NULL, position integer NOT NULL, created_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_channel_categories_server ON channel_categories(server_id, position ASC, id ASC)",
-        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS category_id integer REFERENCES channel_categories(id) ON DELETE SET NULL",
-        "CREATE TABLE IF NOT EXISTS server_roles(id bigserial PRIMARY KEY, server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, name text NOT NULL, color text NOT NULL DEFAULT '#99aab5', permissions bigint NOT NULL DEFAULT 0, position integer NOT NULL DEFAULT 1, hoist boolean NOT NULL DEFAULT false, mentionable boolean NOT NULL DEFAULT false, created_at bigint NOT NULL, updated_at bigint NOT NULL)",
-        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS color text NOT NULL DEFAULT '#99aab5'",
-        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS permissions bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS position integer NOT NULL DEFAULT 1",
-        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS hoist boolean NOT NULL DEFAULT false",
-        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS mentionable boolean NOT NULL DEFAULT false",
-        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS created_at bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE server_roles ADD COLUMN IF NOT EXISTS updated_at bigint NOT NULL DEFAULT 0",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_server_roles_name_unique ON server_roles(server_id, lower(name))",
-        "CREATE INDEX IF NOT EXISTS idx_server_roles_order ON server_roles(server_id, position DESC, id ASC)",
-        "CREATE TABLE IF NOT EXISTS server_member_roles(server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, role_id bigint NOT NULL REFERENCES server_roles(id) ON DELETE CASCADE, assigned_by integer REFERENCES users(id) ON DELETE SET NULL, assigned_at bigint NOT NULL DEFAULT 0, PRIMARY KEY(server_id,user_id,role_id))",
-        "ALTER TABLE server_member_roles ADD COLUMN IF NOT EXISTS assigned_by integer REFERENCES users(id) ON DELETE SET NULL",
-        "ALTER TABLE server_member_roles ADD COLUMN IF NOT EXISTS assigned_at bigint NOT NULL DEFAULT 0",
-        "CREATE INDEX IF NOT EXISTS idx_server_member_roles_user ON server_member_roles(server_id,user_id,role_id)"
-    ]},
-    {28, [
-        "CREATE TABLE IF NOT EXISTS message_reactions(message_id integer NOT NULL REFERENCES messages(id) ON DELETE CASCADE, "
-        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, emoji text NOT NULL, created_at bigint NOT NULL, "
-        "PRIMARY KEY(message_id,user_id,emoji), CHECK(char_length(emoji) BETWEEN 1 AND 16))",
-        "CREATE INDEX IF NOT EXISTS idx_message_reactions_message ON message_reactions(message_id,created_at ASC)",
-        "CREATE INDEX IF NOT EXISTS idx_message_reactions_user ON message_reactions(user_id,message_id)"
-    ]},
-    {29, [
-        "CREATE TABLE IF NOT EXISTS admin_operators(user_id integer PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, "
-        "role text NOT NULL CHECK(role IN ('owner','operator','viewer')), verification_hash text NOT NULL, "
-        "created_by integer REFERENCES users(id) ON DELETE SET NULL, created_at bigint NOT NULL, updated_at bigint NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS admin_sessions(token_hash text PRIMARY KEY, user_id integer NOT NULL REFERENCES admin_operators(user_id) ON DELETE CASCADE, "
-        "csrf text NOT NULL, created_at bigint NOT NULL, last_seen bigint NOT NULL, expires_at bigint NOT NULL, "
-        "ip_hash text NOT NULL DEFAULT '', user_agent_hash text NOT NULL DEFAULT '')",
-        "CREATE INDEX IF NOT EXISTS idx_admin_sessions_user ON admin_sessions(user_id,expires_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_admin_sessions_expiry ON admin_sessions(expires_at)",
-        "CREATE TABLE IF NOT EXISTS admin_enrollments(token_hash text PRIMARY KEY, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
-        "role text NOT NULL CHECK(role IN ('owner','operator','viewer')), created_by integer REFERENCES admin_operators(user_id) ON DELETE CASCADE, "
-        "note text NOT NULL DEFAULT '', created_at bigint NOT NULL, expires_at bigint NOT NULL, used_at bigint)",
-        "CREATE INDEX IF NOT EXISTS idx_admin_enrollments_user ON admin_enrollments(user_id,expires_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_admin_enrollments_creator_unused ON admin_enrollments(created_by) WHERE used_at IS NULL",
-        "CREATE TABLE IF NOT EXISTS admin_audit(id bigserial PRIMARY KEY, actor_user_id integer REFERENCES users(id) ON DELETE SET NULL, "
-        "action text NOT NULL, target_type text NOT NULL DEFAULT '', target_id text NOT NULL DEFAULT '', detail text NOT NULL DEFAULT '', "
-        "ip_hash text NOT NULL DEFAULT '', created_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit(created_at DESC,id DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_messages_created_global ON messages(created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id,id DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at)",
-        "CREATE INDEX IF NOT EXISTS idx_sessions_user_expiry ON sessions(user_id,expires_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_uploads_user_status ON uploads(user_id,status)"
-    ]},
-    {30, [
-        "CREATE TABLE IF NOT EXISTS global_banners(id bigserial PRIMARY KEY, title text NOT NULL DEFAULT '', body text NOT NULL, "
-        "severity text NOT NULL CHECK(severity IN ('info','success','warning','critical')), starts_at bigint NOT NULL CHECK(starts_at>=0), "
-        "ends_at bigint NOT NULL DEFAULT 0 CHECK(ends_at=0 OR ends_at>starts_at), "
-        "dismissible boolean NOT NULL DEFAULT true, link_label text NOT NULL DEFAULT '', link_url text NOT NULL DEFAULT '', enabled boolean NOT NULL DEFAULT true, "
-        "created_by integer REFERENCES users(id) ON DELETE SET NULL, created_at bigint NOT NULL, updated_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_global_banners_window ON global_banners(enabled,starts_at,ends_at,id)",
-        "CREATE INDEX IF NOT EXISTS idx_global_banners_updated ON global_banners(updated_at DESC,id DESC)",
-        "CREATE TABLE IF NOT EXISTS instance_settings(key text PRIMARY KEY, value text NOT NULL, updated_by integer REFERENCES users(id) ON DELETE SET NULL, updated_at bigint NOT NULL)",
-        "INSERT INTO instance_settings(key,value,updated_by,updated_at) VALUES('registration_mode','inherit',NULL,0) ON CONFLICT(key) DO NOTHING"
-    ]}
-    ,{31, [
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS account_state text NOT NULL DEFAULT 'active'",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_at bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_state_check",
-        "ALTER TABLE users ADD CONSTRAINT users_account_state_check CHECK(account_state IN ('active','disabled'))",
-        "CREATE INDEX IF NOT EXISTS idx_users_account_state ON users(account_state,id)"
-    ]}
-    ,{32, [
-        "CREATE TABLE IF NOT EXISTS server_webhooks(id bigserial PRIMARY KEY, server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, name text NOT NULL, url text NOT NULL, secret text NOT NULL, events text NOT NULL, enabled boolean NOT NULL DEFAULT true, created_by integer REFERENCES users(id) ON DELETE SET NULL, created_at bigint NOT NULL, updated_at bigint NOT NULL, last_success_at bigint NOT NULL DEFAULT 0, last_failure_at bigint NOT NULL DEFAULT 0, failure_count integer NOT NULL DEFAULT 0)",
-        "CREATE INDEX IF NOT EXISTS idx_server_webhooks_server ON server_webhooks(server_id,id)",
-        "CREATE TABLE IF NOT EXISTS webhook_deliveries(id bigserial PRIMARY KEY, webhook_id bigint NOT NULL REFERENCES server_webhooks(id) ON DELETE CASCADE, event text NOT NULL, payload bytea NOT NULL, status text NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','delivered','failed')), attempts integer NOT NULL DEFAULT 0, next_attempt_at bigint NOT NULL, locked_at bigint NOT NULL DEFAULT 0, response_code integer NOT NULL DEFAULT 0, last_error text NOT NULL DEFAULT '', created_at bigint NOT NULL, updated_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due ON webhook_deliveries(status,next_attempt_at,id)",
-        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook ON webhook_deliveries(webhook_id,id DESC)"
-    ]}
+migrations() -> pw_db_schema:migrations().
 
-    ,{33, [
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot boolean NOT NULL DEFAULT false",
-        "CREATE INDEX IF NOT EXISTS idx_users_is_bot ON users(is_bot,id) WHERE is_bot=true",
-        "CREATE TABLE IF NOT EXISTS server_bots(id bigserial PRIMARY KEY, server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, bot_user_id integer NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE, name text NOT NULL, token_hash text NOT NULL UNIQUE, created_by integer REFERENCES users(id) ON DELETE SET NULL, created_at bigint NOT NULL, updated_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_server_bots_server ON server_bots(server_id,id)"
-    ]}
-    ,{34, [
-        %% 1.x default members could already attach files, react, and stream. 2.0
-        %% gives those existing behaviors explicit permission bits and enables the
-        %% new voice-note bit for untouched default servers. Customized permission
-        %% masks are deliberately left alone.
-        "ALTER TABLE servers ALTER COLUMN default_permissions SET DEFAULT 59139",
-        "UPDATE servers SET default_permissions=59139 WHERE default_permissions=771"
-    ]}
-    ,{35, [
-        %% Message IDs move off PostgreSQL sequences. Widen every reference first,
-        %% then the primary key, and recreate the two explicit message FKs.
-        "ALTER TABLE message_reactions DROP CONSTRAINT IF EXISTS message_reactions_message_id_fkey",
-        "ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_reply_to_id_fkey",
-        "ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_forwarded_from_id_fkey",
-        "ALTER TABLE message_reactions ALTER COLUMN message_id TYPE bigint USING message_id::bigint",
-        "ALTER TABLE direct_members ALTER COLUMN last_read_message_id TYPE bigint USING last_read_message_id::bigint",
-        "ALTER TABLE messages ALTER COLUMN reply_to_id TYPE bigint USING reply_to_id::bigint",
-        "ALTER TABLE messages ALTER COLUMN forwarded_from_id TYPE bigint USING forwarded_from_id::bigint",
-        "ALTER TABLE messages ALTER COLUMN id TYPE bigint USING id::bigint",
-        "ALTER TABLE messages ALTER COLUMN id DROP DEFAULT",
-        "ALTER TABLE message_reactions ADD CONSTRAINT message_reactions_message_id_fkey FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE",
-        "ALTER TABLE messages ADD CONSTRAINT messages_reply_to_id_fkey FOREIGN KEY(reply_to_id) REFERENCES messages(id) ON DELETE SET NULL",
-        "ALTER TABLE messages ADD CONSTRAINT messages_forwarded_from_id_fkey FOREIGN KEY(forwarded_from_id) REFERENCES messages(id) ON DELETE SET NULL",
-        "CREATE TABLE IF NOT EXISTS message_id_node_leases(node_id smallint PRIMARY KEY CHECK(node_id BETWEEN 0 AND 63), node_name text NOT NULL, lease_until bigint NOT NULL, updated_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_message_id_node_leases_expiry ON message_id_node_leases(lease_until)",
-        "CREATE TABLE IF NOT EXISTS storage_outbox(id bigserial PRIMARY KEY, kind text NOT NULL, entity_id bigint NOT NULL DEFAULT 0, payload bytea NOT NULL, status text NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','delivered','failed')), attempts integer NOT NULL DEFAULT 0, next_attempt_at bigint NOT NULL DEFAULT 0, locked_at bigint NOT NULL DEFAULT 0, last_error text NOT NULL DEFAULT '', created_at bigint NOT NULL, updated_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_storage_outbox_due ON storage_outbox(status,next_attempt_at,id)",
-        "CREATE INDEX IF NOT EXISTS idx_storage_outbox_entity ON storage_outbox(kind,entity_id,id DESC)",
-        "CREATE TABLE IF NOT EXISTS storage_migration_checkpoints(name text PRIMARY KEY, last_id bigint NOT NULL DEFAULT 0, rows_done bigint NOT NULL DEFAULT 0, updated_at bigint NOT NULL)",
-        "INSERT INTO storage_migration_checkpoints(name,last_id,rows_done,updated_at) VALUES('messages',0,0,0) ON CONFLICT(name) DO NOTHING"
-    ]}
-    ,{36, [
-        "CREATE TABLE IF NOT EXISTS server_bans(server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE, user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, banned_by integer REFERENCES users(id) ON DELETE SET NULL, reason text NOT NULL DEFAULT '', created_at bigint NOT NULL, PRIMARY KEY(server_id,user_id))",
-        "CREATE INDEX IF NOT EXISTS idx_server_bans_user ON server_bans(user_id,server_id)",
-        "CREATE INDEX IF NOT EXISTS idx_server_bans_server_created ON server_bans(server_id,created_at DESC,user_id)"
-    ]}
-    ,{37, [
-        "CREATE TABLE IF NOT EXISTS upload_delete_queue(path text PRIMARY KEY, status text NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running')), attempts integer NOT NULL DEFAULT 0, next_attempt_at bigint NOT NULL DEFAULT 0, locked_at bigint NOT NULL DEFAULT 0, last_error text NOT NULL DEFAULT '', created_at bigint NOT NULL, updated_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_upload_delete_queue_due ON upload_delete_queue(status,next_attempt_at,created_at,path)"
-    ]}
-    ,{38, [
-        %% Keep user associations outside the JSON blob so privacy erasure can
-        %% delete queued webhook payloads without parsing arbitrary payload text.
-        "ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS subject_user_id integer",
-        "ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS actor_user_id integer",
-        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subject_user ON webhook_deliveries(subject_user_id,id) WHERE subject_user_id IS NOT NULL",
-        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_actor_user ON webhook_deliveries(actor_user_id,id) WHERE actor_user_id IS NOT NULL"
-    ]}
-    ,{39, [
-        %% A privacy hard-delete must still identify the physical Scylla
-        %% partitions if a prior ambiguous write left a row without a locator.
-        %% Store only routing metadata; never duplicate message bodies here.
-        "ALTER TABLE storage_outbox ADD COLUMN IF NOT EXISTS entity_scope text NOT NULL DEFAULT ''",
-        "ALTER TABLE storage_outbox ADD COLUMN IF NOT EXISTS entity_scope_id bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE storage_outbox ADD COLUMN IF NOT EXISTS entity_created_at bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE storage_outbox DROP CONSTRAINT IF EXISTS storage_outbox_entity_scope_check",
-        "ALTER TABLE storage_outbox ADD CONSTRAINT storage_outbox_entity_scope_check CHECK(entity_scope IN ('','channel','direct'))",
-        "ALTER TABLE storage_outbox DROP CONSTRAINT IF EXISTS storage_outbox_entity_scope_id_check",
-        "ALTER TABLE storage_outbox ADD CONSTRAINT storage_outbox_entity_scope_id_check CHECK(entity_scope_id >= 0)",
-        "ALTER TABLE storage_outbox DROP CONSTRAINT IF EXISTS storage_outbox_entity_created_at_check",
-        "ALTER TABLE storage_outbox ADD CONSTRAINT storage_outbox_entity_created_at_check CHECK(entity_created_at >= 0)"
-    ]}
 
-    ,{40, [
-        %% Search never stores plaintext message terms. Tokens are keyed HMACs
-        %% derived in Erlang and are useless without the instance search key.
-        "CREATE TABLE IF NOT EXISTS message_search_tokens(message_id bigint NOT NULL REFERENCES messages(id) ON DELETE CASCADE, token text NOT NULL, PRIMARY KEY(message_id,token))",
-        "CREATE INDEX IF NOT EXISTS idx_message_search_token ON message_search_tokens(token,message_id DESC)",
-        "CREATE TABLE IF NOT EXISTS message_search_state(id smallint PRIMARY KEY CHECK(id=1), key_fingerprint text NOT NULL DEFAULT '', last_message_id bigint NOT NULL DEFAULT 0, complete boolean NOT NULL DEFAULT false, updated_at bigint NOT NULL DEFAULT 0)",
-        "INSERT INTO message_search_state(id,key_fingerprint,last_message_id,complete,updated_at) VALUES(1,'',0,false,0) ON CONFLICT(id) DO NOTHING"
-    ]}
-    ,{41, [
-        %% Bot commands are a durable, language-neutral queue. Command arguments
-        %% are encrypted before storage; claim tokens are stored only as hashes.
-        "CREATE TABLE IF NOT EXISTS bot_commands(id bigserial PRIMARY KEY,bot_id bigint NOT NULL REFERENCES server_bots(id) ON DELETE CASCADE,server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE,name text NOT NULL,description text NOT NULL DEFAULT '',options_json text NOT NULL DEFAULT '[]',enabled boolean NOT NULL DEFAULT true,created_at bigint NOT NULL,updated_at bigint NOT NULL,UNIQUE(server_id,name))",
-        "CREATE INDEX IF NOT EXISTS idx_bot_commands_bot ON bot_commands(bot_id,id)",
-        "CREATE TABLE IF NOT EXISTS bot_command_invocations(id bigserial PRIMARY KEY,command_id bigint NOT NULL REFERENCES bot_commands(id) ON DELETE CASCADE,bot_id bigint NOT NULL REFERENCES server_bots(id) ON DELETE CASCADE,server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE,channel_id integer NOT NULL REFERENCES channels(id) ON DELETE CASCADE,user_id integer REFERENCES users(id) ON DELETE SET NULL,request_message_id bigint REFERENCES messages(id) ON DELETE SET NULL,args_cipher text NOT NULL,status text NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','claimed','completed','failed')),claim_token_hash text NOT NULL DEFAULT '',lease_until bigint NOT NULL DEFAULT 0,attempts integer NOT NULL DEFAULT 0,response_message_id bigint,fail_reason text NOT NULL DEFAULT '',created_at bigint NOT NULL,updated_at bigint NOT NULL,completed_at bigint NOT NULL DEFAULT 0)",
-        "CREATE INDEX IF NOT EXISTS idx_bot_command_invocations_claim ON bot_command_invocations(bot_id,status,lease_until,id)",
-        "CREATE INDEX IF NOT EXISTS idx_bot_command_invocations_user ON bot_command_invocations(user_id,id DESC) WHERE user_id IS NOT NULL"
-    ]}
-    ,{42, [
-        %% Host moderation changes account access only. It never grants the
-        %% control plane access to messages or private attachment contents.
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderation_title text NOT NULL DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderation_reason text NOT NULL DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderation_severity text NOT NULL DEFAULT 'warning'",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderation_expires_at bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderated_by integer REFERENCES users(id) ON DELETE SET NULL",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS moderated_at bigint NOT NULL DEFAULT 0",
-        "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_state_check",
-        "ALTER TABLE users ADD CONSTRAINT users_account_state_check CHECK(account_state IN ('active','disabled','suspended','banned'))",
-        "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_moderation_severity_check",
-        "ALTER TABLE users ADD CONSTRAINT users_moderation_severity_check CHECK(moderation_severity IN ('info','warning','critical'))",
-        "CREATE TABLE IF NOT EXISTS instance_account_actions(id bigserial PRIMARY KEY,user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,actor_user_id integer REFERENCES users(id) ON DELETE SET NULL,action text NOT NULL CHECK(action IN ('suspend','ban','restore')),title text NOT NULL DEFAULT '',reason text NOT NULL DEFAULT '',severity text NOT NULL DEFAULT 'warning',expires_at bigint NOT NULL DEFAULT 0,created_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_instance_account_actions_user ON instance_account_actions(user_id,id DESC)"
-    ]}
-    ,{43, [
-        %% Channel pins are deliberately separate from message rows so pin
-        %% history can be changed without rewriting encrypted message bodies.
-        "CREATE TABLE IF NOT EXISTS message_pins(channel_id integer NOT NULL REFERENCES channels(id) ON DELETE CASCADE,message_id bigint PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,pinned_by integer REFERENCES users(id) ON DELETE SET NULL,pinned_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_message_pins_channel ON message_pins(channel_id,pinned_at DESC,message_id DESC)"
-    ]}
-    ,{44, [
-        %% Slowmode is channel configuration. Enforcement is serialized per
-        %% user/channel at send time so concurrent API nodes cannot bypass it.
-        "ALTER TABLE channels ADD COLUMN IF NOT EXISTS slowmode_seconds integer NOT NULL DEFAULT 0",
-        "ALTER TABLE channels DROP CONSTRAINT IF EXISTS channels_slowmode_seconds_check",
-        "ALTER TABLE channels ADD CONSTRAINT channels_slowmode_seconds_check CHECK(slowmode_seconds BETWEEN 0 AND 21600)"
-    ]}
-    ,{45, [
-        %% Incoming channel webhooks have dedicated bot identities. Tokens are
-        %% stored only as hashes; deleting a webhook disables its identity while
-        %% preserving authorship of historical messages.
-        "CREATE TABLE IF NOT EXISTS incoming_webhooks(id bigserial PRIMARY KEY,server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE,channel_id integer NOT NULL REFERENCES channels(id) ON DELETE CASCADE,bot_user_id integer NOT NULL UNIQUE REFERENCES users(id),name text NOT NULL,token_hash text NOT NULL UNIQUE,enabled boolean NOT NULL DEFAULT true,created_by integer REFERENCES users(id) ON DELETE SET NULL,created_at bigint NOT NULL,updated_at bigint NOT NULL,last_used_at bigint NOT NULL DEFAULT 0)",
-        "CREATE INDEX IF NOT EXISTS idx_incoming_webhooks_server ON incoming_webhooks(server_id,id)",
-        "CREATE INDEX IF NOT EXISTS idx_incoming_webhooks_channel ON incoming_webhooks(channel_id,id)"
-    ]}
-    ,{46, [
-        %% User-owned developer applications are templates above server-scoped
-        %% bot installations. Existing server_bots remain fully compatible.
-        "CREATE TABLE IF NOT EXISTS developer_applications(id bigserial PRIMARY KEY,owner_user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,public_id text NOT NULL UNIQUE,name text NOT NULL,description text NOT NULL DEFAULT '',avatar_url text NOT NULL DEFAULT '',public boolean NOT NULL DEFAULT false,default_permissions bigint NOT NULL DEFAULT 0,interaction_url text NOT NULL DEFAULT '',interaction_secret text NOT NULL DEFAULT '',ai_enabled boolean NOT NULL DEFAULT false,ai_endpoint text NOT NULL DEFAULT '',ai_model text NOT NULL DEFAULT '',ai_api_key text NOT NULL DEFAULT '',ai_system_prompt text NOT NULL DEFAULT '',created_at bigint NOT NULL,updated_at bigint NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS idx_developer_applications_owner ON developer_applications(owner_user_id,id DESC)",
-        "CREATE TABLE IF NOT EXISTS developer_app_installations(id bigserial PRIMARY KEY,app_id bigint NOT NULL REFERENCES developer_applications(id) ON DELETE CASCADE,server_id integer NOT NULL REFERENCES servers(id) ON DELETE CASCADE,server_bot_id bigint NOT NULL UNIQUE REFERENCES server_bots(id) ON DELETE CASCADE,role_id bigint REFERENCES server_roles(id) ON DELETE SET NULL,installed_by integer REFERENCES users(id) ON DELETE SET NULL,created_at bigint NOT NULL,UNIQUE(app_id,server_id))",
-        "CREATE INDEX IF NOT EXISTS idx_developer_app_installations_app ON developer_app_installations(app_id,id)",
-        "CREATE INDEX IF NOT EXISTS idx_developer_app_installations_server ON developer_app_installations(server_id,id)",
-        "CREATE TABLE IF NOT EXISTS developer_app_commands(id bigserial PRIMARY KEY,app_id bigint NOT NULL REFERENCES developer_applications(id) ON DELETE CASCADE,name text NOT NULL,description text NOT NULL DEFAULT '',options_json text NOT NULL DEFAULT '[]',handler text NOT NULL DEFAULT 'queue' CHECK(handler IN ('queue','webhook','ai')),created_at bigint NOT NULL,updated_at bigint NOT NULL,UNIQUE(app_id,name))",
-        "CREATE INDEX IF NOT EXISTS idx_developer_app_commands_app ON developer_app_commands(app_id,id)",
-        "ALTER TABLE bot_commands ADD COLUMN IF NOT EXISTS developer_command_id bigint REFERENCES developer_app_commands(id) ON DELETE CASCADE",
-        "ALTER TABLE bot_commands ADD COLUMN IF NOT EXISTS handler text NOT NULL DEFAULT 'queue'",
-        "ALTER TABLE bot_commands DROP CONSTRAINT IF EXISTS bot_commands_handler_check",
-        "ALTER TABLE bot_commands ADD CONSTRAINT bot_commands_handler_check CHECK(handler IN ('queue','webhook','ai'))",
-        "CREATE INDEX IF NOT EXISTS idx_bot_commands_handler ON bot_commands(handler,bot_id,id)",
-        "CREATE INDEX IF NOT EXISTS idx_bot_commands_developer_command ON bot_commands(developer_command_id) WHERE developer_command_id IS NOT NULL"
-    ]}
-    ,{47, [
-        %% Server managers can narrow app-command usage by channel, role or
-        %% member. Rules are evaluated at discovery and invocation time.
-        "CREATE TABLE IF NOT EXISTS bot_command_permissions(command_id bigint NOT NULL REFERENCES bot_commands(id) ON DELETE CASCADE,subject_type text NOT NULL CHECK(subject_type IN ('channel','role','user')),subject_id bigint NOT NULL,allow boolean NOT NULL,created_at bigint NOT NULL,updated_at bigint NOT NULL,PRIMARY KEY(command_id,subject_type,subject_id))",
-        "CREATE INDEX IF NOT EXISTS idx_bot_command_permissions_command ON bot_command_permissions(command_id,subject_type,subject_id)"
-    ]}
-    ,{48, [
-        %% Internal webhook/AI workers claim across all installed bots. Keep the
-        %% hot queue tiny even when completed invocation history becomes large;
-        %% completed/failed rows deliberately do not occupy this partial index.
-        "CREATE INDEX IF NOT EXISTS idx_bot_command_invocations_active ON bot_command_invocations(id,lease_until) WHERE status IN ('pending','claimed')"
-    ]}
-    ,{49, [
-        %% Slowmode is evaluated on every channel message send. This partial
-        %% index serves the exact channel+author live-message lookup without
-        %% adding write amplification to deleted/direct/profile message rows.
-        "CREATE INDEX IF NOT EXISTS idx_messages_channel_author_recent ON messages(scope_id,user_id,created_at DESC) WHERE scope='channel' AND deleted_at IS NULL"
-    ]}
-    ,{50, [
-        "ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check",
-        "ALTER TABLE messages ADD CONSTRAINT messages_kind_check CHECK(kind IN ('text','missed_call','call_ended'))"
-    ]}
-    ,{51, [
-        %% Provider-aware no-code AI assistants. Chat triggering is deliberately
-        %% mention/reply-only so a bad prompt cannot make bots answer each other
-        %% forever. Context is opt-in, bounded, and assembled only after the same
-        %% channel authorization check used for command delivery.
-        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_provider text NOT NULL DEFAULT 'openai_compatible'",
-        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_temperature double precision NOT NULL DEFAULT 0.7",
-        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_max_output_tokens integer NOT NULL DEFAULT 1000",
-        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_include_history boolean NOT NULL DEFAULT false",
-        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_history_messages integer NOT NULL DEFAULT 8",
-        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_chat_enabled boolean NOT NULL DEFAULT false",
-        "ALTER TABLE developer_applications ADD COLUMN IF NOT EXISTS ai_chat_trigger text NOT NULL DEFAULT 'mention_or_reply'",
-        "ALTER TABLE developer_applications DROP CONSTRAINT IF EXISTS developer_applications_ai_provider_check",
-        "ALTER TABLE developer_applications ADD CONSTRAINT developer_applications_ai_provider_check CHECK(ai_provider IN ('openai','openai_responses','openai_compatible','anthropic','google','openrouter','groq','mistral','ollama'))",
-        "ALTER TABLE developer_applications DROP CONSTRAINT IF EXISTS developer_applications_ai_temperature_check",
-        "ALTER TABLE developer_applications ADD CONSTRAINT developer_applications_ai_temperature_check CHECK(ai_temperature BETWEEN 0 AND 2)",
-        "ALTER TABLE developer_applications DROP CONSTRAINT IF EXISTS developer_applications_ai_max_output_tokens_check",
-        "ALTER TABLE developer_applications ADD CONSTRAINT developer_applications_ai_max_output_tokens_check CHECK(ai_max_output_tokens BETWEEN 64 AND 8192)",
-        "ALTER TABLE developer_applications DROP CONSTRAINT IF EXISTS developer_applications_ai_history_messages_check",
-        "ALTER TABLE developer_applications ADD CONSTRAINT developer_applications_ai_history_messages_check CHECK(ai_history_messages BETWEEN 0 AND 20)",
-        "ALTER TABLE developer_applications DROP CONSTRAINT IF EXISTS developer_applications_ai_chat_trigger_check",
-        "ALTER TABLE developer_applications ADD CONSTRAINT developer_applications_ai_chat_trigger_check CHECK(ai_chat_trigger IN ('mention','mention_or_reply'))",
-        "CREATE INDEX IF NOT EXISTS idx_bot_command_invocations_developer_activity ON bot_command_invocations(command_id,id DESC)"
-    ]}
-    ,{52, [
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email text NOT NULL DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified boolean NOT NULL DEFAULT false",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at bigint NOT NULL DEFAULT 0",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_verified_email ON users (lower(email)) WHERE email <> '' AND email_verified = true",
-        "CREATE TABLE IF NOT EXISTS account_tokens("
-        "id bigserial PRIMARY KEY, "
-        "user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
-        "purpose text NOT NULL, "
-        "token_hash text NOT NULL, "
-        "email text NOT NULL, "
-        "expires_at bigint NOT NULL, "
-        "used_at bigint, "
-        "created_at bigint NOT NULL)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_account_tokens_hash ON account_tokens(token_hash)",
-        "CREATE INDEX IF NOT EXISTS idx_account_tokens_user_purpose ON account_tokens(user_id, purpose, created_at DESC)",
-        "ALTER TABLE account_tokens DROP CONSTRAINT IF EXISTS account_tokens_purpose_check",
-        "ALTER TABLE account_tokens ADD CONSTRAINT account_tokens_purpose_check CHECK(purpose IN ('password_reset','email_verify'))"
-    ]}
-].
 
 
 
@@ -8299,7 +7719,8 @@ users_not_blocked(Conn, Uid, UserIds) ->
                     case rows(Conn, Sql, Params) of
                         {ok, []} -> true;
                         {ok, _} -> false;
-                        _ -> true
+                        %% A failed lookup must not treat a blocked person as allowed.
+                        _ -> false
                     end;
                 false -> true
             end
@@ -8774,8 +8195,21 @@ conversation_member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, 
     #{user => user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last]),
       last_read_message_id => LastRead, muted => Muted, nickname => Nick, joined_at => Joined, role => GroupRole, group_role => GroupRole}.
 
+notification_map([Id, Kind, Body, Url, Seen, Created, ServerId]) ->
+    Base = notification_map([Id, Kind, Body, Url, Seen, Created]),
+    case db_null(ServerId) of
+        undefined -> Base;
+        Sid -> Base#{server_id => Sid}
+    end;
 notification_map([Id, Kind, Body, Url, Seen, Created]) ->
     #{id => Id, kind => Kind, body => Body, url => Url, seen => Seen, created_at => Created}.
+
+%% Channel mentions stay on #/channel/ID. The server id is resolved for the
+%% rail badge and is omitted when the row is not a channel notification.
+notification_select() ->
+    "SELECT n.id, n.kind, n.body, n.url, n.seen, n.created_at, "
+    "(SELECT c.server_id FROM channels c WHERE n.url = '#/channel/' || c.id::text LIMIT 1) "
+    "FROM notifications n".
 
 thread_sql(undefined, <<>>) ->
     {thread_select() ++ " ORDER BY t.pinned DESC, t.score DESC, t.updated_at DESC LIMIT 120", []};
@@ -9270,7 +8704,9 @@ notify_channel_members(Conn, Sid, Sender, Cid, Msg, Now, SuppressMentions) ->
                  notify_mention(Conn, U, Body, Url,
                      #{type => mention, scope => channel, scope_id => Cid, channel_id => Cid, message => Msg}, Now);
              false ->
-                 create_notification(Conn, U, <<"channel_message">>, Body, Url, Now),
+                 %% Ordinary channel traffic stays on the channel topic. An inbox
+                 %% row for every member is what made the notification list a flood.
+                 %% Mentions still insert a row above.
                  pw_hub:notify_user(U, #{type => channel_message, channel_id => Cid, message => Msg})
          end
      end || R <- Rows],
@@ -9504,8 +8940,23 @@ create_notification_once(Conn, U, K, B, Url, Now) ->
     end.
 
 mark_url_seen0(Conn, Uid, Url) ->
-    _ = exec(Conn, "UPDATE notifications SET seen = true WHERE user_id = $1 AND url = $2", [Uid, Url]),
+    %% Opening the destination removes it from the queue. Marking seen left
+    %% the row in the list.
+    _ = exec(Conn, "DELETE FROM notifications WHERE user_id = $1 AND url = $2", [Uid, Url]),
     ok.
+
+maybe_dismiss_scope_notifications(Conn, Uid, Scope, ScopeId, Before, After)
+  when is_integer(ScopeId), ScopeId > 0, not is_integer(Before), not is_integer(After) ->
+    Url = case Scope of
+        <<"channel">> -> <<"#/channel/", (integer_to_binary(ScopeId))/binary>>;
+        <<"direct">> -> <<"#/dm/", (integer_to_binary(ScopeId))/binary>>;
+        _ -> undefined
+    end,
+    case Url of
+        undefined -> ok;
+        _ -> mark_url_seen0(Conn, Uid, Url)
+    end;
+maybe_dismiss_scope_notifications(_, _, _, _, _, _) -> ok.
 
 record_thread_view(_Conn, undefined, _Uid) -> ok;
 record_thread_view(Conn, ThreadId, Uid) ->
@@ -9531,9 +8982,9 @@ seed_forums(Conn) ->
     end.
 
 maybe_expire_account_restriction(Conn, Uid, State, ExpiresAt, Now)
-  when (State =:= <<"suspended">> orelse State =:= <<"banned">>), is_integer(ExpiresAt), ExpiresAt > 0, ExpiresAt =< Now ->
+  when (State =:= <<"suspended">> orelse State =:= <<"banned">> orelse State =:= <<"disabled">>), is_integer(ExpiresAt), ExpiresAt > 0, ExpiresAt =< Now ->
     ok = exec(Conn,
-        "UPDATE users SET account_state='active',moderation_title='',moderation_reason='',moderation_severity='warning',moderation_expires_at=0,moderated_by=NULL,moderated_at=$2,updated_at=$2 WHERE id=$1",
+        "UPDATE users SET account_state='active',disabled_at=0,moderation_title='',moderation_reason='',moderation_severity='warning',moderation_expires_at=0,moderated_by=NULL,moderated_at=$2,updated_at=$2 WHERE id=$1",
         [Uid, Now]),
     ok = exec(Conn,
         "INSERT INTO instance_account_actions(user_id,actor_user_id,action,title,reason,severity,expires_at,created_at) VALUES($1,NULL,'restore','Automatic restoration','Restriction expired','info',0,$2)",
@@ -9829,11 +9280,12 @@ admin_user_summary([Uid, Username, DisplayName, CreatedAt, LastSeen, Servers, Co
 
 admin_user_detail([Uid, Username, DisplayName, CreatedAt, UpdatedAt, LastSeen, Servers, OwnedServers,
                    Conversations, Messages, Uploads, UploadBytes, ActiveSessions, AccountState, IsBot,
-                   Title, Reason, Severity, ExpiresAt, ModeratedBy, ModeratedAt]) ->
+                   Title, Reason, Severity, ExpiresAt, ModeratedBy, ModeratedAt, DisabledAt, EmailSet, EmailVerified]) ->
     #{id => Uid, username => Username, display_name => DisplayName, created_at => CreatedAt, updated_at => UpdatedAt,
       last_seen => LastSeen, server_count => Servers, owned_server_count => OwnedServers,
       conversation_count => Conversations, message_count => Messages, upload_count => Uploads,
       upload_bytes => UploadBytes, active_sessions => ActiveSessions, account_state => AccountState, is_bot => IsBot,
+      disabled_at => DisabledAt, email_set => EmailSet =:= true, email_verified => EmailVerified =:= true,
       moderation => moderation_public_map(AccountState, Title, Reason, Severity, ExpiresAt, ModeratedBy, ModeratedAt)}.
 
 admin_server_summary([Sid, Name, CreatedAt, UpdatedAt, OwnerId, OwnerUsername, OwnerDisplayName, Members, Channels]) ->
@@ -9870,23 +9322,198 @@ moderation_actor_allowed(Conn, ActorUid, TargetUid) ->
         _ -> {error, forbidden}
     end.
 
+apply_instance_moderation(Conn, ActorUid, TargetUid, Action, Patch0) ->
+    Patch = normalize_instance_moderation_patch(Patch0, Action),
+    case {Action, Patch, TargetUid} of
+        {invalid, _, _} -> {error, invalid_action};
+        {_, {error, Reason}, _} -> {error, Reason};
+        {_, _, Uid} when not is_integer(Uid); Uid =< 0 -> {error, not_found};
+        {_, {ok, Moderation}, Uid} ->
+            Result = with_tx(Conn, fun() ->
+                %% Serialize operator-role checks with the action so demotion and
+                %% moderation cannot race each other across admin nodes.
+                ok = exec(Conn, "LOCK TABLE admin_operators IN SHARE MODE", []),
+                case moderation_actor_allowed(Conn, ActorUid, Uid) of
+                    {error, Reason} -> {error, Reason};
+                    ok ->
+                        case one(Conn, "SELECT id,account_state FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+                            {ok, [_Id, _OldState]} ->
+                                Now = pw_util:now_ms(),
+                                NewState = moderation_action_state(Action),
+                                Title = maps:get(title, Moderation), ReasonText = maps:get(reason, Moderation),
+                                Severity = maps:get(severity, Moderation), ExpiresAt = maps:get(expires_at, Moderation),
+                                case Action of
+                                    restore ->
+                                        ok = exec(Conn,
+                                            "UPDATE users SET account_state='active',disabled_at=0,moderation_title='',moderation_reason='',moderation_severity='warning',moderation_expires_at=0,moderated_by=$2,moderated_at=$3,updated_at=$3 WHERE id=$1",
+                                            [Uid, ActorUid, Now]);
+                                    disable ->
+                                        ok = exec(Conn,
+                                            "UPDATE users SET account_state='disabled',disabled_at=$2,moderation_title=$3,moderation_reason=$4,moderation_severity=$5,moderation_expires_at=$6,moderated_by=$7,moderated_at=$8,updated_at=$8 WHERE id=$1",
+                                            [Uid, Now, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now]);
+                                    _ ->
+                                        ok = exec(Conn,
+                                            "UPDATE users SET account_state=$2,moderation_title=$3,moderation_reason=$4,moderation_severity=$5,moderation_expires_at=$6,moderated_by=$7,moderated_at=$8,updated_at=$8 WHERE id=$1",
+                                            [Uid, NewState, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now])
+                                end,
+                                {ok, SessionRows} = rows(Conn, "DELETE FROM sessions WHERE user_id=$1 RETURNING token_hash", [Uid]),
+                                ok = exec(Conn, "DELETE FROM admin_sessions WHERE user_id=$1", [Uid]),
+                                ok = exec(Conn,
+                                    "INSERT INTO instance_account_actions(user_id,actor_user_id,action,title,reason,severity,expires_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+                                    [Uid, ActorUid, atom_to_binary(Action, utf8), Title, ReasonText, Severity, ExpiresAt, Now]),
+                                Detail = moderation_audit_detail(Action, Title, ReasonText, Severity, ExpiresAt),
+                                admin_audit_insert(Conn, ActorUid, <<"account.", (atom_to_binary(Action, utf8))/binary>>, <<"user">>, integer_to_binary(Uid), Detail, <<>>, Now),
+                                {ok, #{user_id => Uid, account_state => NewState,
+                                    moderation => moderation_public_map(NewState, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now),
+                                    session_hashes => [only_id(R) || R <- SessionRows]}};
+                            _ -> {error, not_found}
+                        end
+                end
+            end),
+            case Result of
+                {ok, #{session_hashes := Hashes, user_id := UserId} = Data} ->
+                    [ets:delete(?SESSION_CACHE, H) || H <- Hashes],
+                    invalidate_session_cache(UserId),
+                    pw_redis:presence_delete(UserId),
+                    pw_upload_gc:invalidate_user(UserId),
+                    Public = maps:remove(session_hashes, Data),
+                    EventType = case Action of
+                        restore -> account_restored;
+                        disable -> account_disabled;
+                        _ -> account_restricted
+                    end,
+                    pw_hub:notify_user(UserId, #{type => EventType, account_state => maps:get(account_state, Public), moderation => maps:get(moderation, Public)}),
+                    {ok, Public};
+                Other -> Other
+            end
+    end.
+
+admin_account_maintenance(Conn, ActorUid, TargetUid, Action) ->
+    case TargetUid of
+        Uid when not is_integer(Uid); Uid =< 0 -> {error, not_found};
+        Uid ->
+            Result = with_tx(Conn, fun() ->
+                ok = exec(Conn, "LOCK TABLE admin_operators IN SHARE MODE", []),
+                case moderation_actor_allowed(Conn, ActorUid, Uid) of
+                    {error, Reason} -> {error, Reason};
+                    ok -> apply_account_maintenance(Conn, ActorUid, Uid, Action)
+                end
+            end),
+            finish_account_maintenance(Result)
+    end.
+
+apply_account_maintenance(Conn, ActorUid, Uid, revoke_sessions) ->
+    case one(Conn, "SELECT id FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+        {ok, [_]} ->
+            Now = pw_util:now_ms(),
+            {ok, SessionRows} = rows(Conn, "DELETE FROM sessions WHERE user_id=$1 RETURNING token_hash", [Uid]),
+            ok = exec(Conn, "DELETE FROM admin_sessions WHERE user_id=$1", [Uid]),
+            ok = record_account_maintenance(Conn, ActorUid, Uid, revoke_sessions, <<"Sessions revoked">>, <<"Operator revoked active sessions">>, Now),
+            {ok, #{user_id => Uid, revoked => length(SessionRows),
+                   session_hashes => [only_id(R) || R <- SessionRows],
+                   notify => #{type => sessions_revoked}}};
+        _ -> {error, not_found}
+    end;
+apply_account_maintenance(Conn, ActorUid, Uid, clear_display_name) ->
+    case one(Conn, "SELECT username,display_name FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+        {ok, [Username, Display]} ->
+            Now = pw_util:now_ms(),
+            Changed = Display =/= Username,
+            case Changed of
+                true -> ok = exec(Conn, "UPDATE users SET display_name=$2,updated_at=$3 WHERE id=$1", [Username, Username, Now]);
+                false -> ok
+            end,
+            ok = record_account_maintenance(Conn, ActorUid, Uid, clear_display_name, <<"Display name reset">>, <<"Display name set to the username">>, Now),
+            {ok, #{user_id => Uid, display_name => Username, changed => Changed, session_hashes => [],
+                   invalidate_profile => true, notify => undefined}};
+        _ -> {error, not_found}
+    end;
+apply_account_maintenance(Conn, ActorUid, Uid, remove_email) ->
+    case one(Conn, "SELECT id FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+        {ok, [_]} ->
+            Now = pw_util:now_ms(),
+            ok = exec(Conn, "UPDATE users SET email='',email_verified=false,email_verified_at=0,updated_at=$2 WHERE id=$1", [Now, Uid]),
+            ok = exec(Conn, "DELETE FROM account_tokens WHERE user_id=$1 AND purpose='email_verify'", [Uid]),
+            ok = record_account_maintenance(Conn, ActorUid, Uid, remove_email, <<"Email removed">>, <<"Account email cleared">>, Now),
+            {ok, #{user_id => Uid, removed => true, email_set => false, email_verified => false,
+                   session_hashes => [], invalidate_profile => true, notify => undefined}};
+        _ -> {error, not_found}
+    end;
+apply_account_maintenance(Conn, ActorUid, Uid, resend_verification) ->
+    case one(Conn, "SELECT username,email,email_verified FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+        {ok, [_Username, <<>>, _Verified]} -> {error, email_required};
+        {ok, [_Username, _Email, true]} ->
+            Now = pw_util:now_ms(),
+            ok = record_account_maintenance(Conn, ActorUid, Uid, resend_verification, <<"Verification already complete">>, <<"No message sent">>, Now),
+            {ok, #{user_id => Uid, already_verified => true, session_hashes => [], notify => undefined}};
+        {ok, [Username, Email, _Verified]} ->
+            Now = pw_util:now_ms(),
+            Mail = issue_account_mail(Conn, Uid, Username, Email, email_verify, 86400000),
+            ok = record_account_maintenance(Conn, ActorUid, Uid, resend_verification, <<"Verification resent">>, <<"Verification message queued">>, Now),
+            {ok, #{user_id => Uid, sent => true, session_hashes => [], notify => undefined, mail => maps:get(mail, Mail)}};
+        _ -> {error, not_found}
+    end.
+
+record_account_maintenance(Conn, ActorUid, Uid, Action, Title, Reason, Now) ->
+    ok = exec(Conn,
+        "INSERT INTO instance_account_actions(user_id,actor_user_id,action,title,reason,severity,expires_at,created_at) VALUES($1,$2,$3,$4,$5,'info',0,$6)",
+        [Uid, ActorUid, atom_to_binary(Action, utf8), Title, Reason, Now]),
+    admin_audit_insert(Conn, ActorUid, <<"account.", (atom_to_binary(Action, utf8))/binary>>, <<"user">>, integer_to_binary(Uid),
+        pw_util:clean_text(<<Title/binary, " - ", Reason/binary>>, 240), <<>>, Now),
+    ok.
+
+finish_account_maintenance({ok, #{user_id := UserId, session_hashes := Hashes} = Data}) ->
+    [ets:delete(?SESSION_CACHE, H) || H <- Hashes],
+    case Hashes =/= [] of
+        true ->
+            invalidate_session_cache(UserId),
+            pw_redis:presence_delete(UserId);
+        false -> ok
+    end,
+    case maps:get(invalidate_profile, Data, false) of
+        true -> invalidate_session_cache(UserId);
+        false -> ok
+    end,
+    case maps:get(notify, Data, undefined) of
+        undefined -> ok;
+        Event -> pw_hub:notify_user(UserId, Event)
+    end,
+    {ok, maps:without([session_hashes, notify, invalidate_profile], Data)};
+finish_account_maintenance(Other) -> Other.
+
 normalize_instance_moderation_action(<<"suspend">>) -> suspend;
 normalize_instance_moderation_action(<<"ban">>) -> ban;
 normalize_instance_moderation_action(<<"restore">>) -> restore;
+normalize_instance_moderation_action(<<"disable">>) -> disable;
+normalize_instance_moderation_action(<<"revoke_sessions">>) -> revoke_sessions;
+normalize_instance_moderation_action(<<"clear_display_name">>) -> clear_display_name;
+normalize_instance_moderation_action(<<"remove_email">>) -> remove_email;
+normalize_instance_moderation_action(<<"resend_verification">>) -> resend_verification;
 normalize_instance_moderation_action(suspend) -> suspend;
 normalize_instance_moderation_action(ban) -> ban;
 normalize_instance_moderation_action(restore) -> restore;
+normalize_instance_moderation_action(disable) -> disable;
+normalize_instance_moderation_action(revoke_sessions) -> revoke_sessions;
+normalize_instance_moderation_action(clear_display_name) -> clear_display_name;
+normalize_instance_moderation_action(remove_email) -> remove_email;
+normalize_instance_moderation_action(resend_verification) -> resend_verification;
 normalize_instance_moderation_action(_) -> invalid.
 
 moderation_action_state(suspend) -> <<"suspended">>;
 moderation_action_state(ban) -> <<"banned">>;
+moderation_action_state(disable) -> <<"disabled">>;
 moderation_action_state(restore) -> <<"active">>.
 
+normalize_instance_moderation_patch(_, invalid) -> {error, invalid_action};
 normalize_instance_moderation_patch(_Patch0, restore) ->
     {ok, #{title => <<>>, reason => <<>>, severity => <<"warning">>, expires_at => 0}};
 normalize_instance_moderation_patch(Patch0, Action) when is_map(Patch0) ->
     Patch = normalize_patch_keys(Patch0), Now = pw_util:now_ms(),
-    DefaultTitle = case Action of suspend -> <<"Account suspended">>; ban -> <<"Account banned">> end,
+    DefaultTitle = case Action of
+        suspend -> <<"Account suspended">>;
+        ban -> <<"Account banned">>;
+        disable -> <<"Account disabled">>
+    end,
     Title0 = pw_util:clean_text(maps:get(<<"title">>, Patch, DefaultTitle), 100),
     Title = case Title0 of <<>> -> DefaultTitle; _ -> Title0 end,
     Reason = pw_util:clean_text(maps:get(<<"reason">>, Patch, <<>>), 1000),

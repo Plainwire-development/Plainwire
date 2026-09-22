@@ -28,6 +28,25 @@ encryption_round_trip_test() ->
         ?assertEqual(Plain, pw_crypto:decrypt(Cipher))
     end).
 
+tampered_envelope_is_not_returned_test() ->
+    with_env("PLAINWIRE_ENC_KEY", test_key(), fun() ->
+        Cipher = pw_crypto:encrypt(<<"hello private message">>),
+        <<"e1:", Rest/binary>> = Cipher,
+        Decoded = base64:decode(Rest),
+        <<Byte, Tail/binary>> = Decoded,
+        Bad = <<"e1:", (base64:encode(<<(Byte bxor 16#ff), Tail/binary>>))/binary>>,
+        ?assertEqual(<<>>, pw_crypto:decrypt(Bad)),
+        ?assertNotEqual(Bad, pw_crypto:decrypt(Bad))
+    end).
+
+missing_key_does_not_return_ciphertext_test() ->
+    Cipher = with_env("PLAINWIRE_ENC_KEY", test_key(), fun() ->
+        pw_crypto:encrypt(<<"hello private message">>)
+    end),
+    with_env("PLAINWIRE_ENC_KEY", unset, fun() ->
+        ?assertEqual(<<>>, pw_crypto:decrypt(Cipher))
+    end).
+
 bad_key_leaves_plaintext_test() ->
     with_env("PLAINWIRE_ENC_KEY", "bad-key", fun() ->
         Plain = <<"hello">>,

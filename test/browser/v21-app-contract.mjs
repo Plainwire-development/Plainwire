@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 const read=p=>readFileSync(p,'utf8');
-const db=read('src/pw_db.erl');
+const db=read('src/pw_db.erl')+'\n'+read('src/pw_db_schema.erl');
 const api=read('src/pw_api.erl');
 const http=read('src/pw_app_http.erl');
 const outbound=read('src/pw_outbound_url.erl');

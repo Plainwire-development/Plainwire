@@ -129,8 +129,13 @@ authed(<<"POST">>, [<<"users">>, IdBin, <<"moderation">>], Req0, Session, _Hash,
     operator_json(Req0, Session, fun(M, Req) ->
         case positive_int(IdBin) of
             undefined -> reply_error(Req, 400, <<"invalid_user_id">>, State);
-            Id -> reply_result(Req, pw_db:admin_apply_user_moderation(maps:get(user_id, Session), Id,
-                maps:get(<<"action">>, M, <<>>), M), State)
+            Id ->
+                case account_action_gate(M, Id) of
+                    {error, rate_limited} -> reply_error(Req, 429, <<"rate_limited">>, State);
+                    {error, mail_disabled} -> reply_error(Req, 409, <<"mail_disabled">>, State);
+                    ok -> reply_account_action(Req, pw_db:admin_apply_user_moderation(maps:get(user_id, Session), Id,
+                        maps:get(<<"action">>, M, <<>>), M), State)
+                end
         end
     end, State);
 authed(<<"GET">>, [<<"users">>, IdBin], Req, Session, _Hash, State) ->
@@ -361,8 +366,34 @@ positive_int(Bin) ->
 privacy_contract() ->
     #{content_access => false,
       excluded => [<<"message_bodies">>, <<"direct_message_text">>, <<"attachment_contents">>,
-                   <<"message_search">>, <<"private_profile_text">>, <<"verification_secrets">>],
+                   <<"message_search">>, <<"private_profile_text">>, <<"verification_secrets">>,
+                   <<"email_addresses">>],
       note => <<"The service admin plane exposes operational metadata and aggregate counts, not communication contents.">>}.
+
+account_action_gate(M, Id) ->
+    case maps:get(<<"action">>, M, <<>>) of
+        <<"resend_verification">> ->
+            case pw_rate:allow({admin_resend_verification, Id}, 4, 600000) of
+                false -> {error, rate_limited};
+                true ->
+                    case pw_mail:enabled() of
+                        true -> ok;
+                        false -> {error, mail_disabled}
+                    end
+            end;
+        _ -> ok
+    end.
+
+%% Verification mail carries a one-time token. Send it here and never put the
+%% token or the address in the operator JSON response.
+reply_account_action(Req, {ok, Data}, State) when is_map(Data) ->
+    case maps:take(mail, Data) of
+        {Mail, Rest} ->
+            _ = pw_mail:send(Mail),
+            reply_ok(Req, Rest#{email_delivery => true}, State);
+        error -> reply_ok(Req, Data, State)
+    end;
+reply_account_action(Req, Other, State) -> reply_result(Req, Other, State).
 
 reply_result(Req, {ok, Data}, State) -> reply_ok(Req, Data, State);
 reply_result(Req, ok, State) -> reply_ok(Req, #{ok => true}, State);
@@ -394,6 +425,8 @@ error_status(cannot_moderate_self) -> {409, <<"cannot_moderate_self">>};
 error_status(owner_protected) -> {409, <<"owner_protected">>};
 error_status(operator_protected) -> {403, <<"operator_protected">>};
 error_status(invalid_registration_mode) -> {400, <<"invalid_registration_mode">>};
+error_status(email_required) -> {400, <<"email_required">>};
+error_status(mail_disabled) -> {409, <<"mail_disabled">>};
 error_status(user_not_found) -> {404, <<"user_not_found">>};
 error_status(not_found) -> {404, <<"not_found">>};
 error_status(database_busy) -> {503, <<"database_busy">>};
