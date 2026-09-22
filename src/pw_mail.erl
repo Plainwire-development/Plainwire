@@ -1,6 +1,6 @@
 -module(pw_mail).
 -behaviour(gen_server).
--export([start_link/0, enabled/0, public_host/0, send/1]).
+-export([start_link/0, enabled/0, public_host/0, send/1, deliver_now/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -ifdef(TEST).
 -export([central_host/1, smtp_configured/0, compose/1, public_url/0, rfc822/4, smtp_send/1]).
@@ -24,15 +24,37 @@ public_host() ->
     host_from_url(public_url()).
 
 send(Mail) when is_map(Mail) ->
+    enqueue(Mail, none);
+send(_) -> {error, invalid_mail}.
+
+%% Wait until the SMTP server accepts the message. Account verification uses
+%% this so the API does not tell someone to check an inbox that was never sent.
+deliver_now(Mail) when is_map(Mail) ->
+    Ref = make_ref(),
+    case enqueue(Mail, {self(), Ref}) of
+        ok ->
+            receive
+                {mail_result, Ref, Result} -> Result
+            after 35000 -> {error, mail_timeout}
+            end;
+        {error, Reason} -> {error, Reason}
+    end;
+deliver_now(_) -> {error, invalid_mail}.
+
+enqueue(Mail, ReplyTo) ->
     case enabled() of
         false -> {error, mail_disabled};
         true ->
             case whereis(?SERVER) of
-                Pid when is_pid(Pid) -> gen_server:cast(?SERVER, {send, sanitize_mail(Mail)}), ok;
+                Pid when is_pid(Pid) ->
+                    gen_server:cast(Pid, mail_cast(sanitize_mail(Mail), ReplyTo)),
+                    ok;
                 _ -> {error, mail_unavailable}
             end
-    end;
-send(_) -> {error, invalid_mail}.
+    end.
+
+mail_cast(Mail, none) -> {send, Mail};
+mail_cast(Mail, ReplyTo) -> {send, Mail, ReplyTo}.
 
 init([]) ->
     process_flag(trap_exit, true),
@@ -41,7 +63,9 @@ init([]) ->
 handle_call(_Msg, _From, State) -> {reply, {error, unknown}, State}.
 
 handle_cast({send, Mail}, State) ->
-    {noreply, enqueue_or_start(Mail, State)};
+    {noreply, enqueue_or_start(Mail, none, State)};
+handle_cast({send, Mail, ReplyTo}, State) ->
+    {noreply, enqueue_or_start(Mail, ReplyTo, State)};
 handle_cast(_Msg, State) -> {noreply, State}.
 
 handle_info({'DOWN', _Ref, process, _Pid, _Reason}, State0) ->
@@ -52,27 +76,51 @@ handle_info(_Info, State) -> {noreply, State}.
 terminate(_Reason, _State) -> ok.
 code_change(_Old, State, _Extra) -> {ok, State}.
 
-enqueue_or_start(Mail, State) ->
+enqueue_or_start(Mail, ReplyTo, State) ->
     case maps:get(inflight, State, 0) < ?MAX_INFLIGHT of
-        true -> start_delivery(Mail, State);
+        true -> start_delivery(Mail, ReplyTo, State);
         false ->
             Q = maps:get(queue, State, queue:new()),
+            Item = {Mail, ReplyTo},
             Bounded = case queue:len(Q) >= 64 of
-                true -> queue:in(Mail, queue:drop(Q));
-                false -> queue:in(Mail, Q)
+                true ->
+                    {{value, Dropped}, Q1} = queue:out(Q),
+                    reply_waiter(Dropped, {error, mail_busy}),
+                    queue:in(Item, Q1);
+                false -> queue:in(Item, Q)
             end,
             State#{queue => Bounded}
     end.
 
 pump(State) ->
-    case queue:out(maps:get(queue, State, queue:new())) of
-        {empty, Q} -> State#{queue => Q};
-        {{value, Mail}, Q} -> start_delivery(Mail, State#{queue => Q})
+    case maps:get(inflight, State, 0) >= ?MAX_INFLIGHT of
+        true -> State;
+        false ->
+            case queue:out(maps:get(queue, State, queue:new())) of
+                {empty, Q} -> State#{queue => Q};
+                {{value, {Mail, ReplyTo}}, Q} -> start_delivery(Mail, ReplyTo, State#{queue => Q})
+            end
     end.
 
-start_delivery(Mail, State) ->
-    {_Pid, _Ref} = spawn_monitor(fun() -> deliver(Mail) end),
+start_delivery(Mail, ReplyTo, State) ->
+    {_Pid, _Ref} = spawn_monitor(fun() ->
+        Result = try deliver(Mail) catch Class:Reason -> {error, {Class, Reason}} end,
+        reply_waiter(ReplyTo, client_result(Result))
+    end),
     State#{inflight => maps:get(inflight, State, 0) + 1}.
+
+reply_waiter({Pid, Ref}, Result) when is_pid(Pid), is_reference(Ref) ->
+    Pid ! {mail_result, Ref, Result};
+reply_waiter({_Mail, ReplyTo}, Result) ->
+    reply_waiter(ReplyTo, Result);
+reply_waiter(_, _) -> ok.
+
+client_result(ok) -> ok;
+client_result({error, mail_disabled}) -> {error, mail_disabled};
+client_result({error, mail_unavailable}) -> {error, mail_unavailable};
+client_result({error, mail_busy}) -> {error, mail_busy};
+client_result({error, invalid_mail}) -> {error, invalid_mail};
+client_result({error, _}) -> {error, mail_rejected}.
 
 sanitize_mail(Mail) ->
     maps:with([kind, to, username, token, app_name], Mail).
@@ -127,13 +175,18 @@ host_from_url(Url) ->
 central_host(Host) ->
     Host =:= <<"plainwi.re">> orelse Host =:= <<"www.plainwi.re">>.
 
-compose(#{kind := Kind, to := To, token := Token} = Mail) when Kind =:= password_reset; Kind =:= email_verify ->
+compose(#{kind := Kind, to := To0, token := Token0} = Mail) when Kind =:= password_reset; Kind =:= email_verify ->
+    Token = header_safe(Token0),
     App = case header_safe(maps:get(app_name, Mail, <<>>)) of
         <<>> -> <<"Plainwire">>;
         Name -> Name
     end,
-    Username = maps:get(username, Mail, <<"there">>),
-    From = from_address(),
+    Username = case header_safe(maps:get(username, Mail, <<>>)) of
+        <<>> -> <<"there">>;
+        Display -> Display
+    end,
+    From = header_safe(from_address()),
+    To = header_safe(To0),
     {Subject, Path, Intro, Action} = case Kind of
         password_reset ->
             {<<"Reset your ", App/binary, " password">>,
@@ -167,14 +220,17 @@ from_address() ->
 deliver(Mail) ->
     case compose(Mail) of
         {error, Reason} ->
-            logger:warning("[plainwire:mail] compose_failed reason=~p", [Reason]);
+            logger:warning("[plainwire:mail] compose_failed reason=~p", [Reason]),
+            {error, Reason};
         Message ->
             case smtp_send(Message) of
                 ok ->
-                    logger:info("[plainwire:mail] sent kind=~s", [maps:get(kind, Mail, unknown)]);
-                {error, Reason} ->
+                    logger:info("[plainwire:mail] sent kind=~s", [maps:get(kind, Mail, unknown)]),
+                    ok;
+                {error, Reason} = Error ->
                     logger:warning("[plainwire:mail] send_failed kind=~s reason=~p",
-                                   [maps:get(kind, Mail, unknown), redact_reason(Reason)])
+                                   [maps:get(kind, Mail, unknown), redact_reason(Reason)]),
+                    Error
             end
     end.
 
@@ -182,42 +238,78 @@ redact_reason({smtp_auth, _}) -> smtp_auth_failed;
 redact_reason({smtp, 535, _}) -> smtp_auth_failed;
 redact_reason(Reason) -> Reason.
 
-smtp_send(#{from := From, to := To, subject := Subject, text := Text}) ->
+smtp_send(Message) -> smtp_send(Message, 1).
+
+smtp_send(Message, Attempt) ->
+    case smtp_once(Message) of
+        ok -> ok;
+        {error, Reason} = Error ->
+            case Attempt < 2 andalso transient_failure(Reason) of
+                true ->
+                    timer:sleep(250),
+                    smtp_send(Message, Attempt + 1);
+                false -> Error
+            end
+    end.
+
+%% One attempt. The live socket is the post-STARTTLS SSL socket when the
+%% session upgraded; closing the original TCP socket instead resets the TLS
+%% session and some servers then drop a message they already accepted.
+smtp_once(#{from := From, to := To, subject := Subject, text := Text}) ->
     Host = binary_to_list(string:trim(pw_util:env_str("PLAINWIRE_SMTP_HOST", <<>>))),
     Port = pw_util:env_int("PLAINWIRE_SMTP_PORT", 587),
-    User = string:trim(pw_util:env_str("PLAINWIRE_SMTP_USER", <<>>)),
+    User = header_safe(string:trim(pw_util:env_str("PLAINWIRE_SMTP_USER", <<>>))),
     Pass = smtp_password(),
     case smtp_connect(Host, Port) of
-        {ok, Sock0} ->
-            try smtp_session(Sock0, User, Pass, From, To, Subject, Text)
-            after close_sock(Sock0)
-            end;
+        {ok, Io} ->
+            put(pw_mail_conn, Io),
+            Result = try smtp_session(Io, User, Pass, header_safe(From), header_safe(To), header_safe(Subject), Text)
+                     catch Class:Reason -> {error, {Class, Reason}}
+                     end,
+            close_io(erase(pw_mail_conn)),
+            Result;
         {error, Reason} -> {error, {connect, Reason}}
+    end;
+smtp_once(_) -> {error, invalid_mail}.
+
+transient_failure({connect, _}) -> true;
+transient_failure(closed) -> true;
+transient_failure(timeout) -> true;
+transient_failure({smtp, 421, _}) -> true;
+transient_failure({smtp, Code, _}) when Code >= 450, Code =< 452 -> true;
+transient_failure(_) -> false.
+
+track(Io) -> put(pw_mail_conn, Io), Io.
+
+live(Fallback) ->
+    case get(pw_mail_conn) of
+        #{} = Io -> Io;
+        _ -> Fallback
     end.
 
 smtp_connect(Host, 465) ->
     case ssl:connect(Host, 465, [binary, {active, false}, {packet, raw}, {nodelay, true} | tls_opts(Host)], ?SMTP_TIMEOUT_MS) of
-        {ok, Ssl} -> {ok, {ssl, Ssl}};
+        {ok, Ssl} -> {ok, #{mod => ssl, sock => Ssl, buf => <<>>}};
         {error, Reason} -> {error, Reason}
     end;
 smtp_connect(Host, Port) ->
     case gen_tcp:connect(Host, Port, [binary, {active, false}, {packet, raw}, {nodelay, true}], ?SMTP_TIMEOUT_MS) of
-        {ok, Sock} -> {ok, {tcp, Sock}};
+        {ok, Sock} -> {ok, #{mod => gen_tcp, sock => Sock, buf => <<>>}};
         {error, Reason} -> {error, Reason}
     end.
 
-smtp_session(Sock0, User, Pass, From, To, Subject, Text) ->
-    case expect(Sock0, 220) of
-        {ok, Sock1} ->
-            case ehlo(Sock1) of
-                {ok, Sock2, Features} ->
-                    case maybe_starttls(Sock2, Features) of
-                        {ok, Sock3} ->
-                            case ehlo(Sock3) of
-                                {ok, Sock4, _} ->
-                                    smtp_authenticated(Sock4, User, Pass, From, To, Subject, Text);
+smtp_session(Io0, User, Pass, From, To, Subject, Text) ->
+    case expect(Io0, 220) of
+        {ok, Io1} ->
+            case ehlo(Io1) of
+                {ok, Io2, Features} ->
+                    case maybe_starttls(Io2, Features) of
+                        {ok, Io3, again} ->
+                            case ehlo(Io3) of
+                                {ok, Io4, _} -> smtp_authenticated(Io4, User, Pass, From, To, Subject, Text);
                                 Error -> Error
                             end;
+                        {ok, Io3, same} -> smtp_authenticated(Io3, User, Pass, From, To, Subject, Text);
                         Error -> Error
                     end;
                 Error -> Error
@@ -225,32 +317,44 @@ smtp_session(Sock0, User, Pass, From, To, Subject, Text) ->
         Error -> Error
     end.
 
-smtp_authenticated({tcp, _} = Sock, User, Pass, From, To, Subject, Text) ->
+smtp_authenticated(#{mod := gen_tcp} = Io, User, Pass, From, To, Subject, Text) ->
     case smtp_tls_required() of
         true -> {error, tls_required};
-        false -> smtp_mail(Sock, User, Pass, From, To, Subject, Text)
+        false -> smtp_mail(Io, User, Pass, From, To, Subject, Text)
     end;
-smtp_authenticated(Sock, User, Pass, From, To, Subject, Text) ->
-    smtp_mail(Sock, User, Pass, From, To, Subject, Text).
+smtp_authenticated(Io, User, Pass, From, To, Subject, Text) ->
+    smtp_mail(Io, User, Pass, From, To, Subject, Text).
 
-smtp_mail(Sock, User, Pass, From, To, Subject, Text) ->
-    case smtp_auth(Sock, User, Pass) of
-        {ok, Sock1} ->
-            case command(Sock1, [<<"MAIL FROM:<">>, From, <<">">>], 250) of
-                {ok, Sock2} ->
-                    case command(Sock2, [<<"RCPT TO:<">>, To, <<">">>], [250, 251]) of
-                        {ok, Sock3} ->
-                            case command(Sock3, <<"DATA">>, 354) of
-                                {ok, Sock4} ->
-                                    Payload = rfc822(From, To, Subject, Text),
-                                    case command(Sock4, [Payload, <<"\r\n.">>], 250) of
-                                        {ok, Sock5} ->
-                                            _ = command(Sock5, <<"QUIT">>, [221, 250]),
-                                            ok;
-                                        Error -> Error
-                                    end;
-                                Error -> Error
-                            end;
+smtp_mail(Io, User, Pass, From, To, Subject, Text) ->
+    case smtp_auth(Io, User, Pass) of
+        {ok, Io1} -> submit(Io1, User, From, To, Subject, Text);
+        Error -> Error
+    end.
+
+%% Some providers reject MAIL FROM when it is not the authenticated address.
+%% Retry the envelope (and the header) with the SMTP user. No new setting.
+submit(Io, User, From, To, Subject, Text) ->
+    case command(Io, [<<"MAIL FROM:<">>, From, <<">">>], 250) of
+        {ok, Io1} -> recipients(Io1, To, Subject, Text, From);
+        {error, {smtp, Code, _}} when (Code =:= 550 orelse Code =:= 553 orelse Code =:= 551 orelse Code =:= 501),
+                                       From =/= User, User =/= <<>> ->
+            case command(live(Io), [<<"MAIL FROM:<">>, User, <<">">>], 250) of
+                {ok, Io1} -> recipients(Io1, To, Subject, Text, User);
+                Error -> Error
+            end;
+        Error -> Error
+    end.
+
+recipients(Io, To, Subject, Text, From) ->
+    case command(Io, [<<"RCPT TO:<">>, To, <<">">>], [250, 251]) of
+        {ok, Io1} ->
+            case command(Io1, <<"DATA">>, 354) of
+                {ok, Io2} ->
+                    Payload = rfc822(From, To, Subject, Text),
+                    case command(Io2, [Payload, <<"\r\n.">>], 250) of
+                        {ok, Io3} ->
+                            _ = command(Io3, <<"QUIT">>, [221, 250]),
+                            ok;
                         Error -> Error
                     end;
                 Error -> Error
@@ -258,29 +362,38 @@ smtp_mail(Sock, User, Pass, From, To, Subject, Text) ->
         Error -> Error
     end.
 
-smtp_auth(Sock, User, Pass) ->
+smtp_auth(Io, User, Pass) ->
     Plain = base64:encode(<<0, User/binary, 0, Pass/binary>>),
-    case command(Sock, [<<"AUTH PLAIN ">>, Plain], 235) of
-        {ok, Sock1} -> {ok, Sock1};
+    case command(Io, [<<"AUTH PLAIN ">>, Plain], 235) of
+        {ok, Io1} -> {ok, Io1};
         %% 535 means the credentials were read and rejected. Retrying AUTH LOGIN
         %% with the same secret spends a second failed attempt per mail against
         %% the provider's lockout counter, so stop here.
         {error, {smtp, 535, _}} = Error -> Error;
+        %% 334 means the server wants the SASL payload as the next line. Sending
+        %% AUTH LOGIN here aborts the exchange and the message is never accepted.
+        {error, {smtp, 334, _}} ->
+            case command(live(Io), Plain, 235) of
+                {ok, Io1} -> {ok, Io1};
+                {error, {smtp, 535, _}} = Error -> Error;
+                {error, {smtp, _, _}} -> smtp_auth_login(live(Io), User, Pass);
+                {error, _} = Error -> Error
+            end;
         %% Any other refusal (504, 534, ...) means PLAIN was not usable on this
         %% connection; LOGIN is worth a try.
-        {error, {smtp, _, _}} -> smtp_auth_login(Sock, User, Pass);
+        {error, {smtp, _, _}} -> smtp_auth_login(live(Io), User, Pass);
         %% A transport error is not an auth problem. Propagate it unchanged so
         %% the log names the real fault.
         {error, _} = Error -> Error
     end.
 
-smtp_auth_login(Sock, User, Pass) ->
-    case command(Sock, <<"AUTH LOGIN">>, 334) of
-        {ok, Sock1} ->
-            case command(Sock1, base64:encode(User), 334) of
-                {ok, Sock2} ->
-                    case command(Sock2, base64:encode(Pass), 235) of
-                        {ok, Sock3} -> {ok, Sock3};
+smtp_auth_login(Io, User, Pass) ->
+    case command(Io, <<"AUTH LOGIN">>, 334) of
+        {ok, Io1} ->
+            case command(Io1, base64:encode(User), 334) of
+                {ok, Io2} ->
+                    case command(Io2, base64:encode(Pass), 235) of
+                        {ok, Io3} -> {ok, Io3};
                         {error, Reason} -> {error, {smtp_auth, Reason}}
                     end;
                 {error, Reason} -> {error, {smtp_auth, Reason}}
@@ -288,18 +401,22 @@ smtp_auth_login(Sock, User, Pass) ->
         {error, Reason} -> {error, {smtp_auth, Reason}}
     end.
 
-maybe_starttls({ssl, _} = Sock, _Features) -> {ok, Sock};
-maybe_starttls(Sock, Features) ->
+maybe_starttls(#{mod := ssl} = Io, _Features) -> {ok, track(Io), again};
+maybe_starttls(Io, Features) ->
     case lists:member(<<"STARTTLS">>, Features) of
         false ->
             case smtp_tls_required() of
                 true -> {error, tls_required};
-                false -> {ok, Sock}
+                false -> {ok, Io, same}
             end;
         true ->
             Host = smtp_host_list(),
-            case command(Sock, <<"STARTTLS">>, 220) of
-                {ok, Sock1} -> ssl_upgrade(Sock1, Host);
+            case command(Io, <<"STARTTLS">>, 220) of
+                {ok, Io1} ->
+                    case ssl_upgrade(Io1, Host) of
+                        {ok, Io2} -> {ok, Io2, again};
+                        Error -> Error
+                    end;
                 Error -> Error
             end
     end.
@@ -318,12 +435,12 @@ tls_opts(Host) ->
         {customize_hostname_check, [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]}
     ].
 
-ssl_upgrade({tcp, Sock}, Host) ->
+ssl_upgrade(#{mod := gen_tcp, sock := Sock}, Host) ->
     case ssl:connect(Sock, tls_opts(Host), ?SMTP_TIMEOUT_MS) of
-        {ok, Ssl} -> {ok, {ssl, Ssl}};
+        {ok, Ssl} -> {ok, track(#{mod => ssl, sock => Ssl, buf => <<>>})};
         {error, Reason} -> {error, {tls, Reason}}
     end;
-ssl_upgrade(Sock, _Host) -> {ok, Sock}.
+ssl_upgrade(Io, _Host) -> {ok, track(Io)}.
 
 ehlo_name() ->
     case public_host() of
@@ -331,78 +448,102 @@ ehlo_name() ->
         Host -> Host
     end.
 
-ehlo(Sock) ->
-    case send_line(Sock, [<<"EHLO ">>, ehlo_name()]) of
+ehlo(Io) ->
+    case send_line(Io, [<<"EHLO ">>, ehlo_name()]) of
         ok ->
-            case recv_reply(Sock) of
-                {ok, 250, Lines} ->
+            case recv_reply(Io) of
+                {ok, 250, Lines, Io1} ->
                     Features = [string:uppercase(string:trim(Text)) || {_Code, Text} <- Lines],
-                    {ok, Sock, Features};
-                {ok, Code, Lines} -> {error, {smtp, Code, Lines}};
-                Error -> Error
+                    {ok, track(Io1), Features};
+                {ok, Code, Lines, Io1} -> track(Io1), {error, {smtp, Code, Lines}};
+                {error, Reason, Io1} -> track(Io1), {error, Reason};
+                {error, Reason} -> {error, Reason}
             end;
-        Error -> Error
+        {error, Reason} -> {error, Reason}
     end.
 
-expect(Sock, Code) ->
-    case recv_reply(Sock) of
-        {ok, Code, _} -> {ok, Sock};
-        {ok, Other, Lines} -> {error, {smtp, Other, Lines}};
-        Error -> Error
+expect(Io, Code) ->
+    case recv_reply(Io) of
+        {ok, Code, _, Io1} -> {ok, track(Io1)};
+        {ok, Other, Lines, Io1} -> track(Io1), {error, {smtp, Other, Lines}};
+        {error, Reason, Io1} -> track(Io1), {error, Reason};
+        {error, Reason} -> {error, Reason}
     end.
 
-command(Sock, Line, Expected) when is_integer(Expected) ->
-    command(Sock, Line, [Expected]);
-command(Sock, Line, Expected) when is_list(Expected) ->
-    case send_line(Sock, Line) of
+command(Io, Line, Expected) when is_integer(Expected) ->
+    command(Io, Line, [Expected]);
+command(Io, Line, Expected) when is_list(Expected) ->
+    case send_line(Io, Line) of
         ok ->
-            case recv_reply(Sock) of
-                {ok, Code, Lines} ->
+            case recv_reply(Io) of
+                {ok, Code, Lines, Io1} ->
+                    track(Io1),
                     case lists:member(Code, Expected) of
-                        true -> {ok, Sock};
+                        true -> {ok, Io1};
                         false -> {error, {smtp, Code, Lines}}
                     end;
-                Error -> Error
+                {error, Reason, Io1} -> track(Io1), {error, Reason};
+                {error, Reason} -> {error, Reason}
             end;
-        Error -> Error
+        {error, Reason} -> {error, Reason}
     end.
 
-send_line({tcp, Sock}, Line) -> gen_tcp:send(Sock, [Line, <<"\r\n">>]);
-send_line({ssl, Sock}, Line) -> ssl:send(Sock, [Line, <<"\r\n">>]).
+send_line(#{mod := Mod, sock := Sock}, Line) ->
+    Mod:send(Sock, [Line, <<"\r\n">>]).
 
-recv_reply(Sock) -> recv_reply(Sock, []).
-recv_reply(Sock, Acc) ->
-    case recv_line(Sock) of
-        {ok, <<A, B, C, Sep, Rest/binary>>} when A >= $0, A =< $9, B >= $0, B =< $9, C >= $0, C =< $9 ->
+recv_reply(Io) -> recv_reply(Io, []).
+recv_reply(Io, Acc) ->
+    case recv_line(Io) of
+        {ok, <<A, B, C, Sep, Rest/binary>>, Io1} when A >= $0, A =< $9, B >= $0, B =< $9, C >= $0, C =< $9 ->
             Code = list_to_integer([A, B, C]),
             Text = binary:replace(Rest, <<"\r">>, <<>>, [global]),
             case Sep of
-                $- -> recv_reply(Sock, [{Code, Text} | Acc]);
-                $\s -> {ok, Code, lists:reverse([{Code, Text} | Acc])};
-                _ -> {error, {bad_smtp, <<A, B, C, Sep, Rest/binary>>}}
+                $- -> recv_reply(Io1, [{Code, Text} | Acc]);
+                $\s -> {ok, Code, lists:reverse([{Code, Text} | Acc]), Io1};
+                _ -> {error, {bad_smtp, <<A, B, C, Sep, Rest/binary>>}, Io1}
             end;
-        {ok, Line} -> {error, {bad_smtp, Line}};
-        Error -> Error
+        {ok, Line, Io1} -> {error, {bad_smtp, Line}, Io1};
+        {error, Reason, Io1} -> {error, Reason, Io1};
+        {error, Reason} -> {error, Reason}
     end.
 
-recv_line(Sock) -> recv_line(Sock, <<>>).
-recv_line(Sock, Acc) when byte_size(Acc) < 8192 ->
-    case recv_bytes(Sock, 1) of
-        {ok, <<"\n">>} -> {ok, Acc};
-        {ok, <<"\r">>} -> recv_line(Sock, Acc);
-        {ok, Byte} -> recv_line(Sock, <<Acc/binary, Byte/binary>>);
-        Error -> Error
-    end;
-recv_line(_Sock, _Acc) -> {error, smtp_line_too_long}.
+recv_line(#{buf := Buf} = Io) when byte_size(Buf) >= 8192 ->
+    {error, smtp_line_too_long, Io};
+recv_line(#{buf := Buf} = Io) ->
+    case binary:match(Buf, <<"\n">>) of
+        {Pos, _} ->
+            <<Line:Pos/binary, "\n", Rest/binary>> = Buf,
+            {ok, strip_cr(Line), Io#{buf => Rest}};
+        nomatch ->
+            case recv_chunk(Io) of
+                {ok, Io1} -> recv_line(Io1);
+                Error -> Error
+            end
+    end.
 
-recv_bytes({tcp, Sock}, N) -> gen_tcp:recv(Sock, N, ?SMTP_TIMEOUT_MS);
-recv_bytes({ssl, Sock}, N) -> ssl:recv(Sock, N, ?SMTP_TIMEOUT_MS).
+recv_chunk(#{mod := Mod, sock := Sock, buf := Buf} = Io) ->
+    case Mod:recv(Sock, 0, ?SMTP_TIMEOUT_MS) of
+        {ok, <<>>} -> {error, closed, Io};
+        {ok, Data} -> {ok, Io#{buf => <<Buf/binary, Data/binary>>}};
+        {error, Reason} -> {error, Reason, Io}
+    end.
 
-close_sock({tcp, Sock}) ->
-    try gen_tcp:close(Sock) catch _:_ -> ok end;
-close_sock({ssl, Sock}) ->
-    try ssl:close(Sock) catch _:_ -> ok end;
-close_sock(_) -> ok.
+strip_cr(<<>>) -> <<>>;
+strip_cr(Line) ->
+    Size = byte_size(Line) - 1,
+    case Line of
+        <<Trimmed:Size/binary, "\r">> -> Trimmed;
+        _ -> Line
+    end.
+
+close_io(undefined) -> ok;
+close_io(#{mod := ssl, sock := Sock}) ->
+    try ssl:close(Sock) catch _:_ -> ok end,
+    ok;
+close_io(#{mod := gen_tcp, sock := Sock}) ->
+    try gen_tcp:close(Sock) catch _:_ -> ok end,
+    ok;
+close_io(_) -> ok.
 
 header_safe(Value) ->
     Bin = pw_util:bin(Value),
@@ -424,19 +565,66 @@ rfc822(From0, To0, Subject0, Text) ->
     From = header_safe(From0),
     To = header_safe(To0),
     Subject = header_safe(Subject0),
-    Date = iolist_to_binary(httpd_util:rfc1123_date()),
-    Id = iolist_to_binary([pw_util:random_token(12), "@plainwire"]),
-    SafeText = smtp_dot_stuff(Text),
+    {Encoding, Encoded} = transfer_encode(pw_util:bin(Text)),
     iolist_to_binary([
         "From: Plainwire <", From, ">\r\n",
         "To: <", To, ">\r\n",
         "Subject: ", Subject, "\r\n",
-        "Date: ", Date, "\r\n",
-        "Message-ID: <", Id, ">\r\n",
+        "Date: ", smtp_date(), "\r\n",
+        "Message-ID: <", message_id(From), ">\r\n",
         "MIME-Version: 1.0\r\n",
         "Content-Type: text/plain; charset=utf-8\r\n",
-        "Content-Transfer-Encoding: 8bit\r\n",
+        "Content-Transfer-Encoding: ", Encoding, "\r\n",
         "Auto-Submitted: auto-generated\r\n",
         "\r\n",
-        SafeText
+        smtp_dot_stuff(Encoded)
     ]).
+
+message_id(From) ->
+    Domain = case binary:split(From, <<"@">>) of
+        [_, Domain0] when byte_size(Domain0) >= 3 -> Domain0;
+        _ ->
+            case public_host() of
+                <<>> -> <<"plainwire.local">>;
+                Host -> Host
+            end
+    end,
+    <<(pw_util:random_token(16))/binary, $@, Domain/binary>>.
+
+smtp_date() ->
+    try iolist_to_binary(httpd_util:rfc1123_date())
+    catch _:_ -> <<"Thu, 01 Jan 1970 00:00:00 GMT">>
+    end.
+
+%% 7bit when the body is ASCII. Quoted-printable otherwise, so a server that
+%% did not advertise 8BITMIME still accepts the message.
+transfer_encode(Body) ->
+    case ascii_body(Body) of
+        true -> {<<"7bit">>, Body};
+        false -> {<<"quoted-printable">>, quoted_printable(Body)}
+    end.
+
+ascii_body(<<>>) -> true;
+ascii_body(<<C, Rest/binary>>) when C =:= $\t; C =:= $\n; C =:= $\r; C >= 32, C =< 126 ->
+    ascii_body(Rest);
+ascii_body(_) -> false.
+
+quoted_printable(Body) ->
+    iolist_to_binary(lists:reverse(qp(binary_to_list(Body), 0, []))).
+
+qp([], _Col, Acc) -> Acc;
+qp([$\r, $\n | Rest], _Col, Acc) -> qp(Rest, 0, [$\n, $\r | Acc]);
+qp([$\n | Rest], _Col, Acc) -> qp(Rest, 0, [$\n, $\r | Acc]);
+qp([C | Rest], Col, Acc) when Col >= 73 -> qp([C | Rest], 0, [$\n, $\r, $= | Acc]);
+qp([C | Rest], Col, Acc) when C =:= $\t; C >= 33, C =< 126, C =/= $= ->
+    qp(Rest, Col + 1, [C | Acc]);
+qp([$\s | Rest], Col, Acc) ->
+    case Rest of
+        [$\n | _] -> qp(Rest, Col + 3, ["=20" | Acc]);
+        [$\r, $\n | _] -> qp(Rest, Col + 3, ["=20" | Acc]);
+        [] -> qp([], Col + 3, ["=20" | Acc]);
+        _ -> qp(Rest, Col + 1, [$\s | Acc])
+    end;
+qp([C | Rest], Col, Acc) ->
+    Hex = io_lib:format("=~2.16.0B", [C]),
+    qp(Rest, Col + 3, [Hex | Acc]).

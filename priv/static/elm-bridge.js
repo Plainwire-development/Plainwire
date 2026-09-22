@@ -8142,10 +8142,14 @@
         if (!next || !next.includes('@') || !next.includes('.')) { status.textContent = 'Enter a valid email address.'; return; }
         button.disabled = true;
         try {
-          await accountApi('POST', '/email', { email: next, password: password.value });
+          const saved = await accountApi('POST', '/email', { email: next, password: password.value });
+          api({ method: 'GET', path: '/me' });
+          if (saved.email_delivery === false) {
+            status.textContent = 'The address was saved, but the mail server did not accept the verification message.';
+            return;
+          }
           closeAccountDialog();
           send(app.ports.bridgeReceive, { tag: 'toast', data: 'Check your inbox to verify this email.' });
-          api({ method: 'GET', path: '/me' });
         } catch (error) {
           status.textContent = error.message === 'bad_password' ? 'Current password is incorrect.'
             : error.message === 'email_taken' ? 'That email is already verified on another account.'
@@ -8159,8 +8163,14 @@
         label: 'Resend verification', className: 'btn secondary', onClick: async (button) => {
           button.disabled = true; status.textContent = '';
           try {
-            await accountApi('POST', '/email/resend', {});
-            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Verification email sent, if this instance can send mail.' });
+            const sent = await accountApi('POST', '/email/resend', {});
+            if (sent.already_verified) {
+              send(app.ports.bridgeReceive, { tag: 'toast', data: 'This email is already verified.' });
+            } else if (sent.email_delivery === false) {
+              status.textContent = 'The mail server did not accept the verification message.';
+            } else {
+              send(app.ports.bridgeReceive, { tag: 'toast', data: 'Verification email sent.' });
+            }
           } catch (error) {
             status.textContent = error.message === 'email_required' ? 'Add an email first.' : 'Could not resend verification.';
           } finally { button.disabled = false; }

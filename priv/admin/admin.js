@@ -912,7 +912,9 @@ function confirmAccountAction(
         remove_email: "Email removed.",
         resend_verification: data.already_verified
           ? "Email is already verified."
-          : "Verification email queued.",
+          : data.email_delivery === false
+            ? "The mail server did not accept the verification message."
+            : "Verification email sent.",
       };
       toast(messages[action] || "Account updated.");
       await showUser(user.id);

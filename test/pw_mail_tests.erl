@@ -64,6 +64,17 @@ smtp_headers_reject_injected_breaks_test() ->
     Msg = pw_mail:rfc822(<<"from@example.com\r\nBcc: evil@example.com">>, <<"user@example.com">>, <<"Hi\r\nBcc: evil@example.com">>, <<"ok">>),
     ?assertEqual(nomatch, binary:match(Msg, <<"\r\nBcc:">>)).
 
+smtp_message_id_uses_from_domain_and_ascii_is_7bit_test() ->
+    Msg = pw_mail:rfc822(<<"from@example.com">>, <<"user@example.com">>, <<"Hi">>, <<"ok">>),
+    ?assertNotEqual(nomatch, binary:match(Msg, <<"@example.com>">>)),
+    ?assertEqual(nomatch, binary:match(Msg, <<"@plainwire>">>)),
+    ?assertNotEqual(nomatch, binary:match(Msg, <<"Content-Transfer-Encoding: 7bit\r\n">>)).
+
+smtp_non_ascii_body_is_quoted_printable_test() ->
+    Msg = pw_mail:rfc822(<<"from@example.com">>, <<"user@example.com">>, <<"Hi">>, <<"héllo">>),
+    ?assertNotEqual(nomatch, binary:match(Msg, <<"Content-Transfer-Encoding: quoted-printable\r\n">>)),
+    ?assertEqual(nomatch, binary:match(Msg, <<"8bit">>)).
+
 compose_verify_mail_uses_verify_fragment_test() ->
     with_env([{"PLAINWIRE_PUBLIC_URL", "https://plainwi.re"}], fun() ->
         Mail = pw_mail:compose(#{kind => email_verify, to => <<"user@example.com">>,
@@ -144,8 +155,42 @@ smtp_refuses_to_authenticate_without_tls_test() ->
 smtp_transport_error_is_not_reported_as_auth_failure_test() ->
     {Server, Port} = start_fake_smtp(#{close_after => <<"AUTH">>}),
     Result = with_smtp_env(Port, fun() -> pw_mail:smtp_send(sample_message(<<"body">>)) end),
-    ?assertEqual({error, closed}, Result),
+    ?assertMatch({error, {connect, econnrefused}}, Result),
     ?assertEqual(1, length(auth_lines(fake_smtp_transcript(Server)))).
+
+%% A server that answers AUTH PLAIN with 334 is waiting for the SASL payload.
+%% Starting AUTH LOGIN instead leaves the exchange unfinished.
+smtp_auth_plain_334_continues_instead_of_login_test() ->
+    {Server, Port} = start_fake_smtp(#{plain_continue => true}),
+    Result = with_smtp_env(Port, fun() -> pw_mail:smtp_send(sample_message(<<"body">>)) end),
+    ?assertEqual(ok, Result),
+    Lines = fake_smtp_transcript(Server),
+    ?assertEqual(nomatch, binary:match(iolist_to_binary(lists:join(<<"\n">>, Lines)), <<"AUTH LOGIN">>)),
+    ?assert(lists:member(<<"QUIT">>, Lines)).
+
+%% MAIL FROM is retried with the authenticated address when the configured
+%% From is rejected. Operators do not need a new environment variable.
+smtp_retries_envelope_with_authenticated_user_test() ->
+    {Server, Port} = start_fake_smtp(#{reject_first_mail => true}),
+    Result = with_env([{"PLAINWIRE_SMTP_HOST", "127.0.0.1"},
+                       {"PLAINWIRE_SMTP_PORT", integer_to_list(Port)},
+                       {"PLAINWIRE_SMTP_USER", "mailer@example.com"},
+                       {"PLAINWIRE_SMTP_PASS", "secret"},
+                       {"PLAINWIRE_SMTP_TLS", "false"},
+                       {"PLAINWIRE_PUBLIC_URL", "https://plainwi.re"}], fun() ->
+        pw_mail:smtp_send(sample_message(<<"body">>))
+    end),
+    ?assertEqual(ok, Result),
+    Lines = fake_smtp_transcript(Server),
+    ?assert(lists:member(<<"MAIL FROM:<noreply@example.com>">>, Lines)),
+    ?assert(lists:member(<<"MAIL FROM:<mailer@example.com>">>, Lines)).
+
+smtp_retries_a_dropped_greeting_once_test() ->
+    {Server, Port} = start_fake_smtp(#{accepts => 2, close_after => <<"EHLO">>, close_times => 1}),
+    Result = with_smtp_env(Port, fun() -> pw_mail:smtp_send(sample_message(<<"body">>)) end),
+    ?assertEqual(ok, Result),
+    Lines = fake_smtp_transcript(Server),
+    ?assert(lists:member(<<"QUIT">>, Lines)).
 
 %% --- fake SMTP server -------------------------------------------------------
 
@@ -168,19 +213,24 @@ start_fake_smtp(Opts) ->
                                      {reuseaddr, true}, {ip, {127, 0, 0, 1}}]),
     {ok, Port} = inet:port(LSock),
     Parent = self(),
+    Accepts = maps:get(accepts, Opts, 1),
     Server = spawn(fun() ->
-        Lines = try
-            {ok, Sock} = gen_tcp:accept(LSock, 10000),
-            ok = gen_tcp:send(Sock, <<"220 fake.localhost ESMTP\r\n">>),
-            Collected = serve(Sock, Opts, none, []),
-            catch gen_tcp:close(Sock),
-            Collected
-        catch _:_ -> []
-        end,
+        Lines = accept_sessions(LSock, Opts, Accepts, []),
         catch gen_tcp:close(LSock),
-        Parent ! {fake_smtp, self(), lists:reverse(Lines)}
+        Parent ! {fake_smtp, self(), Lines}
     end),
     {Server, Port}.
+
+accept_sessions(_LSock, _Opts, 0, Acc) -> lists:reverse(Acc);
+accept_sessions(LSock, Opts, N, Acc) ->
+    case gen_tcp:accept(LSock, 10000) of
+        {ok, Sock} ->
+            ok = gen_tcp:send(Sock, <<"220 fake.localhost ESMTP\r\n">>),
+            Collected = try serve(Sock, Opts, none, []) catch _:_ -> [] end,
+            catch gen_tcp:close(Sock),
+            accept_sessions(LSock, Opts, N - 1, lists:reverse(Collected, Acc));
+        {error, _} -> lists:reverse(Acc)
+    end.
 
 fake_smtp_transcript(Server) ->
     receive {fake_smtp, Server, Lines} -> Lines
@@ -210,10 +260,19 @@ handle_line(Sock, Opts, login_user, _Line) ->
 handle_line(Sock, Opts, login_pass, _Line) ->
     reply(Sock, Opts, auth_login_result, <<"235 2.7.0 Authentication succeeded">>),
     {continue, none};
+handle_line(Sock, Opts, plain_payload, _Line) ->
+    reply(Sock, Opts, auth_plain, <<"235 2.7.0 Authentication succeeded">>),
+    {continue, none};
 handle_line(Sock, Opts, none, Line) ->
     Cmd = iolist_to_binary(string:uppercase(hd(binary:split(Line, <<" ">>)))),
     case maps:get(close_after, Opts, undefined) of
-        Cmd -> stop;
+        Cmd ->
+            Seen = case get({closed_cmd, Cmd}) of undefined -> 0; N -> N end,
+            put({closed_cmd, Cmd}, Seen + 1),
+            case Seen < maps:get(close_times, Opts, 1) of
+                true -> stop;
+                false -> dispatch(Sock, Opts, Cmd, Line)
+            end;
         _ -> dispatch(Sock, Opts, Cmd, Line)
     end.
 
@@ -224,12 +283,26 @@ dispatch(Sock, Opts, <<"EHLO">>, _Line) ->
 dispatch(Sock, Opts, <<"AUTH">>, <<"AUTH LOGIN", _/binary>>) ->
     reply(Sock, Opts, auth_login, <<"334 VXNlcm5hbWU6">>),
     {continue, login_user};
-dispatch(Sock, Opts, <<"AUTH">>, _Line) ->
-    reply(Sock, Opts, auth_plain, <<"235 2.7.0 Authentication succeeded">>),
-    {continue, none};
+dispatch(Sock, Opts, <<"AUTH">>, Line) ->
+    case maps:get(plain_continue, Opts, false) andalso binary:match(Line, <<"PLAIN">>) =/= nomatch of
+        true ->
+            reply(Sock, Opts, auth_plain_challenge, <<"334 ">>),
+            {continue, plain_payload};
+        false ->
+            reply(Sock, Opts, auth_plain, <<"235 2.7.0 Authentication succeeded">>),
+            {continue, none}
+    end;
 dispatch(Sock, Opts, <<"MAIL">>, _Line) ->
-    reply(Sock, Opts, mail, <<"250 2.1.0 Ok">>),
-    {continue, none};
+    N = case get(mail_count) of undefined -> 0; C -> C end,
+    put(mail_count, N + 1),
+    case maps:get(reject_first_mail, Opts, false) andalso N =:= 0 of
+        true ->
+            gen_tcp:send(Sock, <<"550 5.1.0 sender rejected\r\n">>),
+            {continue, none};
+        false ->
+            reply(Sock, Opts, mail, <<"250 2.1.0 Ok">>),
+            {continue, none}
+    end;
 dispatch(Sock, Opts, <<"RCPT">>, _Line) ->
     reply(Sock, Opts, rcpt, <<"250 2.1.5 Ok">>),
     {continue, none};

@@ -305,10 +305,11 @@ Deployment and update instructions are kept in [deploy/README.md](deploy/README.
 
 ## Version
 
-Current release: **2.5.2**
+Current release: **2.5.3**
 
 Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history.
 
+* [2.5.3 release notes](RELEASE_NOTES_2.5.3.md)
 * [2.5.2 release notes](RELEASE_NOTES_2.5.2.md)
 * [2.5.1 release notes](RELEASE_NOTES_2.5.1.md)
 * [2.5.0 release notes](RELEASE_NOTES_2.5.0.md)

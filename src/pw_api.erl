@@ -106,7 +106,7 @@ handle(<<"POST">>, [<<"password">>, <<"forgot">>], Req0, _) ->
             true ->
                 case pw_db:request_password_reset(Identity) of
                     {ok, Data} ->
-                        Public = maybe_dispatch_mail(Data),
+                        Public = maybe_dispatch_mail(Data, async),
                         pw_util:ok_json(Req, #{ok => true, data => maps:with([accepted], Public#{accepted => true})});
                     {error, database_unavailable} -> pw_util:err_json(Req, 503, <<"database_unavailable">>);
                     {error, database_busy} -> pw_util:err_json(Req, 503, <<"database_busy">>);
@@ -1056,11 +1056,15 @@ result(Req, {error, E}) when is_atom(E) -> pw_util:err_json(Req, 400, atom_to_bi
 result(Req, {error, E}) -> pw_util:err_json(Req, 400, pw_util:bin(E));
 result(Req, Other) -> pw_util:ok_json(Req, #{ok=>true,data=>Other}).
 
-maybe_dispatch_mail(Data) when is_map(Data) ->
+maybe_dispatch_mail(Data) -> maybe_dispatch_mail(Data, await).
+maybe_dispatch_mail(Data, Mode) when is_map(Data), (Mode =:= await orelse Mode =:= async) ->
     case maps:take(mail, Data) of
         {Mail, Rest} ->
-            _ = pw_mail:send(Mail),
-            Rest#{email_delivery => true};
+            Delivered = case Mode of
+                async -> pw_mail:send(Mail) =:= ok;
+                await -> pw_mail:deliver_now(Mail) =:= ok
+            end,
+            Rest#{email_delivery => Delivered};
         error -> Data
     end;
-maybe_dispatch_mail(Data) -> Data.
+maybe_dispatch_mail(Data, _) -> Data.
