@@ -975,7 +975,7 @@ local_mac_platforms(Uids, MacOnline) ->
     maps:from_list([{Uid, <<"macos">>} || Uid <- Uids, maps:is_key(Uid, MacOnline)]).
 
 platform_value(true) -> <<"macos">>;
-platform_value(false) -> null.
+platform_value(false) -> undefined.
 
 update_presence(Uid, Prev, Effective, PrevMac, Mac, Skip, Online0) ->
     Visible = visible_status(Effective),
@@ -988,7 +988,7 @@ update_presence(Uid, Prev, Effective, PrevMac, Mac, Skip, Online0) ->
             maps:put(Uid, Effective, Online0);
         {_, false} ->
             send_presence_watchers(Uid, #{type => presence_offline, user_id => Uid,
-                                          status => Effective, client_platform => null}, Skip),
+                                          status => Effective, client_platform => undefined}, Skip),
             maps:remove(Uid, Online0);
         {Effective, true} when PrevMac =:= Mac ->
             Online0;
