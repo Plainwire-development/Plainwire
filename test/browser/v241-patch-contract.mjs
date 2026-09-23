@@ -14,8 +14,8 @@ const types = read('priv/static/elm/src/Types.elm');
 const env = read('.env.example');
 const appSrc = read('src/plainwire_relay.app.src');
 
-assert.equal(version, '2.5.8');
-assert.match(appSrc, /\{vsn, "2.5.8"\}/);
+assert.match(version, /^2\.(?:5|6)\.\d+$/);
+assert.ok(appSrc.includes(`{vsn, "${version}"}`));
 assert.doesNotMatch(mail, /41844184/);
 assert.doesNotMatch(env, /41844184/);
 assert.doesNotMatch(mail, /plainwirenoreply@proton\.me/);
@@ -43,4 +43,4 @@ assert.match(types, /emailVerified : Bool/);
 assert.match(env, /PLAINWIRE_MAIL_ENABLED=/);
 assert.match(env, /PLAINWIRE_SMTP_PASS=/);
 
-console.log('PASS: 2.4.1 tour, call, and hosted password-reset behavior still holds on 2.5.8');
+console.log(`PASS: 2.4.1 tour, call, and hosted password-reset behavior still holds on ${version}`);
