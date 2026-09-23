@@ -95,7 +95,7 @@ assert.match(ws, /ws_upgrade, ip/);
 assert.match(hub, /pw_realtime_registry:relay_signal\(voice/);
 assert.match(hub, /pw_realtime_registry:relay_signal\(call/);
 assert.match(hub, /pw_realtime_registry:relay_activity/);
-assert.match(hub, /pw_async_pool:submit\(Tag, fun\(\) -> pw_redis:presence_get/);
+assert.match(hub, /pw_async_pool:submit\(Tag, fun\(\) ->\s*\{pw_redis:presence_get\(Uids\), pw_redis:presence_platform_get\(Uids\)\}/);
 assert.match(hub, /presence_set_many/);
 assert.doesNotMatch(hub, /watchers = #\{\}/, 'presence reverse indexes must not be copied through the hub state map');
 assert.match(hub, /realtime_registry_ready[\s\S]{0,350}realtime_resync/, 'registry restart asks clients to rebuild non-authoritative presence indexes');
