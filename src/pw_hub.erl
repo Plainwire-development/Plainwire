@@ -1,7 +1,7 @@
 -module(pw_hub).
 -behaviour(gen_server).
 -export([
-    start_link/0, connect/2, connect/3, disconnect/1, disconnect/2, subscribe/2, unsubscribe_all/1, watch_presence/2,
+    start_link/0, connect/2, connect/3, connect/4, disconnect/1, disconnect/2, subscribe/2, unsubscribe_all/1, watch_presence/2,
     revoke_server_access/3, revoke_conversation_access/2,
     notify_user/2, broadcast/2, status_update/2,
     voice_join/4, voice_leave/3, voice_state/5, voice_signal/5, voice_activity/5,
@@ -26,11 +26,13 @@
 room_capacity() -> pw_media_topology:room_capacity().
 share_capacity() -> pw_media_topology:share_capacity().
 
--record(st, {users = #{}, pids = #{}, pid_statuses = #{}, subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}}).
+-record(st, {users = #{}, pids = #{}, pid_statuses = #{}, pid_platforms = #{},
+             subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}, mac_online = #{}}).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 connect(Uid, Pid) -> connect(Uid, Pid, <<"online">>).
-connect(Uid, Pid, Status) -> gen_server:cast(?MODULE, {connect, Uid, Pid, Status}).
+connect(Uid, Pid, Status) -> connect(Uid, Pid, Status, undefined).
+connect(Uid, Pid, Status, Platform) -> gen_server:cast(?MODULE, {connect, Uid, Pid, Status, Platform}).
 disconnect(Pid) -> gen_server:cast(?MODULE, {disconnect, Pid}).
 disconnect(Pid, RtcMemberships) when is_list(RtcMemberships) ->
     gen_server:cast(?MODULE, {disconnect, Pid, RtcMemberships});
@@ -175,7 +177,7 @@ accept_ring(Cid, Uid, Pid, Profile, Audience0, St0) ->
             end
     end.
 
-handle_cast({connect, Uid, Pid, Status0}, St) ->
+handle_cast({connect, Uid, Pid, Status0, Platform0}, St) ->
     monitor(process, Pid),
     pw_realtime_registry:register(Uid, Pid),
     pw_realtime_registry:subscribe(Pid, {system, global}),
@@ -183,20 +185,28 @@ handle_cast({connect, Uid, Pid, Status0}, St) ->
     Pids = maps:put(Pid, Uid, St#st.pids),
     Subs = add_to_set({system, global}, Pid, St#st.subs),
     Status = normalize_status(Status0),
+    Platform = normalize_platform(Platform0),
     PidStatuses = maps:put(Pid, Status, St#st.pid_statuses),
+    PidPlatforms = maps:put(Pid, Platform, St#st.pid_platforms),
     Prev = maps:get(Uid, St#st.online, undefined),
+    PrevMac = maps:is_key(Uid, St#st.mac_online),
     Effective = effective_status(Uid, Users, PidStatuses),
-    Online = update_presence(Uid, Prev, Effective, Pid, St#st.online),
-    pw_redis:presence_set(Uid, Effective, ?REDIS_PRESENCE_TTL_MS),
+    Mac = effective_mac(Uid, Users, PidStatuses, PidPlatforms),
+    Online = update_presence(Uid, Prev, Effective, PrevMac, Mac, Pid, St#st.online),
+    MacOnline = update_mac_online(Uid, Mac, St#st.mac_online),
+    pw_redis:presence_set(Uid, Effective, Mac, ?REDIS_PRESENCE_TTL_MS),
     %% Seed the new socket with the account-wide effective status immediately.
     %% A second tab being idle or invisible must not make an active tab look
     %% offline to itself or to other presence watchers.
     Visible = case visible_status(Effective) of true -> [Uid]; false -> [] end,
     Statuses = case Visible of [] -> #{}; _ -> #{Uid => Effective} end,
-    pw_realtime_delivery:send_event(Pid, #{type => presence_state, online => Visible, statuses => Statuses}),
+    Platforms = case Mac andalso Visible =/= [] of true -> #{Uid => <<"macos">>}; false -> #{} end,
+    pw_realtime_delivery:send_event(Pid, #{type => presence_state, online => Visible,
+                                          statuses => Statuses, platforms => Platforms}),
     send_active_calls(Pid, Uid, St#st.calls),
     log("client_connected", #{uid => Uid, sessions => length(maps:get(Uid, Users, [])), online_users => map_size(Online)}),
-    {noreply, St#st{users = Users, pids = Pids, pid_statuses = PidStatuses, online = Online, subs = Subs}};
+    {noreply, St#st{users = Users, pids = Pids, pid_statuses = PidStatuses,
+                    pid_platforms = PidPlatforms, online = Online, mac_online = MacOnline, subs = Subs}};
 handle_cast({disconnect, Pid}, St) ->
     log("client_disconnected", #{uid => maps:get(Pid, St#st.pids, undefined)}),
     {noreply, remove_pid(Pid, St, registry)};
@@ -241,14 +251,18 @@ handle_cast({watch_presence, Pid, Uids0}, St0) ->
     end,
     _ = pw_realtime_registry:replace_presence_watch(Pid, Uids),
     LocalStatuses = maps:from_list([{U, S} || U <- Uids, {ok, S} <- [maps:find(U, St0#st.online)]]),
+    LocalPlatforms = local_mac_platforms(Uids, St0#st.mac_online),
     %% Redis may be remote or briefly slow. Never block the hub control-plane
     %% mailbox on a presence read; a bounded worker fills in cross-node state.
     Tag = {presence_snapshot, Pid, Uids},
-    case pw_async_pool:submit(Tag, fun() -> pw_redis:presence_get(Uids) end, self()) of
+    case pw_async_pool:submit(Tag, fun() ->
+        {pw_redis:presence_get(Uids), pw_redis:presence_platform_get(Uids)}
+    end, self()) of
         ok -> ok;
         {error, _} ->
             pw_realtime_delivery:send_event(Pid, #{type => presence_state,
-                online => maps:keys(LocalStatuses), statuses => LocalStatuses})
+                online => maps:keys(LocalStatuses), statuses => LocalStatuses,
+                platforms => LocalPlatforms})
     end,
     {noreply, St0};
 handle_cast(cluster_resync, St) ->
@@ -391,11 +405,14 @@ handle_cast({status_update, Uid, Pid0, Status0}, St) ->
             {noreply, St};
         _ ->
             Prev = maps:get(Uid, St#st.online, undefined),
+            PrevMac = maps:is_key(Uid, St#st.mac_online),
             PidStatuses = maps:put(Pid, Status, St#st.pid_statuses),
             Effective = effective_status(Uid, St#st.users, PidStatuses),
-            Online = update_presence(Uid, Prev, Effective, undefined, St#st.online),
-            pw_redis:presence_set(Uid, Effective, ?REDIS_PRESENCE_TTL_MS),
-            {noreply, St#st{pid_statuses = PidStatuses, online = Online}}
+            Mac = effective_mac(Uid, St#st.users, PidStatuses, St#st.pid_platforms),
+            Online = update_presence(Uid, Prev, Effective, PrevMac, Mac, undefined, St#st.online),
+            MacOnline = update_mac_online(Uid, Mac, St#st.mac_online),
+            pw_redis:presence_set(Uid, Effective, Mac, ?REDIS_PRESENCE_TTL_MS),
+            {noreply, St#st{pid_statuses = PidStatuses, online = Online, mac_online = MacOnline}}
     end;
 handle_cast(_, St) -> {noreply, St}.
 
@@ -443,18 +460,24 @@ start_ring(Cid, Uid, Pid, Profile, Targets, St0) ->
     St1#st{rings = maps:put(Key, Ring, St1#st.rings)}.
 
 handle_info(redis_presence_refresh, St) ->
-    pw_redis:presence_set_many(maps:to_list(St#st.online), ?REDIS_PRESENCE_TTL_MS),
+    pw_redis:presence_set_many(
+        [{Uid, Status, maps:is_key(Uid, St#st.mac_online)} || {Uid, Status} <- maps:to_list(St#st.online)],
+        ?REDIS_PRESENCE_TTL_MS),
     erlang:send_after(?REDIS_PRESENCE_REFRESH_MS, self(), redis_presence_refresh),
     {noreply, St};
 handle_info({pw_async_result, {presence_snapshot, Pid, Uids}, Remote0}, St) ->
     CurrentWatch = pw_realtime_registry:presence_watches(Pid),
     case CurrentWatch =/= unavailable andalso lists:sort(CurrentWatch) =:= Uids of
         true ->
-            Remote = case Remote0 of M when is_map(M) -> M; _ -> #{} end,
+            {Remote, RemotePlatforms} = case Remote0 of
+                {S, P} when is_map(S), is_map(P) -> {S, P};
+                _ -> {#{}, #{}}
+            end,
             Local = maps:from_list([{U, S} || U <- Uids, {ok, S} <- [maps:find(U, St#st.online)]]),
             Statuses = maps:merge(Remote, Local),
+            Platforms = maps:merge(RemotePlatforms, local_mac_platforms(Uids, St#st.mac_online)),
             pw_realtime_delivery:send_event(Pid, #{type => presence_state,
-                online => maps:keys(Statuses), statuses => Statuses}),
+                online => maps:keys(Statuses), statuses => Statuses, platforms => Platforms}),
             {noreply, St};
         false ->
             %% The socket changed its watch set (or disconnected) while the
@@ -878,16 +901,19 @@ HintMemberships when is_list(HintMemberships) -> HintMemberships;
     Users = case Uid of undefined -> St0#st.users; _ -> update_set(Uid, Pid, St0#st.users) end,
     Pids = maps:remove(Pid, St0#st.pids),
     PidStatuses = maps:remove(Pid, St0#st.pid_statuses),
-    Online = case Uid of
-        undefined -> St0#st.online;
+    PidPlatforms = maps:remove(Pid, St0#st.pid_platforms),
+    {Online, MacOnline} = case Uid of
+        undefined -> {St0#st.online, St0#st.mac_online};
         _ ->
             Prev = maps:get(Uid, St0#st.online, undefined),
+            PrevMac = maps:is_key(Uid, St0#st.mac_online),
             Effective = effective_status(Uid, Users, PidStatuses),
-            Updated = update_presence(Uid, Prev, Effective, Pid, St0#st.online),
+            Mac = effective_mac(Uid, Users, PidStatuses, PidPlatforms),
+            Updated = update_presence(Uid, Prev, Effective, PrevMac, Mac, Pid, St0#st.online),
             %% Clear only this node's Redis presence slot when its last visible
             %% session disappears; another Plainwire node may still be online.
-            pw_redis:presence_set(Uid, Effective, ?REDIS_PRESENCE_TTL_MS),
-            Updated
+            pw_redis:presence_set(Uid, Effective, Mac, ?REDIS_PRESENCE_TTL_MS),
+            {Updated, update_mac_online(Uid, Mac, St0#st.mac_online)}
     end,
     Subs = case {SubKeys, RtcHint} of
         {unavailable, _} -> remove_from_all(Pid, St0#st.subs);
@@ -903,7 +929,9 @@ HintMemberships when is_list(HintMemberships) -> HintMemberships;
     Voices = detach_pid_from_rooms(Pid, St0#st.voices, voice, Users, RtcMemberships),
     Calls = detach_pid_from_rooms(Pid, St0#st.calls, call, Users, RtcMemberships),
     Rings = drop_caller_rings(Pid, St0#st.rings, St0#st.users),
-    St0#st{users = Users, pids = Pids, pid_statuses = PidStatuses, online = Online, subs = Subs, voices = Voices, calls = Calls, rings = Rings}.
+    St0#st{users = Users, pids = Pids, pid_statuses = PidStatuses,
+           pid_platforms = PidPlatforms, online = Online, mac_online = MacOnline,
+           subs = Subs, voices = Voices, calls = Calls, rings = Rings}.
 
 
 first_user_pid(Uid, Users) ->
@@ -931,20 +959,42 @@ effective_status(Uid, Users, PidStatuses) ->
             end
     end.
 
-update_presence(Uid, Prev, Effective, Skip, Online0) ->
+normalize_platform(<<"macos">>) -> <<"macos">>;
+normalize_platform(_) -> undefined.
+
+effective_mac(Uid, Users, PidStatuses, PidPlatforms) ->
+    lists:any(fun(Pid) ->
+        maps:get(Pid, PidPlatforms, undefined) =:= <<"macos">> andalso
+        visible_status(normalize_status(maps:get(Pid, PidStatuses, <<"invisible">>)))
+    end, maps:get(Uid, Users, [])).
+
+update_mac_online(Uid, true, MacOnline) -> maps:put(Uid, true, MacOnline);
+update_mac_online(Uid, false, MacOnline) -> maps:remove(Uid, MacOnline).
+
+local_mac_platforms(Uids, MacOnline) ->
+    maps:from_list([{Uid, <<"macos">>} || Uid <- Uids, maps:is_key(Uid, MacOnline)]).
+
+platform_value(true) -> <<"macos">>;
+platform_value(false) -> null.
+
+update_presence(Uid, Prev, Effective, PrevMac, Mac, Skip, Online0) ->
     Visible = visible_status(Effective),
+    Platform = platform_value(Mac),
     case {Prev, Visible} of
         {undefined, false} -> Online0;
         {undefined, true} ->
-            send_presence_watchers(Uid, #{type => presence_online, user_id => Uid, status => Effective}, Skip),
+            send_presence_watchers(Uid, #{type => presence_online, user_id => Uid,
+                                          status => Effective, client_platform => Platform}, Skip),
             maps:put(Uid, Effective, Online0);
         {_, false} ->
-            send_presence_watchers(Uid, #{type => presence_offline, user_id => Uid, status => Effective}, Skip),
+            send_presence_watchers(Uid, #{type => presence_offline, user_id => Uid,
+                                          status => Effective, client_platform => null}, Skip),
             maps:remove(Uid, Online0);
-        {Effective, true} ->
+        {Effective, true} when PrevMac =:= Mac ->
             Online0;
         {_, true} ->
-            send_presence_watchers(Uid, #{type => presence_status, user_id => Uid, status => Effective}, Skip),
+            send_presence_watchers(Uid, #{type => presence_status, user_id => Uid,
+                                          status => Effective, client_platform => Platform}, Skip),
             maps:put(Uid, Effective, Online0)
     end.
 

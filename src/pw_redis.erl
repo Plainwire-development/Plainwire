@@ -2,7 +2,8 @@
 -behaviour(gen_server).
 
 -export([start_link/0, enabled/0, command/1, command/2, cast_command/1,
-         rate_allow/3, presence_set/3, presence_set_many/2, presence_get/1, presence_delete/1, cache_put/3, cache_get/1,
+         rate_allow/3, presence_set/3, presence_set/4, presence_set_many/2,
+         presence_get/1, presence_platform_get/1, presence_delete/1, cache_put/3, cache_get/1,
          cache_delete/1, cache_version/1, cache_bump_version/1,
          cache_get_at_version/2, cache_put_at_version/4, stats/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -61,23 +62,33 @@ rate_allow(Key, Limit, WindowMs) when Limit > 0, WindowMs > 0 ->
     end;
 rate_allow(_, _, _) -> false.
 
-presence_set(Uid, Status0, TtlMs) when is_integer(Uid), Uid > 0, TtlMs >= 1000 ->
+presence_set(Uid, Status0, TtlMs) -> presence_set(Uid, Status0, false, TtlMs).
+presence_set(Uid, Status0, HasMac, TtlMs) when is_integer(Uid), Uid > 0, TtlMs >= 1000 ->
     Status = safe_status(Status0),
     Owner = presence_owner(),
     Now = pw_util:now_ms(),
-    cast_command(presence_set_command(Uid, Status, TtlMs, Owner, Now));
-presence_set(_, _, _) -> ok.
+    cast_command(presence_set_command(Uid, Status, TtlMs, Owner, Now)),
+    cast_command(presence_platform_set_command(Uid, HasMac andalso Status =/= <<"invisible">>,
+                                               TtlMs, Owner, Now));
+presence_set(_, _, _, _) -> ok.
 
 %% Refreshing thousands of online users one TCP round-trip at a time creates a
 %% burst every presence TTL interval and can bury the Redis worker mailbox.
 %% Pipeline single-key Lua commands so this remains compatible with Redis
 %% Cluster hash-slot rules while collapsing the network round trips.
 presence_set_many(Pairs0, TtlMs) when is_list(Pairs0), TtlMs >= 1000 ->
-    Pairs = [{Uid, safe_status(Status)} || {Uid, Status} <- Pairs0,
-        is_integer(Uid), Uid > 0],
+    Pairs = [{Uid, safe_status(Status), HasMac} || {Uid, Status, HasMac} <-
+        [case Pair of
+             {U, S, M} -> {U, S, M};
+             {U, S} -> {U, S, false}
+         end || Pair <- Pairs0], is_integer(Uid), Uid > 0],
     Owner = presence_owner(),
     Now = pw_util:now_ms(),
-    Commands = [presence_set_command(Uid, Status, TtlMs, Owner, Now) || {Uid, Status} <- Pairs],
+    Commands = lists:flatmap(fun({Uid, Status, HasMac}) ->
+        [presence_set_command(Uid, Status, TtlMs, Owner, Now),
+         presence_platform_set_command(Uid, HasMac andalso Status =/= <<"invisible">>,
+                                       TtlMs, Owner, Now)]
+    end, Pairs),
     lists:foreach(fun(Batch) -> cast_pipeline(Batch) end, chunk_list(Commands, 256)),
     ok;
 presence_set_many(_, _) -> ok.
@@ -94,6 +105,15 @@ presence_set_command(Uid, Status, TtlMs, Owner, Now) ->
                "if redis.call('HLEN',KEYS[1])==0 then redis.call('DEL',KEYS[1]) end; return 1 end; "
                "redis.call('HSET',KEYS[1],owner,status..'|'..tostring(now+ttl)); redis.call('PEXPIRE',KEYS[1],ttl*2); return 1">>,
     [<<"EVAL">>, Script, <<"1">>, Key, Owner, integer_to_binary(Now), integer_to_binary(TtlMs), Status].
+
+presence_platform_set_command(Uid, HasMac, TtlMs, Owner, Now) ->
+    Key = redis_key(<<"presence_platform">>, integer_to_binary(Uid)),
+    Script = <<"if ARGV[4]=='0' then redis.call('HDEL',KEYS[1],ARGV[1]); "
+               "if redis.call('HLEN',KEYS[1])==0 then redis.call('DEL',KEYS[1]) end; return 1 end; "
+               "redis.call('HSET',KEYS[1],ARGV[1],tostring(tonumber(ARGV[2])+tonumber(ARGV[3]))); "
+               "redis.call('PEXPIRE',KEYS[1],tonumber(ARGV[3])*2); return 1">>,
+    [<<"EVAL">>, Script, <<"1">>, Key, Owner, integer_to_binary(Now),
+     integer_to_binary(TtlMs), case HasMac of true -> <<"1">>; _ -> <<"0">> end].
 
 presence_get(Uids0) when is_list(Uids0) ->
     Uids = lists:usort([U || U <- Uids0, is_integer(U), U > 0]),
@@ -113,6 +133,23 @@ presence_get(Uids0) when is_list(Uids0) ->
             ]),
             maps:from_list([{U, normalize_presence(V)} || {U, {ok, V}} <- Results, is_binary(V)])
     end.
+
+presence_platform_get(Uids0) when is_list(Uids0) ->
+    Uids = lists:usort([U || U <- Uids0, is_integer(U), U > 0]),
+    Now = integer_to_binary(pw_util:now_ms()),
+    Pairs = [{U, presence_platform_get_command(U, Now)} || U <- Uids],
+    Results = lists:append([presence_get_batch(Batch) || Batch <- chunk_list(Pairs, 256)]),
+    maps:from_list([{U, <<"macos">>} || {U, {ok, <<"macos">>}} <- Results]).
+
+presence_platform_get_command(Uid, Now) ->
+    Key = redis_key(<<"presence_platform">>, integer_to_binary(Uid)),
+    Script = <<"local now=tonumber(ARGV[1]); local vals=redis.call('HGETALL',KEYS[1]); "
+               "local active=false; for i=1,#vals,2 do "
+               "if (tonumber(vals[i+1]) or 0)<=now then redis.call('HDEL',KEYS[1],vals[i]); "
+               "else active=true end end; "
+               "if redis.call('HLEN',KEYS[1])==0 then redis.call('DEL',KEYS[1]) end; "
+               "if active then return 'macos' else return false end">>,
+    [<<"EVAL">>, Script, <<"1">>, Key, Now].
 
 presence_get_command(Uid, Now) ->
     Key = redis_key(<<"presence">>, integer_to_binary(Uid)),
@@ -135,7 +172,8 @@ presence_delete(Uid) when is_integer(Uid), Uid > 0 ->
     Owner = presence_owner(),
     Key = redis_key(<<"presence">>, integer_to_binary(Uid)),
     Script = <<"redis.call('HDEL',KEYS[1],ARGV[1]); if redis.call('HLEN',KEYS[1])==0 then redis.call('DEL',KEYS[1]) end; return 1">>,
-    cast_command([<<"EVAL">>, Script, <<"1">>, Key, Owner]);
+    cast_command([<<"EVAL">>, Script, <<"1">>, Key, Owner]),
+    cast_command(presence_platform_set_command(Uid, false, 1000, Owner, pw_util:now_ms()));
 presence_delete(_) -> ok.
 
 presence_owner() ->

@@ -114,6 +114,39 @@ multi_session_presence_prefers_visible_session_test() ->
         stop_test_hub(Hub)
     end.
 
+mac_platform_tracks_visible_sessions_test() ->
+    stop_existing_hub(),
+    {ok, Hub} = start_test_hub(),
+    Mac = spawn(fun idle_socket/0),
+    Web = spawn(fun idle_socket/0),
+    try
+        pw_hub:connect(7, Mac, <<"online">>, <<"macos">>),
+        pw_hub:connect(7, Web, <<"online">>),
+        pw_hub:connect(9, self(), <<"online">>),
+        _ = gen_server:call(pw_hub, sync),
+        flush_presence_state(),
+        pw_hub:watch_presence(self(), [7]),
+        _ = gen_server:call(pw_hub, sync),
+        Presence = await_presence_state(),
+        ?assertEqual(<<"macos">>, maps:get(7, maps:get(platforms, Presence))),
+
+        %% The account stays online in the web client while its Mac badge clears.
+        pw_hub:disconnect(Mac),
+        _ = gen_server:call(pw_hub, sync),
+        ?assertEqual({<<"online">>, null}, await_presence_change(7)),
+        pw_hub:connect(7, Mac, <<"online">>, <<"macos">>),
+        _ = gen_server:call(pw_hub, sync),
+        ?assertEqual({<<"online">>, <<"macos">>}, await_presence_change(7)),
+
+        pw_hub:status_update(7, Mac, <<"invisible">>),
+        _ = gen_server:call(pw_hub, sync),
+        ?assertEqual({<<"online">>, null}, await_presence_change(7))
+    after
+        exit(Mac, kill),
+        exit(Web, kill),
+        stop_test_hub(Hub)
+    end.
+
 call_accept_establishes_bidirectional_signaling_test() ->
     stop_existing_hub(),
     {ok, Hub} = start_test_hub(),
@@ -501,6 +534,19 @@ await_presence_status(Uid) ->
         ?assert(false)
     end.
 
+await_presence_change(Uid) ->
+    receive
+        {hub_text, Payload, Type} when Type =:= presence_status; Type =:= presence_online ->
+            Json = jsx:decode(Payload, [return_maps]),
+            case maps:get(<<"user_id">>, Json, undefined) of
+                Uid -> {maps:get(<<"status">>, Json), maps:get(<<"client_platform">>, Json, undefined)};
+                _ -> await_presence_change(Uid)
+            end;
+        _ -> await_presence_change(Uid)
+    after 1000 ->
+        ?assert(false)
+    end.
+
 restore_env(Name, false) -> os:unsetenv(Name);
 restore_env(Name, Value) -> os:putenv(Name, Value).
 
@@ -516,9 +562,13 @@ await_presence_state() ->
             Statuses = maps:from_list([
                 {presence_uid(Key), Value} || {Key, Value} <- maps:to_list(Statuses0)
             ]),
+            Platforms = maps:from_list([
+                {presence_uid(Key), Value} || {Key, Value} <-
+                    maps:to_list(maps:get(<<"platforms">>, Json, #{}))
+            ]),
             #{type => presence_state,
               online => maps:get(<<"online">>, Json, []),
-              statuses => Statuses}
+              statuses => Statuses, platforms => Platforms}
     after 1000 ->
         ?assert(false)
     end.

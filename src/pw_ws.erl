@@ -86,11 +86,19 @@ init_bot_socket(Req0, Token) ->
 
 websocket_accept(Req0, Session0, Token, Uid, Status, AuthKind) ->
     Session = strip_session_urls(Session0),
+    %% Only the native Mac client advertises this platform. Browsers and bots
+    %% remain unmarked; the hub will drop the mark when this socket closes.
+    Platform = case {AuthKind,
+                     cowboy_req:header(<<"x-plainwire-client-platform">>, Req0),
+                     cowboy_req:header(<<"user-agent">>, Req0, <<>>)} of
+        {user, <<"macos">>, <<"Plainwire-Apple/", _/binary>>} -> <<"macos">>;
+        _ -> undefined
+    end,
     WsCompress = pw_util:env_bool("PLAINWIRE_WS_COMPRESS", true),
     WsOpts = #{idle_timeout => 300000, max_frame_size => 65536, compress => WsCompress},
     {cowboy_websocket, Req0, #{session=>Session, token=>Token, auth_kind=>AuthKind,
         last_auth_check=>erlang:monotonic_time(millisecond), uid=>Uid, subs=>[], voice=>undefined,
-        voice_profile=>undefined, call=>undefined, status=>Status}, WsOpts}.
+        voice_profile=>undefined, call=>undefined, status=>Status, platform=>Platform}, WsOpts}.
 
 bot_authorization(Req) ->
     case cowboy_req:header(<<"authorization">>, Req) of
@@ -98,10 +106,10 @@ bot_authorization(Req) ->
         _ -> error
     end.
 
-websocket_init(State=#{uid:=Uid, status:=Status}) ->
+websocket_init(State=#{uid:=Uid, status:=Status, platform:=Platform}) ->
     process_flag(message_queue_data, off_heap),
     debug(info, "connected", #{uid => Uid, status => Status}),
-    pw_hub:connect(Uid, self(), Status),
+    pw_hub:connect(Uid, self(), Status, Platform),
     erlang:send_after(60000, self(), revalidate_auth),
     Session = strip_session_urls(maps:get(session, State)),
     {reply, {text, pw_util:json(#{type=>hello, session=>Session})}, State}.
