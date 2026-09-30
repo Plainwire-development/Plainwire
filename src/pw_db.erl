@@ -56,7 +56,7 @@
 -export([profile_file_signature/2, extract_file_ids/1,
          normalize_banner_patch/2, safe_banner_link/1, normalize_registration_mode/1,
          normalize_ai_provider/1, normalize_ai_chat_trigger/1, normalize_ai_temperature/1,
-         command_options_from_args/1]).
+         command_options_from_args/1, search_state/1]).
 -endif.
 
 -record(st, {}).
@@ -5750,8 +5750,10 @@ route({upload_delete_finish, Path0, Result}, Conn) ->
 %% public-to-members, yes. imaginary ids, no; they bloat hub subscriptions.
 route(search_index_status, Conn) ->
     case one(Conn, "SELECT key_fingerprint,last_message_id,complete,updated_at FROM message_search_state WHERE id=1", []) of
-        {ok, [Fingerprint, LastId, Complete, UpdatedAt]} ->
-            {ok, #{key_fingerprint => Fingerprint, last_message_id => LastId, complete => Complete, updated_at => UpdatedAt}};
+        {ok, [_, _, _, UpdatedAt] = Row} ->
+            {Fingerprint, LastId, Complete} = search_state(Row),
+            {ok, #{key_fingerprint => Fingerprint, last_message_id => LastId, complete => Complete,
+                   updated_at => int_or(pw_util:int(UpdatedAt), 0)}};
         _ -> {ok, #{key_fingerprint => <<>>, last_message_id => 0, complete => false, updated_at => 0}}
     end;
 route({search_index_reconcile, Limit0}, Conn) ->
@@ -5763,10 +5765,7 @@ route({search_index_reconcile, Limit0}, Conn) ->
             with_tx(Conn, fun() ->
                 {ok, State} = one(Conn,
                     "SELECT key_fingerprint,last_message_id,complete FROM message_search_state WHERE id=1 FOR UPDATE", []),
-                {OldFingerprint, Last0, Complete0} = case State of
-                    [F, L0, C0] -> {F, L0, C0};
-                    _ -> {<<>>, 0, false}
-                end,
+                {OldFingerprint, Last0, Complete0} = search_state(State),
                 Last = case OldFingerprint =:= Fingerprint of
                     true -> Last0;
                     false ->
@@ -5910,6 +5909,17 @@ sync_search_row(Conn, [Mid, Body, DeletedAt, Kind]) ->
         false -> exec(Conn, "DELETE FROM message_search_tokens WHERE message_id=$1", [Mid])
     end;
 sync_search_row(_Conn, _) -> ok.
+
+%% message_search_state is read without parameters, so rows/3 takes the
+%% simple-query path (epgsql:squery) and every column arrives as text:
+%% last_message_id as <<"0">> and complete as <<"t">>/<<"f">>, never an integer
+%% or the atoms true/false. `<<"f">> andalso ...` raised badarg on every
+%% reconcile, so the backfill never advanced and pw_search_index retried it
+%% every three seconds. Accept the text form as well as the typed one; see
+%% route(admin_operator_count, _) and route({upload_ref_backfill, _}, _).
+search_state([Fingerprint, LastId, Complete | _]) ->
+    {Fingerprint, int_or(pw_util:int(LastId), 0), Complete =:= true orelse Complete =:= <<"t">>};
+search_state(_) -> {<<>>, 0, false}.
 
 replace_message_search_tokens(Conn, Mid, Plain) ->
     Hashes = pw_crypto:search_hashes(Plain),

@@ -79,3 +79,23 @@ registration_mode_validation_test() ->
     ?assertEqual(<<"enabled">>, pw_db:normalize_registration_mode(enabled)),
     ?assertEqual(<<"disabled">>, pw_db:normalize_registration_mode(<<"disabled">>)),
     ?assertEqual(invalid, pw_db:normalize_registration_mode(<<"open">>)).
+
+%% message_search_state is read through epgsql:squery, which returns every
+%% column as text. The reconcile route used `complete` as an andalso operand.
+search_state_accepts_text_results_test() ->
+    ?assertEqual({<<"fp">>, 0, false}, pw_db:search_state([<<"fp">>, <<"0">>, <<"f">>])),
+    ?assertEqual({<<"fp">>, 96346551137728, true},
+                 pw_db:search_state([<<"fp">>, <<"96346551137728">>, <<"t">>])),
+    [ begin
+          {Fingerprint, _, Complete} = pw_db:search_state([<<"fp">>, <<"0">>, Raw]),
+          ?assertEqual(Expected, Complete andalso Fingerprint =:= <<"fp">>)
+      end || {Raw, Expected} <- [{<<"t">>, true}, {<<"f">>, false}, {true, true}, {false, false}, {null, false}] ].
+
+search_state_accepts_typed_results_test() ->
+    ?assertEqual({<<"fp">>, 42, true}, pw_db:search_state([<<"fp">>, 42, true])),
+    ?assertEqual({<<>>, 0, false}, pw_db:search_state([<<>>, 0, false])).
+
+search_state_tolerates_status_row_and_missing_row_test() ->
+    ?assertEqual({<<"fp">>, 7, true}, pw_db:search_state([<<"fp">>, <<"7">>, <<"t">>, <<"1700000000000">>])),
+    ?assertEqual({<<>>, 0, false}, pw_db:search_state(undefined)),
+    ?assertEqual({<<"fp">>, 0, false}, pw_db:search_state([<<"fp">>, null, <<"f">>])).
