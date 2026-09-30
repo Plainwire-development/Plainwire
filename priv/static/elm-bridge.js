@@ -1342,7 +1342,12 @@
   let localStream = null;
   let localMicrophoneLease = null;
   let microphoneRequest = null;
+  let microphoneRebuildRequest = null;
   let microphoneEpoch = 0;
+  let microphoneRecoveryTimer = null;
+  let microphoneRecoveryAttempts = 0;
+  let microphoneRecoveryInFlight = false;
+  let microphoneRecoveryRetryRequested = false;
   let room = null;
   // Set while this client is tearing down a room it had joined, so a peer-left
   // echo of that departure cannot also play the "someone else left" cue.
@@ -4169,7 +4174,8 @@
       debug('WS', 'connected', { queued: queued.length, room });
       send(app.ports.bridgeReceive, { tag: 'ws_status', data: true });
       publishPresence(true);
-      if (room && room.joined && localStream) {
+      const staleRtcTypes = new Set(['voice_signal', 'call_signal', 'voice_state', 'call_state', 'voice_activity', 'call_quality', 'voice_join', 'call_join', 'call_accept', 'call_ring']);
+      if (room && room.joined) {
         // The server detached the old socket and peers closed their old transport.
         // Rejoin first, then replay only durable queued work. Old ICE/signaling and
         // state patches belong to the dead socket session and must never race ahead
@@ -4184,7 +4190,21 @@
           : { type: 'call_join', conversation_id: room.id };
         rtcAction('reconnect', room.kind, room.id, room.epoch);
         sendWs(join);
-        const staleRtcTypes = new Set(['voice_signal', 'call_signal', 'voice_state', 'call_state', 'voice_activity', 'call_quality']);
+        queued.filter((value) => !staleRtcTypes.has(value?.type)).forEach((value) => sendWs(value));
+      } else if (room && (pendingRtcAction || room.ringing)) {
+        // A socket can die after the user clicks Join/Answer, before the room
+        // roster reaches this tab. Replay the intent on the new socket instead
+        // of leaving the call in a pending state until a page refresh.
+        const action = pendingRtcAction?.action;
+        if (room.kind === 'voice') {
+          rtcAction('reconnect', room.kind, room.id, room.epoch);
+          sendWs({ type: 'voice_join', channel_id: room.id });
+        } else if (action === 'start') {
+          sendWs({ type: 'call_ring', conversation_id: room.id });
+        } else {
+          rtcAction(room.ringing ? 'recover_ring' : action === 'accept' ? 'recover_accept' : 'reconnect', room.kind, room.id, room.epoch);
+          sendWs({ type: 'call_join', conversation_id: room.id });
+        }
         queued.filter((value) => !staleRtcTypes.has(value?.type)).forEach((value) => sendWs(value));
       } else {
         queued.forEach((value) => sendWs(value));
@@ -4212,6 +4232,7 @@
       }
     };
     ws.onmessage = (event) => {
+      if (ws !== socket) return;
       try {
         wsLastMessageAt = Date.now();
         const msg = JSON.parse(event.data);
@@ -4694,14 +4715,30 @@
     stream.getAudioTracks().forEach((track) => {
       track.enabled = !micMuted;
       debug('MEDIA', 'microphone_track', { label: track.label, enabled: track.enabled, settings: track.getSettings?.(), processing_mode: voiceProcessingMode });
-      track.onended = () => debug('MEDIA', 'microphone_track_ended', { label: track.label }, 'warn');
+      track.onended = () => {
+        debug('MEDIA', 'microphone_track_ended', { label: track.label }, 'warn');
+        if (localStream === stream) scheduleMicrophoneRecovery();
+      };
       track.onmute = () => debug('MEDIA', 'microphone_track_muted', { label: track.label }, 'warn');
       track.onunmute = () => debug('MEDIA', 'microphone_track_unmuted', { label: track.label });
+    });
+    // The Web Audio destination can remain live after a USB/Bluetooth input
+    // disappears. Watch the physical source too, or the call sends silence forever.
+    localMicrophoneLease?.rawStream?.getAudioTracks()?.forEach((track) => {
+      if (stream.getAudioTracks().includes(track)) return;
+      track.addEventListener('ended', () => {
+        debug('MEDIA', 'microphone_source_ended', { label: track.label }, 'warn');
+        if (localStream === stream) scheduleMicrophoneRecovery();
+      }, { once: true });
     });
   };
 
   const releaseCurrentMicrophone = () => {
     microphoneEpoch++;
+    clearTimeout(microphoneRecoveryTimer);
+    microphoneRecoveryTimer = null;
+    microphoneRecoveryAttempts = 0;
+    microphoneRecoveryRetryRequested = false;
     const lease = localMicrophoneLease;
     const stream = localStream;
     if (micTest?.stream === stream) stopMicTest();
@@ -4713,14 +4750,19 @@
   };
 
   const ensureMedia = async () => {
-    if (localStream && localMicrophoneLease?.mode === voiceProcessingMode && localStream.getAudioTracks().some((track) => track.readyState === 'live')) {
+    if (localStream && localMicrophoneLease?.mode === voiceProcessingMode &&
+        localStream.getAudioTracks().some((track) => track.readyState === 'live') &&
+        localMicrophoneLease.rawStream?.getAudioTracks().some((track) => track.readyState === 'live')) {
       debug('MEDIA', 'reusing_microphone', { tracks: localStream.getAudioTracks().length, processing_mode: voiceProcessingMode });
       return localStream;
     }
-    if (microphoneRequest) {
-      try { await microphoneRequest; } catch (_) {}
-      return ensureMedia();
+    if (room?.joined && room.stateSynced && localStream && localMicrophoneLease) {
+      // A peer joining while an input has failed must not tear down the old
+      // stream behind every existing sender. Replace it on all senders first.
+      await rebuildLocalMicrophone();
+      return localStream;
     }
+    if (microphoneRequest) return microphoneRequest;
     microphoneRequest = (async () => {
       releaseCurrentMicrophone();
       const requestEpoch = microphoneEpoch;
@@ -4772,7 +4814,7 @@
     }
   };
 
-  const rebuildLocalMicrophone = async () => {
+  const performMicrophoneRebuild = async () => {
     if (!localStream) return false;
     const changeEpoch = ++microphoneEpoch;
     const previousLease = localMicrophoneLease;
@@ -4788,9 +4830,11 @@
       throw new Error('No microphone track');
     }
     track.enabled = !micMuted;
+    const screenAtMix = screenStream;
+    const mixerAtMix = screenAudioMixer;
     let replacementMixer = null;
     try {
-      replacementMixer = await createScreenAudioMixer(screenStream, replacementLease.stream);
+      replacementMixer = await createScreenAudioMixer(screenAtMix, replacementLease.stream);
     } catch (error) {
       await replacementLease.release();
       throw error;
@@ -4800,18 +4844,20 @@
       .map((pc) => ({ pc, sender: pc._audioSender, previous: pc._audioSender.track }));
     const results = await Promise.allSettled(senders.map(({ sender }) => sender.replaceTrack(replacementTrack)));
     const failed = results.find((result, i) => result.status === 'rejected' && senders[i].pc.signalingState !== 'closed');
-    if (failed || changeEpoch !== microphoneEpoch) {
+    const stateChanged = changeEpoch !== microphoneEpoch || screenAtMix !== screenStream || mixerAtMix !== screenAudioMixer;
+    if (failed || stateChanged) {
       // Wait for every swap before rolling back. Otherwise a slow successful swap
       // can leave a peer transmitting a stopped replacement microphone.
       await Promise.allSettled(senders.map(({ pc, sender, previous }) =>
         pc.signalingState !== 'closed' && sender.track === replacementTrack
-          ? sender.replaceTrack(changeEpoch === microphoneEpoch ? previous : localStream?.getAudioTracks()[0] || null)
+          ? sender.replaceTrack(stateChanged ? outgoingAudioTrack() : previous)
           : Promise.resolve()));
       disposeScreenAudioMixer(replacementMixer);
       await replacementLease.release();
-      throw failed?.reason || new Error('microphone_request_cancelled');
+      throw failed?.reason || new Error(stateChanged && changeEpoch === microphoneEpoch ? 'screen_share_changed_during_microphone_switch' : 'microphone_request_cancelled');
     }
     const previousMixer = screenAudioMixer;
+    const lostScreenAudio = screenAudioSource !== 'none' && !replacementMixer;
     screenAudioMixer = replacementMixer;
     localMicrophoneLease = replacementLease;
     localStream = replacementLease.stream;
@@ -4820,16 +4866,90 @@
     disposeScreenAudioMixer(previousMixer);
     if (previousLease) previousLease.release().catch(() => {});
     else stopStream(previousStream);
+    if (lostScreenAudio) {
+      screenAudioSource = 'none';
+      screenAudioDeviceLabel = '';
+      updateScreenControls();
+      if (room?.joined) sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen_audio: false } });
+    }
     return true;
   };
 
+  const rebuildLocalMicrophone = () => {
+    if (!microphoneRebuildRequest) {
+      microphoneRebuildRequest = performMicrophoneRebuild().finally(() => { microphoneRebuildRequest = null; });
+    }
+    return microphoneRebuildRequest;
+  };
+
+  const scheduleMicrophoneRecovery = () => {
+    if (!room?.joined || microphoneRecoveryTimer || microphoneRecoveryInFlight || microphoneRecoveryAttempts >= 5) return;
+    const epoch = room.epoch;
+    const delay = Math.min(8000, 500 * 2 ** microphoneRecoveryAttempts);
+    microphoneRecoveryTimer = setTimeout(async () => {
+      microphoneRecoveryTimer = null;
+      if (!room?.joined || room.epoch !== epoch) return;
+      if (!localStream || !localMicrophoneLease) return;
+      const rawTracks = localMicrophoneLease?.rawStream?.getAudioTracks() || [];
+      const outputTracks = localStream?.getAudioTracks() || [];
+      if (rawTracks.some((track) => track.readyState === 'live') &&
+          outputTracks.some((track) => track.readyState === 'live')) return;
+      microphoneRecoveryInFlight = true;
+      microphoneRecoveryAttempts++;
+      let permissionDenied = false;
+      try {
+        await rebuildLocalMicrophone();
+        if (!room?.joined || room.epoch !== epoch) return;
+        microphoneRecoveryAttempts = 0;
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone reconnected.' });
+      } catch (error) {
+        debug('MEDIA', 'microphone_recovery_failed', { attempt: microphoneRecoveryAttempts, name: error.name, error: error.message }, 'warn');
+        permissionDenied = error.name === 'NotAllowedError' || error.name === 'SecurityError';
+        if (room?.joined && room.epoch === epoch &&
+            (permissionDenied || microphoneRecoveryAttempts >= 5)) {
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone disconnected. Check its permission or choose another input in call settings.' });
+        }
+      } finally {
+        microphoneRecoveryInFlight = false;
+        if (microphoneRecoveryRetryRequested && room?.joined && room.epoch === epoch) {
+          microphoneRecoveryRetryRequested = false;
+          microphoneRecoveryAttempts = 0;
+          scheduleMicrophoneRecovery();
+        } else if (room?.joined && room.epoch === epoch && !permissionDenied && microphoneRecoveryAttempts > 0 && microphoneRecoveryAttempts < 5) {
+          scheduleMicrophoneRecovery();
+        }
+      }
+    }, delay);
+  };
+
+  const retryDeadMicrophone = () => {
+    if (!room?.joined || !localStream || !localMicrophoneLease) return;
+    const rawLive = localMicrophoneLease?.rawStream?.getAudioTracks().some((track) => track.readyState === 'live');
+    const outputLive = localStream?.getAudioTracks().some((track) => track.readyState === 'live');
+    if (rawLive && outputLive) return;
+    if (microphoneRecoveryInFlight) {
+      microphoneRecoveryRetryRequested = true;
+      return;
+    }
+    microphoneRecoveryAttempts = 0;
+    clearTimeout(microphoneRecoveryTimer);
+    microphoneRecoveryTimer = null;
+    scheduleMicrophoneRecovery();
+  };
+
   const replaceMicrophone = async (deviceId) => {
+    if (microphoneRebuildRequest) await microphoneRebuildRequest.catch(() => {});
     const previousId = selectedInputId;
     selectedInputId = String(deviceId || '');
     storage.setItem('plainwire_audio_input', selectedInputId);
     try {
       const changed = await rebuildLocalMicrophone();
-      if (changed) send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone changed' });
+      if (changed) {
+        microphoneRecoveryAttempts = 0;
+        clearTimeout(microphoneRecoveryTimer);
+        microphoneRecoveryTimer = null;
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone changed' });
+      }
     } catch (error) {
       selectedInputId = previousId;
       storage.setItem('plainwire_audio_input', selectedInputId);
@@ -4846,6 +4966,7 @@
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Install the licensed Krisp browser SDK and models on the server first.' });
       return publishAudioDevices();
     }
+    if (microphoneRebuildRequest) await microphoneRebuildRequest.catch(() => {});
     const previousMode = voiceProcessingMode;
     if (nextMode === previousMode) return publishAudioDevices();
     voiceProcessingMode = nextMode;
@@ -5733,12 +5854,15 @@
       // chooser/replacement promises are pending; limiting rollback to the old
       // target list would leave that new peer watching the rejected capture.
       const rollbackPeers = Array.from(peers.entries()).filter(([, pc]) => pc.signalingState !== 'closed');
-      await Promise.allSettled(rollbackPeers.map(([, pc]) => Promise.all([
+      const rollbackResults = await Promise.allSettled(rollbackPeers.map(([, pc]) => Promise.all([
         pc._videoSender ? pc._videoSender.replaceTrack(previous?.getVideoTracks()[0] || null) : Promise.resolve(),
         pc._audioSender ? pc._audioSender.replaceTrack(previousAudioTrack) : Promise.resolve()
       ])));
       disposeScreenAudioMixer(capturedMixer);
       stopStream(captured);
+      rollbackResults.forEach((result, index) => {
+        if (result.status === 'rejected') schedulePeerRebuild(rollbackPeers[index][0], rollbackPeers[index][1], 'screen_rollback_failed');
+      });
       screenSenders.clear();
       if (previous) rollbackPeers.forEach(([uid, pc]) => { if (pc._videoSender) screenSenders.set(uid, pc._videoSender); });
       send(app.ports.bridgeReceive, { tag: 'toast', data: previous ? 'Could not switch screens. Your previous share is unchanged.' : 'Could not start sharing. Please try again.' });
@@ -5763,9 +5887,12 @@
       screenAudioDeviceLabel = '';
       screenAudioMixer = null;
       const microphoneTrack = outgoingAudioTrack(localStream, null);
-      Promise.allSettled(Array.from(peers.values(), pc =>
-        pc._audioSender ? pc._audioSender.replaceTrack(microphoneTrack) : Promise.resolve()
-      )).finally(() => disposeScreenAudioMixer(capturedMixer));
+      const audioPeers = Array.from(peers.entries()).filter(([, pc]) => pc._audioSender && pc.signalingState !== 'closed');
+      Promise.allSettled(audioPeers.map(([, pc]) => pc._audioSender.replaceTrack(microphoneTrack)))
+        .then((results) => results.forEach((result, index) => {
+          if (result.status === 'rejected') schedulePeerRebuild(audioPeers[index][0], audioPeers[index][1], 'screen_audio_restore_failed');
+        }))
+        .finally(() => disposeScreenAudioMixer(capturedMixer));
       updateScreenControls();
       if (room && ws?.readyState === WebSocket.OPEN) {
         sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { screen_audio: false } });
@@ -5852,13 +5979,19 @@
     updateScreenControls();
     // Restore camera video on all peer senders
     const cameraTrack = localStream && localStream.getVideoTracks()[0];
+    const restore = [];
     peers.forEach((pc, peerUid) => {
       if (pc._videoSender) {
-        pc._videoSender.replaceTrack(cameraTrack || null).catch(() => {});
+        restore.push({ peerUid, pc, promise: pc._videoSender.replaceTrack(cameraTrack || null) });
       }
       if (pc._audioSender) {
-        pc._audioSender.replaceTrack(outgoingAudioTrack()).catch(() => {});
+        restore.push({ peerUid, pc, promise: pc._audioSender.replaceTrack(outgoingAudioTrack()) });
       }
+    });
+    Promise.allSettled(restore.map((item) => item.promise)).then((results) => {
+      results.forEach((result, index) => {
+        if (result.status === 'rejected') schedulePeerRebuild(restore[index].peerUid, restore[index].pc, 'screen_stop_restore_failed');
+      });
     });
     screenSenders.clear();
     removeLocalScreenPreview();
@@ -6218,6 +6351,16 @@
         error_kind: errorKind || '(unscoped)', error_id: errorId || 0, error: msg.error
       }, 'warn');
       return false;
+    }
+    if (msg.error === 'no_active_call' && pendingRtcAction.action === 'recover_ring') {
+      rtcAction('start', 'call', room.id, room.epoch);
+      sendWs({ type: 'call_ring', conversation_id: room.id });
+      return true;
+    }
+    if (msg.error === 'no_active_call' && pendingRtcAction.action === 'recover_accept') {
+      rtcAction('accept', 'call', room.id, room.epoch);
+      sendWs({ type: 'call_accept', conversation_id: room.id });
+      return true;
     }
     const failed = { ...pendingRtcAction };
     const copy = rtcJoinErrorCopy(msg.error, failed.action, failed.kind);
@@ -6999,6 +7142,9 @@
       debug('RTC', 'stale_roster_ignored', { kind, id, room });
       return;
     }
+    room.latestUsers = users;
+    if (room.joinInFlightEpoch === room.epoch) return;
+    room.joinInFlightEpoch = room.epoch;
     room.joined = true;
     callHealth?.start();
     startRtcRefresh();
@@ -7007,8 +7153,24 @@
     startRtcPersistence();
     const epoch = room.epoch;
     debug('RTC', 'room_joined', { kind, id, participant_count: users.length });
-    await ensureMedia();
+    try {
+      if (!room.stateSynced) await ensureMedia();
+      else if (!localMicrophoneLease?.rawStream?.getAudioTracks().some((track) => track.readyState === 'live') ||
+               !localStream?.getAudioTracks().some((track) => track.readyState === 'live')) {
+        scheduleMicrophoneRecovery();
+      }
+    } catch (error) {
+      if (room?.epoch === epoch) {
+        debug('RTC', 'room_media_failed', { kind, id, name: error.name, error: error.message }, 'warn');
+        leaveRtcRoom({ notifyServer: true });
+        send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: kind });
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not start the microphone. Check permission or choose another input, then rejoin.' });
+      }
+      return;
+    }
     if (!room || room.epoch !== epoch) return;
+    users = room.latestUsers || [];
+    room.joinInFlightEpoch = 0;
     rtcLocalDeparture = false;
     if (!room.stateSynced) {
       // The server forgets seat state across a fresh join or reconnect and drops
@@ -7135,7 +7297,14 @@
     }
     if (/^(voice|call)_/.test(msg.type || '')) debug('RTC', 'server_event', { message: msg });
     if (['voice_state', 'call_state', 'voice_peer_joined', 'call_peer_joined', 'call_ringing', 'call_incoming'].includes(msg.type)) markActive();
-    if (msg.type === 'call_ringing' && pendingRtcAction?.action === 'start') pendingRtcAction = null;
+    if (msg.type === 'call_ringing' && eventMatchesRoom(msg)) {
+      room.ringing = true;
+      if (pendingRtcAction?.action === 'start') pendingRtcAction = null;
+    }
+    if (msg.type === 'call_accepted' && eventMatchesRoom(msg)) {
+      room.ringing = false;
+      if (!room.joined) rtcAction('join', 'call', room.id, room.epoch);
+    }
     if (failPendingRtcAction(msg)) return true;
     if (msg.type === 'voice_state') {
       if (!roomMatches('voice', msg.channel_id)) return;
@@ -9294,6 +9463,7 @@
     if (room?.joined) {
       playAllRemoteAudio();
       auditRtcPeers('browser_online');
+      retryDeadMicrophone();
     }
   });
   window.addEventListener('offline', () => debug('NETWORK', 'browser_offline', {}, 'warn'));
@@ -9304,6 +9474,7 @@
       audioContext()?.resume?.();
       playAllRemoteAudio();
       auditRtcPeers('foreground');
+      retryDeadMicrophone();
     }
   }, { passive: true });
   window.addEventListener('unhandledrejection', (event) => debug('ERROR', 'unhandled_promise_rejection', { error: event.reason?.message || String(event.reason) }, 'error'));
@@ -9336,7 +9507,10 @@
     target.classList.add('image-failed');
   }, true);
 
-  navigator.mediaDevices?.addEventListener?.('devicechange', publishAudioDevices);
+  navigator.mediaDevices?.addEventListener?.('devicechange', () => {
+    publishAudioDevices();
+    retryDeadMicrophone();
+  });
   loadVoiceProcessingConfig().then(publishAudioDevices);
   window.addEventListener('pagehide', cleanupRtcMedia);
   window.addEventListener('beforeunload', cleanupRtcMedia);

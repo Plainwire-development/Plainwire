@@ -31,6 +31,7 @@ const states = new Map();
 const members = new Set();
 // Simulates a slow relay path: ICE candidates arrive long after offer/answer.
 let candidateDelayMs = 0;
+let dropNextRing = false;
 const roster = () => people.slice(0, 2).map(p => ({ user_id: p.id, profile: p, muted: false, deafened: false, screen: false, ...states.get(p.id) }));
 const voiceRoster = () => people.slice(0, 2).map(p => ({ user_id: p.id, profile: p, muted: false, deafened: false, screen: false, screen_audio: false, reconnecting: false }));
 async function setup(uid) {
@@ -94,6 +95,7 @@ async function setup(uid) {
     navigator.mediaDevices.getUserMedia = async (constraints) => {
       window.__gumRequests.push(constraints);
       if (constraints.audio?.deviceId?.exact === 'unplugged') throw new DOMException('Device removed', 'NotFoundError');
+      if (window.__micDisconnected && constraints.audio?.deviceId?.exact === 'desk') throw new DOMException('Device removed', 'NotFoundError');
       const ctx = new AudioContext();
       await ctx.resume();
       const oscillator = ctx.createOscillator();
@@ -138,6 +140,11 @@ async function setup(uid) {
         return send(uid, { type: 'voice_state', channel_id: 9, users: voiceRoster() });
       }
       if (msg.type === 'call_ring') {
+        if (dropNextRing) {
+          dropNextRing = false;
+          ws.close({ code: 1011, reason: 'simulated transport loss' });
+          return;
+        }
         send(uid, { type: 'call_ringing', conversation_id: 1, profile: people[uid === 1 ? 1 : 0] });
         send(uid === 1 ? 2 : 1, { type: 'call_incoming', conversation_id: 1, from_user_id: uid, profile: people[uid - 1] });
       }
@@ -205,6 +212,17 @@ try {
     assert(result.inbound.some(r => r.packets > 10 && r.energy > 0), `peer ${i + 1} receives audible RTP`);
     assert(result.transceivers.some(t => t.kind === 'audio' && t.sending && t.enabled && t.direction === 'sendrecv'), `peer ${i + 1} sends microphone on negotiated transceiver`);
   }
+  // Losing the signaling socket in an active call must rebuild the seat and
+  // both media paths without a page refresh.
+  const oldPeerCount = await a.evaluate(() => window.__pcs.length);
+  members.delete(1);
+  send(2, { type: 'call_peer_left', conversation_id: 1, user_id: 1 });
+  send(2, { type: 'call_state', conversation_id: 1, users: roster().filter((user) => members.has(user.user_id)) });
+  await sockets.get(1).close({ code: 1011, reason: 'simulated transport loss' });
+  await a.waitForFunction((count) => window.__pcs.length > count && window.__pcs.at(-1).connectionState === 'connected', oldPeerCount, { timeout: 20000 });
+  await b.waitForFunction(() => window.__pcs.at(-1).connectionState === 'connected');
+  await a.waitForFunction(async () => [...(await window.__pcs.at(-1).getStats()).values()]
+    .some((report) => report.type === 'inbound-rtp' && report.kind === 'audio' && report.packetsReceived > 5 && report.totalAudioEnergy > 0));
   assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_audio_input')), '', 'unavailable saved microphone recovers to default');
   await a.getByRole('button', { name: 'Open call details', exact: true }).click();
   await a.waitForSelector('#call-microphone');
@@ -278,6 +296,28 @@ try {
   await a.locator('#call-microphone').selectOption('headset');
   await a.waitForFunction(() => document.querySelector('#call-microphone')?.value === 'desk');
   assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track === window.__beforeFailedSwap && window.__beforeFailedSwap.readyState === 'live'), true);
+
+  // A processed Web Audio track can stay live when its physical source dies.
+  // The call must switch to the default device and resume audible RTP.
+  await a.evaluate(() => {
+    window.__beforeDisconnect = window.__pcs.at(-1)._audioSender.track;
+    const raw = window.__mics.findLast((mic) => mic.stream.getAudioTracks()[0].readyState === 'live').stream.getAudioTracks()[0];
+    window.__micDisconnected = true;
+    raw.stop();
+    raw.dispatchEvent(new Event('ended'));
+  });
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track !== window.__beforeDisconnect && window.__pcs.at(-1)._audioSender.track.readyState === 'live');
+  assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_audio_input')), '', 'disconnected selected input falls back to the default');
+  const beforeRecoveredAudio = (await stats(b)).inbound[0].energy;
+  await b.waitForTimeout(400);
+  assert((await stats(b)).inbound[0].energy > beforeRecoveredAudio, 'microphone recovers without rejoining or refreshing');
+  await a.evaluate(() => {
+    const output = window.__pcs.at(-1)._audioSender.track;
+    window.__beforeOutputDisconnect = output;
+    output.stop();
+    output.dispatchEvent(new Event('ended'));
+  });
+  await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track !== window.__beforeOutputDisconnect && window.__pcs.at(-1)._audioSender.track.readyState === 'live');
 
   // Screen audio is mixed onto the negotiated audio sender, preserving the
   // existing SDP shape and microphone controls.
@@ -524,8 +564,11 @@ try {
   await a.waitForSelector('#compose');
   await a.waitForTimeout(600);
   const silentCount = await toneCount();
+  const ringsBeforeReconnect = clientMessages.filter((item) => item.uid === 2 && item.msg.type === 'call_ring').length;
+  dropNextRing = true;
   await b.getByRole('button', { name: 'Start call', exact: true }).click();
   await a.getByRole('button', { name: 'Decline', exact: true }).waitFor();
+  assert(clientMessages.filter((item) => item.uid === 2 && item.msg.type === 'call_ring').length >= ringsBeforeReconnect + 2, 'pending call intent replays after signaling loss');
   await a.waitForTimeout(100);
   assert.equal(await toneCount(), silentCount, 'disabled sounds suppress incoming ringing');
   await a.getByRole('button', { name: 'Decline', exact: true }).click();
@@ -543,5 +586,5 @@ try {
   await a.screenshot({ path: 'test-results/voice-refresh-roster.png' });
   await a.getByRole('button', { name: 'Leave', exact: true }).click();
   assert.deepEqual(errors, [], 'no browser exceptions during calls and screen sharing');
-  console.log('PASS: real bidirectional RTP; missing device fallback; live input meter; mute/unmute; deafen state restoration; microphone swap and failed-swap recovery; screen sharing with mixed audio in both directions; hide/show and reopen viewing; quality presets; source replacement/cancellation/rollback/stop race; fullscreen and colour metadata; pointer/keyboard resizing; mobile viewer expansion; call-health measurements; mobile controls; call cleanup; refreshed voice profile roster; direct audio settings; all sound previews and disabled ringing.');
+  console.log('PASS: real bidirectional RTP; signaling reconnect and pending call replay; physical and processed microphone recovery; missing device fallback; live input meter; mute/unmute; deafen state restoration; microphone swap and failed-swap recovery; screen sharing with mixed audio in both directions; hide/show and reopen viewing; quality presets; source replacement/cancellation/rollback/stop race; fullscreen and colour metadata; pointer/keyboard resizing; mobile viewer expansion; call-health measurements; mobile controls; call cleanup; refreshed voice profile roster; direct audio settings; all sound previews and disabled ringing.');
 } finally { await browser.close(); server.close(); }
