@@ -5,6 +5,7 @@ import { resolve, extname } from 'node:path';
 import assert from 'node:assert/strict';
 import { now, people, sync, conversations } from './fixtures.mjs';
 import { nativeHealth } from './native-health.mjs';
+import { measureAudioPower } from './rtc-audio.mjs';
 
 // Real RTCPeerConnections and RTP media. Only identity, signaling transport and
 // microphone hardware are fixtures, so no microphone or external server is needed.
@@ -196,8 +197,13 @@ async function stats(page) {
     const pc = window.__pcs.filter(p => p.signalingState !== 'closed').at(-1);
     if (!pc) return null;
     const reports = [...(await pc.getStats()).values()];
-    return { video: reports.filter(r => r.type === 'inbound-rtp' && r.kind === 'video').map(r => r.framesDecoded), connection: pc.connectionState, transceivers: pc.getTransceivers().map(t => ({ mid: t.mid, direction: t.currentDirection, kind: t.receiver.track.kind, sending: !!t.sender.track, enabled: t.sender.track?.enabled })), inbound: reports.filter(r => r.type === 'inbound-rtp' && r.kind === 'audio').map(r => ({ packets: r.packetsReceived, energy: r.totalAudioEnergy })), outbound: reports.filter(r => r.type === 'outbound-rtp' && r.kind === 'audio').map(r => r.packetsSent) };
+    return { video: reports.filter(r => r.type === 'inbound-rtp' && r.kind === 'video').map(r => r.framesDecoded), connection: pc.connectionState, transceivers: pc.getTransceivers().map(t => ({ mid: t.mid, direction: t.currentDirection, kind: t.receiver.track.kind, sending: !!t.sender.track, enabled: t.sender.track?.enabled })), inbound: reports.filter(r => r.type === 'inbound-rtp' && r.kind === 'audio').map(r => ({ id: r.id, packets: r.packetsReceived, energy: r.totalAudioEnergy, duration: r.totalSamplesDuration })), outbound: reports.filter(r => r.type === 'outbound-rtp' && r.kind === 'audio').map(r => r.packetsSent) };
   });
+}
+async function audioPower(page, label) {
+  const sample = await measureAudioPower(async () => (await stats(page))?.inbound[0], { label });
+  if (process.env.RTC_DEBUG) console.log(label, sample);
+  return sample.power;
 }
 try {
   const [a, b] = await Promise.all([setup(1), setup(2)]);
@@ -259,16 +265,11 @@ try {
   assert.equal(await a.evaluate(() => document.querySelector('#remote-audio-2').volume), .35);
   assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_peer_volume_1_2')), '35');
   await a.locator('pw-input-volume input').fill('0');
-  await a.waitForTimeout(600);
-  const quietBefore = (await stats(b)).inbound[0].energy;
-  await b.waitForTimeout(300);
-  const quietDelta = (await stats(b)).inbound[0].energy - quietBefore;
+  const quietPower = await audioPower(b, 'input volume 0%');
   await a.locator('pw-input-volume input').fill('100');
-  await a.waitForTimeout(500);
-  const loudBefore = (await stats(b)).inbound[0].energy;
-  await b.waitForTimeout(300);
-  const loudDelta = (await stats(b)).inbound[0].energy - loudBefore;
-  assert(loudDelta > quietDelta * 4 + .0001, 'input volume changes real outgoing audio energy');
+  const loudPower = await audioPower(b, 'input volume 100%');
+  assert(quietPower < .0001 && loudPower > quietPower * 4 + .0001,
+    `input volume changes real outgoing audio energy (quiet power ${quietPower}, loud power ${loudPower})`);
   await a.getByRole('button', { name: 'Mute', exact: true }).click();
   await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === false);
   await a.waitForFunction(() => document.querySelector('[data-call-mic-meter]')?.getAttribute('aria-valuenow') === '0');
@@ -282,9 +283,7 @@ try {
   await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track !== window.__beforeMicSwap && window.__pcs.at(-1)._audioSender.track.readyState === 'live');
   await a.waitForFunction(() => window.__beforeMicSwap.readyState === 'ended');
   await a.waitForFunction(() => window.__mics[0].stream.getAudioTracks()[0].readyState === 'ended');
-  const beforeSwap = (await stats(b)).inbound[0].energy;
-  await b.waitForTimeout(250);
-  assert((await stats(b)).inbound[0].energy > beforeSwap, 'switched microphone remains audible remotely');
+  assert(await audioPower(b, 'switched microphone') > .0001, 'switched microphone remains audible remotely');
 
   // A sender failure must preserve the current microphone and roll back selection.
   await a.evaluate(() => {
@@ -308,9 +307,7 @@ try {
   });
   await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track !== window.__beforeDisconnect && window.__pcs.at(-1)._audioSender.track.readyState === 'live');
   assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_audio_input')), '', 'disconnected selected input falls back to the default');
-  const beforeRecoveredAudio = (await stats(b)).inbound[0].energy;
-  await b.waitForTimeout(400);
-  assert((await stats(b)).inbound[0].energy > beforeRecoveredAudio, 'microphone recovers without rejoining or refreshing');
+  assert(await audioPower(b, 'recovered microphone') > .0001, 'microphone recovers without rejoining or refreshing');
   await a.evaluate(() => {
     const output = window.__pcs.at(-1)._audioSender.track;
     window.__beforeOutputDisconnect = output;
@@ -353,11 +350,9 @@ try {
   await a.locator('pw-screen-settings summary').click();
   await a.locator('[data-screen-audio-status].active').waitFor();
   await a.getByText('Shared audio is flowing and mixed with your microphone.', { exact: true }).waitFor();
-  const sharedAudioBeforeMute = (await stats(b)).inbound[0].energy;
   await a.getByRole('button', { name: 'Mute', exact: true }).click();
   assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track.enabled), true, 'muting the microphone keeps the mixed share track live');
-  await b.waitForTimeout(400);
-  assert((await stats(b)).inbound[0].energy > sharedAudioBeforeMute, 'shared source audio continues while the microphone is muted');
+  assert(await audioPower(b, 'screen audio with microphone muted') > .0001, 'shared source audio continues while the microphone is muted');
   await a.getByRole('button', { name: 'Unmute', exact: true }).click();
   await a.getByRole('combobox', { name: 'Screen sharing quality', exact: true }).selectOption('motion');
   await a.getByRole('button', { name: 'Change shared screen', exact: true }).click();
@@ -505,9 +500,7 @@ try {
   await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === true && [...document.querySelectorAll('audio')].filter(el => el.srcObject).every(el => !el.muted));
   assert.deepEqual(await remotePlayback(a), [false], 'undeafen restores remote playback');
   assert.equal(await a.getByRole('button', { name: 'Mute', exact: true }).getAttribute('aria-pressed'), 'false', 'undeafen restores the unmuted microphone');
-  const beforeUndeafenEnergy = (await stats(b)).inbound[0].energy;
-  await b.waitForTimeout(400);
-  assert((await stats(b)).inbound[0].energy > beforeUndeafenEnergy, 'microphone is audible again after undeafening');
+  assert(await audioPower(b, 'undeafened microphone') > .0001, 'microphone is audible again after undeafening');
   assert.equal((await stats(a)).connection, 'connected', 'deafening does not disturb the connection');
   await a.getByRole('button', { name: 'Mute', exact: true }).click();
   await a.waitForFunction(() => window.__pcs.at(-1)._audioSender.track.enabled === false);
