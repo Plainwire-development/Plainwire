@@ -93,26 +93,31 @@ list(Conn, Actor, Opts) -> checked(fun() ->
     Q = text(maps:get(<<"q">>,Opts,<<>>),100),
     Assigned = choice(maps:get(<<"assigned">>,Opts,<<"all">>), [<<"all">>,<<"mine">>,<<"unassigned">>], invalid_report_filter),
     Before = cursor(maps:get(<<"before">>,Opts,undefined)), Limit = limit(maps:get(<<"limit">>,Opts,30)),
-    %% A reviewer does not gain access to reports they submitted or are about
-    %% them. Another operator must handle that conflict of interest.
+    %% Own submissions are visible through the reporter allowlist, read-only.
+    %% Reports about the reviewer remain hidden; mutations still require neutrality.
     Reports = rows(Conn, select_report() ++
-        " WHERE r.reporter_id IS DISTINCT FROM $1 AND r.subject_id IS DISTINCT FROM $1 AND r.id<$2 "
+        " WHERE r.subject_id IS DISTINCT FROM $1 AND r.id<$2 "
         "AND ($3='all' OR ($3='active' AND r.status IN ('open','in_review')) OR r.status=$3) "
+        "AND (r.reporter_id IS DISTINCT FROM $1 OR ($4='all' AND $7='all')) "
         "AND ($4='all' OR r.priority=$4) "
         "AND ($5='' OR r.subject_username ILIKE $6 OR r.reporter_username ILIKE $6) "
         "AND ($7='all' OR ($7='mine' AND r.assignee_id=$1) OR ($7='unassigned' AND r.assignee_id IS NULL)) "
         "ORDER BY r.id DESC LIMIT $8", [Actor,Before,Status,Priority,Q,<<"%",Q/binary,"%">>,Assigned,Limit+1]),
-    {ok, P} = page([summary_map(R) || R <- Reports], Limit),
-    Counts = rows(Conn, "SELECT status,count(*) FROM moderation_reports WHERE reporter_id IS DISTINCT FROM $1 AND subject_id IS DISTINCT FROM $1 GROUP BY status", [Actor]),
+    {ok, P} = page([queue_map(report_map(R), Actor) || R <- Reports], Limit),
+    Counts = rows(Conn, "SELECT status,count(*) FROM moderation_reports WHERE subject_id IS DISTINCT FROM $1 GROUP BY status", [Actor]),
     {ok,P#{counts => maps:from_list([{S,N} || [S,N] <- Counts])}}
 end).
 
 detail(Conn, Actor, Id0) -> checked(fun() ->
     _ = reviewer(Conn,Actor), Id = positive(Id0), R = get_report(Conn,Id,false),
-    neutral(R,Actor),
+    need(maps:get(subject_id,R) =/= Actor,forbidden),
     audit(Conn,Actor,Id,<<"view">>,pw_util:now_ms()),
-    History = rows(Conn,"SELECT id,actor_id,actor_username,action,note,created_at FROM moderation_report_events WHERE report_id=$1 ORDER BY id DESC LIMIT 100",[Id]),
-    {ok,R#{evidence => evidence_list(Conn,Id),history => [#{id=>I,actor_id=>A,actor_username=>U,action=>Act,note=>pw_crypto:decrypt(N),created_at=>T} || [I,A,U,Act,N,T] <- History]}}
+    case maps:get(reporter_id,R) =:= Actor of
+        true -> {ok,(own_view(R))#{evidence => evidence_list(Conn,Id)}};
+        false ->
+            History = rows(Conn,"SELECT id,actor_id,actor_username,action,note,created_at FROM moderation_report_events WHERE report_id=$1 ORDER BY id DESC LIMIT 100",[Id]),
+            {ok,R#{evidence => evidence_list(Conn,Id),history => [#{id=>I,actor_id=>A,actor_username=>U,action=>Act,note=>pw_crypto:decrypt(N),created_at=>T} || [I,A,U,Act,N,T] <- History]}}
+    end
 end).
 
 update(Conn, Actor, Id0, M) -> checked(fun() ->
@@ -180,7 +185,7 @@ action_done(Conn,Actor,R,Action,Now) ->
 evidence(Conn, Role, Uid, Id0, Evidence0) -> checked(fun() ->
     Id = positive(Id0), EId = positive(Evidence0), R = get_report(Conn,Id,false),
     case Role of
-        admin -> _ = reviewer(Conn,Uid), neutral(R,Uid);
+        admin -> _ = reviewer(Conn,Uid), need(maps:get(subject_id,R) =/= Uid,forbidden);
         reporter -> need(maps:get(reporter_id,R) =:= Uid,not_found)
     end,
     case row(Conn,"SELECT content_type,name,size,sha256,data FROM moderation_report_evidence WHERE report_id=$1 AND id=$2",[Id,EId]) of
@@ -285,6 +290,14 @@ report_map([Id,Reporter,Subject,RU,RD,SU,SD,C,Reason,Context,Status,Priority,Ass
     #{id=>Id,reporter_id=>Reporter,subject_id=>Subject,reporter_username=>RU,reporter_display_name=>RD,subject_username=>SU,subject_display_name=>SD,
       category=>C,reason=>pw_crypto:decrypt(Reason),message_context=>reveal_context(jsx:decode(Context,[return_maps])),status=>Status,priority=>Priority,assignee_id=>Assignee,resolution=>Resolution,
       public_response=>pw_crypto:decrypt(Response),revision=>Revision,created_at=>Created,updated_at=>Updated,closed_at=>Closed,evidence_purged_at=>Purged}.
+own_view(R) ->
+    (public_map(R))#{own_submission => true, reporter_id => maps:get(reporter_id,R),
+        reporter_username => maps:get(reporter_username,R), reporter_display_name => maps:get(reporter_display_name,R)}.
+queue_map(R, Actor) ->
+    case maps:get(reporter_id,R) =:= Actor of
+        true -> maps:remove(reason,own_view(R));
+        false -> summary_map(R)
+    end.
 summary_map(R) when is_list(R) -> summary_map(report_map(R));
 summary_map(R) -> maps:without([reason,message_context,request_key,request_hash],R).
 public_map(R) when is_list(R) -> public_map(report_map(R));

@@ -14,9 +14,11 @@ Choose or paste screenshots into the form; each preview has a **Remove screensho
 
 The admin **Reports** view identifies both the reporter and reported account. Reviewers can filter the queue, assign themselves, set priority, add private notes, resolve, dismiss, or reopen resolved/dismissed decisions. Threat reports start at high priority. Closing or reopening requires an internal note. A public response is optional and is shown only to the reporter. Withdrawn cases cannot be reopened.
 
-Cases assigned to another reviewer are read-only to operators; owners can take them over. A reviewer cannot access a case they submitted or a case about their own account. Viewers have no report access. Every request rechecks durable roles and account eligibility; edits carry an expected revision, returning HTTP 409 when another action changed the case.
+Cases assigned to another reviewer are read-only to operators; owners can take them over. Owners and operators can see their own submissions as read-only cases, using the same reporter-safe fields as **My reports**. Internal notes, assignment, priority, resolution codes, and message context stay hidden, and another owner or operator must review the case. Reports about the signed-in reviewer remain hidden. Own submissions appear only when both priority and assignment filters are **All**, so those filters cannot reveal private review metadata. Viewers have no report access. Every request rechecks durable roles and account eligibility; edits carry an expected revision, returning HTTP 409 when another action changed the case.
 
 Assigned cases can invoke the existing instance-wide suspend, ban, or disable action. The account restriction, session revocation, action record, and case resolution commit together. Existing owner/operator/self protections still apply. The affected account sees a separately entered moderation reason; the reporter's identity and evidence are not automatically copied into it. No restriction happens just because a report was filed.
+
+Reports are saved before submission succeeds. The visible queue checks for changes every five seconds, including while a case or filter input is in use; background updates preserve open case drafts and unapplied filter text. **Refresh reports** checks immediately. Status, username, priority, assignment, and older-page filters can hide new cases; use the newest page and matching filters to see them. Temporary refresh failures retain the last queue and retry automatically.
 
 ## Limits and evidence storage
 
@@ -49,7 +51,7 @@ Separate admin API, owner/operator only:
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/api/reports` | Queue with `status`, `priority`, `assigned`, `q`, `before`, `limit` |
-| GET | `/api/reports/:id` | Submitted content, screenshot metadata, latest 100 history entries |
+| GET | `/api/reports/:id` | Submitted content, screenshot metadata, latest 100 history entries; own submissions return reporter-safe fields without private history |
 | POST | `/api/reports/:id` | `action`, `expected_revision`, and action-specific `note`, `priority`, `resolution`, `public_response` |
 | GET | `/api/reports/:id/evidence/:evidence_id` | Read the exact submitted screenshot |
 

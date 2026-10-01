@@ -25,15 +25,24 @@ const app = await serve('priv/static'), admin = await serve('priv/admin');
 const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_EXECUTABLE || undefined, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
 const errors = [], posts = [], reports = [], submissions = new Map();
 let profileBlocked = false;
-let uploads = 0, failResponse = true, delayDetails = false, releaseDetail, adminRole = 'owner';
-const publicReport = report => { const { history, reporter_id, reporter_username, reporter_display_name, message_context, assignee_id, ...safe } = report; return safe; };
+let uploads = 0, failResponse = true, delayDetails = false, releaseDetail, adminRole = 'owner', adminUid = 3, failAdminList = false;
+const publicReport = report => Object.fromEntries(['id', 'subject_id', 'subject_username', 'subject_display_name', 'category', 'reason', 'status', 'public_response', 'revision', 'created_at', 'updated_at', 'evidence_purged_at', 'evidence'].filter(key => key in report).map(key => [key, report[key]]));
+const ownReport = report => ({ ...publicReport(report), own_submission: true, reporter_id: report.reporter_id, reporter_username: report.reporter_username, reporter_display_name: report.reporter_display_name });
 const response = (route, data, status = 200, error) => route.fulfill({ status, json: { ok: status < 400, data, ...(error ? { error } : {}) } });
-const list = url => ({ items: reports.filter(r => url.searchParams.get('status') !== 'active' || ['open', 'in_review'].includes(r.status)).toReversed(), next_before: null, counts: { open: reports.filter(r => r.status === 'open').length, in_review: reports.filter(r => r.status === 'in_review').length } });
+const list = url => {
+  const visible = reports.filter(r => r.subject_id !== adminUid);
+  const status = url.searchParams.get('status') || 'active';
+  return { items: visible.filter(r => (status === 'all' || (status === 'active' ? ['open', 'in_review'].includes(r.status) : r.status === status)) && (r.reporter_id !== adminUid || ['priority', 'assigned'].every(key => !url.searchParams.get(key) || url.searchParams.get(key) === 'all'))).toReversed().map(r => r.reporter_id === adminUid ? ownReport(r) : r), next_before: null, counts: { open: visible.filter(r => r.status === 'open').length, in_review: visible.filter(r => r.status === 'in_review').length } };
+};
 async function reportApi(route, isAdmin) {
   const req = route.request(), url = new URL(req.url()), path = url.pathname, method = req.method();
   if (method !== 'GET') posts.push({ isAdmin, path, body: req.postDataJSON(), csrf: req.headers()['x-csrf-token'] });
+  if (isAdmin && adminRole === 'viewer') return response(route, null, 403, 'forbidden');
+  const current = reports.find(r => r.id === Number(path.split('/')[3]));
+  if (isAdmin && current?.subject_id === adminUid) return response(route, null, 403, 'forbidden');
   if (/\/evidence\/\d+$/.test(path)) return route.fulfill({ contentType: 'image/png', body: png });
   if (path === '/api/reports' && method === 'GET') {
+    if (isAdmin && failAdminList) { failAdminList = false; return response(route, null, 503, 'database_busy'); }
     const data = list(url); if (!isAdmin) data.items = reports.toReversed().map(publicReport);
     return response(route, data);
   }
@@ -50,16 +59,17 @@ async function reportApi(route, isAdmin) {
   if (!report) return response(route, null, 404, 'not_found');
   if (method === 'GET') {
     if (delayDetails) { delayDetails = false; releaseDetail = () => response(route, report); return; }
-    return response(route, report);
+    return response(route, isAdmin && report.reporter_id === adminUid ? ownReport(report) : report);
   }
+  if (isAdmin && report.reporter_id === adminUid) return response(route, null, 403, 'forbidden');
   const body = req.postDataJSON();
   if (body.expected_revision !== report.revision) return response(route, null, 409, 'report_conflict');
   if (path.endsWith('/withdraw')) report.status = 'withdrawn';
-  else if (body.action === 'claim') { report.assignee_id = 3; report.status = 'in_review'; }
+  else if (body.action === 'claim') { report.assignee_id = adminUid; report.status = 'in_review'; }
   else if (body.action === 'unassign') { report.assignee_id = null; report.status = 'open'; }
   else if (body.action === 'priority') report.priority = body.priority;
   else if (['resolve', 'dismiss'].includes(body.action)) { report.status = body.action === 'resolve' ? 'resolved' : 'dismissed'; report.public_response = body.public_response; report.resolution = body.resolution; }
-  else if (body.action === 'reopen') { report.status = 'in_review'; report.assignee_id = 3; report.public_response = ''; }
+  else if (body.action === 'reopen') { report.status = 'in_review'; report.assignee_id = adminUid; report.public_response = ''; }
   report.revision++; report.history.unshift({ id: report.revision, actor_username: 'owner', action: body.action || 'withdrawn', note: body.note || '', created_at: now });
   return response(route, isAdmin ? report : publicReport(report));
 }
@@ -139,7 +149,7 @@ try {
     const req = route.request(), url = new URL(req.url()), path = url.pathname;
     if (path.startsWith('/api/reports')) return reportApi(route, true);
     if (path === '/api/status') return response(route, { instance_id: 'report-test', bootstrap_available: false });
-    if (path === '/api/me') return response(route, { username: 'owner', display_name: 'Owner', role: adminRole, user_id: 3, csrf: 'operator-csrf' });
+    if (path === '/api/me') return response(route, { username: 'owner', display_name: 'Owner', role: adminRole, user_id: adminUid, csrf: 'operator-csrf' });
     if (path === '/api/overview') return response(route, { runtime: {} });
     if (path === '/api/users/2/moderation' && req.method() === 'POST') {
       const body = req.postDataJSON(); posts.push({ isAdmin: true, path, body, csrf: req.headers()['x-csrf-token'] });
@@ -150,6 +160,7 @@ try {
     return response(route, []);
   });
   const panel = await operators.newPage(); panel.on('pageerror', e => errors.push(e.message));
+  await panel.clock.install();
   await panel.goto(admin.origin); await panel.locator('#app').waitFor({ state: 'visible' });
   await panel.locator('[data-view="reports"]').click();
   await panel.locator('.report-queue-item[data-report-id="1"]').click();
@@ -221,16 +232,75 @@ try {
   await panel.locator('#modal-close').click();
   await panel.setViewportSize({ width: 1440, height: 1000 });
   await panel.locator('.report-filters select[name="status"]').selectOption('all'); await panel.getByRole('button', { name: 'Filter reports' }).click();
+  // New submissions refresh the existing queue while filter and case drafts
+  // remain intact, including recovery after a temporary API failure.
+  await page.getByRole('dialog').getByRole('button', { name: 'Close', exact: true }).click();
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  async function submitLive(reason, id) {
+    await page.goto(app.origin + '/#profile/2');
+    await page.getByRole('button', { name: 'Report user', exact: true }).click();
+    await page.getByRole('dialog').locator('[name="reason"]').fill(reason);
+    await page.getByRole('button', { name: 'Submit report', exact: true }).click();
+    await page.getByRole('heading', { name: `Report #${id} submitted` }).waitFor();
+    await page.getByRole('button', { name: 'Done', exact: true }).click();
+  }
+  const searchDraft = 'Unapplied search draft';
+  await panel.locator('.report-filters input[name="q"]').fill(searchDraft);
+  await submitLive('New case while filter is focused', 3);
+  await panel.clock.runFor(5001);
+  await panel.locator('.report-queue-item[data-report-id="3"]').waitFor();
+  assert.equal(await panel.locator('.report-filters input[name="q"]').inputValue(), searchDraft, 'background updates preserve unapplied filters');
+  await panel.locator('.report-queue-item[data-report-id="3"]').click();
+  await panel.locator('.report-note-form textarea').fill('Unsubmitted internal note');
+  await submitLive('New case while another case is open', 4);
+  await panel.clock.runFor(5001);
+  await panel.locator('.report-queue-item[data-report-id="4"]').waitFor({ state: 'attached' });
+  assert.equal(await panel.locator('.report-queue-item[data-report-id="4"]').count(), 1, 'queue refresh runs with an open case');
+  assert.equal(await panel.locator('.report-note-form textarea').inputValue(), 'Unsubmitted internal note', 'refresh never replaces an open case draft');
+  assert.equal(await panel.locator('.report-detail').getAttribute('data-report-id'), '3');
+  await panel.locator('#modal-close').click();
+  assert.equal(await panel.locator('.report-queue-item[data-report-id="3"]').evaluate(node => node === document.activeElement), true, 'closing a case returns focus to its refreshed queue item');
+  failAdminList = true;
+  await panel.clock.runFor(5001);
+  await panel.locator('.report-refresh-status').filter({ hasText: 'Could not refresh' }).waitFor();
+  assert.equal(await panel.locator('.report-queue-item').count(), 4, 'a refresh failure keeps the last successful queue');
+  await panel.clock.runFor(5001);
+  await panel.locator('.report-refresh-status').filter({ hasText: 'Checks for new reports' }).waitFor();
   delayDetails = true; await panel.locator('.report-queue-item[data-report-id="1"]').click();
   await panel.waitForFunction(() => document.querySelector('#modal-subtitle').textContent === 'Loading case…');
   await panel.locator('#modal-close').click();
   for (let i = 0; !releaseDetail && i < 100; i++) await new Promise(r => setTimeout(r, 20));
   assert.ok(releaseDetail); await releaseDetail();
   await panel.waitForTimeout(150); assert.equal(await panel.locator('#modal-backdrop').isVisible(), false, 'late case responses do not reopen a dismissed modal');
+  // The same account can see its own case but gets only the reporter-safe
+  // response, with no review controls or internal reviewer information.
+  adminUid = me.id;
+  await panel.reload(); await panel.locator('#app').waitFor({ state: 'visible' });
+  await panel.locator('[data-view="reports"]').click();
+  await panel.locator('.report-queue-item[data-report-id="3"]').waitFor();
+  assert.ok((await panel.locator('.report-queue-item[data-report-id="3"]').textContent()).includes('Your submission · read-only'));
+  await panel.locator('.report-filters select[name="status"]').selectOption('all');
+  await panel.getByRole('button', { name: 'Filter reports' }).click();
+  await panel.locator('.report-queue-item[data-report-id="1"]').click();
+  await panel.locator('.report-own-submission').waitFor();
+  const ownText = await panel.locator('.report-detail').textContent();
+  assert.ok(ownText.includes('This was reviewed with the original case.'));
+  assert.ok(!ownText.includes('Private operator assessment'));
+  assert.equal(await panel.locator('.report-detail').locator('.report-history, .report-note-form, .report-decision-form, .report-actions').count(), 0, 'own case has no moderation controls or private history');
+  assert.equal(await panel.getByRole('button', { name: 'Assign to me', exact: true }).count(), 0);
+  assert.equal(await panel.locator('.report-detail pre').count(), 0, 'own admin view does not expose message context or review metadata');
+  await panel.waitForFunction(() => document.querySelector('.report-evidence-gallery img')?.naturalWidth > 0);
+  await panel.locator('#modal-close').click();
+  adminUid = 2;
+  await panel.reload(); await panel.locator('#app').waitFor({ state: 'visible' });
+  await panel.locator('[data-view="reports"]').click();
+  await panel.getByText('No reports match these filters.', { exact: true }).waitFor();
+  assert.equal(await panel.locator('.report-queue-item').count(), 0, 'reports about the signed-in reviewer remain hidden');
+  adminUid = 3;
   adminRole = 'viewer'; await panel.reload(); await panel.locator('#app').waitFor({ state: 'visible' });
   assert.equal(await panel.locator('[data-view="reports"]').isVisible(), false, 'viewers cannot open reports');
   assert.deepEqual(errors, []);
-  console.log('PASS: reporting forms, scoped evidence, screenshot-only reports, retry idempotency, draft isolation, private admin review, assignment, conflicts, linked restrictions, decisions, withdrawal, stale modals, viewer isolation, and mobile layouts.');
+  console.log('PASS: reporting forms, scoped evidence, screenshot-only reports, retry idempotency, draft isolation, private admin review, assignment, conflicts, linked restrictions, decisions, withdrawal, background refresh preserving drafts, refresh recovery, own-submission privacy, subject exclusion, stale modals, viewer isolation, and mobile layouts.');
 } finally {
   await browser.close(); await Promise.all([app.server, admin.server].map(server => new Promise(r => server.close(r))));
 }

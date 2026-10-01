@@ -16,6 +16,7 @@ const state = {
   modalTrigger: null,
   viewEpoch: 0,
   authEpoch: 0,
+  reportRefreshPending: false,
   reports: { status: "active", priority: "all", assigned: "all", q: "", before: null },
 };
 const $ = (s) => document.querySelector(s);
@@ -444,10 +445,12 @@ async function loadView(manual = false) {
 }
 function scheduleRefresh() {
   stopRefresh();
-  const ms = state.view === "control" ? 30000 : 15000;
+  const ms = state.view === "reports" ? 5000 : state.view === "control" ? 30000 : 15000;
   if (["overview", "host", "control", "reports"].includes(state.view))
     state.refreshTimer = setInterval(() => {
-      if (!document.hidden && state.me && $("#modal-backdrop").hidden && !content.querySelector("input:focus,textarea:focus,select:focus")) loadView();
+      if (document.hidden || !state.me) return;
+      if (state.view === "reports") refreshReportQueue();
+      else if ($("#modal-backdrop").hidden && !content.querySelector("input:focus,textarea:focus,select:focus")) loadView();
     }, ms);
 }
 function stopRefresh() {
@@ -461,8 +464,10 @@ document.addEventListener("visibilitychange", () => {
     !document.hidden &&
     state.me &&
     ["overview", "host", "control", "reports"].includes(state.view)
-  )
-    loadView();
+  ) {
+    if (state.view === "reports") refreshReportQueue();
+    else loadView();
+  }
 });
 
 function metric(label, value, hint = "") {
@@ -1099,7 +1104,21 @@ function showModerationAction(user, current, action, report = null) {
 }
 
 const reportCategories = { harassment: "Harassment or bullying", hate: "Hate or discrimination", threats: "Threats or violence", spam: "Spam", scam: "Scam or fraud", privacy: "Privacy violation", impersonation: "Impersonation", other: "Other" };
-async function renderReports(epoch) {
+async function refreshReportQueue() {
+  if (state.reportRefreshPending || state.view !== "reports" || !canOperate() || !content.querySelector(".report-queue")) return;
+  state.reportRefreshPending = true;
+  const epoch = state.viewEpoch;
+  try {
+    await renderReports(epoch, true);
+    if (epoch === state.viewEpoch) $("#last-refresh").textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  } catch (error) {
+    if (epoch === state.viewEpoch && canOperate()) {
+      const message = content.querySelector(".report-refresh-status");
+      if (message) message.textContent = "Could not refresh reports. Retrying automatically; use Refresh to try now.";
+    }
+  } finally { state.reportRefreshPending = false; }
+}
+async function renderReports(epoch, background = false) {
   const filters = { ...state.reports }, params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) if (value !== null && value !== "") params.set(key, value);
   params.set("limit", "30");
@@ -1114,18 +1133,32 @@ async function renderReports(epoch) {
   const search = field("Reporter or reported username", "q", "search"); search.querySelector("input").value = filters.q; search.querySelector("input").maxLength = 100;
   const apply = el("button", "primary", "Filter reports"); apply.type = "submit"; form.append(search, apply);
   form.addEventListener("submit", event => { event.preventDefault(); state.reports = { status: inputValue(form,"status"), priority: inputValue(form,"priority"), assigned: inputValue(form,"assigned"), q: inputValue(form,"q"), before: null }; loadView(); });
-  panel.append(form, el("p", "muted", `${fmtNum(data.counts?.open)} awaiting review · ${fmtNum(data.counts?.in_review)} under review. Cases involving your own account are excluded.`));
+  const summary = el("p", "muted report-queue-summary", `${fmtNum(data.counts?.open)} awaiting review · ${fmtNum(data.counts?.in_review)} under review. Your submissions are read-only; reports about you are hidden.`);
+  const status = el("p", "muted report-refresh-status", "Checks for new reports every 5 seconds. Filters may hide matching cases."); status.setAttribute("role", "status");
+  const refresh = el("button", "secondary", "Refresh reports"); refresh.type = "button"; refresh.addEventListener("click", () => refreshReportQueue());
+  panel.append(form, summary, status, refresh);
   const list = el("div", "report-case-list");
   for (const report of data.items || []) {
-    const button = el("button", `report-queue-item priority-${report.priority}`); button.type = "button"; button.dataset.reportId = report.id;
-    button.append(el("strong", "", `#${report.id} · ${reportCategories[report.category] || report.category}`), el("span", "", `Reported: ${report.subject_display_name || report.subject_username} (@${report.subject_username})`), el("span", "muted", `Reporter: ${report.reporter_display_name || report.reporter_username} (@${report.reporter_username})`), el("span", "report-status", `${titleCase(report.status)} · ${titleCase(report.priority)} · ${report.assignee_id ? `Reviewer #${report.assignee_id}` : "Unassigned"} · ${fmtTime(report.created_at)}`));
+    const button = el("button", `report-queue-item${report.own_submission ? "" : ` priority-${report.priority}`}`); button.type = "button"; button.dataset.reportId = report.id;
+    button.append(el("strong", "", `#${report.id} · ${reportCategories[report.category] || report.category}`), el("span", "", `Reported: ${report.subject_display_name || report.subject_username} (@${report.subject_username})`), el("span", "muted", `Reporter: ${report.reporter_display_name || report.reporter_username} (@${report.reporter_username})`), el("span", "report-status", `${titleCase(report.status)} · ${report.own_submission ? "Your submission · read-only" : `${titleCase(report.priority)} · ${report.assignee_id ? `Reviewer #${report.assignee_id}` : "Unassigned"}`} · ${fmtTime(report.created_at)}`));
     button.addEventListener("click", () => showReport(report.id)); list.append(button);
   }
   if (!list.children.length) list.append(el("p", "empty-state", "No reports match these filters."));
-  const paging = el("div", "report-actions");
+  const paging = el("div", "report-actions report-paging");
   if (filters.before) { const newest = el("button", "secondary", "Newest reports"); newest.addEventListener("click", () => { state.reports.before = null; loadView(); }); paging.append(newest); }
   if (data.next_before) { const more = el("button", "secondary", "Older reports"); more.addEventListener("click", () => { state.reports.before = data.next_before; loadView(); }); paging.append(more); }
-  panel.append(list, paging); clear(content); content.append(panel);
+  panel.append(list, paging);
+  const current = background && content.querySelector(".report-queue");
+  if (current) {
+    const focusedId = document.activeElement?.closest(".report-queue-item")?.dataset.reportId;
+    const triggerId = state.modalTrigger?.closest(".report-queue-item")?.dataset.reportId;
+    current.querySelector(".report-case-list").replaceWith(list);
+    current.querySelector(".report-paging").replaceWith(paging);
+    current.querySelector(".report-queue-summary").replaceWith(summary);
+    current.querySelector(".report-refresh-status").textContent = status.textContent;
+    if (triggerId) state.modalTrigger = list.querySelector(`[data-report-id="${triggerId}"]`) || current.querySelector(".report-filters input");
+    if (focusedId) list.querySelector(`[data-report-id="${focusedId}"]`)?.focus({ preventScroll: true });
+  } else { clear(content); content.append(panel); }
 }
 async function showReport(id) {
   if (!canOperate()) return;
@@ -1136,7 +1169,7 @@ async function showReport(id) {
   catch (error) { if (epoch === state.modalEpoch) { $("#modal-subtitle").textContent = "Could not load case"; $("#modal-body").replaceChildren(el("p", "error", error.message)); } return; }
   if (epoch !== state.modalEpoch || $("#modal-backdrop").hidden || !canOperate()) return;
   const body = el("div", "report-detail"); body.dataset.reportId = id;
-  body.append(el("p", "report-status", `${titleCase(report.status)} · ${titleCase(report.priority)} · ${report.assignee_id ? `Reviewer #${report.assignee_id}` : "Unassigned"}`));
+  body.append(el("p", "report-status", report.own_submission ? `${titleCase(report.status)} · Your submission · read-only` : `${titleCase(report.status)} · ${titleCase(report.priority)} · ${report.assignee_id ? `Reviewer #${report.assignee_id}` : "Unassigned"}`));
   const identities = el("div", "report-identities");
   for (const [label, prefix] of [["Reported account", "subject"], ["Reporter", "reporter"]]) {
     const card = el("section", "report-identity"); card.append(el("small", "muted", label), el("strong", "", report[`${prefix}_display_name`] || report[`${prefix}_username`]), el("span", "", `@${report[`${prefix}_username`]} · ${report[`${prefix}_id`] ? `user ${report[`${prefix}_id`]}` : "deleted account"}`)); identities.append(card);
@@ -1156,6 +1189,12 @@ async function showReport(id) {
   if (gallery.children.length) body.append(el("h3", "", "Submitted screenshots"), gallery);
   if (report.evidence_purged_at) body.append(el("p", "muted", `Evidence expired under the retention policy on ${fmtTime(report.evidence_purged_at)}.`));
   if (report.public_response) body.append(el("h3", "", "Response visible to reporter"), el("p", "report-text", report.public_response));
+  if (report.own_submission) {
+    body.append(el("p", "form-help report-own-submission", "You filed this report. Another owner or operator must review it. Internal notes and reviewer assignment remain private."));
+    const reload = el("button", "secondary", "Reload case"); reload.type = "button"; reload.addEventListener("click", () => showReport(id)); body.append(reload);
+    showModal(`Report #${id} · Your submission`, `Submitted ${fmtTime(report.created_at)}`, body);
+    return;
+  }
   const active = ["open", "in_review"].includes(report.status), own = report.assignee_id === state.me.user_id, owner = state.me.role === "owner", writable = !report.assignee_id || own || owner;
   const actions = el("div", "report-actions"); let busy = false;
   const mutate = async patch => {

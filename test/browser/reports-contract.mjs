@@ -10,7 +10,8 @@ assert.match(reports, /uploads WHERE id=\$1 AND user_id=\$2 AND status='ready' F
 assert.match(reports, /file:pread\(Fd,0,\?FILE_MAX\+1\)/, 'snapshot reads are bounded even if the filesystem file changes');
 assert.match(reports, /sha256_hex\(Data\) =:= ExpectedHash[\s\S]*image_type\(Data\)/, 'server verifies file bytes, hashes, and raster signatures');
 assert.doesNotMatch(reports, /upload_refs|upload_readable|message_search/, 'reviewer evidence access never widens general file or conversation ACLs');
-assert.match(reports, /reporter_id IS DISTINCT FROM \$1 AND r.subject_id IS DISTINCT FROM \$1/, 'queue excludes reviewer conflicts of interest');
+assert.match(reports, /WHERE r.subject_id IS DISTINCT FROM \$1/, 'queue excludes cases about the reviewing account');
+assert.match(reports, /own_view\(R\) ->[\s\S]*public_map\(R\)[\s\S]*own_submission => true/, 'own submissions use the reporter allowlist and are read-only');
 assert.match(reports, /neutral\(R,Actor\)[\s\S]*revision\(R,M\)/, 'case mutations validate neutrality and revision');
 assert.match(reports, /owner[\s\S]*operator[\s\S]*forbidden/, 'durable roles protect report content');
 assert.match(reports, /public_map\(R\) -> maps:with\(\[id,subject_id[\s\S]{0,300}evidence_purged_at\]/, 'reporter JSON uses an allowlist rather than returning private notes or assignments');

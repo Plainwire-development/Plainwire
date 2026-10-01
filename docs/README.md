@@ -1,6 +1,6 @@
 # Plainwire documentation
 
-These notes match the 2.6.5 tree. PostgreSQL is required. Redis and ScyllaDB are optional.
+These notes match the 2.6.5-1 tree. PostgreSQL is required. Redis and ScyllaDB are optional.
 
 ## Run it
 
@@ -32,3 +32,5 @@ These notes match the 2.6.5 tree. PostgreSQL is required. Redis and ScyllaDB are
 Older release notes live next to the README (`RELEASE_NOTES_*.md`). They describe the release they were written for; they are not a second copy of this index.
 
 The [2.6.5 audit record](SECURITY_AUDIT_2.6.5.md) documents the latest permission, admin lifecycle, and call-window fixes.
+
+The [2.6.5-1 patch notes](../RELEASE_NOTES_2.6.5-1.md) cover same-account report visibility and background queue refresh.
