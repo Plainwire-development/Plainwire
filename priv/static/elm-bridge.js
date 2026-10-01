@@ -1395,6 +1395,9 @@
   let resumeAttempted = false;
   let resumeInFlight = false;
   let pendingRtcAction = null;
+  let pendingRtcInvitation = null;
+  const callAcceptRequest = (id) => ({ type: 'call_accept', conversation_id: id,
+    ...(pendingRtcInvitation?.id === Number(id) ? { invite_id: pendingRtcInvitation.token } : {}) });
   let speakerOn = true;
   let micMuted = false;
   let deafened = false;
@@ -6397,7 +6400,7 @@
     }
     if (msg.error === 'no_active_call' && pendingRtcAction.action === 'recover_accept') {
       rtcAction('accept', 'call', room.id, room.epoch);
-      sendWs({ type: 'call_accept', conversation_id: room.id });
+      sendWs(callAcceptRequest(room.id));
       return true;
     }
     const failed = { ...pendingRtcAction };
@@ -6427,6 +6430,7 @@
     else clearRtcIntent();
     stopRtcPersistence();
     pendingRtcAction = null;
+    pendingRtcInvitation = null;
     if (notifyServer && previous) {
       if (previous.kind === 'voice') sendWs({ type: 'voice_leave' });
       else sendWs({ type: previous.joined ? 'call_leave' : 'call_cancel', conversation_id: previous.id });
@@ -7340,6 +7344,7 @@
       if (pendingRtcAction?.action === 'start') pendingRtcAction = null;
     }
     if (msg.type === 'call_accepted' && eventMatchesRoom(msg)) {
+      pendingRtcInvitation = null;
       room.ringing = false;
       if (!room.joined) rtcAction('join', 'call', room.id, room.epoch);
     }
@@ -7801,7 +7806,8 @@
     clearLongPressContext();
     if (event.pointerType !== 'touch' || event.button !== 0) return;
     const target = event.target?.closest?.('[data-long-context="true"]');
-    if (!target || event.target?.closest?.('button, a, input, textarea, select, [contenteditable="true"]')) return;
+    const interactive = event.target?.closest?.('button, a, input, textarea, select, [contenteditable="true"]');
+    if (!target || (interactive && interactive !== target)) return;
     const state = {
       pointerId: event.pointerId,
       x: event.clientX, y: event.clientY,
@@ -9204,6 +9210,24 @@
           }
         });
         break;
+      case 'ring_call_member':
+        {
+        const id = Number(data?.conversation_id);
+        const target = Number(data?.to_user_id);
+        if (!room?.joined || room.kind !== 'call' || Number(room.id) !== id) {
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Join this group call before ringing someone.' });
+        } else if (!ws || ws.readyState !== WebSocket.OPEN) {
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Reconnecting. Try ringing again once connected.' });
+        } else if (Number.isInteger(target) && target > 0 && target !== Number(meId) && !(room.roster instanceof Set && room.roster.has(target))) {
+          sendWs({ type: 'call_invite', conversation_id: id, to_user_id: target });
+        }
+        break;
+        }
+      case 'decline_call_invite':
+        if (data?.invite_id && ws?.readyState === WebSocket.OPEN) {
+          sendWs({ type: 'call_decline', conversation_id: data.conversation_id, invite_id: data.invite_id });
+        }
+        break;
       case 'start_call':
         {
         const epoch = switchRtcRoom('call', data);
@@ -9238,12 +9262,15 @@
         }
       case 'accept_call':
         {
-        const epoch = switchRtcRoom('call', data);
-        rtcAction('accept', 'call', data, epoch);
+        const id = Number(typeof data === 'object' ? data?.conversation_id : data);
+        if (!Number.isInteger(id) || id <= 0) break;
+        const epoch = switchRtcRoom('call', id);
+        pendingRtcInvitation = typeof data?.invite_id === 'string' ? { id, token: data.invite_id } : null;
+        rtcAction('accept', 'call', id, epoch);
         ensureMedia()
           .then(() => {
             if (!room || room.epoch !== epoch) return;
-            sendWs({ type: 'call_accept', conversation_id: data });
+            sendWs(callAcceptRequest(id));
             stopRingtones();
           })
           .catch(() => {

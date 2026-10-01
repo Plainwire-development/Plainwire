@@ -8,6 +8,7 @@ send_user(Pids, Event) -> send_many(Pids, normalize_user_event(Event)).
 normalize_user_event(Event) when is_map(Event) ->
     case maps:get(type, Event, undefined) of
         call_incoming -> Event;
+        call_invite_ended -> Event;
         call_ended -> Event;
         call_declined -> Event;
         call_accepted -> Event;

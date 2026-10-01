@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import { now, people, sync, conversations } from './fixtures.mjs';
 import { nativeHealth } from './native-health.mjs';
 import { measureAudioPower } from './rtc-audio.mjs';
+import { testGroupInvitations } from './rtc-group-invites.mjs';
 
 // Real RTCPeerConnections and RTP media. Only identity, signaling transport and
 // microphone hardware are fixtures, so no microphone or external server is needed.
@@ -33,7 +34,21 @@ const members = new Set();
 // Simulates a slow relay path: ICE candidates arrive long after offer/answer.
 let candidateDelayMs = 0;
 let dropNextRing = false;
-const roster = () => people.slice(0, 2).map(p => ({ user_id: p.id, profile: p, muted: false, deafened: false, screen: false, ...states.get(p.id) }));
+let groupMode = false;
+let invitation = null;
+let invitationSequence = 0;
+const callUsers = () => groupMode ? [1, 2, 3] : [1, 2];
+const callConversation = () => groupMode ? { ...conversations[0], name: 'Group call regression', member_count: 3,
+  members: people.slice(0, 3).map(user => ({ user, role: user.id === 1 ? 'owner' : 'member' })) } : conversations[0];
+const roster = () => people.slice(0, groupMode ? 3 : 2).map(p => ({ user_id: p.id, profile: p, muted: false, deafened: false, screen: false, ...states.get(p.id) }));
+const joinedRoster = () => roster().filter(user => members.has(user.user_id));
+function finishInvitation(status) {
+  if (!invitation) return;
+  send(invitation.target, { type: 'call_invite_ended', conversation_id: 1, invite_id: invitation.token, reason: status });
+  send(invitation.from, { type: 'call_invite_status', conversation_id: 1, to_user_id: invitation.target,
+    invite_id: invitation.token, expires_at: invitation.expires, status });
+  invitation = null;
+}
 const voiceRoster = () => people.slice(0, 2).map(p => ({ user_id: p.id, profile: p, muted: false, deafened: false, screen: false, screen_audio: false, reconnecting: false }));
 async function setup(uid) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
@@ -115,9 +130,9 @@ async function setup(uid) {
     const reply = data => route.fulfill({ json: { ok: true, data } });
     if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', default_theme: 'system', version: '1.9.0', asset_version: '1.9.0', registration_enabled: true } });
     if (path === '/api/me') return reply({ user: people[uid - 1], csrf: 'test', server_time: now });
-    if (path === '/api/sync') return reply({ ...sync, conversations: [{ ...conversations[0], peer_id: uid === 1 ? 2 : 1, peer_name: people[uid === 1 ? 1 : 0].display_name }] });
+    if (path === '/api/sync') return reply({ ...sync, conversations: [{ ...callConversation(), peer_id: uid === 1 ? 2 : 1, peer_name: people[uid === 1 ? 1 : 0].display_name }] });
     if (path === '/api/messages') return reply([]);
-    if (path === '/api/conversation/1') return reply({ conversation: conversations[0], members: conversations[0].members });
+    if (path === '/api/conversation/1') return reply({ conversation: callConversation(), members: callConversation().members });
     if (path === '/api/rtc-config') return reply({ iceServers: [] });
     if (path === '/api/voice-processing-config') return reply({ krisp_available: false });
     return reply({});
@@ -147,14 +162,48 @@ async function setup(uid) {
           return;
         }
         send(uid, { type: 'call_ringing', conversation_id: 1, profile: people[uid === 1 ? 1 : 0] });
-        send(uid === 1 ? 2 : 1, { type: 'call_incoming', conversation_id: 1, from_user_id: uid, profile: people[uid - 1] });
+        for (const target of callUsers().filter(id => id !== uid)) {
+          send(target, { type: 'call_incoming', conversation_id: 1, from_user_id: uid, profile: people[uid - 1] });
+        }
+      }
+      if (msg.type === 'call_invite') {
+        assert(groupMode && members.has(uid) && msg.to_user_id === 3 && !members.has(3), 'only a joined caller rings the absent group member');
+        invitation = { from: uid, target: 3, token: `rtc-invite-${++invitationSequence}`, expires: Date.now() + 45000 };
+        send(uid, { type: 'call_invite_status', conversation_id: 1, to_user_id: 3, invite_id: invitation.token,
+          expires_at: invitation.expires, status: 'ringing' });
+        send(3, { type: 'call_incoming', conversation_id: 1, from_user_id: uid, profile: people[uid - 1],
+          invite_id: invitation.token, expires_at: invitation.expires });
+      }
+      if (msg.type === 'call_decline') {
+        if (msg.invite_id === 'busy-invite') return;
+        if (msg.invite_id) {
+          assert.equal(msg.invite_id, invitation?.token, 'decline carries the matching invitation');
+          finishInvitation('declined');
+        } else {
+          for (const target of callUsers()) send(target, { type: 'call_declined', conversation_id: 1 });
+        }
       }
       if (msg.type === 'call_accept') {
+        if (msg.invite_id) {
+          assert.equal(uid, invitation?.target);
+          assert.equal(msg.invite_id, invitation?.token, 'accept carries the matching invitation');
+          const caller = invitation.from;
+          finishInvitation('accepted');
+          send(uid, { type: 'call_accepted', conversation_id: 1, user_id: caller, profile: people[caller - 1] });
+          for (const target of members) send(target, { type: 'call_peer_joined', conversation_id: 1, user_id: uid, profile: people[uid - 1] });
+          members.add(uid);
+          for (const target of members) send(target, { type: 'call_state', conversation_id: 1, users: joinedRoster() });
+          return;
+        }
         states.clear();
         members.add(1); members.add(2);
         for (const target of [1, 2]) {
           send(target, { type: 'call_accepted', conversation_id: 1, user_id: target === 1 ? 2 : 1, profile: people[target === 1 ? 1 : 0] });
-          send(target, { type: 'call_state', conversation_id: 1, users: roster() });
+          send(target, { type: 'call_state', conversation_id: 1, users: joinedRoster() });
+        }
+        if (groupMode) {
+          for (const target of members) send(target, { type: 'call_state', conversation_id: 1, users: joinedRoster() });
+          send(3, { type: 'call_ended', conversation_id: 1, reason: 'accepted' });
         }
       }
       if (msg.type === 'call_join') {
@@ -170,14 +219,16 @@ async function setup(uid) {
       }
       if (msg.type === 'call_state' && msg.patch) {
         states.set(uid, { ...states.get(uid), ...msg.patch });
-        for (const target of [1, 2]) send(target, { type: 'call_state', conversation_id: 1, users: roster() });
+        for (const target of members) send(target, { type: 'call_state', conversation_id: 1, users: joinedRoster() });
       }
       if (msg.type === 'call_leave') {
         members.delete(uid);
-        const other = uid === 1 ? 2 : 1;
-        send(other, { type: 'call_peer_left', conversation_id: 1, user_id: uid });
-        send(other, { type: 'call_state', conversation_id: 1, users: roster().filter(u => members.has(u.user_id)) });
-        for (const target of [1, 2]) send(target, { type: 'call_presence', conversation_id: 1, active: members.size > 0, users: roster().filter(u => members.has(u.user_id)) });
+        for (const other of members) {
+          send(other, { type: 'call_peer_left', conversation_id: 1, user_id: uid });
+          send(other, { type: 'call_state', conversation_id: 1, users: joinedRoster() });
+        }
+        for (const target of callUsers()) send(target, { type: 'call_presence', conversation_id: 1, active: members.size > 0, users: joinedRoster() });
+        if (invitation?.from === uid) finishInvitation('caller_left');
       }
       if (msg.type === 'call_cancel') {
         for (const target of [1, 2]) send(target, { type: 'call_cancelled', conversation_id: 1 });
@@ -207,6 +258,7 @@ async function audioPower(page, label) {
 }
 try {
   const [a, b] = await Promise.all([setup(1), setup(2)]);
+  if (!process.env.PLAINWIRE_TEST_GROUP_CALL_ONLY) {
   await a.getByRole('button', { name: 'Start call', exact: true }).click();
   await b.getByRole('button', { name: 'Accept', exact: true }).click();
   await a.waitForFunction(() => window.__pcs.some(p => p.connectionState === 'connected'), null, { timeout: 15000 }).catch(async e => { console.log(await stats(a), await stats(b)); throw e; });
@@ -578,6 +630,10 @@ try {
   assert.equal(await a.getByText(/^User \d+$/).count(), 0, 'voice refresh never exposes numeric fallback labels');
   await a.screenshot({ path: 'test-results/voice-refresh-roster.png' });
   await a.getByRole('button', { name: 'Leave', exact: true }).click();
+  }
+  groupMode = true;
+  await testGroupInvitations({ a, b, setup, origin, send, clientMessages, finishInvitation });
   assert.deepEqual(errors, [], 'no browser exceptions during calls and screen sharing');
-  console.log('PASS: real bidirectional RTP; signaling reconnect and pending call replay; physical and processed microphone recovery; missing device fallback; live input meter; mute/unmute; deafen state restoration; microphone swap and failed-swap recovery; screen sharing with mixed audio in both directions; hide/show and reopen viewing; quality presets; source replacement/cancellation/rollback/stop race; fullscreen and colour metadata; pointer/keyboard resizing; mobile viewer expansion; call-health measurements; mobile controls; call cleanup; refreshed voice profile roster; direct audio settings; all sound previews and disabled ringing.');
+  if (process.env.PLAINWIRE_TEST_GROUP_CALL_ONLY) console.log('PASS: targeted group invitations, decline/expiry isolation, stale notifications, mobile long press, and real three-peer audio without interrupting the original call.');
+  else  console.log('PASS: real bidirectional RTP; signaling reconnect and pending call replay; physical and processed microphone recovery; missing device fallback; live input meter; mute/unmute; deafen state restoration; microphone swap and failed-swap recovery; screen sharing with mixed audio in both directions; hide/show and reopen viewing; quality presets; source replacement/cancellation/rollback/stop race; fullscreen and colour metadata; pointer/keyboard resizing; mobile viewer expansion; call-health measurements; mobile controls; call cleanup; refreshed voice profile roster; direct audio settings; all sound previews and disabled ringing; targeted group invitations, decline/expiry isolation, mobile long press, and three-peer audio without interrupting the original call.');
 } finally { await browser.close(); server.close(); }

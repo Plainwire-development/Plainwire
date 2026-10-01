@@ -6,6 +6,7 @@
     notify_user/2, broadcast/2, status_update/2,
     voice_join/4, voice_leave/3, voice_state/5, voice_signal/5, voice_activity/5,
     call_ring/5, call_decline/2, call_cancel/3, call_accept/5,
+    call_invite/5, call_invite_caller/3, call_accept_invite/6, call_decline_invite/3,
     call_join/5, call_rejoin/5, call_leave/3, call_state/5, call_signal/5,
     room_capacity/0, share_capacity/0, status_update/3, stats/0
 ]).
@@ -27,7 +28,8 @@ room_capacity() -> pw_media_topology:room_capacity().
 share_capacity() -> pw_media_topology:share_capacity().
 
 -record(st, {users = #{}, pids = #{}, pid_statuses = #{}, pid_platforms = #{},
-             subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}, mac_online = #{}}).
+             subs = #{}, voices = #{}, calls = #{}, rings = #{}, online = #{}, mac_online = #{},
+             invites = #{}, invite_senders = #{}}).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 connect(Uid, Pid) -> connect(Uid, Pid, <<"online">>).
@@ -63,6 +65,10 @@ voice_activity(Kind, Id, Uid, Pid, Active) ->
         _ -> ok
     end.
 call_ring(Cid, Uid, Pid, Profile, Targets) -> gen_server:cast(?MODULE, {call_ring, Cid, Uid, Pid, Profile, Targets}).
+call_invite(Cid, Uid, Pid, Profile, Target) -> join_call({call_invite, Cid, Uid, Pid, Profile, Target}).
+call_invite_caller(Cid, Uid, Token) -> join_call({call_invite_caller, Cid, Uid, Token}).
+call_accept_invite(Cid, Uid, Pid, Profile, Audience, Token) -> join_call({call_accept_invite, Cid, Uid, Pid, Profile, Audience, Token}).
+call_decline_invite(Cid, Uid, Token) -> gen_server:cast(?MODULE, {call_decline_invite, Cid, Uid, Token}).
 call_decline(Cid, Uid) -> gen_server:cast(?MODULE, {call_decline, Cid, Uid}).
 call_cancel(Cid, Uid, Pid) -> gen_server:cast(?MODULE, {call_cancel, Cid, Uid, Pid}).
 call_accept(Cid, Uid, Pid, Profile, Audience) -> join_call({call_accept, Cid, Uid, Pid, Profile, Audience}).
@@ -131,6 +137,18 @@ handle_call({call_rejoin, ConversationId, Uid, Pid, Profile, Audience}, _From, S
                     {reply, ok, do_call_join(ConversationId, Uid, Pid, Profile, Audience, St1)}
             end
     end;
+handle_call({call_invite, Cid, Uid, Pid, Profile, Target}, _From, St0) ->
+    {Reply, St} = invite_call_member(Cid, Uid, Pid, Profile, Target, St0),
+    {reply, Reply, St};
+handle_call({call_invite_caller, Cid, Uid, Token}, _From, St) ->
+    Reply = case maps:get(Uid, St#st.invites, undefined) of
+        #{cid := Cid, token := Token, caller_id := Caller} -> {ok, Caller};
+        _ -> {error, no_active_call}
+    end,
+    {reply, Reply, St};
+handle_call({call_accept_invite, Cid, Uid, Pid, Profile, Audience, Token}, _From, St0) ->
+    {Reply, St} = accept_call_invite(Cid, Uid, Pid, Profile, Audience, Token, St0),
+    {reply, Reply, St};
 handle_call({call_accept, Cid, Uid, Pid, Profile, Audience0}, _From, St0) ->
     {Reply, St} = accept_ring(Cid, Uid, Pid, Profile, Audience0, St0),
     {reply, Reply, St};
@@ -146,7 +164,8 @@ handle_call(stats, _From, St) ->
               voice_participants => lists:sum([map_size(Room) || Room <- VoiceRooms]),
               call_rooms => length(CallRooms),
               call_participants => lists:sum([map_size(Room) || Room <- CallRooms]),
-              ringing_calls => map_size(St#st.rings)}, St};
+              ringing_calls => map_size(St#st.rings),
+              call_invitations => map_size(St#st.invites)}, St};
 handle_call(_, _, St) -> {reply, ok, St}.
 
 %% reconnecting users don't count against themselves.
@@ -177,6 +196,100 @@ accept_ring(Cid, Uid, Pid, Profile, Audience0, St0) ->
             end
     end.
 
+%% Invitations are indexed by recipient and sender socket. A recipient can have
+%% one pending invitation, and leaving/disconnecting touches only that socket's
+%% invitations. Their events never end or replace the existing group call.
+invite_call_member(Cid, Uid, Pid, Profile, Target, St) ->
+    Room = maps:get({call, Cid}, St#st.calls, #{}),
+    case {member_owned(Room, Uid, Pid), Uid =:= Target, maps:is_key(Target, Room), room_admits(Room, Target)} of
+        {false, _, _, _} -> {{error, not_in_call}, St};
+        {_, true, _, _} -> {{error, forbidden}, St};
+        {_, _, true, _} -> {{error, already_joined}, St};
+        {_, _, _, false} -> {{error, room_full}, St};
+        _ ->
+            case maps:get(Target, St#st.invites, undefined) of
+                #{cid := Cid, caller_pid := Pid, expires_at := Expires, token := Token} ->
+                    {{ok, invite_status(Cid, Target, Token, ringing, Expires)}, St};
+                #{cid := Cid} -> {{error, already_ringing}, St};
+                Invite when is_map(Invite) -> {{error, user_busy}, St};
+                _ -> new_call_invite(Cid, Uid, Pid, Profile, Target, St)
+            end
+    end.
+
+new_call_invite(Cid, Uid, Pid, Profile, Target, St) ->
+    case maps:get(Target, St#st.users, []) =/= [] andalso not call_invite_busy(Target, St) of
+        false -> {{error, user_unavailable}, St};
+        true ->
+            case pw_rate:allow({call_invite, Uid, Target}, 1, 30000)
+                 andalso pw_rate:allow({call_invite_target, Target}, 3, 60000) of
+                false -> {{error, rate_limited}, St};
+                true ->
+                    Token = pw_util:random_token(16),
+                    RingMs = ring_timeout_ms(),
+                    Expires = pw_util:now_ms() + RingMs,
+                    Timer = erlang:send_after(RingMs, self(), {call_invite_timeout, Target, Token}),
+                    Invite = #{cid => Cid, caller_id => Uid, caller_pid => Pid, profile => strip_profile(Profile),
+                               token => Token, expires_at => Expires, timer => Timer},
+                    notify_user(Target, call_invite_event(Invite)),
+                    {{ok, invite_status(Cid, Target, Token, ringing, Expires)},
+                     St#st{invites = maps:put(Target, Invite, St#st.invites),
+                           invite_senders = add_to_set(Pid, Target, St#st.invite_senders)}}
+            end
+    end.
+
+call_invite_busy(Uid, St) ->
+    InRoom = case pw_realtime_registry:user_rtc_memberships(Uid) of
+        Memberships when is_list(Memberships) -> Memberships =/= [];
+        _ -> lists:any(fun(Room) -> maps:is_key(Uid, Room) end, maps:values(St#st.calls) ++ maps:values(St#st.voices))
+    end,
+    InRoom orelse lists:any(fun(#{caller_id := Caller, targets := Targets, declined := Declined}) ->
+        Caller =:= Uid orelse (lists:member(Uid, Targets) andalso not lists:member(Uid, Declined))
+    end, maps:values(St#st.rings)).
+
+call_invite_event(#{cid := Cid, caller_id := Uid, profile := Profile, token := Token, expires_at := Expires}) ->
+    #{type => call_incoming, conversation_id => Cid, from_user_id => Uid, profile => Profile,
+      invite_id => Token, expires_at => Expires}.
+
+invite_status(Cid, Target, Token, Status, Expires) ->
+    #{type => call_invite_status, conversation_id => Cid, to_user_id => Target,
+      invite_id => Token, status => Status, expires_at => Expires}.
+
+accept_call_invite(Cid, Uid, Pid, Profile, Audience, Token, St) ->
+    Room = maps:get({call, Cid}, St#st.calls, #{}),
+    case maps:get(Uid, St#st.invites, undefined) of
+        #{cid := Cid, token := Token, caller_id := Caller, caller_pid := CPid, profile := CallerProfile, expires_at := Expires} ->
+            case {member_owned(Room, Caller, CPid) andalso Expires > pw_util:now_ms(), room_admits(Room, Uid)} of
+                {false, _} -> {{error, no_active_call}, finish_call_invite(Uid, caller_left, St)};
+                {_, false} -> {{error, room_full}, finish_call_invite(Uid, room_full, St)};
+                {true, true} ->
+                    St1 = finish_call_invite(Uid, accepted, St),
+                    St2 = evict_other_rooms(Uid, Pid, {call, Cid}, St1),
+                    pw_realtime_delivery:send_event(Pid, #{type => call_accepted, conversation_id => Cid,
+                        user_id => Caller, profile => CallerProfile}),
+                    {ok, do_call_join(Cid, Uid, Pid, Profile, Audience, St2)}
+            end;
+        _ -> {{error, no_active_call}, St}
+    end.
+
+finish_call_invite(Uid, Reason, St) ->
+    case maps:take(Uid, St#st.invites) of
+        error -> St;
+        {#{cid := Cid, token := Token, caller_pid := Pid, timer := Timer, expires_at := Expires}, Invites} ->
+            cancel_timer(Timer),
+            notify_user(Uid, #{type => call_invite_ended, conversation_id => Cid, invite_id => Token, reason => Reason}),
+            pw_realtime_delivery:send_event(Pid, invite_status(Cid, Uid, Token, Reason, Expires)),
+            St#st{invites = Invites, invite_senders = update_set(Pid, Uid, St#st.invite_senders)}
+    end.
+
+clear_sent_invites(Pid, Reason, St) -> clear_sent_invites(Pid, all, Reason, St).
+clear_sent_invites(Pid, Cid, Reason, St) ->
+    lists:foldl(fun(Target, Acc) ->
+        case maps:get(Target, Acc#st.invites, undefined) of
+            #{cid := Id} when Cid =:= all; Cid =:= Id -> finish_call_invite(Target, Reason, Acc);
+            _ -> Acc
+        end
+    end, St, maps:get(Pid, St#st.invite_senders, [])).
+
 handle_cast({connect, Uid, Pid, Status0, Platform0}, St) ->
     monitor(process, Pid),
     pw_realtime_registry:register(Uid, Pid),
@@ -204,6 +317,14 @@ handle_cast({connect, Uid, Pid, Status0, Platform0}, St) ->
     pw_realtime_delivery:send_event(Pid, #{type => presence_state, online => Visible,
                                           statuses => Statuses, platforms => Platforms}),
     send_active_calls(Pid, Uid, St#st.calls),
+    case maps:get(Uid, St#st.invites, undefined) of
+        #{expires_at := Expires} = Invite ->
+            case Expires > pw_util:now_ms() of
+                true -> pw_realtime_delivery:send_event(Pid, call_invite_event(Invite));
+                false -> ok
+            end;
+        _ -> ok
+    end,
     log("client_connected", #{uid => Uid, sessions => length(maps:get(Uid, Users, [])), online_users => map_size(Online)}),
     {noreply, St#st{users = Users, pids = Pids, pid_statuses = PidStatuses,
                     pid_platforms = PidPlatforms, online = Online, mac_online = MacOnline, subs = Subs}};
@@ -241,7 +362,13 @@ handle_cast({revoke_conversation_access, Uid, ConversationId}, St0) ->
     Calls = remove_user_from_room_now(call, ConversationId, Uid, St0#st.calls, St0#st.users),
     send_many(Pids, #{type => access_revoked, scope => direct, conversation_id => ConversationId}),
     log("conversation_access_revoked", #{uid => Uid, conversation_id => ConversationId, tabs => length(Pids)}),
-    {noreply, St0#st{subs = Subs, calls = Calls}};
+    St1 = lists:foldl(fun(Pid, Acc) -> clear_sent_invites(Pid, ConversationId, access_revoked, Acc) end,
+                     St0#st{subs = Subs, calls = Calls}, Pids),
+    St2 = case maps:get(Uid, St1#st.invites, undefined) of
+        #{cid := ConversationId} -> finish_call_invite(Uid, access_revoked, St1);
+        _ -> St1
+    end,
+    {noreply, St2};
 handle_cast({watch_presence, Pid, Uids0}, St0) ->
     Requested = [U || U <- Uids0, is_integer(U), U > 0],
     %% include self. older clients somehow made themselves look offline.
@@ -283,6 +410,7 @@ handle_cast(realtime_registry_ready, St) ->
 handle_cast({notify_user, Uid, Event}, St) ->
     Payload = case maps:get(type, Event, undefined) of
         call_incoming -> Event;
+        call_invite_ended -> Event;
         call_ended -> Event;
         call_declined -> Event;
         call_accepted -> Event;
@@ -359,6 +487,11 @@ handle_cast({call_decline, Cid, Uid}, St0) ->
         _ ->
             {noreply, St0}
     end;
+handle_cast({call_decline_invite, Cid, Uid, Token}, St0) ->
+    case maps:get(Uid, St0#st.invites, undefined) of
+        #{cid := Cid, token := Token} -> {noreply, finish_call_invite(Uid, declined, St0)};
+        _ -> {noreply, St0}
+    end;
 handle_cast({call_cancel, Cid, Uid, _Pid}, St0) ->
     Key = {ring, Cid},
     case maps:get(Key, St0#st.rings, undefined) of
@@ -381,7 +514,7 @@ handle_cast({call_leave, ConversationId, Uid, Pid}, St0) ->
             send_many(room_pids(Room), #{type => call_state, conversation_id => ConversationId, users => room_users(Room)}),
             Calls = put_or_remove(Key, Room, St0#st.calls),
             send_call_presence(ConversationId, Room, Audience, St0#st.users),
-            {noreply, St0#st{calls = Calls}}
+            {noreply, clear_sent_invites(Pid, caller_left, St0#st{calls = Calls})}
     end;
 handle_cast({call_state, ConversationId, Uid, Pid, Patch, Profile}, St0) ->
     {noreply, apply_room_state(call, ConversationId, Uid, Pid, Patch, Profile, St0)};
@@ -435,7 +568,8 @@ replace_own_ring(St, Key, Pid) ->
             end_ring(St, Key, call_cancelled, missed)
     end.
 
-start_ring(Cid, Uid, Pid, Profile, Targets, St0) ->
+start_ring(Cid, Uid, Pid, Profile, Targets, StInitial) ->
+    St0 = finish_call_invite(Uid, busy, StInitial),
     Key = {ring, Cid},
     StBase = evict_other_rooms(Uid, Pid, Key, St0),
     St1 = end_user_rings(replace_own_ring(StBase, Key, Pid), Uid, Key),
@@ -484,6 +618,11 @@ handle_info({pw_async_result, {presence_snapshot, Pid, Uids}, Remote0}, St) ->
             %% remote lookup was in flight. Discard the stale snapshot.
             {noreply, St}
     end;
+handle_info({call_invite_timeout, Uid, Token}, St0) ->
+    case maps:get(Uid, St0#st.invites, undefined) of
+        #{token := Token} -> {noreply, finish_call_invite(Uid, timeout, St0)};
+        _ -> {noreply, St0}
+    end;
 handle_info({ring_timeout, Cid, Uid}, St0) ->
     Key = {ring, Cid},
     case maps:get(Key, St0#st.rings, undefined) of
@@ -502,7 +641,8 @@ handle_info(_, St) -> {noreply, St}.
 terminate(_, _) -> ok.
 code_change(_, St, _) -> {ok, St}.
 
-do_voice_join(ChannelId, Uid, Pid, Profile, St0) ->
+do_voice_join(ChannelId, Uid, Pid, Profile, StInitial) ->
+    St0 = finish_call_invite(Uid, joined, StInitial),
     Key = {voice, ChannelId},
     Room0 = maps:get(Key, St0#st.voices, #{}),
     notify_superseded(Room0, Uid, Pid, #{type => voice_superseded, channel_id => ChannelId}),
@@ -516,7 +656,12 @@ do_voice_join(ChannelId, Uid, Pid, Profile, St0) ->
     send_many(room_pids(Room), #{type => voice_state, channel_id => ChannelId, users => room_users(Room)}),
     St0#st{voices = maps:put(Key, Room, St0#st.voices)}.
 
-do_call_join(ConversationId, Uid, Pid, Profile, Audience0, St0) ->
+do_call_join(ConversationId, Uid, Pid, Profile, Audience0, StInitial) ->
+    StBase = finish_call_invite(Uid, joined, StInitial),
+    St0 = case maps:get(Uid, maps:get({call, ConversationId}, StBase#st.calls, #{}), undefined) of
+        #{pid := OldPid} when OldPid =/= Pid -> clear_sent_invites(OldPid, caller_left, StBase);
+        _ -> StBase
+    end,
     Key = {call, ConversationId},
     Room0 = maps:get(Key, St0#st.calls, #{}),
     notify_superseded(Room0, Uid, Pid, #{type => call_superseded, conversation_id => ConversationId}),
@@ -589,7 +734,15 @@ evict_other_rooms(Uid, NewPid, KeepKey, St0) ->
     Memberships = pw_realtime_registry:user_rtc_memberships(Uid),
     Voices = evict_from_rooms(Uid, NewPid, KeepKey, St0#st.voices, voice, St0#st.users, Memberships),
     Calls = evict_from_rooms(Uid, NewPid, KeepKey, St0#st.calls, call, St0#st.users, Memberships),
-    St0#st{voices = Voices, calls = Calls}.
+    St1 = St0#st{voices = Voices, calls = Calls},
+    lists:foldl(fun(Pid, Acc) ->
+        lists:foldl(fun(Target, State) ->
+            case maps:get(Target, State#st.invites, undefined) of
+                #{cid := Cid} when KeepKey =:= {call, Cid}, Pid =:= NewPid -> State;
+                _ -> finish_call_invite(Target, caller_left, State)
+            end
+        end, Acc, maps:get(Pid, Acc#st.invite_senders, []))
+    end, St1, lists:usort([NewPid | maps:get(Uid, St1#st.users, [])])).
 
 evict_from_rooms(Uid, NewPid, KeepKey, Rooms, Kind, Users, Memberships) when is_list(Memberships) ->
     Entries = [{Id, OldPid} || {Kind0, Id, OldPid} <- Memberships, Kind0 =:= Kind, {Kind, Id} =/= KeepKey],
@@ -929,9 +1082,14 @@ HintMemberships when is_list(HintMemberships) -> HintMemberships;
     Voices = detach_pid_from_rooms(Pid, St0#st.voices, voice, Users, RtcMemberships),
     Calls = detach_pid_from_rooms(Pid, St0#st.calls, call, Users, RtcMemberships),
     Rings = drop_caller_rings(Pid, St0#st.rings, St0#st.users),
-    St0#st{users = Users, pids = Pids, pid_statuses = PidStatuses,
+    St1 = St0#st{users = Users, pids = Pids, pid_statuses = PidStatuses,
            pid_platforms = PidPlatforms, online = Online, mac_online = MacOnline,
-           subs = Subs, voices = Voices, calls = Calls, rings = Rings}.
+           subs = Subs, voices = Voices, calls = Calls, rings = Rings},
+    St2 = clear_sent_invites(Pid, caller_offline, St1),
+    case maps:get(Uid, Users, []) of
+        [] -> finish_call_invite(Uid, offline, St2);
+        _ -> St2
+    end.
 
 
 first_user_pid(Uid, Users) ->

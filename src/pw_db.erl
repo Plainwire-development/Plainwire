@@ -36,7 +36,7 @@
     add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4,
     close_conversation/2, leave_conversation/2, accept_message_request/2, deny_message_request/2,
     mark_conversation_read/2, notifications/1, mark_notifications_seen/1, clear_notifications/1, mark_url_seen/2,
-    member_of_channel/2, channel_identity/2, channel_message_identity/2, voice_access/2, stream_access/2, member_of_conversation/2, member_of_server/2, member_of_thread_forum/2, conversation_peer_ids/2,
+    member_of_channel/2, channel_identity/2, channel_message_identity/2, voice_access/2, stream_access/2, member_of_conversation/2, member_of_server/2, member_of_thread_forum/2, conversation_peer_ids/2, call_invite_target/3,
     subscribable/2,
     begin_upload/6, finish_upload/3, abort_upload/2, get_upload/2, stale_uploads/2, delete_upload/1,
     upload_delete_claim/1, upload_delete_finish/2, queue_stale_upload_deletes/2,
@@ -58,7 +58,7 @@
          normalize_ai_provider/1, normalize_ai_chat_trigger/1, normalize_ai_temperature/1,
          command_options_from_args/1, search_state/1]).
 -export([test_account_recovery/2]).
--export([test_validate_upload_refs/3, test_edit_thread/2]).
+-export([test_validate_upload_refs/3, test_edit_thread/2, test_call_invite_target/4]).
 -endif.
 
 -record(st, {}).
@@ -453,6 +453,7 @@ member_of_conversation(Uid, Cid) -> call({member_of_conversation, Uid, Cid}).
 member_of_server(Uid, Sid) -> call({member_of_server, Uid, Sid}).
 member_of_thread_forum(Uid, ThreadId) -> call({member_of_thread_forum, Uid, ThreadId}).
 conversation_peer_ids(Uid, Cid) -> call({conversation_peer_ids, Uid, Cid}).
+call_invite_target(Uid, Cid, Target) -> call({call_invite_target, Uid, Cid, Target}).
 subscribable(Kind, Id) -> call({subscribable, Kind, Id}).
 begin_upload(Uid, Id, Name, Type, Size, Path) -> call({begin_upload, Uid, Id, Name, Type, Size, Path}).
 finish_upload(Uid, Id, Hash) -> call({finish_upload, Uid, Id, Hash}).
@@ -5932,6 +5933,26 @@ route({member_of_thread_forum, Uid, ThreadId0}, Conn) ->
         {ok, [_]} -> true;
         _ -> false
     end;
+route({call_invite_target, Uid, Cid0, Target0}, Conn) ->
+    Cid = pw_util:int(Cid0),
+    Target = pw_util:int(Target0),
+    is_integer(Cid) andalso Cid > 0 andalso is_integer(Target) andalso Target > 0
+        andalso Target =/= Uid
+        andalso case one(Conn,
+            "SELECT recipient.user_id FROM direct_members caller "
+            "JOIN direct_members recipient ON recipient.thread_id=caller.thread_id "
+            "JOIN users cu ON cu.id=caller.user_id JOIN users ru ON ru.id=recipient.user_id "
+            "WHERE caller.thread_id=$1 AND caller.user_id=$2 AND recipient.user_id=$3 "
+            "AND caller.request_state='accepted' AND recipient.request_state='accepted' "
+            "AND cu.account_state='active' AND ru.account_state='active' AND NOT cu.is_bot AND NOT ru.is_bot "
+            "AND (SELECT COUNT(*) FROM direct_members WHERE thread_id=$1)>2 "
+            "AND NOT EXISTS (SELECT 1 FROM direct_members m JOIN friendships f "
+            "ON ((f.user_low=m.user_id AND f.user_high IN ($2,$3)) "
+            "OR (f.user_high=m.user_id AND f.user_low IN ($2,$3))) "
+            "WHERE m.thread_id=$1 AND f.status='blocked')", [Cid, Uid, Target]) of
+            {ok, [Target]} -> true;
+            _ -> false
+        end;
 route({conversation_peer_ids, Uid, Cid0}, Conn) ->
     Cid = pw_util:int(Cid0),
     case conversation_can_send(Conn, Uid, Cid) of
@@ -7487,6 +7508,7 @@ ensure_message_attachments_allowed(Conn, Uid, Scope, ScopeId, Body) ->
 -ifdef(TEST).
 test_validate_upload_refs(Conn, Uid, Body) -> ensure_upload_refs_readable(Conn, Uid, Body).
 test_edit_thread(Op = {edit_thread, _, _, _, _}, Conn) -> route(Op, Conn).
+test_call_invite_target(Conn, Uid, Cid, Target) -> route({call_invite_target, Uid, Cid, Target}, Conn).
 -endif.
 
 %% Owner access is intrinsic. Every other read must be justified by a live

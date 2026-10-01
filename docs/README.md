@@ -1,6 +1,6 @@
 # Plainwire documentation
 
-These notes match the 2.6.3 tree. PostgreSQL is required. Redis and ScyllaDB are optional.
+These notes match the 2.6.4 tree. PostgreSQL is required. Redis and ScyllaDB are optional.
 
 ## Run it
 
@@ -21,6 +21,7 @@ These notes match the 2.6.3 tree. PostgreSQL is required. Redis and ScyllaDB are
 * [Bots](BOTS.md) — Bot API v1, slash commands, and the no-code assistant limits the server actually enforces
 * [Webhooks](WEBHOOKS.md)
 * [Screen sharing](SCREEN_SHARING.md)
+* [Group call invitations](GROUP_CALL_INVITATIONS.md)
 * [Call health](CALL_HEALTH.md)
 * [Cloudflare TURN](CLOUDFLARE_TURN.md)
 * [Client themes and plugins](CLIENT_EXTENSIONS.md)

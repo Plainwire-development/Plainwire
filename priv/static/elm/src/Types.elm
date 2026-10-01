@@ -419,6 +419,14 @@ type alias CallPopup =
     , userId : Int
     , displayName : String
     , avatarUrl : String
+    , inviteId : Maybe String
+    , expiresAt : Int
+    }
+
+
+type alias CallInvitation =
+    { inviteId : String
+    , expiresAt : Int
     }
 
 
@@ -529,6 +537,7 @@ type alias Model =
     , voice : VoiceState
     , callUI : CallUI
     , activeCalls : Dict Int ActiveCall
+    , callInvites : Dict Int (Dict Int CallInvitation)
     , callMode : CallMode
     , soundEnabled : Bool
     , chatEnterSends : Bool

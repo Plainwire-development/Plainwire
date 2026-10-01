@@ -21,10 +21,19 @@ assert.match(joinElm, /E\.string "join_call"/, 'existing-call Join uses the dedi
 assert.doesNotMatch(joinElm, /E\.string "accept_call"/, 'existing-call Join must never impersonate ringing-call Accept');
 
 const acceptBridge = between(bridge, "      case 'accept_call':", "      case 'join_call':");
-assert.match(acceptBridge, /type: 'call_accept'/, 'ringing-call Accept still uses call_accept');
+assert.match(acceptBridge, /sendWs\(callAcceptRequest\(id\)\)/, 'ringing-call Accept uses the shared call_accept request');
+assert.match(bridge, /const callAcceptRequest = \(id\) => \(\{ type: 'call_accept'/, 'ordinary and targeted Accept retain the call_accept protocol');
+assert.match(bridge, /pendingRtcInvitation\?\.id === Number\(id\)[\s\S]*invite_id: pendingRtcInvitation.token/, 'invitation capability is included only for its matching room');
 const joinBridge = between(bridge, "      case 'join_call':", "      case 'decline_call':");
 assert.match(joinBridge, /type: 'call_join'/, 'existing-call Join sends call_join');
 assert.doesNotMatch(joinBridge, /type: 'call_accept'/, 'existing-call Join does not send call_accept');
+const inviteBridge = between(bridge, "      case 'ring_call_member':", "      case 'start_call':");
+for (const destructive of ['switchRtcRoom(', 'leaveRtcRoom(', 'stopPendingCallMedia(', 'ensureMedia(']) {
+  assert.ok(!inviteBridge.includes(destructive), `ringing or declining an invitation must not invoke ${destructive}`);
+}
+assert.match(inviteBridge, /type: 'call_invite'/, 'targeted ringing uses its own protocol');
+const acceptInviteWs = between(ws, 'handle_msg(#{<<"type">> := <<"call_accept">>, <<"conversation_id">> := Cid0, <<"invite_id">> := Token}', 'handle_msg(#{<<"type">> := <<"call_decline">>, <<"conversation_id">> := Cid0, <<"invite_id">> := Token}');
+assert.match(acceptInviteWs, /call_invite_caller\(Cid, Uid, Token\)[\s\S]*call_invite_target\(Caller, Cid, Uid\)[\s\S]*call_accept_invite/, 'acceptance rechecks the token-bound caller and current permission before joining');
 
 assert.match(ws, /<<"call_join">>[\s\S]*pw_hub:call_rejoin/, 'browser call_join is routed through active-room-only rejoin');
 assert.match(hub, /handle_call\(\{call_rejoin[\s\S]*maps:find\(\{call, ConversationId\}[\s\S]*\{error, no_active_call\}/, 'stale call rejoin cannot resurrect an ended room');

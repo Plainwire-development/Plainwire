@@ -183,6 +183,8 @@ Server owners can define custom roles and permission sets, and members can use s
 
 ### Voice calls
 
+While you are in a group call, right-click an absent member in the group's People list and choose **Ring to call**. On touch screens, press and hold their row. They can accept or decline; the ongoing call continues either way. See [group call invitations](docs/GROUP_CALL_INVITATIONS.md).
+
 For reliable calls outside a local network, configure a TURN server.
 
 Plainwire supports coturn and external TURN services.
@@ -305,10 +307,11 @@ Deployment and update instructions are kept in [deploy/README.md](deploy/README.
 
 ## Version
 
-Current release: **2.6.3**
+Current release: **2.6.4**
 
 Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history.
 
+* [2.6.4 release notes](RELEASE_NOTES_2.6.4.md)
 * [2.6.3 release notes](RELEASE_NOTES_2.6.3.md)
 * [2.6.2 release notes](RELEASE_NOTES_2.6.2.md)
 * [2.6.1 release notes](RELEASE_NOTES_2.6.1.md)

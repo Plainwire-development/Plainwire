@@ -318,6 +318,7 @@ init flags url _ =
             }
       , callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
       , activeCalls = Dict.empty
+      , callInvites = Dict.empty
       , callMode = Idle
       , soundEnabled = True
       , chatEnterSends = True
@@ -1427,10 +1428,26 @@ update msg model =
             )
 
         Tick now ->
-            ( { model | serverTime = Time.posixToMillis now }, Cmd.none )
+            let
+                time =
+                    Time.posixToMillis now
+
+                next =
+                    { model | serverTime = time, callInvites = Dict.map (\_ -> Dict.filter (\_ invitation -> invitation.expiresAt > time)) model.callInvites }
+            in
+            case model.callUI.incoming of
+                Just incoming ->
+                    if incoming.inviteId /= Nothing && incoming.expiresAt > 0 && incoming.expiresAt <= time then
+                        update (DeclineCall incoming.conversationId) next
+
+                    else
+                        ( next, Cmd.none )
+
+                Nothing ->
+                    ( next, Cmd.none )
 
         WsStatus connected ->
-            ( { model | wsConnected = connected }
+            ( { model | wsConnected = connected, callInvites = if connected then model.callInvites else Dict.empty }
             , if connected && not model.wsConnected && model.me /= Nothing then
                 Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), routeCmd model.active, routeSubCmd model.active ]
 
@@ -1699,25 +1716,51 @@ update msg model =
                     ( { model | toast = Just "Open a Wire link like /#wire/CODE to join." }, Cmd.none )
 
         AcceptCall conversationId ->
-            let
-                active =
-                    { conversationId = conversationId, users = [], startTime = model.serverTime, expanded = False }
-            in
-            ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Just active }, callMode = Connected, voice = updateVoiceMode "call" conversationId model.voice }
-            , Cmd.batch
-                [ bridgeSend (E.object [ ( "tag", E.string "accept_call" ), ( "data", E.int conversationId ) ])
-                , playRingtone False
-                ]
-            )
+            if Maybe.map .conversationId model.callUI.incoming /= Just conversationId then
+                ( model, Cmd.none )
+
+            else
+                let
+                    active =
+                        { conversationId = conversationId, users = [], startTime = model.serverTime, expanded = False }
+
+                    request =
+                        case model.callUI.incoming |> Maybe.andThen (\incoming -> if incoming.conversationId == conversationId then incoming.inviteId else Nothing) of
+                            Just token ->
+                                E.object [ ( "conversation_id", E.int conversationId ), ( "invite_id", E.string token ) ]
+
+                            Nothing ->
+                                E.int conversationId
+                in
+                ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Just active }, callMode = Connected, voice = updateVoiceMode "call" conversationId model.voice }
+                , Cmd.batch
+                    [ bridgeSend (E.object [ ( "tag", E.string "accept_call" ), ( "data", request ) ])
+                    , playRingtone False
+                    ]
+                )
 
         DeclineCall conversationId ->
-            ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }, callMode = Idle }
-            , Cmd.batch
-                [ bridgeSend (E.object [ ( "tag", E.string "decline_call" ), ( "data", E.int conversationId ) ])
-                , playRingtone False
-                , playOutgoingRingtone False
-                ]
-            )
+            if Maybe.map .conversationId model.callUI.incoming /= Just conversationId then
+                ( model, Cmd.none )
+
+            else
+                case model.callUI.incoming |> Maybe.andThen (\incoming -> if incoming.conversationId == conversationId then incoming.inviteId else Nothing) of
+                    Just token ->
+                        ( { model | callUI = { incoming = Nothing, outgoing = model.callUI.outgoing, active = model.callUI.active }, callMode = if model.voice.mode == Nothing then Idle else Connected }
+                        , Cmd.batch
+                            [ bridgeSend (E.object [ ( "tag", E.string "decline_call_invite" ), ( "data", E.object [ ( "conversation_id", E.int conversationId ), ( "invite_id", E.string token ) ] ) ])
+                            , playRingtone False
+                            ]
+                        )
+
+                    Nothing ->
+                        ( { model | callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }, callMode = Idle }
+                        , Cmd.batch
+                            [ bridgeSend (E.object [ ( "tag", E.string "decline_call" ), ( "data", E.int conversationId ) ])
+                            , playRingtone False
+                            , playOutgoingRingtone False
+                            ]
+                        )
 
         EndCall ->
             let
@@ -4246,6 +4289,56 @@ handleWsEvent val model =
         Ok ( "call_incoming", ev ) ->
             handleCallIncoming ev model
 
+        Ok ( "call_invite_status", ev ) ->
+            handleCallInviteStatus ev model
+
+        Ok ( "call_invite_error", ev ) ->
+            let
+                error =
+                    D.decodeValue (D.field "error" D.string) ev |> Result.withDefault "unavailable"
+
+                message =
+                    case error of
+                        "rate_limited" ->
+                            "Please wait before ringing again."
+
+                        "already_ringing" ->
+                            "Someone is already ringing this member."
+
+                        "already_joined" ->
+                            "This member is already in the call."
+
+                        "room_full" ->
+                            "This call is full."
+
+                        "user_unavailable" ->
+                            "This member cannot be rung right now."
+
+                        "user_busy" ->
+                            "This member cannot be rung right now."
+
+                        "forbidden" ->
+                            "You cannot ring this member in this group."
+
+                        _ ->
+                            "Could not ring this member. Join the group call and try again."
+            in
+            ( { model | toast = Just message }, Process.sleep 4000 |> Task.perform (\_ -> DismissToast) )
+
+        Ok ( "call_invite_ended", ev ) ->
+            case ( model.callUI.incoming, D.decodeValue (D.field "conversation_id" D.int) ev, D.decodeValue (D.field "invite_id" D.string) ev ) of
+                ( Just incoming, Ok cid, Ok token ) ->
+                    if incoming.conversationId == cid && incoming.inviteId == Just token then
+                        ( { model | callUI = { incoming = Nothing, outgoing = model.callUI.outgoing, active = model.callUI.active }, callMode = if model.voice.mode == Nothing then Idle else Connected }
+                        , playRingtone False
+                        )
+
+                    else
+                        ( model, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
         Ok ( "call_ringing", ev ) ->
             case D.decodeValue callOutgoingDecoder ev of
                 Ok out ->
@@ -4265,7 +4358,7 @@ handleWsEvent val model =
                     ( { model
                         | callUI =
                             { incoming = Nothing
-                            , outgoing = Just { conversationId = out.convId, userId = 0, displayName = out.displayName, avatarUrl = out.avatarUrl }
+                            , outgoing = Just { conversationId = out.convId, userId = 0, displayName = out.displayName, avatarUrl = out.avatarUrl, inviteId = Nothing, expiresAt = 0 }
                             , active = Just active
                             }
                         , activeCalls = Dict.insert out.convId active model.activeCalls
@@ -5485,40 +5578,99 @@ messageApplies active message =
 handleCallIncoming : E.Value -> Model -> ( Model, Cmd Msg )
 handleCallIncoming ev model =
     case D.decodeValue callIncomingDecoder ev of
-        Ok { convId, userId, displayName, avatarUrl } ->
-            ( { model
-                | callUI =
-                    { incoming =
-                        Just
-                            { conversationId = convId
-                            , userId = userId
-                            , displayName = displayName
-                            , avatarUrl = avatarUrl
-                            }
-                    , outgoing = Nothing
-                    , active = model.callUI.active
-                    }
-                , callMode = Ringing
-              }
-            , bridgeSend
-                (E.object
-                    [ ( "tag", E.string "play_ringtone" )
-                    , ( "data", E.null )
-                    ]
+        Ok incoming ->
+            if incoming.inviteId /= Nothing && (model.voice.mode /= Nothing || model.callUI.outgoing /= Nothing || (model.callUI.incoming /= Nothing && model.callUI.incoming /= Just incoming)) then
+                ( model
+                , bridgeSend (E.object [ ( "tag", E.string "decline_call_invite" ), ( "data", E.object [ ( "conversation_id", E.int incoming.conversationId ), ( "invite_id", E.string (Maybe.withDefault "" incoming.inviteId) ) ] ) ])
                 )
+
+            else if model.callUI.incoming == Just incoming then
+                ( model, Cmd.none )
+
+            else
+                ( { model
+                    | callUI =
+                        { incoming =
+                            Just incoming
+                        , outgoing = Nothing
+                        , active = model.callUI.active
+                        }
+                    , callMode = Ringing
+                  }
+                , bridgeSend
+                    (E.object
+                        [ ( "tag", E.string "play_ringtone" )
+                        , ( "data", E.null )
+                        ]
+                    )
+                )
+
+        Err _ ->
+            ( model, Cmd.none )
+
+
+handleCallInviteStatus : E.Value -> Model -> ( Model, Cmd Msg )
+handleCallInviteStatus ev model =
+    case D.decodeValue callInviteStatusDecoder ev of
+        Ok { cid, uid, token, status, expires } ->
+            let
+                updateMembers current =
+                    let
+                        members =
+                            Maybe.withDefault Dict.empty current
+                    in
+                    Just
+                        (if status == "ringing" && isJoinedCall cid model then
+                            Dict.insert uid { inviteId = token, expiresAt = expires } members
+
+                         else if Maybe.map .inviteId (Dict.get uid members) == Just token then
+                            Dict.remove uid members
+
+                         else
+                            members
+                        )
+
+                message =
+                    case status of
+                        "ringing" ->
+                            Just "Ringing… They can accept or decline."
+
+                        "declined" ->
+                            Just "They declined the invitation. Your call is still active."
+
+                        "timeout" ->
+                            Just "No answer. Your call is still active."
+
+                        _ ->
+                            Nothing
+            in
+            ( { model | callInvites = Dict.update cid updateMembers model.callInvites, toast = if isJoinedCall cid model && message /= Nothing then message else model.toast }
+            , if message /= Nothing then Process.sleep 4000 |> Task.perform (\_ -> DismissToast) else Cmd.none
             )
 
         Err _ ->
             ( model, Cmd.none )
 
 
-callIncomingDecoder : Decoder { convId : Int, userId : Int, displayName : String, avatarUrl : String }
+callInviteStatusDecoder : Decoder { cid : Int, uid : Int, token : String, status : String, expires : Int }
+callInviteStatusDecoder =
+    D.map5 (\cid uid token status expires -> { cid = cid, uid = uid, token = token, status = status, expires = expires })
+        (D.field "conversation_id" D.int)
+        (D.field "to_user_id" D.int)
+        (D.field "invite_id" D.string)
+        (D.field "status" D.string)
+        (D.field "expires_at" D.int)
+
+
+callIncomingDecoder : Decoder CallPopup
 callIncomingDecoder =
-    D.map4 (\c u d a -> { convId = c, userId = u, displayName = d, avatarUrl = a })
+    D.map6 (\c u d a i e -> { conversationId = c, userId = u, displayName = d, avatarUrl = a, inviteId = i, expiresAt = e })
         (D.field "conversation_id" D.int)
         (D.field "from_user_id" D.int)
         (D.oneOf [ D.at [ "profile", "display_name" ] D.string, D.succeed "Unknown" ])
         (D.oneOf [ D.at [ "profile", "avatar_url" ] D.string, D.succeed "" ])
+        (D.maybe (D.field "invite_id" D.string))
+        (D.field "expires_at" D.int |> defaultValue 0)
 
 
 callOutgoingDecoder : Decoder { convId : Int, displayName : String, avatarUrl : String }

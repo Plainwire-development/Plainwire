@@ -261,6 +261,47 @@ handle_msg(#{<<"type">> := <<"voice_signal">>, <<"to_user_id">> := To0, <<"signa
         {To, true} when is_integer(To), To > 0 -> pw_hub:voice_signal(Cid, Uid, self(), To, Sig), {ok, State};
         _ -> {ok, State}
     end;
+handle_msg(#{<<"type">> := <<"call_invite">>, <<"conversation_id">> := Cid0, <<"to_user_id">> := Target0}, State=#{uid:=Uid, session:=Session}) ->
+    Cid = pw_util:int(Cid0),
+    Target = pw_util:int(Target0),
+    case maps:get(call, State, undefined) =:= Cid andalso is_integer(Cid)
+         andalso pw_db:call_invite_target(Uid, Cid, Target) =:= true of
+        false -> reply_call_invite_error(State, Cid, Target, forbidden);
+        true ->
+            case pw_hub:call_invite(Cid, Uid, self(), maps:get(user, Session), Target) of
+                {ok, Event} -> {reply, {text, pw_util:json(Event)}, State};
+                {error, Reason} -> reply_call_invite_error(State, Cid, Target, Reason)
+            end
+    end;
+handle_msg(#{<<"type">> := <<"call_accept">>, <<"conversation_id">> := Cid0, <<"invite_id">> := Token}, State=#{uid:=Uid, session:=Session})
+  when is_binary(Token), byte_size(Token) > 0, byte_size(Token) =< 96 ->
+    Cid = pw_util:int(Cid0),
+    %% Resolve the caller from the recipient-bound token, then recheck both
+    %% accounts, memberships and blocks. Changes while ringing fail closed.
+    case pw_hub:call_invite_caller(Cid, Uid, Token) of
+        {ok, Caller} ->
+            case pw_db:call_invite_target(Caller, Cid, Uid) of
+                true ->
+                    case pw_db:conversation_peer_ids(Uid, Cid) of
+                        {ok, Audience} ->
+                            case pw_hub:call_accept_invite(Cid, Uid, self(), maps:get(user, Session), Audience, Token) of
+                                %% The hub has atomically admitted this seat and
+                                %% evicted other rooms. Do not leave the new seat.
+                                ok -> {ok, State#{voice => undefined, call => Cid}};
+                                {error, Reason} -> reply_rtc_error(State, Reason, call, Cid)
+                            end;
+                        _ -> reply_rtc_error(State, forbidden, call, Cid)
+                    end;
+                _ -> reply_rtc_error(State, forbidden, call, Cid)
+            end;
+        {error, Reason} -> reply_rtc_error(State, Reason, call, Cid)
+    end;
+handle_msg(#{<<"type">> := <<"call_decline">>, <<"conversation_id">> := Cid0, <<"invite_id">> := Token}, State=#{uid:=Uid})
+  when is_binary(Token), byte_size(Token) > 0, byte_size(Token) =< 96 ->
+    pw_hub:call_decline_invite(pw_util:int(Cid0), Uid, Token), {ok, State};
+handle_msg(#{<<"type">> := Type, <<"invite_id">> := _}, State)
+  when Type =:= <<"call_accept">>; Type =:= <<"call_decline">> ->
+    reply_error(State, invalid_invite);
 handle_msg(#{<<"type">> := <<"call_ring">>, <<"conversation_id">> := Cid0}, State=#{uid:=Uid, session:=Session}) ->
     Cid = pw_util:int(Cid0),
     case pw_db:conversation_peer_ids(Uid, Cid) of
@@ -612,6 +653,10 @@ safe_json_decode(Data) ->
     try jsx:decode(Data, [return_maps]) catch _:_ -> error end.
 
 reply_error(State, E) -> {reply, {text, pw_util:json(#{type=>error,error=>E})}, State}.
+reply_call_invite_error(State, Cid, Target, Reason) ->
+    {reply, {text, pw_util:json(#{type => call_invite_error, conversation_id => Cid,
+                               to_user_id => Target, error => Reason})}, State}.
+
 reply_rtc_error(State, E, Kind, Id) ->
     {reply, {text, pw_util:json(#{type => error, error => E, rtc_kind => Kind, rtc_id => Id})}, State}.
 maybe_leave_voice(State=#{uid:=Uid, voice:=Cid}) when is_integer(Cid) -> pw_hub:voice_leave(Cid, Uid, self()), State;

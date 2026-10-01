@@ -1239,6 +1239,7 @@ ctxItemView idx item =
                    )
             )
         , attribute "role" "menuitem"
+        , disabled (item.msg == NoOp)
         , onClick (CtxAction idx)
         ]
         [ span [ class "ctx-icon", attribute "aria-hidden" "true" ] [ text (Maybe.withDefault "" item.icon) ]
@@ -1471,6 +1472,33 @@ userContext model user x y =
         blockedByMe =
             Maybe.map .blockedByMe relationship == Just True
 
+        ringItems =
+            case model.active of
+                DmView cid ->
+                    case callConversation cid model of
+                        Just conversation ->
+                            if conversation.memberCount > 2 && isJoinedCall cid model && model.callMode == Connected && not isSelf && not user.isBot && not blocked && List.any (\member -> member.user.id == user.id) (callRoster model conversation) && not (List.member user.id (callJoinedUserIds model cid)) then
+                                let
+                                    ringing =
+                                        Dict.get cid model.callInvites |> Maybe.andThen (Dict.get user.id) |> Maybe.map (\invitation -> invitation.expiresAt > model.serverTime) |> Maybe.withDefault False
+                                in
+                                [ { label = if ringing then "Ringing…" else "Ring to call"
+                                  , icon = Just "♪"
+                                  , danger = False
+                                  , sep = False
+                                  , msg = if ringing then NoOp else BridgeEvent "ring_call_member" (E.object [ ( "conversation_id", E.int cid ), ( "to_user_id", E.int user.id ) ])
+                                  }
+                                ]
+
+                            else
+                                []
+
+                        Nothing ->
+                            []
+
+                _ ->
+                    []
+
         actions =
             if isSelf then
                 [ { label = "View my profile", icon = Just "○", danger = False, sep = False, msg = Go ("#profile/" ++ String.fromInt user.id) }
@@ -1480,7 +1508,9 @@ userContext model user x y =
             else
                 [ { label = "View profile", icon = Just "○", danger = False, sep = False, msg = Go ("#profile/" ++ String.fromInt user.id) }
                 , { label = "Message", icon = Just "✉", danger = False, sep = False, msg = BridgeEvent "dm_user" (E.int user.id) }
-                , { label = "Copy username", icon = Just "⧉", danger = False, sep = False, msg = CopyText ("@" ++ user.username) }
+                ]
+                    ++ ringItems
+                    ++ [ { label = "Copy username", icon = Just "⧉", danger = False, sep = False, msg = CopyText ("@" ++ user.username) }
                 , if blocked && blockedByMe then
                     { label = "Unblock", icon = Just "✓", danger = False, sep = True, msg = BridgeEvent "unblock_user" (E.int user.id) }
 
@@ -1827,7 +1857,12 @@ renderCallPopup kind popup model =
         party =
             if incoming then
                 { name = popup.displayName
-                , detail = "Answer to join the call. Your microphone stays off until you accept."
+                , detail =
+                    if popup.inviteId /= Nothing then
+                        "Invited you to " ++ (callConversation popup.conversationId model |> Maybe.map (\conversation -> if String.isEmpty conversation.name then "the group call" else conversation.name) |> Maybe.withDefault "the group call") ++ ". Your microphone stays off until you accept."
+
+                    else
+                        "Answer to join the call. Your microphone stays off until you accept."
                 , avatarUrl = popup.avatarUrl
                 }
 
@@ -2420,7 +2455,7 @@ renderCallUser model u =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "2.6.3", attribute "data-ui-revision" "interface-5" ]
+    div [ class "layout", attribute "data-ui-version" "2.6.4", attribute "data-ui-revision" "interface-5" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -5538,18 +5573,21 @@ renderGroupMembers model conversation =
                 ]
 
              else
-                List.map (groupMemberRow model conversation.ownerId) conversation.members
+                List.map (groupMemberRow model conversation) conversation.members
             )
         ]
 
 
-groupMemberRow : Model -> Int -> MemberUser -> Html Msg
-groupMemberRow model ownerId member =
+groupMemberRow : Model -> Conversation -> MemberUser -> Html Msg
+groupMemberRow model conversation member =
     let
         user =
             member.user
+
+        ringing =
+            Dict.get conversation.id model.callInvites |> Maybe.andThen (Dict.get user.id) |> Maybe.map (\invitation -> invitation.expiresAt > model.serverTime) |> Maybe.withDefault False
     in
-    button [ class "group-member", onClick (ShowUserPopup user.id), onContextMenu (OpenUserCtx user), attribute "aria-label" ("Open " ++ user.displayName ++ "'s profile") ]
+    button [ class "group-member", type_ "button", onClick (ShowUserPopup user.id), onContextMenu (OpenUserCtx user), attribute "data-long-context" "true", attribute "aria-label" ("Open " ++ user.displayName ++ "'s profile") ]
         [ div [ class "group-member-avatar" ]
             [ presenceAvatar model.userStatuses user.id user.avatarUrl user.displayName ""
             ]
@@ -5557,7 +5595,12 @@ groupMemberRow model ownerId member =
             [ b [] [ text user.displayName ]
             , small [ class "muted" ] [ text ("@" ++ user.username) ]
             ]
-        , if user.id == ownerId || member.role == "owner" then
+        , if ringing then
+            span [ class "pill group-ringing", attribute "aria-live" "polite" ] [ text "Ringing…" ]
+
+          else
+            text ""
+        , if user.id == conversation.ownerId || member.role == "owner" then
             span [ class "pill group-owner" ] [ text "owner" ]
 
           else if member.role == "moderator" then
@@ -6516,4 +6559,3 @@ encodeServer server =
         , ( "banner_url", E.string server.bannerUrl )
         , ( "accent_color", E.string server.accentColor )
         ]
-
