@@ -147,8 +147,8 @@ for (const knob of ['PLAINWIRE_REDIS_POOL_SIZE', 'PLAINWIRE_ASYNC_MAX_QUEUE', 'P
 
 assert.match(sup, /pw_realtime_registry/);
 assert.match(sup, /pw_async_pool/);
-assert.match(rebar, /70ae2ff5d5f5740a60b3d68a5898be3edf4e4802/, 'Ranch 2.2.1 is pinned for Ranch 2.x listener semantics');
-assert.match(lock, /70ae2ff5d5f5740a60b3d68a5898be3edf4e4802/, 'Ranch 2.2.1 lock matches rebar config');
+assert.match(rebar, /9e6257cc2d22951dd555571c402e8f86af7f7698/, 'Ranch 2.3.0 is pinned for Ranch 2.x listener semantics');
+assert.match(lock, /9e6257cc2d22951dd555571c402e8f86af7f7698/, 'Ranch 2.3.0 lock matches rebar config');
 assert.match(sup, /num_conns_sups => ConnSups/);
 assert.match(sup, /per_connection_supervisor_limit\(MaxConnections, ConnSups\)/);
 assert.match(makefile, /load:/);

@@ -216,13 +216,13 @@ assert "self() ! {restart_lane, Idx}" in db_source
 package = json.loads(Path('package.json').read_text())
 lock = json.loads(Path('package-lock.json').read_text())
 elm_manifest = json.loads(Path('priv/static/elm/elm.json').read_text())
-assert package['devDependencies']['elm'] == '0.19.1-6'
-assert lock['packages']['']['devDependencies']['elm'] == '0.19.1-6'
+assert package['devDependencies']['elm'] == '0.19.2-0'
+assert lock['packages']['']['devDependencies']['elm'] == '0.19.2-0'
 assert package.get('engines', {}).get('node') == '>=20.19'
 assert lock['packages'][''].get('engines', {}).get('node') == '>=20.19'
 assert package['allowScripts'] == {
-    '@parcel/watcher@2.5.6': True,
-    'elm@0.19.1-6': True,
+    '@parcel/watcher@2.6.0': True,
+    'elm@0.19.2-0': True,
     'esbuild@0.28.2': True,
 }
 assert lock['packages']['node_modules/less']['version'] == '4.9.1'

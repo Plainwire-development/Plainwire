@@ -10,7 +10,7 @@ After committed durable operations, API nodes route eligible user/topic events t
 
 ## Build and configure
 
-The pinned Partisan revision is `45474ceb710dafa91a4af2dc87b34512354f6ba8` (6.2.0). It requires OTP 27+ with OTP sources installed because its build transforms OTP modules. The standard dependency set also requires OTP 27+. Exercise the two-node TLS topology in staging before enabling it in production.
+The pinned Partisan revision is `9ea358e6c641442d339e6f9c76b219c801e563dc` (6.3.0). It requires OTP 27+ with OTP sources installed because its build transforms OTP modules. The standard dependency set also requires OTP 27+. Exercise the two-node TLS topology in staging before enabling it in production.
 
 ```sh
 npm ci

@@ -84,4 +84,4 @@ The version is pinned in several places, and verify-source checks they all match
 ## Conventions
 
 - `rebar.config` compiles with `warn_unused_vars, warn_shadow_vars, warn_export_all`. Test-only exports go inside `-ifdef(TEST).` blocks.
-- Dependencies are pinned to exact git refs or versions (Ranch 2.2.1 is deliberate). npm install scripts are allow-listed through `allowScripts` in `package.json`, and verify-source asserts that list, so don't loosen it.
+- Dependencies are pinned to exact git refs or versions (Ranch 2.x is deliberate: listener scaling relies on its connection-supervisor semantics; currently 2.3.0). npm install scripts are allow-listed through `allowScripts` in `package.json`, and verify-source asserts that list, so don't loosen it.
