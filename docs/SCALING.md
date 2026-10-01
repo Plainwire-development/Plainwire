@@ -31,7 +31,7 @@ Connection admission has separate limits for:
 - per-IP WebSocket upgrade bursts (`PLAINWIRE_WS_UPGRADES_PER_IP_MIN`);
 - global WebSocket upgrade bursts (`PLAINWIRE_WS_UPGRADES_GLOBAL_MIN`).
 
-Ranch 2.2.1 is pinned because Plainwire uses Ranch 2.x connection-supervisor semantics. Ranch applies `max_connections` per connection supervisor, so Plainwire divides the configured listener-wide target across `PLAINWIRE_HTTP_CONNECTION_SUPERVISORS` internally instead of multiplying the operator's intended ceiling. The value remains a soft admission ceiling because accepts are concurrent.
+Ranch 2.3.0 is pinned because Plainwire uses Ranch 2.x connection-supervisor semantics. Ranch applies `max_connections` per connection supervisor, so Plainwire divides the configured listener-wide target across `PLAINWIRE_HTTP_CONNECTION_SUPERVISORS` internally instead of multiplying the operator's intended ceiling. The value remains a soft admission ceiling because accepts are concurrent.
 
 Presence watches are capped by `PLAINWIRE_PRESENCE_WATCH_MAX` at both the WebSocket parser and realtime-registry boundary. This keeps a single connection from creating unbounded high-cardinality ETS relationships. Fixed-window rate state is separately capped by `PLAINWIRE_RATE_MAX_ENTRIES`; once that global ETS budget is full, novel rate-limit keys fail closed while existing keys continue to update until normal garbage collection frees space.
 
