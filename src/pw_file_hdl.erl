@@ -33,7 +33,8 @@ serve(Req0, Uid, Id, Head) ->
             Headers = maps:merge(pw_util:security_headers(), #{
                 <<"content-type">> => Type, <<"content-length">> => integer_to_binary(Size),
                 <<"content-disposition">> => disposition(Type, Name),
-                <<"cache-control">> => <<"private, max-age=86400, immutable">>,
+                <<"cache-control">> => <<"private, no-cache, must-revalidate">>,
+                <<"vary">> => <<"cookie">>,
                 <<"etag">> => <<"\"", Hash/binary, "\"">>,
                 <<"accept-ranges">> => <<"bytes">>
             }),

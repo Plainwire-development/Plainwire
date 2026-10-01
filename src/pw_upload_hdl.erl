@@ -7,7 +7,8 @@
 init(Req0, _) ->
     case {cowboy_req:method(Req0), auth(Req0)} of
         {<<"POST">>, {ok, Session}} -> upload(Req0, Session);
-        {_, {error, _}} -> pw_util:err_json(Req0, 401, <<"not_authenticated">>);
+        {_, {error, no_session}} -> pw_util:err_json(Req0, 401, <<"not_authenticated">>);
+        {_, {error, _}} -> pw_util:err_json(Req0, 503, <<"database_unavailable">>);
         _ -> pw_util:err_json(Req0, 405, <<"method_not_allowed">>)
     end.
 

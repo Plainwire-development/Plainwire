@@ -4,11 +4,11 @@ Plainwire 2.6.4-1 adds an instance-wide reporting system. Users submit cases; se
 
 ## Submit and track
 
-Right-click a person and choose **Report user**, or right-click their message and choose **Report message**. On touch screens, use the existing press-and-hold context menu. Select a category and add a reason, screenshots, or both. Categories cover harassment, hate, threats, spam, scams, privacy violations, impersonation, and other concerns.
+Open a person’s full profile or server profile and choose **Report user**. You can also right-click a person and choose **Report user**, or right-click their message and choose **Report message**. On touch screens, use the existing press-and-hold context menu. Select a category and add a reason, screenshots, or both. Categories cover harassment, hate, threats, spam, scams, privacy violations, impersonation, and other concerns.
 
-Screenshots show a preview before submission. Review them for unrelated private information. From a message menu, an unchecked option lets you deliberately share a copy of that one message. The server verifies the reported author, current access, and that the message is text and has not been deleted. Nearby messages are never copied. A reporter who has blocked the person can still report the account from the user menu without linking a now-inaccessible message.
+Choose or paste screenshots into the form; each preview has a **Remove screenshot** button. Invalid additions keep your existing selections. Screenshots show a preview before submission. Review them for unrelated private information. From a message menu, an unchecked option lets you deliberately share a copy of that one message. The server verifies the reported author, current access, and that the message is text and has not been deleted. Nearby messages are never copied. A reporter who has blocked the person can still report the account from the user menu without linking a now-inaccessible message.
 
-**My reports** is available in the Workspace menu, your own user menu, and the report form. It shows status, the submitted reason/screenshots, and any public reviewer response. Open and under-review cases can be withdrawn. Review notes, assignment, and other people's reports are not exposed.
+**My reports** is available in the Workspace menu, your own profile, your own user menu, and the report form. It shows status, the submitted reason/screenshots, and any public reviewer response. Open and under-review cases can be withdrawn. Review notes, assignment, and other people's reports are not exposed.
 
 ## Review workflow
 

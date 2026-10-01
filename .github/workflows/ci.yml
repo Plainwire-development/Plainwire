@@ -89,6 +89,8 @@ jobs:
         run: npm run test:security-audit
       - name: Reporting and moderation browser regressions
         run: npm run test:reports
+      - name: Responsive settings and admin moderation regressions
+        run: node test/browser/settings-responsive.mjs && node test/browser/admin-moderation.mjs
       - name: WebRTC regression suite
         run: npm run test:rtc
       - name: Verify source archive construction

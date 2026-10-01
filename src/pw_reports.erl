@@ -16,7 +16,7 @@ statuses() -> [<<"open">>, <<"in_review">>, <<"resolved">>, <<"dismissed">>, <<"
 priorities() -> [<<"low">>, <<"normal">>, <<"high">>, <<"urgent">>].
 
 validate(M) when is_map(M) -> checked(fun() ->
-    Subject = positive(maps:get(<<"user_id">>, M, undefined)),
+    Subject = entity_id(maps:get(<<"user_id">>, M, undefined)),
     Category = choice(maps:get(<<"category">>, M, <<"other">>), categories(), invalid_report),
     Reason = text(maps:get(<<"reason">>, M, <<>>), 4000),
     Key = maps:get(<<"request_key">>, M, <<>>),
@@ -317,6 +317,7 @@ need(true,_) -> ok;
 need(_,Reason) -> fail(Reason).
 fail(Reason) -> throw({report_error,Reason}).
 positive(V) -> case pw_util:int(V) of I when is_integer(I),I>0,I=<9223372036854775807 -> I; _ -> fail(invalid_report) end.
+entity_id(V) -> I = positive(V), need(I =< 2147483647, invalid_report), I.
 cursor(undefined) -> 9223372036854775807;
 cursor(null) -> 9223372036854775807;
 cursor(V) -> positive(V).

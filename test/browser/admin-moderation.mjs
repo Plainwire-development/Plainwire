@@ -11,7 +11,7 @@ const origin=`http://127.0.0.1:${server.address().port}`;
 await mkdir('test-results',{recursive:true});
 
 const posts=[];
-let accountState='active';
+let accountState='active', delayedUsers=false, delayedDetails=false, expired=false, releaseUsers, releaseDetails;
 const user={id:7,username:'ada',display_name:'Ada Lovelace',is_bot:false,account_state:'active',created_at:Date.now()-86400000,updated_at:Date.now(),last_seen:Date.now(),disabled_at:0,email_set:true,email_verified:false,server_count:2,owned_server_count:1,conversation_count:3,message_count:40,upload_count:1,upload_bytes:1024,active_sessions:1};
 const json=(data,status=200)=>({status,contentType:'application/json',body:JSON.stringify({ok:status<400,data,...(status>=400?{error:'failed'}:{})})});
 const moderation=()=>({account_state:accountState,moderation:accountState==='active'?null:{title:accountState==='banned'?'Access revoked':'Account suspended',reason:'policy',severity:accountState==='banned'?'critical':'warning',expires_at:0}});
@@ -29,9 +29,9 @@ try {
     if(path==='/api/status')return route.fulfill(json({instance_id:'test',bootstrap_available:false,recovery_available:false}));
     if(path==='/api/me')return route.fulfill(json({username:'owner',display_name:'Owner',role:'owner',csrf:'csrf-test',instance_id:'test',user_id:1}));
     if(path==='/api/overview')return route.fulfill(json({users:1,active_users_24h:1,servers:1,channels:1,messages:1,messages_24h:1,upload_bytes:1024,ready_uploads:1,active_sessions:1,admin_sessions:1,runtime:{uptime_ms:1000,otp_release:'27',realtime:{available:true,online_users:1,websocket_connections:1,call_participants:0,voice_participants:0,call_rooms:0,voice_rooms:0},database:{available:true,pool_size:4},native_media_quality:{available:false},turn:{},cluster:{backend:'local'}}}));
-    if(path==='/api/users' && method==='GET')return route.fulfill(json([{...user,account_state:accountState}]));
-    if(path==='/api/users/7' && method==='GET')return route.fulfill(json({...user,account_state:accountState}));
-    if(path==='/api/users/7/moderation' && method==='GET')return route.fulfill(json(moderation()));
+    if(path==='/api/users' && method==='GET'){if(delayedUsers)await new Promise(resolve=>{releaseUsers=resolve;});return route.fulfill(json([{...user,account_state:accountState}]));}
+    if(path==='/api/users/7' && method==='GET'){if(delayedDetails)await new Promise(resolve=>{releaseDetails=resolve;});return route.fulfill(json({...user,account_state:accountState}));}
+    if(path==='/api/users/7/moderation' && method==='GET')return route.fulfill(json(moderation(),expired?401:200));
     if(path==='/api/users/7/moderation/history')return route.fulfill(json([]));
     if(path==='/api/users/7/moderation' && method==='POST'){
       const action=String(route.request().postDataJSON()?.action||'');
@@ -122,6 +122,37 @@ try {
   await page.getByRole('button',{name:'Publish banner'}).click();
   await page.locator('.toast',{hasText:'Banner published'}).waitFor();
   assert.ok(posts.some(p=>p.path==='/api/banners'&&p.method==='POST'),'Publish banner must POST');
+
+  // Late list/detail responses may not replace the selected view or reopen
+  // dismissed moderation controls; session expiry clears private DOM content.
+  delayedUsers=true;
+  await page.locator('[data-view="users"]').click();
+  await page.waitForTimeout(100);
+  assert.ok(releaseUsers);
+  await page.locator('[data-view="control"]').click();
+  await page.getByRole('button',{name:'Reconcile clients'}).waitFor();
+  releaseUsers(); delayedUsers=false;
+  await page.waitForTimeout(100);
+  assert.ok(await page.getByRole('button',{name:'Reconcile clients'}).isVisible(), 'stale user list cannot overwrite service controls');
+  await page.locator('[data-view="users"]').click();
+  await page.getByText('Ada Lovelace',{exact:true}).click();
+  await page.locator('#modal-body .account-detail-stack').waitFor();
+  await page.locator('#modal-close').click();
+  delayedDetails=true;
+  await page.getByText('Ada Lovelace',{exact:true}).click();
+  await page.waitForTimeout(100); assert.ok(releaseDetails);
+  await page.locator('#modal-close').click();
+  releaseDetails(); delayedDetails=false;
+  await page.waitForTimeout(100);
+  assert.equal(await page.locator('#modal-backdrop').isVisible(),false,'late account details cannot reopen a closed dialog');
+  await page.getByText('Ada Lovelace',{exact:true}).click();
+  await page.locator('#modal-body .account-detail-stack').waitFor();
+  expired=true;
+  await page.getByRole('button',{name:'Restore access',exact:true}).click();
+  await page.getByRole('dialog').getByRole('button',{name:'Restore access',exact:true}).click();
+  await page.locator('#auth').waitFor({state:'visible'});
+  assert.equal(await page.locator('#modal-body').textContent(),'','session expiry removes sensitive account detail DOM');
+  assert.equal(await page.locator('#content').textContent(),'','session expiry removes sensitive account list DOM');
 
   assert.deepEqual(errors,[]);
   console.log('PASS: control-plane ban/suspend/disable/restore, session revoke, profile and email actions, reconcile, registration, and banner actions send API requests');

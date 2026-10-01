@@ -932,6 +932,11 @@ serverProfileModal model profile =
 
               else
                 text ""
+            , if not viewingSelf then
+                reportProfileAction user.id user.displayName
+
+              else
+                text ""
             ]
         ]
     ]
@@ -2233,7 +2238,7 @@ renderExpandedCallOverlay active model =
                     , liveCallTimer "call-overlay-timer pw-live-call-timer" active.startTime
                     ]
                 ]
-            , button [ class "btn icon-btn call-minimize", title "Minimize call", onClick ToggleCallOverlay ]
+            , button [ class "btn icon-btn call-minimize", attribute "aria-label" "Minimize call", title "Minimize call", onClick ToggleCallOverlay ]
                 [ span [ class "call-minimize-icon", attribute "aria-hidden" "true" ] [] ]
             ]
         , if model.voice.screenShare then
@@ -2291,6 +2296,7 @@ renderExpandedCallOverlay active model =
         , div [ class "call-tools" ]
             [ button [ class "btn ghost", onClick (BridgeEvent "open_voice_settings" E.null) ] [ span [ class "ui-icon ui-icon-settings", attribute "aria-hidden" "true" ] [], text "Audio settings" ]
             , button [ class "btn ghost", onClick (BridgeEvent "unlock_audio" E.null), title "Enable playback if your browser blocked call audio" ] [ text "Enable audio" ]
+            , button [ class "btn ghost", type_ "button", attribute "data-call-reset" "true", title "Restore the default call window size and position" ] [ text "Reset window" ]
             ]
         , div [ class "call-overlay-controls", attribute "aria-label" "Call controls" ]
             [ control
@@ -2468,7 +2474,7 @@ renderCallUser model u =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "2.6.4-1", attribute "data-ui-revision" "interface-5" ]
+    div [ class "layout", attribute "data-ui-version" "2.6.5", attribute "data-ui-revision" "interface-5" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -5136,6 +5142,16 @@ voiceParticipantRow selfId members vu =
         ]
 
 
+reportProfileAction : Int -> String -> Html Msg
+reportProfileAction userId displayName =
+    button
+        [ class "btn ghost profile-report-action"
+        , type_ "button"
+        , onClick (BridgeEvent "report_user" (E.object [ ( "user_id", E.int userId ), ( "display_name", E.string displayName ) ]))
+        ]
+        [ text "Report user" ]
+
+
 renderProfilePage : Model -> Html Msg
 renderProfilePage model =
     case model.currentProfile of
@@ -5249,6 +5265,11 @@ renderProfilePage model =
 
                               else
                                 text ""
+                            , if viewingSelf then
+                                button [ class "btn secondary", onClick (BridgeEvent "my_reports" E.null) ] [ text "My reports" ]
+
+                              else
+                                reportProfileAction u.id u.displayName
                             ]
                         ]
                     ]

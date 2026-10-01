@@ -11,9 +11,11 @@ validation_test() ->
     lists:foreach(fun(Patch)->?assertMatch({error,_},pw_reports:validate(maps:merge(B,Patch))) end,
         [#{<<"reason">>=>lists:duplicate(4001,$a)},#{<<"reason">>=>binary:copy(<<"a">>,4001)},
          #{<<"category">>=><<"made_up">>},#{<<"user_id">>=>-1},#{<<"user_id">>=>9223372036854775808},
+         #{<<"user_id">>=>2147483648},
          #{<<"request_key">>=><<"bad key">>},#{<<"evidence_ids">>=>[file_id(),file_id()]},
          #{<<"evidence_ids">>=>[<<"../private.png">>]},#{<<"evidence_ids">>=><<"oops">>},
          #{<<"include_message">>=>true},#{<<"include_message">>=><<"false">>}]),
+    ?assertMatch({ok,#{message_id:=9007199254740991}},pw_reports:validate(B#{<<"message_id">>=>9007199254740991})),
     ?assertEqual({error,invalid_report},pw_reports:validate([])).
 
 raster_validation_test() ->

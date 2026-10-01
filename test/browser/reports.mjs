@@ -24,6 +24,7 @@ async function serve(directory) {
 const app = await serve('priv/static'), admin = await serve('priv/admin');
 const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_EXECUTABLE || undefined, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
 const errors = [], posts = [], reports = [], submissions = new Map();
+let profileBlocked = false;
 let uploads = 0, failResponse = true, delayDetails = false, releaseDetail, adminRole = 'owner';
 const publicReport = report => { const { history, reporter_id, reporter_username, reporter_display_name, message_context, assignee_id, ...safe } = report; return safe; };
 const response = (route, data, status = 200, error) => route.fulfill({ status, json: { ok: status < 400, data, ...(error ? { error } : {}) } });
@@ -71,6 +72,7 @@ try {
     if (path === '/api/client-config') return route.fulfill({ json: { app_name: 'Plainwire', version, registration_enabled: true } });
     if (path === '/api/me') return response(route, { user: me, csrf: 'report-csrf', server_time: now });
     if (path === '/api/sync') return response(route, sync);
+    if (/^\/api\/profile\/\d+$/.test(path)) return response(route, { user: people[Number(path.split('/').at(-1)) - 1], relationship: { status: profileBlocked ? 'blocked' : 'none', blocked_by_me: profileBlocked } });
     if (path === '/api/messages') return response(route, messages);
     if (path === '/api/conversation/1') return response(route, { conversation: conversations[0], members: conversations[0].members });
     if (path === '/api/rtc-config') return response(route, { iceServers: [] });
@@ -100,6 +102,37 @@ try {
   assert.equal(attempts[0].csrf, 'report-csrf');
   await dialog.getByRole('button', { name: 'Done', exact: true }).click();
   assert.equal(await page.locator('#compose').inputValue(), 'Keep this draft', 'report uploads do not attach evidence or clear the chat draft');
+
+  // Profile reports are available on desktop and phone, including blocked
+  // accounts. A rejected file selection keeps the existing evidence intact.
+  await page.goto(app.origin + '/#profile/2');
+  await page.getByRole('button', { name: 'Report user', exact: true }).click();
+  await page.getByRole('dialog').locator('[name="evidence"]').setInputFiles({ name: 'first.png', mimeType: 'image/png', buffer: png });
+  await page.getByRole('dialog').locator('[name="evidence"]').setInputFiles({ name: 'unsafe.svg', mimeType: 'image/svg+xml', buffer: Buffer.from('<svg/>') });
+  assert.equal(await page.locator('.report-evidence-gallery figure').count(), 1);
+  await page.getByRole('button', { name: 'Remove screenshot first.png', exact: true }).click();
+  assert.equal(await page.locator('.report-evidence-gallery figure').count(), 0);
+  await page.locator('.report-form textarea').evaluate((node, bytes) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array(bytes)], 'pasted.png', { type: 'image/png' }));
+    node.dispatchEvent(new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true }));
+  }, [...png]);
+  await page.getByRole('button', { name: 'Remove screenshot pasted.png', exact: true }).waitFor();
+  assert.equal(await page.getByRole('dialog').locator('[name="include_message"]').count(), 0, 'profile reports never imply sharing a chat message');
+  await page.getByRole('dialog').getByRole('button', { name: 'Close', exact: true }).click();
+  profileBlocked = true;
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.reload(); await page.getByRole('button', { name: 'Unblock', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Report user', exact: true }).click();
+  assert.ok(await page.getByRole('dialog').evaluate(node => node.scrollWidth <= node.clientWidth + 2));
+  await page.getByRole('dialog').getByRole('button', { name: 'Close', exact: true }).click();
+  await page.goto(app.origin + '/#profile/1'); await page.getByRole('button', { name: 'Edit profile', exact: true }).waitFor();
+  assert.equal(await page.getByRole('button', { name: 'Report user', exact: true }).count(), 0, 'self profile offers report history instead of self reporting');
+  await page.getByRole('button', { name: 'My reports', exact: true }).click();
+  await page.locator('.report-case-card').waitFor();
+  await page.getByRole('dialog').getByRole('button', { name: 'Close', exact: true }).click();
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto(app.origin + '/#dm/1'); await page.locator('.msg[data-mid="1"]').waitFor();
 
   const operators = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
   await operators.route('**/api/**', async route => {

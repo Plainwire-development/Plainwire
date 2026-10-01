@@ -15,6 +15,7 @@ const state = {
   modalEpoch: 0,
   modalTrigger: null,
   viewEpoch: 0,
+  authEpoch: 0,
   reports: { status: "active", priority: "all", assigned: "all", q: "", before: null },
 };
 const $ = (s) => document.querySelector(s);
@@ -72,6 +73,7 @@ function inputValue(form, name) {
 }
 
 async function api(path, opts = {}) {
+  const authEpoch = state.authEpoch;
   const headers = { accept: "application/json", ...(opts.headers || {}) };
   if (opts.body !== undefined) {
     headers["content-type"] = "application/json";
@@ -81,15 +83,19 @@ async function api(path, opts = {}) {
     headers["x-csrf-token"] = state.csrf;
   const res = await fetch(`/api${path}`, {
     credentials: "same-origin",
+    cache: "no-store",
+    signal: AbortSignal.timeout(20000),
     ...opts,
     headers,
   });
+  if (authEpoch !== state.authEpoch) throw new Error("Session changed");
   let payload;
   try {
     payload = await res.json();
   } catch {
     throw new Error(`HTTP ${res.status}`);
   }
+  if (authEpoch !== state.authEpoch) throw new Error("Session changed");
   if (
     res.status === 401 &&
     !["/login", "/enroll", "/bootstrap", "/recover"].includes(path)
@@ -178,6 +184,13 @@ async function boot() {
   }
 }
 function showAuth() {
+  state.authEpoch++;
+  state.viewEpoch++;
+  closeModal(true);
+  clear(content);
+  state.usersQuery = state.serversQuery = "";
+  state.usersOffset = state.serversOffset = 0;
+  state.reports = { status: "active", priority: "all", assigned: "all", q: "", before: null };
   state.me = null;
   state.csrf = "";
   stopRefresh();
@@ -186,6 +199,8 @@ function showAuth() {
   document.body.classList.remove("nav-open");
 }
 function enterApp(me) {
+  state.authEpoch++;
+  closeModal(true);
   state.me = me;
   state.csrf = me.csrf || "";
   $("#auth").hidden = true;
@@ -406,13 +421,13 @@ async function loadView(manual = false) {
   const epoch = ++state.viewEpoch;
   showLoading();
   try {
-    if (state.view === "overview") await renderOverview();
-    else if (state.view === "users") await renderUsers();
-    else if (state.view === "servers") await renderServers();
-    else if (state.view === "control") await renderControl();
-    else if (state.view === "host") await renderHost();
-    else if (state.view === "operators") await renderOperators();
-    else if (state.view === "audit") await renderAudit();
+    if (state.view === "overview") await renderOverview(epoch);
+    else if (state.view === "users") await renderUsers(epoch);
+    else if (state.view === "servers") await renderServers(epoch);
+    else if (state.view === "control") await renderControl(epoch);
+    else if (state.view === "host") await renderHost(epoch);
+    else if (state.view === "operators") await renderOperators(epoch);
+    else if (state.view === "audit") await renderAudit(epoch);
     else if (state.view === "reports") await renderReports(epoch);
     if (epoch !== state.viewEpoch) return;
     $("#last-refresh").textContent =
@@ -476,8 +491,11 @@ function okLabel(v) {
   return v ? "Healthy" : "Unavailable";
 }
 
-async function renderOverview() {
+async function renderOverview(epoch = null) {
+  if (state.view !== "overview" || !state.me) return;
+  if (epoch === null) epoch = ++state.viewEpoch;
   const d = await api("/overview");
+  if (epoch !== state.viewEpoch || state.view !== "overview" || !state.me) return;
   clear(content);
   const g = el("div", "metric-grid");
   g.append(
@@ -642,9 +660,12 @@ function clickableRow(body, cells, onClick) {
   body.append(tr);
 }
 
-async function renderUsers() {
+async function renderUsers(epoch = null) {
+  if (state.view !== "users" || !state.me) return;
+  if (epoch === null) epoch = ++state.viewEpoch;
   const q = encodeURIComponent(state.usersQuery),
     d = await api(`/users?q=${q}&limit=50&offset=${state.usersOffset}`);
+  if (epoch !== state.viewEpoch || state.view !== "users" || !state.me) return;
   clear(content);
   content.append(
     panelTitle(
@@ -702,12 +723,31 @@ async function renderUsers() {
   content.append(t.wrap, pager("users", d.length));
 }
 
+function modalLoadFailed(epoch, error, retry) {
+  if (epoch !== state.modalEpoch || $("#modal-backdrop").hidden || !state.me) return;
+  const body = el("div");
+  const button = el("button", "secondary", "Retry");
+  button.type = "button";
+  button.addEventListener("click", retry);
+  body.append(el("p", "error", error.message), button);
+  $("#modal-body").replaceChildren(body);
+  $("#modal-subtitle").textContent = "Could not load details";
+}
+
 async function showUser(id) {
-  const [u, m, h] = await Promise.all([
-    api(`/users/${id}`),
-    api(`/users/${id}/moderation`),
-    api(`/users/${id}/moderation/history`),
-  ]);
+  if (!canOperate()) return;
+  showModal("Account moderation", `User ${id} · loading…`, el("p", "muted", "Loading…"));
+  const epoch = state.modalEpoch;
+  let details;
+  try {
+    details = await Promise.all([
+      api(`/users/${id}`),
+      api(`/users/${id}/moderation`),
+      api(`/users/${id}/moderation/history`),
+    ]);
+  } catch (error) { modalLoadFailed(epoch, error, () => showUser(id)); return; }
+  if (epoch !== state.modalEpoch || $("#modal-backdrop").hidden || !canOperate()) return;
+  const [u, m, h] = details;
   const wrap = el("div", "account-detail-stack");
   const body = el("div", "kv-grid");
   const emailSet = u.email_set === true,
@@ -1168,9 +1208,12 @@ async function showReport(id) {
   body.append(history); showModal(`Report #${id} · ${reportCategories[report.category] || report.category}`, `Submitted ${fmtTime(report.created_at)}`, body);
 }
 
-async function renderServers() {
+async function renderServers(epoch = null) {
+  if (state.view !== "servers" || !state.me) return;
+  if (epoch === null) epoch = ++state.viewEpoch;
   const q = encodeURIComponent(state.serversQuery),
     d = await api(`/servers?q=${q}&limit=50&offset=${state.serversOffset}`);
+  if (epoch !== state.viewEpoch || state.view !== "servers" || !state.me) return;
   clear(content);
   content.append(
     panelTitle(
@@ -1212,7 +1255,13 @@ async function renderServers() {
   content.append(t.wrap, pager("servers", d.length));
 }
 async function showServer(id) {
-  const s = await api(`/servers/${id}`);
+  if (!canOperate()) return;
+  showModal("Server metadata", `Server ${id} · loading…`, el("p", "muted", "Loading…"));
+  const epoch = state.modalEpoch;
+  let s;
+  try { s = await api(`/servers/${id}`); }
+  catch (error) { modalLoadFailed(epoch, error, () => showServer(id)); return; }
+  if (epoch !== state.modalEpoch || $("#modal-backdrop").hidden || !canOperate()) return;
   const body = el("div", "kv-grid");
   [
     ["Server", s.name],
@@ -1315,11 +1364,14 @@ function checkboxField(label, name, checked = true) {
   return l;
 }
 
-async function renderControl() {
+async function renderControl(epoch = null) {
+  if (state.view !== "control" || !state.me) return;
+  if (epoch === null) epoch = ++state.viewEpoch;
   const [banners, controls] = await Promise.all([
     api("/banners"),
     api("/controls"),
   ]);
+  if (epoch !== state.viewEpoch || state.view !== "control" || !state.me) return;
   clear(content);
   const operate = canOperate();
   const head = panelTitle(
@@ -1626,8 +1678,11 @@ function showBannerEditor(existing = null) {
   );
 }
 
-async function renderHost() {
+async function renderHost(epoch = null) {
+  if (state.view !== "host" || !state.me) return;
+  if (epoch === null) epoch = ++state.viewEpoch;
   const d = await api("/host");
+  if (epoch !== state.viewEpoch || state.view !== "host" || !state.me) return;
   clear(content);
   const g = el("div", "metric-grid");
   g.append(
@@ -1716,8 +1771,11 @@ function kv(k, v) {
   return n;
 }
 
-async function renderOperators() {
+async function renderOperators(epoch = null) {
+  if (state.view !== "operators" || !state.me) return;
+  if (epoch === null) epoch = ++state.viewEpoch;
   const ops = await api("/operators");
+  if (epoch !== state.viewEpoch || state.view !== "operators" || !state.me) return;
   clear(content);
   const head = panelTitle(
     "Service operators",
@@ -1842,8 +1900,11 @@ function showEnrollmentModal() {
   );
 }
 
-async function renderAudit() {
+async function renderAudit(epoch = null) {
+  if (state.view !== "audit" || !state.me) return;
+  if (epoch === null) epoch = ++state.viewEpoch;
   const rows = await api("/audit?limit=100");
+  if (epoch !== state.viewEpoch || state.view !== "audit" || !state.me) return;
   clear(content);
   content.append(
     panelTitle(
@@ -1974,7 +2035,10 @@ function showModal(title, subtitle, body, actions = [], locked = false) {
   });
   $("#modal-close").hidden = locked;
   $("#modal-backdrop").hidden = false;
+  $("#app").inert = $("#auth").inert = true;
+  const epoch = state.modalEpoch;
   setTimeout(() => {
+    if (epoch !== state.modalEpoch || $("#modal-backdrop").hidden) return;
     const target = locked
       ? $("#modal-actions button:last-child")
       : $("#modal-close");
@@ -1986,6 +2050,7 @@ function closeModal(force = false) {
   if (!$("#modal-backdrop").hidden) {
     state.modalEpoch++;
     $("#modal-backdrop").hidden = true;
+    $("#app").inert = $("#auth").inert = false;
     state.modalTrigger?.isConnected && state.modalTrigger.focus({ preventScroll: true });
     state.modalTrigger = null;
     state.modalLocked = false;

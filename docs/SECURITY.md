@@ -148,3 +148,7 @@ Do not remove these bounds to make a synthetic benchmark look better. Tune them 
 ## Rate-limit state bounds
 
 `PLAINWIRE_RATE_MAX_ENTRIES` caps local fixed-window ETS cardinality. Novel keys fail closed at the ceiling until expired counters are collected.
+
+## Private attachment cache validation
+
+Authenticated attachment responses use private/no-cache/must-revalidate and vary by Cookie. Conditional, range, and HEAD requests check the current file authorization before sending bytes or a 304 response. This prevents future browser cache reuse across revoked access or account changes. Previously downloaded or cached copies cannot be recalled. Report evidence uses private/no-store. See the [2.6.5 audit record](SECURITY_AUDIT_2.6.5.md).

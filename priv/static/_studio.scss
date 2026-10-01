@@ -1,8 +1,11 @@
-/* The call workspace: quiet surfaces, generous controls, useful screen space. */
+/* Call controls stay above floating shares; dialogs and menus stay actionable. */
+@media (min-width: 761px) { .call-layer { z-index: 1000; } }
+.modal { z-index: 1100; }
+.ctx-menu { z-index: 1200; }
 .call-layer { width: max-content; max-width: calc(100vw - 24px); align-items: flex-end; }
 .call-overlay.expanded {
-  position: relative; display: flex; flex-direction: column; width: 420px;
-  height: min(710px, calc(100dvh - 40px)); min-width: 340px; min-height: 360px;
+  position: relative; display: flex; flex-direction: column; width: var(--pw-call-panel-width, 420px);
+  height: var(--pw-call-panel-height, min(710px, calc(100dvh - 40px))); min-width: 340px; min-height: 360px;
   max-width: calc(100vw - 24px); max-height: calc(100dvh - 24px);
   container-type: inline-size; border-radius: 16px; overflow: auto;
   background: var(--bg); border: 1px solid var(--line2); scrollbar-width: thin;

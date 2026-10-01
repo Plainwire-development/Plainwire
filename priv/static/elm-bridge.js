@@ -549,19 +549,40 @@
     const feedback = reportNode('p', 'admin-inline-message'); feedback.setAttribute('role', 'status');
     const actions = reportNode('div', 'admin-row-actions'), submit = reportNode('button', 'btn', 'Submit report'); submit.type = 'submit';
     const mine = reportButton('My reports', () => { shell.destroy(); openMyReports(); }, true); actions.append(mine, submit);
-    form.append(categoryLabel, reason.label, evidenceLabel, reportNode('p', 'muted', 'Up to 3 PNG or JPEG screenshots, 5 MiB each. Review screenshots for private information before sharing. Up to 5 new reports per day.'), gallery);
+    form.append(categoryLabel, reason.label, evidenceLabel, reportNode('p', 'muted', 'Choose or paste up to 3 PNG or JPEG screenshots, 5 MiB each. Remove any screenshot before submitting. Review screenshots for private information before sharing. Up to 5 new reports per day.'), gallery);
     if (messageId > 0) form.append(messageLabel);
     form.append(feedback, actions); shell.body.append(form);
     let files = [], busy = false, requestKey = '', lastPayload = '';
     const uploaded = new WeakMap();
-    evidence.addEventListener('change', () => {
-      for (const url of previews) URL.revokeObjectURL(url); previews.clear(); gallery.replaceChildren();
-      files = [...evidence.files]; feedback.textContent = '';
-      if (files.length > 3 || files.some(file => !['image/png', 'image/jpeg'].includes(file.type) || !file.size || file.size > 5242880)) {
-        feedback.textContent = 'Choose up to 3 PNG or JPEG screenshots, 5 MiB each.'; feedback.classList.add('error'); files = []; evidence.value = ''; return;
+    const renderEvidence = () => {
+      for (const url of previews) URL.revokeObjectURL(url);
+      previews.clear(); gallery.replaceChildren();
+      for (const file of files) {
+        const url = URL.createObjectURL(file); previews.add(url);
+        const figure = reportNode('figure', ''), img = reportNode('img', '');
+        img.src = url; img.alt = file.name;
+        const remove = reportButton('Remove screenshot', () => {
+          if (busy) return;
+          files = files.filter(item => item !== file);
+          feedback.textContent = ''; feedback.classList.remove('error'); renderEvidence();
+        }, true);
+        remove.setAttribute('aria-label', `Remove screenshot ${file.name}`);
+        figure.append(img, reportNode('figcaption', '', file.name), remove); gallery.append(figure);
       }
-      feedback.classList.remove('error');
-      for (const file of files) { const url = URL.createObjectURL(file); previews.add(url); const figure = reportNode('figure', ''); const img = reportNode('img', ''); img.src = url; img.alt = file.name; figure.append(img, reportNode('figcaption', '', file.name)); gallery.append(figure); }
+    };
+    const addEvidence = incoming => {
+      if (busy) return;
+      const candidates = [...files, ...incoming];
+      evidence.value = ''; feedback.textContent = '';
+      if (candidates.length > 3 || candidates.some(file => !['image/png', 'image/jpeg'].includes(file.type) || !file.size || file.size > 5242880)) {
+        feedback.textContent = 'Choose up to 3 PNG or JPEG screenshots, 5 MiB each.'; feedback.classList.add('error'); return;
+      }
+      files = candidates; feedback.classList.remove('error'); renderEvidence();
+    };
+    evidence.addEventListener('change', () => addEvidence([...evidence.files]));
+    form.addEventListener('paste', event => {
+      const pasted = [...(event.clipboardData?.files || [])];
+      if (pasted.length) { event.preventDefault(); addEvidence(pasted); }
     });
     form.addEventListener('submit', async event => {
       event.preventDefault(); if (busy) return;
@@ -621,7 +642,7 @@
           }
           list.append(card);
         }
-        if (!list.children.length) adminMessage(list, 'You have not submitted any reports. Right-click a person or message to report an issue.');
+        if (!list.children.length) adminMessage(list, 'You have not submitted any reports. Open a person’s profile and choose Report user, or right-click a message to report it.');
       } catch (error) { if (shell.backdrop.isConnected) { status.textContent = error.message; status.classList.add('error'); } }
       finally { busy = false; refresh.disabled = more.disabled = false; }
     };
@@ -5451,6 +5472,13 @@
     let fitRestore = null;
     let fitted = false;
     let visualHidden = false;
+    const rememberGeometry = () => {
+      const previousHeight = floatPositions[id]?.h;
+      const next = clampFloatWindow(wrapper);
+      if (visualHidden && Number.isFinite(previousHeight)) next.h = previousHeight;
+      floatPositions[id] = next;
+      saveFloatStates();
+    };
     wrapper.addEventListener('pointerdown', bringForward);
 
     btnHide.addEventListener('click', (e) => {
@@ -5528,8 +5556,7 @@
         btnFit.title = 'Restore window size';
         btnFit.setAttribute('aria-label', 'Restore screen share window size');
       }
-      floatPositions[id] = clampFloatWindow(wrapper);
-      saveFloatStates();
+      rememberGeometry();
     };
     btnFit.addEventListener('click', (e) => { e.stopPropagation(); fitToScreen(); });
     bar.addEventListener('dblclick', (e) => {
@@ -5573,8 +5600,7 @@
       dragging = false;
       dragPointer = null;
       bar.style.cursor = 'grab';
-      floatPositions[id] = clampFloatWindow(wrapper);
-      saveFloatStates();
+      rememberGeometry();
     };
     bar.addEventListener('pointerup', finishDrag);
     bar.addEventListener('pointercancel', finishDrag);
@@ -5586,7 +5612,7 @@
     let resizeObserver = null;
     if ('ResizeObserver' in window) {
       const observer = new ResizeObserver(() => {
-        if (wrapper.style.display === 'none' || isCompactFloatLayout() || document.fullscreenElement === wrapper) return;
+        if (visualHidden || wrapper.style.display === 'none' || isCompactFloatLayout() || document.fullscreenElement === wrapper) return;
         const rect = wrapper.getBoundingClientRect();
         const w = Math.min(Math.max(220, rect.width), Math.max(220, window.innerWidth - 16));
         const h = Math.min(Math.max(160, rect.height), Math.max(160, window.innerHeight - 16));
@@ -5601,8 +5627,7 @@
     }
     if (!resizeObserved) {
       wrapper.addEventListener('pointerup', () => {
-        floatPositions[id] = clampFloatWindow(wrapper);
-        saveFloatStates();
+        rememberGeometry();
       });
     }
 
@@ -5617,8 +5642,7 @@
         wrapper.style.removeProperty('height');
         return;
       }
-      floatPositions[id] = clampFloatWindow(wrapper);
-      saveFloatStates();
+      rememberGeometry();
     };
     window.addEventListener('resize', onViewportResize, { passive: true });
 
@@ -7638,27 +7662,33 @@
       node.style.removeProperty('bottom');
       node.style.removeProperty('transform');
       node.classList.remove('detached', 'dragging');
-      saved = null;
       if (persist) {
+        saved = null;
         try { storage.removeItem(key); } catch (_) {}
       }
     };
 
-    // Elm reuses the same element when the expanded panel is minimized into the
-    // compact bar, so a size written here would stick to the small bar. Track the
-    // element that carries the size, and watch class changes inside the layer
-    // because that swap adds or removes no call-layer nodes.
+    // Dimensions only apply to expanded panels in CSS. Elm reuses this div
+    // for the compact bar, so writing inline width/height leaks into that bar.
     let sizedPanel = null;
-    let observedLayer = null;
-    let classFrame = 0;
     const clearPanelSize = (panel) => {
-      panel.style.removeProperty('width');
-      panel.style.removeProperty('height');
+      for (const name of ['width', 'height', '--pw-call-panel-width', '--pw-call-panel-height']) panel.style.removeProperty(name);
     };
-    const classObserver = new MutationObserver(() => {
-      if (classFrame || drag || resizing) return;
-      classFrame = requestAnimationFrame(() => { classFrame = 0; applySaved(); });
+    const boundedSize = (w, h, maxW = innerWidth - 24, maxH = innerHeight - 24) => ({
+      w: Math.max(1, Math.min(Math.max(340, w), maxW)),
+      h: Math.max(1, Math.min(Math.max(380, h), maxH))
     });
+    const sizePanel = (panel, size) => {
+      panel.style.setProperty('--pw-call-panel-width', `${size.w}px`);
+      panel.style.setProperty('--pw-call-panel-height', `${size.h}px`);
+      sizedPanel = panel;
+    };
+    const resetWindow = () => {
+      preferredSize = null;
+      storage.removeItem(sizeKey);
+      resetLayerPosition(layer(), true);
+      applySaved();
+    };
 
     const keepLayerOnScreen = (target) => {
       if (!target || !desktop() || drag || resizing) return;
@@ -7670,26 +7700,26 @@
 
     const applySaved = () => {
       const node = layer();
-      if (node !== observedLayer) {
-        classObserver.disconnect();
-        if (node) classObserver.observe(node, { attributes: true, attributeFilter: ['class'], subtree: true });
-        observedLayer = node;
+      if (!node) {
+        if (sizedPanel) clearPanelSize(sizedPanel);
+        sizedPanel = null;
+        drag = resizing = null;
+        document.documentElement.classList.remove('pw-call-detached');
+        return;
       }
-      if (!node) { sizedPanel = null; return; }
       const panel = node.querySelector('.call-overlay.expanded');
       if (sizedPanel && sizedPanel !== panel) { clearPanelSize(sizedPanel); sizedPanel = null; }
       if (panel) {
         if (desktop() && preferredSize) {
-          panel.style.width = `${Math.min(Math.max(340, preferredSize.w), innerWidth - 24)}px`;
-          panel.style.height = `${Math.min(Math.max(380, preferredSize.h), innerHeight - 24)}px`;
-          sizedPanel = panel;
+          sizePanel(panel, boundedSize(preferredSize.w, preferredSize.h));
         } else { clearPanelSize(panel); sizedPanel = null; }
       }
       if (!desktop()) {
         resetLayerPosition(node, false);
         return;
       }
-      if (saved) requestAnimationFrame(() => { setLayerPosition(node, saved, false); keepLayerOnScreen(node); });
+      if (saved) setLayerPosition(node, saved, false);
+      keepLayerOnScreen(node);
     };
 
     document.addEventListener('pointerdown', (ev) => {
@@ -7706,7 +7736,7 @@
       const handle = ev.target.closest?.('[data-call-drag-handle="true"]');
       if (!handle) return;
       if (ev.target.closest('.call-bar-controls, .call-overlay-controls, .call-popup-actions, .call-minimize')) return;
-      const blocking = ev.target.closest('input, select, a, textarea');
+      const blocking = ev.target.closest('button, input, select, a, textarea');
       if (blocking) return;
       const node = handle.closest('.call-layer') || layer();
       if (!node) return;
@@ -7728,10 +7758,8 @@
     document.addEventListener('pointermove', (ev) => {
       if (resizing && ev.pointerId === resizing.pointer) {
         const r = resizing, bounds = r.node.getBoundingClientRect();
-        const w = Math.min(Math.max(340, r.w + ev.clientX - r.x), innerWidth - bounds.left - 12);
-        const h = Math.min(Math.max(380, r.h + ev.clientY - r.y), innerHeight - bounds.top - 12);
-        r.panel.style.width = `${w}px`; r.panel.style.height = `${h}px`; sizedPanel = r.panel;
-        preferredSize = { w, h }; ev.preventDefault(); return;
+        preferredSize = boundedSize(r.w + ev.clientX - r.x, r.h + ev.clientY - r.y, innerWidth - bounds.left - 12, innerHeight - bounds.top - 12);
+        sizePanel(r.panel, preferredSize); ev.preventDefault(); return;
       }
       if (!drag || drag.pointerId !== ev.pointerId) return;
       const dx = ev.clientX - drag.startX;
@@ -7757,7 +7785,7 @@
 
     const finish = (ev) => {
       if (resizing && ev.pointerId === resizing.pointer) {
-        resizing = null; storage.setItem(sizeKey, JSON.stringify(preferredSize)); return;
+        resizing = null; storage.setItem(sizeKey, JSON.stringify(preferredSize)); applySaved(); return;
       }
       if (!drag || drag.pointerId !== ev.pointerId) return;
       if (raf) { cancelAnimationFrame(raf); raf = 0; }
@@ -7767,6 +7795,7 @@
       finished.node.classList.remove('dragging');
       if (finished.moved) {
         suppressClick = true;
+        setTimeout(() => { suppressClick = false; }, 0);
         setLayerPosition(finished.node, { x: finished.nextX, y: finished.nextY }, true);
       }
     };
@@ -7777,7 +7806,7 @@
       const grip = ev.target.closest?.('[data-call-resize]');
       if (!grip || !desktop() || !['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(ev.key)) return;
       const rect = grip.closest('.call-overlay').getBoundingClientRect();
-      preferredSize = { w: rect.width + (ev.key === 'ArrowRight' ? 24 : ev.key === 'ArrowLeft' ? -24 : 0), h: rect.height + (ev.key === 'ArrowDown' ? 24 : ev.key === 'ArrowUp' ? -24 : 0) };
+      preferredSize = boundedSize(rect.width + (ev.key === 'ArrowRight' ? 24 : ev.key === 'ArrowLeft' ? -24 : 0), rect.height + (ev.key === 'ArrowDown' ? 24 : ev.key === 'ArrowUp' ? -24 : 0));
       storage.setItem(sizeKey, JSON.stringify(preferredSize)); applySaved(); ev.preventDefault();
     });
 
@@ -7785,14 +7814,13 @@
       if (!desktop()) return;
       const handle = ev.target.closest?.('[data-call-drag-handle="true"]');
       if (!handle) return;
-      if (ev.target.closest('.call-bar-controls, .call-overlay-controls, .call-popup-actions, .call-minimize, input, select, a')) return;
-      const node = handle.closest('.call-layer') || layer();
-      preferredSize = null; storage.removeItem(sizeKey); applySaved();
-      resetLayerPosition(node, true);
+      if (ev.target.closest('.call-bar-controls, .call-overlay-controls, .call-popup-actions, .call-minimize, button, input, select, a')) return;
+      resetWindow();
       ev.preventDefault();
     });
 
     document.addEventListener('click', (ev) => {
+      if (ev.target.closest?.('[data-call-reset]')) { resetWindow(); return; }
       if (!suppressClick || !ev.target.closest?.('.call-layer')) return;
       suppressClick = false;
       ev.preventDefault();
@@ -7812,13 +7840,17 @@
 
     let positionFrame = 0;
     const observer = new MutationObserver((records) => {
-      const selector = '.call-layer, .call-overlay, .call-compact-bar, .call-popup';
-      const changed = records.some((record) => [...record.addedNodes, ...record.removedNodes].some((node) =>
-        node.nodeType === Node.ELEMENT_NODE && (node.matches?.(selector) || node.querySelector?.(selector))));
-      if (!changed || positionFrame || drag) return;
+      const selector = '.call-layer, .call-overlay, .call-bar.compact, .call-popup';
+      const changed = records.some(record => record.type === 'attributes'
+        ? record.target.matches('.call-overlay, .call-bar')
+        : [...record.addedNodes, ...record.removedNodes].some(node =>
+          node.nodeType === Node.ELEMENT_NODE && (node.matches(selector) || node.querySelector(selector))));
+      if (!changed || positionFrame || drag || resizing) return;
       positionFrame = requestAnimationFrame(() => { positionFrame = 0; applySaved(); });
     });
-    observer.observe(root || document.body, { childList: true, subtree: true });
+    // Browser.application replaces the mount node. Observe the live body, and
+    // ignore our layer's position classes to avoid a mutation feedback loop.
+    observer.observe(document.body, { childList: true, attributes: true, attributeFilter: ['class'], subtree: true });
     applySaved();
   };
 

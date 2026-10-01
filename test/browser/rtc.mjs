@@ -284,6 +284,28 @@ try {
   assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_audio_input')), '', 'unavailable saved microphone recovers to default');
   await a.getByRole('button', { name: 'Open call details', exact: true }).click();
   await a.waitForSelector('#call-microphone');
+  // The first resize must work without a prior keyboard resize or viewport
+  // change; Browser.application replaces the original mount element.
+  const header = await a.locator('.call-overlay-title').boundingBox();
+  await a.mouse.move(header.x + 20, header.y + 10);
+  await a.mouse.down();
+  await a.mouse.move(60, 50, { steps: 8 });
+  await a.mouse.up();
+  const firstGrip = await a.getByRole('button', { name: 'Resize call window', exact: true }).boundingBox();
+  await a.mouse.move(firstGrip.x + firstGrip.width / 2, firstGrip.y + firstGrip.height / 2);
+  await a.mouse.down();
+  await a.mouse.move(firstGrip.x + 180, firstGrip.y + 50, { steps: 8 });
+  await a.mouse.up();
+  const firstResized = await a.locator('.call-overlay').boundingBox();
+  assert(firstResized.width > 500, 'first pointer resize expands the call window');
+  await a.getByRole('button', { name: 'Minimize call', exact: true }).click();
+  await a.locator('.call-bar.compact').waitFor();
+  await a.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const firstCompact = await a.locator('.call-bar.compact').boundingBox();
+  assert(firstCompact.width <= 390 && firstCompact.height < 100, 'first pointer resize must not leave a giant minimized call bar');
+  await a.getByRole('button', { name: 'Open call details', exact: true }).click();
+  await a.waitForFunction(width => Math.abs((document.querySelector('.call-overlay.expanded')?.getBoundingClientRect().width || 0) - width) < 2, firstResized.width);
+  await a.getByRole('button', { name: 'Reset window', exact: true }).click();
   // Keyboard resizing persists and reflows participant cards at wider sizes.
   const grip = a.getByRole('button', { name: 'Resize call window', exact: true });
   const originalWidth = (await a.locator('.call-overlay').boundingBox()).width;
@@ -301,6 +323,15 @@ try {
   assert((await a.locator('.call-bar.compact').boundingBox()).width < resizedBox.width - 100, 'minimized call bar is not left at the resized size');
   await a.getByRole('button', { name: 'Open call details', exact: true }).click();
   await a.waitForFunction(width => Math.abs((document.querySelector('.call-overlay.expanded')?.getBoundingClientRect().width || 0) - width) < 2, resizedBox.width);
+  // Phone layout ignores desktop geometry without losing the user's saved
+  // dimensions or position when returning to desktop.
+  const desktopPosition = await a.evaluate(() => localStorage.getItem('plainwire_call_window_v2'));
+  await a.setViewportSize({ width: 390, height: 844 });
+  await a.waitForFunction(() => { const panel = document.querySelector('.call-overlay.expanded'); return panel && panel.getBoundingClientRect().width <= 390 && !panel.style.height; });
+  assert.ok((await a.locator('.call-overlay').boundingBox()).height < 844);
+  await a.setViewportSize({ width: 1280, height: 900 });
+  await a.waitForFunction(width => Math.abs((document.querySelector('.call-overlay.expanded')?.getBoundingClientRect().width || 0) - width) < 2, resizedBox.width);
+  assert.equal(await a.evaluate(() => localStorage.getItem('plainwire_call_window_v2')), desktopPosition, 'phone layout preserves the saved desktop position');
   await a.waitForSelector('#call-microphone');
   await a.locator('.call-overlay-title').dblclick();
   assert.equal(Math.round((await a.locator('.call-overlay').boundingBox()).width), Math.round(originalWidth));
@@ -456,8 +487,12 @@ try {
   await b.waitForFunction(() => document.querySelector('#pw-float-stage-1')?.classList.contains('screen-visual-hidden'));
   assert.equal(await viewer.locator('video').isVisible(), false, 'hiding a share removes the video without closing it');
   assert((await viewer.boundingBox()).height < viewerHeight / 2, 'hidden share collapses to a compact title bar');
+  await b.setViewportSize({ width: 1280, height: 890 });
+  await b.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   await viewer.getByRole('button', { name: 'Show shared screen', exact: true }).click();
   await viewer.locator('video').waitFor({ state: 'visible' });
+  assert(Math.abs((await viewer.boundingBox()).height - viewerHeight) < 2, 'hide/show and viewport changes preserve the expanded viewer height');
+  await b.setViewportSize({ width: 1280, height: 900 });
   await viewer.getByRole('button', { name: 'Stop watching screen', exact: true }).click();
   await b.getByRole('button', { name: 'Watch screen', exact: true }).click();
   await b.waitForFunction(() => document.querySelector('#pw-float-stage-1 video')?.videoWidth > 0);
