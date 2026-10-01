@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI Agents when working with code in this repository.
 
 Plainwire Relay is a self-hostable chat server (servers/channels, DMs, forums, voice/screen-share calls, bots). The backend is Erlang/OTP + Cowboy on PostgreSQL. The frontend is an Elm SPA with a large JS bridge. Redis and ScyllaDB are optional.
 
