@@ -254,7 +254,7 @@ validate(Result) ->
 cleanup(Pids, RegistryPid, OwnRegistry) ->
     lists:foreach(fun(Pid) ->
         pw_realtime_registry:unregister(Pid),
-        catch Pid ! stop
+        Pid ! stop
     end, Pids),
     case {OwnRegistry, whereis(pw_realtime_registry)} of
         {true, RegistryPid} -> gen_server:stop(RegistryPid, normal, 2000);
