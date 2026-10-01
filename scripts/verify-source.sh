@@ -7,6 +7,8 @@ node --check priv/static/elm-bridge.js
 node --check priv/static/plugin-worker.js
 node --check priv/static/call-health.js
 node --check priv/admin/admin.js
+node --check test/browser/reports.mjs
+node test/browser/reports-contract.mjs
 node --check web/markdown.js
 node --check web/interface.js
 node --check web/source-hub.js

@@ -158,6 +158,31 @@ authed(<<"GET">>, [<<"operators">>], Req, Session, _Hash, State) ->
     inspect_only(Req, Session, fun() ->
         reply_result(Req, pw_db:admin_operators(maps:get(user_id, Session)), State)
     end, State);
+authed(<<"GET">>, [<<"reports">>], Req, Session, _Hash, State) ->
+    case can_operate(Session) of
+        true -> reply_result(Req, pw_db:admin_reports(maps:get(user_id,Session), report_options(Req)), State);
+        false -> reply_error(Req,403,<<"forbidden">>,State)
+    end;
+authed(<<"GET">>, [<<"reports">>, Id], Req, Session, _Hash, State) ->
+    case can_operate(Session) of
+        true -> reply_result(Req, pw_db:admin_report(maps:get(user_id,Session),Id), State);
+        false -> reply_error(Req,403,<<"forbidden">>,State)
+    end;
+authed(<<"POST">>, [<<"reports">>, Id], Req0, Session, _Hash, State) ->
+    operator_json(Req0, Session, fun(M,Req) ->
+        reply_result(Req, pw_db:admin_update_report(maps:get(user_id,Session),Id,M), State)
+    end, State);
+authed(<<"GET">>, [<<"reports">>, Id, <<"evidence">>, Evidence], Req, Session, _Hash, State) ->
+    case can_operate(Session) of
+        true ->
+            case pw_db:report_evidence(admin,maps:get(user_id,Session),Id,Evidence) of
+                {ok,#{content_type:=Type,data:=Bytes}} ->
+                    Headers = (admin_security_headers())#{<<"content-type">>=>Type,<<"cache-control">>=><<"private, no-store">>,<<"content-disposition">>=><<"inline">>},
+                    {ok,cowboy_req:reply(200,Headers,Bytes,Req),State};
+                Error -> reply_result(Req,Error,State)
+            end;
+        false -> reply_error(Req,403,<<"forbidden">>,State)
+    end;
 authed(<<"GET">>, [<<"banners">>], Req, _Session, _Hash, State) ->
     reply_result(Req, pw_db:admin_banners(), State);
 authed(<<"POST">>, [<<"banners">>], Req0, Session, _Hash, State) ->
@@ -371,10 +396,15 @@ positive_int(Bin) ->
 
 privacy_contract() ->
     #{content_access => false,
+      content_access_scope => <<"operational views">>,
+      report_evidence_access => <<"owner/operator: reporter-submitted evidence only">>,
       excluded => [<<"message_bodies">>, <<"direct_message_text">>, <<"attachment_contents">>,
                    <<"message_search">>, <<"private_profile_text">>, <<"verification_secrets">>,
                    <<"email_addresses">>],
-      note => <<"The service admin plane exposes operational metadata and aggregate counts, not communication contents.">>}.
+      note => <<"Operational views expose metadata and counts. Reports separately expose only reasons and evidence deliberately submitted for moderation; they do not grant access to surrounding conversations or files.">>}.
+
+report_options(Req) -> maps:from_list([{K,V} || {K,V} <- cowboy_req:parse_qs(Req),
+    lists:member(K,[<<"before">>,<<"limit">>,<<"status">>,<<"priority">>,<<"q">>,<<"assigned">>])]).
 
 account_action_gate(M, Id) ->
     case maps:get(<<"action">>, M, <<>>) of
@@ -415,6 +445,15 @@ reply_result(Req, {error, Error}, State) ->
     reply_error(Req, Code, Public, State);
 reply_result(Req, _, State) -> reply_error(Req, 500, <<"internal_error">>, State).
 
+error_status(report_evidence_unavailable) -> {503, <<"report_evidence_unavailable">>};
+error_status(report_conflict) -> {409, <<"report_conflict">>};
+error_status(report_assigned_elsewhere) -> {409, <<"report_assigned_elsewhere">>};
+error_status(report_closed) -> {409, <<"report_closed">>};
+error_status(report_not_assigned) -> {409, <<"report_not_assigned">>};
+error_status(invalid_report) -> {400, <<"invalid_report">>};
+error_status(invalid_report_filter) -> {400, <<"invalid_report_filter">>};
+error_status(invalid_report_action) -> {400, <<"invalid_report_action">>};
+error_status(report_note_required) -> {400, <<"report_note_required">>};
 error_status(bad_login) -> {401, <<"bad_login">>};
 error_status(no_session) -> {401, <<"not_authenticated">>};
 error_status(forbidden) -> {403, <<"forbidden">>};

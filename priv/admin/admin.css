@@ -1162,3 +1162,27 @@ tbody tr:last-child td {
 .moderation-form .form-help {
   max-width: 560px;
 }
+
+.report-filters { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 12px; margin-bottom: 14px; align-items: end; }
+.report-filters label { display: grid; gap: 6px; min-width: 0; font-size: 12px; color: var(--muted); }
+.report-filters label:nth-last-of-type(1) { grid-column: span 2; }
+.report-case-list, .report-detail { display: grid; gap: 14px; min-width: 0; }
+.report-queue-item { display: grid; gap: 6px; width: 100%; text-align: left; white-space: normal; overflow-wrap: anywhere; padding: 16px; border-left: 3px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+.report-queue-item.priority-high { border-left-color: #dfae50; }
+.report-queue-item.priority-urgent { border-left-color: #ed6875; }
+.report-status { color: var(--muted); font-size: 12px; }
+.report-identities { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; }
+.report-identity { display: grid; gap: 5px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; overflow-wrap: anywhere; }
+.report-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font: inherit; max-width: 100%; }
+.report-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+.report-actions label { display: grid; gap: 5px; }
+.report-evidence-gallery { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(200px,100%),1fr)); gap: 12px; }
+.report-evidence-gallery figure { margin: 0; min-width: 0; }
+.report-evidence-gallery img { width: 100%; height: 200px; object-fit: contain; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; }
+.report-evidence-gallery figcaption { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.report-history { display: grid; gap: 12px; padding-left: 20px; }
+.report-history li { display: grid; gap: 5px; }
+.report-detail h3 { margin: 6px 0 0; }
+.report-note-form, .report-decision-form { padding: 14px; background: var(--panel-2); border-radius: 9px; }
+.report-note-form textarea, .report-decision-form textarea { resize: vertical; }
+@media (max-width: 600px) { .report-filters, .report-identities { grid-template-columns: 1fr; } .report-filters label:nth-last-of-type(1) { grid-column: auto; } .report-actions button { flex: 1 1 auto; } }

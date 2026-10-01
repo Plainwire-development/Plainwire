@@ -11,6 +11,7 @@
     "start": "bash scripts/start.sh",
     "start:build": "bash scripts/start.sh --build",
     "test:browser": "node test/browser/run.mjs",
+    "test:reports": "node test/browser/reports-contract.mjs && node test/browser/reports.mjs",
     "test:security-audit": "node test/browser/security-audit.mjs",
     "test:rtc": "node test/browser/rtc-audio-test.mjs && node test/browser/rtc.mjs",
     "test:rtc-contract": "node test/browser/rtc-contract.mjs",

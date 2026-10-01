@@ -146,6 +146,7 @@ test-release-contract:
 test-browser: frontend test-rtc-contract test-ui-contract test-admin-contract test-integrations-contract test-storage-contract test-storage-tools test-v21-contract test-v22-bot-contract test-v24-bot-contract test-v241-patch-contract test-scalability-contract test-release-contract
 	$(NPM) run test:browser
 	$(NPM) run test:security-audit
+	$(NPM) run test:reports
 	$(NODE) test/browser/settings-responsive.mjs
 	$(NODE) test/browser/admin-moderation.mjs
 	$(NPM) run test:rtc

@@ -128,6 +128,7 @@ init([]) ->
         {read_concurrency, true}, {write_concurrency, true}]),
     _ = ets:new(pw_upload_active, [named_table, public, set, {write_concurrency, true}]),
     erlang:send_after(60000, self(), sweep),
+    erlang:send_after(60000, self(), report_retention),
     erlang:send_after(5000, self(), upload_ref_backfill),
     erlang:send_after(1000, self(), drain_delete_queue),
     {ok, #{}}.
@@ -149,11 +150,16 @@ handle_info(sweep, State) ->
     _ = ets:select_delete(pw_upload_authz_cache, Expiry),
     erlang:send_after(3600000, self(), sweep),
     {noreply, State};
-%% backfill old encrypted messages in restart-safe batches.
+%% Report evidence expires independently of ordinary upload retention.
+handle_info(report_retention, State) ->
+    _ = pw_db:reports_gc(),
+    erlang:send_after(60000, self(), report_retention),
+    {noreply, State};
 handle_info(drain_delete_queue, State) ->
     _ = drain_delete_queue(32),
     erlang:send_after(5000, self(), drain_delete_queue),
     {noreply, State};
+%% backfill old encrypted messages in restart-safe batches.
 handle_info(upload_ref_backfill, State) ->
     case pw_db:upload_ref_backfill(500) of
         {ok, done} ->

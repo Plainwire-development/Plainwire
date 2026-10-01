@@ -1,6 +1,6 @@
 # Host control plane
 
-The control plane administers one Plainwire instance. It is not a per-server moderation screen, and it does not read message bodies, direct-message text, attachment contents, or email addresses.
+The control plane administers one Plainwire instance. Operational views cannot browse messages, private conversations, arbitrary attachments, or email addresses. The Reports view exposes only reasons and evidence explicitly submitted for moderation, including opt-in copies of individual messages.
 
 It is off until you enable it. The listener is separate from the public Cowboy listener and defaults to loopback.
 
@@ -17,10 +17,10 @@ Open `http://127.0.0.1:8090`. The first owner uses the one-time bootstrap token 
 | Role | What it can do |
 | --- | --- |
 | viewer | Overview and host health only |
-| operator | Inspect accounts, servers, operators, and audit. Change account access and service controls |
+| operator | Inspect accounts, servers, operators, and audit. Review submitted reports. Change account access and service controls |
 | owner | Everything an operator can do, plus operator enrollment, role changes, and removal |
 
-Viewers cannot open the account, server, operator, or audit views. Mutating requests need the operator session cookie and the `x-csrf-token` header. Operators cannot change their own account, another operator, or an owner. An owner cannot disable another owner.
+Viewers cannot open the account, server, operator, audit, or report views. Mutating requests need the operator session cookie and the `x-csrf-token` header. Operators cannot change their own account, another operator, or an owner. An owner cannot disable another owner.
 
 ## Account actions
 
@@ -37,6 +37,16 @@ These buttons call `POST /api/users/:id/moderation`. They are recorded in the op
 * **Resend verification** queues a verification message only when mail is enabled on this host (`PLAINWIRE_MAIL_ENABLED` and SMTP, or the official `plainwi.re` host with SMTP). It is rate-limited. The one-time token is not returned to the browser.
 
 There is no control that shows or sets a password, and no control that signs the operator in as another user.
+
+## Report review
+
+Open **Reports** to see who reported an account, the reported identity, category, status, priority, and assignment. Filter by status, priority, assignment, or either username. Active cases refresh every 15 seconds while the view is visible and no case or filter input is in use. Pagination is bounded to 30 cases in the UI and at most 50 through the API.
+
+Assign the case to yourself, inspect submitted screenshots and any deliberately shared message copy, and add internal review notes. Owners can take over another reviewer's assignment. Operators cannot modify a case assigned to somebody else. Reporters see their own status and an optional public response, never internal notes or reviewer identity. A reviewer cannot access cases they filed or cases about their own account; another operator must handle them.
+
+Resolve or dismiss with an outcome and a required internal decision note. Closed decisions can be reopened with a note; withdrawn cases stay withdrawn. From an assigned case, **Suspend account**, **Ban account**, and **Disable account** use the existing account restrictions and resolve the case in the same transaction. A failure rolls back both. Enter a separate reason for the affected user without identifying the reporter. Existing protections for owners, operators, and self-moderation apply. Reports do not automatically establish a violation or change account access.
+
+Case actions, case access, and screenshot access enter the operator audit without copying submitted content into that audit. See [REPORTING.md](REPORTING.md) for limits, storage, privacy, and endpoint contracts.
 
 ## Service controls
 

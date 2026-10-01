@@ -1320,7 +1320,14 @@ messageContext model message x y =
             else
                 []
     in
-    { items = base ++ reactionItems ++ pinItems ++ authorItems ++ mineItems, x = x, y = y }
+    { items = base ++ reactionItems ++ pinItems ++ authorItems ++ mineItems ++
+        (if not mine && message.id > 0 && message.kind == "text" && message.deletedAt == Nothing then
+            [ { label = "Report message", icon = Just "⚑", danger = True, sep = True, msg = BridgeEvent "report_user" (E.object [ ( "user_id", E.int message.userId ), ( "display_name", E.string message.displayName ), ( "message_id", E.int message.id ) ]) } ]
+         else
+            []
+        )
+    , x = x, y = y }
+
 
 
 conversationContext : Model -> Conversation -> Int -> Int -> ContextMenu
@@ -1503,6 +1510,7 @@ userContext model user x y =
             if isSelf then
                 [ { label = "View my profile", icon = Just "○", danger = False, sep = False, msg = Go ("#profile/" ++ String.fromInt user.id) }
                 , { label = "Copy username", icon = Just "⧉", danger = False, sep = False, msg = CopyText ("@" ++ user.username) }
+                , { label = "My reports", icon = Just "⚑", danger = False, sep = True, msg = BridgeEvent "my_reports" E.null }
                 ]
 
             else
@@ -1521,7 +1529,12 @@ userContext model user x y =
                     { label = "Block", icon = Just "⊘", danger = True, sep = True, msg = BridgeEvent "block_user" (E.int user.id) }
                 ]
     in
-    { items = actions, x = x, y = y }
+    { items = actions ++
+        (if isSelf then [] else
+            [ { label = "Report user", icon = Just "⚑", danger = True, sep = True, msg = BridgeEvent "report_user" (E.object [ ( "user_id", E.int user.id ), ( "display_name", E.string user.displayName ) ]) } ]
+        )
+    , x = x, y = y }
+
 
 
 renderCallLayer : Model -> Html Msg
@@ -2455,7 +2468,7 @@ renderCallUser model u =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "2.6.4", attribute "data-ui-revision" "interface-5" ]
+    div [ class "layout", attribute "data-ui-version" "2.6.4-1", attribute "data-ui-revision" "interface-5" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -2542,6 +2555,7 @@ renderServersSheet model =
                 , div [ class "servers-sheet-actions" ]
                     [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "Create server" ]
                     , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with Wire" ]
+                    , button [ class "btn secondary", onClick (BridgeEvent "my_reports" E.null) ] [ text "My reports" ]
                     ]
                 ]
             ]
@@ -3014,6 +3028,7 @@ sideHead model =
             , div [ class "workspace-menu-items" ]
                 [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "Create server" ]
                 , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with Wire" ]
+                , button [ class "btn secondary", onClick (BridgeEvent "my_reports" E.null) ] [ text "My reports" ]
                 ]
             ]
         ]

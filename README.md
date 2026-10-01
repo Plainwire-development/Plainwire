@@ -274,7 +274,7 @@ Caddy, nginx, and similar reverse proxies work well in front of Plainwire.
 
 Plainwire 1.9.0 includes an optional host-level operator console. It administers the configured Plainwire service instance itself; it is not a per-server moderation panel. The control plane is disabled by default and runs on a separate Cowboy listener when enabled.
 
-The console is intentionally private-content blind. It can inspect service health, runtime/build information, database and realtime health, aggregate message/upload/call statistics, registered accounts, hosted server metadata, resource usage, operators, and operator audit history. It has no message-body, DM-text, attachment-content, message-search, email-address, or verification-secret endpoint.
+Operational views show service health, runtime/build information, database and realtime health, aggregate message/upload/call statistics, accounts, server metadata, resource usage, operators, and audit history. They cannot browse private messages or arbitrary attachments. The Reports view is a limited exception: owners and operators can review reasons, screenshots, and single-message copies explicitly submitted by a reporter. Viewers cannot access reports. Message search, email addresses, and verification secrets remain unavailable. See [reporting and moderation](docs/REPORTING.md).
 
 Owners and operators can also change account access. Suspend, ban, and disable require a user-facing reason and revoke that account's sessions. Restore returns the account to active. Separate confirmed actions sign an account out everywhere without changing its state, set the display name back to the username, remove an email without showing the address, and resend verification when mail is enabled on that host. Viewers cannot use those actions. There is no password reveal and no impersonation control. See [docs/ADMIN.md](docs/ADMIN.md).
 
@@ -285,7 +285,7 @@ Operator access is instance-bound:
 * the first service owner uses a one-time bootstrap token printed by that running instance plus their normal Plainwire account password;
 * every operator then receives their own high-entropy verification key, stored only as an HMAC bound to that instance secret;
 * cloning Plainwire creates a different instance secret, so keys created by the clone cannot authenticate to another deployment;
-* `viewer` accounts see aggregate overview/host health only, `operator` accounts can inspect content-free user/server/operator/audit metadata, and `owner` accounts additionally manage service-operator access;
+* `viewer` accounts see aggregate overview/host health only, `operator` accounts can inspect operational metadata and review submitted reports, and `owner` accounts additionally manage service-operator access;
 * one-time owner-issued enrollment/recovery codes are account-bound and consumed atomically;
 * losing the last usable owner key can be recovered only by somebody who controls that host: temporarily enable `PLAINWIRE_ADMIN_LOCAL_RECOVERY=true`, keep the admin listener on loopback, restart, use the one-time recovery token printed locally, then disable local recovery before the next restart.
 
@@ -307,11 +307,11 @@ Deployment and update instructions are kept in [deploy/README.md](deploy/README.
 
 ## Version
 
-Current release: **2.6.4**
+Current release: **2.6.4-1**
 
 Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history.
 
-* [2.6.4 release notes](RELEASE_NOTES_2.6.4.md)
+* [2.6.4-1 release notes](RELEASE_NOTES_2.6.4-1.md)
 * [2.6.3 release notes](RELEASE_NOTES_2.6.3.md)
 * [2.6.2 release notes](RELEASE_NOTES_2.6.2.md)
 * [2.6.1 release notes](RELEASE_NOTES_2.6.1.md)

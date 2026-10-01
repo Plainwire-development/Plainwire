@@ -9572,3 +9572,19 @@ pw-developer-portal { display: block; width: 100%; min-width: 0; container: deve
   .developer-activity-row { grid-template-columns: 1fr; }
   .developer-activity-state { justify-self: start; }
 }
+
+.report-form { display: grid; gap: 14px; min-width: 0; }
+.report-form .admin-field { min-width: 0; }
+.report-form select { width: 100%; padding: 10px; color: var(--text1); background: var(--bg2); border: 1px solid var(--line); border-radius: 8px; }
+.report-message-consent { display: flex; align-items: flex-start; gap: 9px; line-height: 1.5; font-size: 13px; }
+.report-message-consent input { flex: none; margin-top: 4px; }
+.report-evidence-gallery { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(180px,100%),1fr)); gap: 12px; min-width: 0; }
+.report-evidence-gallery figure { margin: 0; min-width: 0; }
+.report-evidence-gallery img { display: block; width: 100%; max-height: 220px; object-fit: contain; border: 1px solid var(--line); border-radius: 8px; background: var(--bg1); }
+.report-evidence-gallery figcaption { margin-top: 5px; overflow-wrap: anywhere; color: var(--text3); font-size: 12px; }
+.report-case-list { display: grid; gap: 12px; }
+.report-case-card { display: grid; gap: 10px; min-width: 0; }
+.report-case-card strong, .report-text, .report-response { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+.report-status { font-size: 12px; color: var(--text3); }
+.report-response { padding: 12px; border-left: 3px solid var(--accent); background: var(--bg2); }
+@media (max-width: 600px) { .report-form .admin-row-actions { flex-wrap: wrap; } .report-form input[type=file] { max-width: 100%; font-size: 12px; } }

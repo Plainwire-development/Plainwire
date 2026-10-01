@@ -12,6 +12,10 @@ const state = {
   serversQuery: "",
   modalLocked: false,
   modalOnClose: null,
+  modalEpoch: 0,
+  modalTrigger: null,
+  viewEpoch: 0,
+  reports: { status: "active", priority: "all", assigned: "all", q: "", before: null },
 };
 const $ = (s) => document.querySelector(s);
 const content = $("#content");
@@ -110,7 +114,13 @@ function errorText(code) {
     recovery_unavailable: "Host-local recovery is not active for this startup.",
     invalid_enrollment: "That enrollment/recovery code is invalid or expired.",
     last_owner: "The final service owner cannot be demoted or removed.",
-    forbidden: "Your operator role does not allow that action.",
+    forbidden: "Your operator role does not allow that action, or this case involves your account.",
+    report_conflict: "This case changed. Reload it before continuing.",
+    report_assigned_elsewhere: "This case is assigned to another reviewer.",
+    report_not_assigned: "Assign this case to yourself before taking action.",
+    report_closed: "This case is closed. Reload it to see its current status.",
+    report_note_required: "Add an internal note explaining this decision.",
+    invalid_report_action: "The report decision or linked account does not match this case.",
     rate_limited: "Too many attempts. Try again shortly.",
     database_busy: "The database is busy. Try again.",
     database_unavailable: "The database is temporarily unavailable.",
@@ -188,7 +198,7 @@ function enterApp(me) {
   const requested = state.view || "overview";
   selectView(
     me.role === "viewer" &&
-      ["users", "servers", "operators", "audit"].includes(requested)
+      ["users", "servers", "operators", "audit", "reports"].includes(requested)
       ? "overview"
       : requested,
   );
@@ -196,7 +206,7 @@ function enterApp(me) {
 
 function applyRoleUi() {
   const viewer = state.me?.role === "viewer";
-  ["users", "servers", "operators", "audit"].forEach((v) => {
+  ["users", "servers", "operators", "audit", "reports"].forEach((v) => {
     const b = document.querySelector(`[data-view="${v}"]`);
     if (b) b.hidden = viewer;
   });
@@ -377,6 +387,7 @@ function selectView(view) {
       "Operators",
       "Instance-local service operator access and verification.",
     ],
+    reports: ["Reports", "Review submitted evidence, assign cases, and record moderation decisions."],
     audit: [
       "Audit",
       "Content-free operator security and control-plane history.",
@@ -392,6 +403,7 @@ function selectView(view) {
 }
 async function loadView(manual = false) {
   if (!state.me) return;
+  const epoch = ++state.viewEpoch;
   showLoading();
   try {
     if (state.view === "overview") await renderOverview();
@@ -401,10 +413,13 @@ async function loadView(manual = false) {
     else if (state.view === "host") await renderHost();
     else if (state.view === "operators") await renderOperators();
     else if (state.view === "audit") await renderAudit();
+    else if (state.view === "reports") await renderReports(epoch);
+    if (epoch !== state.viewEpoch) return;
     $("#last-refresh").textContent =
       `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
     if (manual) toast("Refreshed.");
   } catch (e) {
+    if (epoch !== state.viewEpoch) return;
     clear(content);
     const box = el("div", "panel");
     box.append(el("strong", "", "Could not load this view"));
@@ -415,9 +430,9 @@ async function loadView(manual = false) {
 function scheduleRefresh() {
   stopRefresh();
   const ms = state.view === "control" ? 30000 : 15000;
-  if (["overview", "host", "control"].includes(state.view))
+  if (["overview", "host", "control", "reports"].includes(state.view))
     state.refreshTimer = setInterval(() => {
-      if (!document.hidden && state.me) loadView();
+      if (!document.hidden && state.me && $("#modal-backdrop").hidden && !content.querySelector("input:focus,textarea:focus,select:focus")) loadView();
     }, ms);
 }
 function stopRefresh() {
@@ -430,7 +445,7 @@ document.addEventListener("visibilitychange", () => {
   if (
     !document.hidden &&
     state.me &&
-    ["overview", "host", "control"].includes(state.view)
+    ["overview", "host", "control", "reports"].includes(state.view)
   )
     loadView();
 });
@@ -931,7 +946,7 @@ function confirmAccountAction(
     }
   });
 }
-function showModerationAction(user, current, action) {
+function showModerationAction(user, current, action, report = null) {
   if (action === "restore") {
     confirmAction(
       "Restore account access?",
@@ -1011,11 +1026,13 @@ function showModerationAction(user, current, action) {
   apply.type = "submit";
   apply.setAttribute("form", form.id);
   cancel.addEventListener("click", () =>
-    showUser(user.id).catch((e) => toast(e.message, true)),
+    (report ? showReport(report.id) : showUser(user.id)).catch((e) => toast(e.message, true)),
   );
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (apply.disabled) return;
     apply.disabled = true;
+    const epoch = state.modalEpoch;
     const rawExpiry = expiry.querySelector("input").value;
     const expiresAt = rawExpiry ? new Date(rawExpiry).getTime() : 0;
     try {
@@ -1027,16 +1044,128 @@ function showModerationAction(user, current, action) {
           reason: reasonField.querySelector("input").value,
           severity: severity.querySelector("select").value,
           expires_at: Number.isFinite(expiresAt) ? expiresAt : 0,
+          ...(report ? { report_id: report.id, report_revision: report.revision } : {}),
         },
       });
       toast(spec.toast);
-      await showUser(user.id);
+      if (epoch === state.modalEpoch) await (report ? showReport(report.id) : showUser(user.id));
+      if (report && state.view === "reports") loadView();
     } catch (err) {
       toast(err.message, true);
       apply.disabled = false;
     }
   });
-  showModal(spec.modal, spec.note, form, [cancel, apply]);
+  showModal(spec.modal, report ? `Case #${report.id}. This decision restricts the account and resolves this case together. Enter a user-facing reason without identifying the reporter.` : spec.note, form, [cancel, apply]);
+}
+
+const reportCategories = { harassment: "Harassment or bullying", hate: "Hate or discrimination", threats: "Threats or violence", spam: "Spam", scam: "Scam or fraud", privacy: "Privacy violation", impersonation: "Impersonation", other: "Other" };
+async function renderReports(epoch) {
+  const filters = { ...state.reports }, params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) if (value !== null && value !== "") params.set(key, value);
+  params.set("limit", "30");
+  const data = await api(`/reports?${params}`);
+  if (epoch !== state.viewEpoch || state.view !== "reports" || !canOperate()) return;
+  const panel = el("section", "panel report-queue"), form = el("form", "report-filters");
+  for (const [name, label, values] of [
+    ["status", "Status", ["active", "all", "open", "in_review", "resolved", "dismissed", "withdrawn"]],
+    ["priority", "Priority", ["all", "low", "normal", "high", "urgent"]],
+    ["assigned", "Assignment", ["all", "mine", "unassigned"]],
+  ]) { const control = fieldSelect(label, name, values); control.querySelector("select").value = filters[name]; form.append(control); }
+  const search = field("Reporter or reported username", "q", "search"); search.querySelector("input").value = filters.q; search.querySelector("input").maxLength = 100;
+  const apply = el("button", "primary", "Filter reports"); apply.type = "submit"; form.append(search, apply);
+  form.addEventListener("submit", event => { event.preventDefault(); state.reports = { status: inputValue(form,"status"), priority: inputValue(form,"priority"), assigned: inputValue(form,"assigned"), q: inputValue(form,"q"), before: null }; loadView(); });
+  panel.append(form, el("p", "muted", `${fmtNum(data.counts?.open)} awaiting review · ${fmtNum(data.counts?.in_review)} under review. Cases involving your own account are excluded.`));
+  const list = el("div", "report-case-list");
+  for (const report of data.items || []) {
+    const button = el("button", `report-queue-item priority-${report.priority}`); button.type = "button"; button.dataset.reportId = report.id;
+    button.append(el("strong", "", `#${report.id} · ${reportCategories[report.category] || report.category}`), el("span", "", `Reported: ${report.subject_display_name || report.subject_username} (@${report.subject_username})`), el("span", "muted", `Reporter: ${report.reporter_display_name || report.reporter_username} (@${report.reporter_username})`), el("span", "report-status", `${titleCase(report.status)} · ${titleCase(report.priority)} · ${report.assignee_id ? `Reviewer #${report.assignee_id}` : "Unassigned"} · ${fmtTime(report.created_at)}`));
+    button.addEventListener("click", () => showReport(report.id)); list.append(button);
+  }
+  if (!list.children.length) list.append(el("p", "empty-state", "No reports match these filters."));
+  const paging = el("div", "report-actions");
+  if (filters.before) { const newest = el("button", "secondary", "Newest reports"); newest.addEventListener("click", () => { state.reports.before = null; loadView(); }); paging.append(newest); }
+  if (data.next_before) { const more = el("button", "secondary", "Older reports"); more.addEventListener("click", () => { state.reports.before = data.next_before; loadView(); }); paging.append(more); }
+  panel.append(list, paging); clear(content); content.append(panel);
+}
+async function showReport(id) {
+  if (!canOperate()) return;
+  showModal(`Report #${id}`, "Loading case…", el("p", "muted", "Loading…"));
+  const epoch = state.modalEpoch;
+  let report;
+  try { report = await api(`/reports/${id}`); }
+  catch (error) { if (epoch === state.modalEpoch) { $("#modal-subtitle").textContent = "Could not load case"; $("#modal-body").replaceChildren(el("p", "error", error.message)); } return; }
+  if (epoch !== state.modalEpoch || $("#modal-backdrop").hidden || !canOperate()) return;
+  const body = el("div", "report-detail"); body.dataset.reportId = id;
+  body.append(el("p", "report-status", `${titleCase(report.status)} · ${titleCase(report.priority)} · ${report.assignee_id ? `Reviewer #${report.assignee_id}` : "Unassigned"}`));
+  const identities = el("div", "report-identities");
+  for (const [label, prefix] of [["Reported account", "subject"], ["Reporter", "reporter"]]) {
+    const card = el("section", "report-identity"); card.append(el("small", "muted", label), el("strong", "", report[`${prefix}_display_name`] || report[`${prefix}_username`]), el("span", "", `@${report[`${prefix}_username`]} · ${report[`${prefix}_id`] ? `user ${report[`${prefix}_id`]}` : "deleted account"}`)); identities.append(card);
+  }
+  body.append(identities, el("h3", "", "Submitted reason"), el("p", "report-text", report.reason || "Screenshot evidence only."));
+  const context = report.message_context || {};
+  if (context.message_id) {
+    body.append(el("h3", "", "Message context"), el("p", "muted", `Message #${context.message_id} · ${fmtTime(context.created_at)}`));
+    body.append(el("pre", "report-text", context.body === undefined ? "The reporter did not share the message text." : context.body));
+  }
+  const gallery = el("div", "report-evidence-gallery");
+  for (const evidence of report.evidence || []) {
+    const figure = el("figure", ""), link = el("a", ""); link.href = `/api/reports/${report.id}/evidence/${evidence.id}`; link.target = "_blank"; link.rel = "noopener noreferrer";
+    const image = el("img", ""); image.src = link.href; image.alt = evidence.name; image.loading = "lazy"; link.append(image);
+    figure.append(link, el("figcaption", "", `${evidence.name} · ${fmtBytes(evidence.size)}`)); gallery.append(figure);
+  }
+  if (gallery.children.length) body.append(el("h3", "", "Submitted screenshots"), gallery);
+  if (report.evidence_purged_at) body.append(el("p", "muted", `Evidence expired under the retention policy on ${fmtTime(report.evidence_purged_at)}.`));
+  if (report.public_response) body.append(el("h3", "", "Response visible to reporter"), el("p", "report-text", report.public_response));
+  const active = ["open", "in_review"].includes(report.status), own = report.assignee_id === state.me.user_id, owner = state.me.role === "owner", writable = !report.assignee_id || own || owner;
+  const actions = el("div", "report-actions"); let busy = false;
+  const mutate = async patch => {
+    if (busy) return; busy = true; const token = state.modalEpoch;
+    for (const control of body.querySelectorAll("button,input,textarea,select")) control.disabled = true;
+    try {
+      await api(`/reports/${id}`, { method: "POST", body: { ...patch, expected_revision: report.revision } });
+      if (token === state.modalEpoch) await showReport(id);
+      if (state.view === "reports") loadView();
+    } catch (error) {
+      toast(error.message, true);
+      if (token === state.modalEpoch) for (const control of body.querySelectorAll("button,input,textarea,select")) control.disabled = false;
+    } finally { busy = false; }
+  };
+  const actionButton = (label, patch, cls = "secondary") => { const button = el("button", cls, label); button.type = "button"; button.addEventListener("click", () => mutate(patch)); return button; };
+  const refresh = el("button", "secondary", "Reload case"); refresh.type = "button"; refresh.addEventListener("click", () => showReport(id)); actions.append(refresh);
+  if (active && writable) {
+    if (!own) actions.append(actionButton("Assign to me", { action: "claim" }, "primary"));
+    if (report.assignee_id) actions.append(actionButton("Unassign", { action: "unassign" }));
+    const priority = fieldSelect("Priority", "priority", ["low", "normal", "high", "urgent"]); priority.querySelector("select").value = report.priority;
+    const setPriority = el("button", "secondary", "Set priority"); setPriority.type = "button"; setPriority.addEventListener("click", () => mutate({ action: "priority", priority: priority.querySelector("select").value })); actions.append(priority, setPriority);
+  }
+  body.append(actions);
+  if (writable) {
+    const noteForm = el("form", "auth-form report-note-form"), note = el("label", "", "Internal review note"), textarea = el("textarea", ""); textarea.name = "note"; textarea.rows = 3; textarea.maxLength = 4000; textarea.required = true; note.append(textarea);
+    const save = el("button", "secondary", "Add internal note"); save.type = "submit"; noteForm.append(note, el("p", "form-help", "Internal notes are visible only to authorized reviewers."), save);
+    noteForm.addEventListener("submit", event => { event.preventDefault(); mutate({ action: "note", note: textarea.value }); }); body.append(noteForm);
+    if ((active && (own || owner)) || ["resolved", "dismissed"].includes(report.status)) {
+      const form = el("form", "auth-form report-decision-form"), noteLabel = el("label", "", "Decision note (internal)"), noteInput = el("textarea", ""); noteInput.name = "note"; noteInput.required = true; noteInput.maxLength = 4000; noteInput.rows = 3; noteLabel.append(noteInput); form.append(noteLabel);
+      const resolve = el("button", "primary", active ? "Resolve report" : "Reopen report"); resolve.type = "submit";
+      let resolution, response;
+      if (active) {
+        resolution = fieldSelect("Outcome", "resolution", ["no_violation", "insufficient_evidence", "duplicate", "invalid_report"]);
+        response = el("label", "", "Response to reporter (optional)"); const input = el("textarea", ""); input.name = "public_response"; input.maxLength = 1000; input.rows = 2; response.append(input); form.append(resolution, response);
+        const dismiss = el("button", "secondary", "Dismiss report"); dismiss.type = "button"; dismiss.addEventListener("click", () => { if (form.reportValidity()) mutate({ action: "dismiss", note: noteInput.value, resolution: inputValue(form,"resolution"), public_response: inputValue(form,"public_response") }); }); form.append(dismiss);
+      }
+      form.append(resolve); form.addEventListener("submit", event => { event.preventDefault(); mutate(active ? { action: "resolve", note: noteInput.value, resolution: inputValue(form,"resolution"), public_response: inputValue(form,"public_response") } : { action: "reopen", note: noteInput.value }); }); body.append(form);
+    }
+  } else body.append(el("p", "muted", "Another reviewer is assigned. A service owner can reassign this case."));
+  if (report.status === "in_review" && (own || owner) && report.subject_id) {
+    const moderation = el("div", "report-actions");
+    for (const [action, label] of [["suspend", "Suspend account"], ["ban", "Ban account"], ["disable", "Disable account"]]) {
+      const button = el("button", "danger", label); button.type = "button"; button.addEventListener("click", () => showModerationAction({ id: report.subject_id, username: report.subject_username, display_name: report.subject_display_name }, {}, action, report)); moderation.append(button);
+    }
+    body.append(el("h3", "", "Account moderation"), el("p", "form-help", "These actions affect the whole instance and resolve this case. Review the evidence first; reports alone do not establish a violation."), moderation);
+  }
+  body.append(el("h3", "", "Case history"));
+  const history = el("ol", "report-history");
+  for (const entry of report.history || []) { const item = el("li", ""); item.append(el("strong", "", `${titleCase(entry.action)} · @${entry.actor_username}`), el("small", "muted", fmtTime(entry.created_at))); if (entry.note) item.append(el("p", "report-text", entry.note)); history.append(item); }
+  body.append(history); showModal(`Report #${id} · ${reportCategories[report.category] || report.category}`, `Submitted ${fmtTime(report.created_at)}`, body);
 }
 
 async function renderServers() {
@@ -1823,6 +1952,8 @@ async function showSecurityModal() {
 }
 
 function showModal(title, subtitle, body, actions = [], locked = false) {
+  state.modalEpoch++;
+  if ($("#modal-backdrop").hidden) state.modalTrigger = document.activeElement;
   state.modalLocked = locked;
   state.modalOnClose = null;
   $("#modal-title").textContent = title;
@@ -1853,7 +1984,10 @@ function showModal(title, subtitle, body, actions = [], locked = false) {
 function closeModal(force = false) {
   if (state.modalLocked && !force) return false;
   if (!$("#modal-backdrop").hidden) {
+    state.modalEpoch++;
     $("#modal-backdrop").hidden = true;
+    state.modalTrigger?.isConnected && state.modalTrigger.focus({ preventScroll: true });
+    state.modalTrigger = null;
     state.modalLocked = false;
     $("#modal-close").hidden = false;
     clear($("#modal-body"));
@@ -1864,6 +1998,12 @@ function closeModal(force = false) {
   }
   return true;
 }
+document.addEventListener("keydown", event => {
+  if (event.key !== "Tab" || $("#modal-backdrop").hidden) return;
+  const items = [...$("#modal-backdrop").querySelectorAll("button,input,textarea,select,a[href]")].filter(node => !node.disabled && node.getClientRects().length);
+  const first = items[0], last = items.at(-1);
+  if (first && (!$("#modal-backdrop").contains(document.activeElement) || (event.shiftKey && document.activeElement === first) || (!event.shiftKey && document.activeElement === last))) { event.preventDefault(); (event.shiftKey ? last : first).focus(); }
+}, true);
 $("#modal-close").addEventListener("click", () => closeModal());
 $("#modal-backdrop").addEventListener("click", (e) => {
   if (e.target === $("#modal-backdrop")) closeModal();

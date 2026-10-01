@@ -33,9 +33,9 @@ npm run test:rtc                           # WebRTC regressions
 make load USERS=250 DURATION=2 RATE=2000   # in-process realtime fanout smoke (CI runs this)
 ```
 
-The browser tests serve `priv/static` from a throwaway Node server and fulfil `/api/**` with fixtures from `test/browser/fixtures.mjs`. They don't need PostgreSQL. Two EUnit modules (account recovery and upload authorization) run against a real database only when `PLAINWIRE_TEST_POSTGRES_PORT`/`_USER`/`_DB` are set; otherwise they're skipped.
+The browser tests serve `priv/static` from a throwaway Node server and fulfil `/api/**` with fixtures from `test/browser/fixtures.mjs`. They don't need PostgreSQL. Account recovery, upload authorization, group-call authorization, and reporting EUnit modules run against a real database only when `PLAINWIRE_TEST_POSTGRES_PORT`/`_USER`/`_DB` are set; otherwise they're skipped.
 
-CI (`.github/workflows/ci.yml`) runs these steps in order: verify-source, `npm run build`, `rebar3 compile && rebar3 eunit`, the load smoke, the live-load selftest, `gleam format --check`/`gleam check` in `tools/load/gleam`, then test:browser, test:security-audit, test:rtc, and the source archive build.
+CI (`.github/workflows/ci.yml`) runs these steps in order: verify-source, `npm run build`, `rebar3 compile && rebar3 eunit`, the load smoke, the live-load selftest, `gleam format --check`/`gleam check` in `tools/load/gleam`, then test:browser, test:security-audit, test:reports, test:rtc, and the source archive build.
 
 ## Source contracts: read before refactoring
 
@@ -61,7 +61,7 @@ The version is pinned in several places, and verify-source checks they all match
 - **`pw_db`** (~10k lines) holds nearly all domain logic and authorization, not just SQL. Each public function wraps a message (`login(U,P) -> call({login,U,P})`). `call/1` reserves a slot on a pool of *lanes*, where each lane is a process owning one epgsql connection, and the work runs in the matching `route({...}, Conn)` clause. Add a feature as an export, a `call` wrapper and a `route` clause. The schema and migrations live in `pw_db_schema.erl`.
 - **Message storage:** `pw_message_store` is the read/edit/delete boundary. Its backend is `postgres`, `scylla` or `dual`, chosen by `pw_scylla_config`; in `dual`, PostgreSQL stays the read authority. Writes always go through `pw_db` so that PG transactions, Scylla write intents and the durable `pw_storage_outbox` can't be bypassed. `pw_storage_reconciler`/`pw_storage_migration` handle backfill. PostgreSQL is always required.
 - **Realtime:** `pw_ws` is the per-connection Cowboy WebSocket handler for users and bots. `pw_hub` is the control-plane gen_server for presence, subscriptions and the call/voice state machine. Hot-path fanout skips the hub mailbox: it goes through concurrent ETS in `pw_realtime_registry`, and `pw_realtime_delivery` sends the JSON frames. Calls are mesh WebRTC (`pw_media_topology`), with TURN config from `pw_rtc_config`/`pw_cf_turn`.
-- **Optional subsystems** are gated by env vars and degrade to no-ops when disabled: `pw_redis` (`PLAINWIRE_REDIS_ENABLED`), Scylla (`pw_scylla*`), clustering (`pw_cluster*`; the Partisan transport exists only in the `PROFILE=cluster` rebar profile), the admin control plane (`pw_admin_*`, separate listener, "private-content blind" by design), the native media-quality worker (`pw_media_quality`), mail, KLIPY and the GitHub proxy.
+- **Optional subsystems** are gated by env vars and degrade to no-ops when disabled: `pw_redis` (`PLAINWIRE_REDIS_ENABLED`), Scylla (`pw_scylla*`), clustering (`pw_cluster*`; the Partisan transport exists only in the `PROFILE=cluster` rebar profile), the admin control plane (`pw_admin_*`, separate listener, operational metadata plus explicitly submitted moderation evidence), the native media-quality worker (`pw_media_quality`), mail, KLIPY and the GitHub proxy.
 - **Background dispatchers** (webhooks, app interactions, AI bots, upload GC, search index) poll claim/finish functions in `pw_db`.
 - Configuration comes from env vars read at runtime (`pw_util:env_int/2` etc.), not from `sys.config`.
 

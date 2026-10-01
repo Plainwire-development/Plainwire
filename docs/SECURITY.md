@@ -10,7 +10,7 @@ Redis is a realtime accelerator. Presence, rate limits, temporary coordination a
 
 ScyllaDB is an optional high-volume timeline store. Enabling it does not replace PostgreSQL authority for accounts, permissions or other relational metadata.
 
-The host control plane is separate from per-server moderation and remains private-content blind.
+The host control plane is separate from per-server moderation. Operational views cannot browse private content. Reports expose only evidence explicitly submitted by a reporter to authorized owners and operators.
 
 ## Message encryption at rest
 
@@ -109,7 +109,7 @@ Do not expose TURN administration interfaces publicly. Restrict firewall rules t
 
 ## Host-admin privacy boundary
 
-The service control plane exposes service health and account/server operational metadata needed to run the instance. It intentionally does not expose:
+The service control plane exposes service health and account/server operational metadata. Operational views do not expose:
 
 - private message or DM bodies;
 - attachment contents;
@@ -117,6 +117,10 @@ The service control plane exposes service health and account/server operational 
 - plaintext bot tokens;
 - plaintext host-admin verification material;
 - encryption or TURN secrets.
+
+The report review endpoints are a bounded exception for reporter-submitted reasons and screenshots, plus an opt-in snapshot of one accessible, undeleted message authored by the reported account. No surrounding conversation or arbitrary upload can be fetched through report review. Reporters can read only their own cases; viewers cannot review cases. Cases filed by or about the current reviewer are excluded. Internal notes and assignment never enter reporter responses. Review reads and actions are audited without evidence content.
+
+Report screenshots are copied into PostgreSQL, independently of the original upload's deletion. Reasons, message copies, review notes, custom reporter responses, and screenshot bytes use `PLAINWIRE_ENC_KEY` encryption at rest when configured, with existing previous-key rotation support. Closed-case screenshots and message snapshots expire after 90 days by default; case reasons and review history remain. Protect the database, backups, and encryption keys accordingly. See [report limits and retention](REPORTING.md).
 
 Host access is still privileged. Somebody who controls the machine, database and encryption keys can access more than the web control plane intentionally exposes.
 

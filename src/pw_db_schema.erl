@@ -578,4 +578,19 @@ migrations() -> [
         "ALTER TABLE instance_account_actions DROP CONSTRAINT IF EXISTS instance_account_actions_action_check",
         "ALTER TABLE instance_account_actions ADD CONSTRAINT instance_account_actions_action_check CHECK(action IN ('suspend','ban','restore','disable','revoke_sessions','clear_display_name','remove_email','resend_verification'))"
     ]}
+    ,{54, [
+        "CREATE TABLE IF NOT EXISTS moderation_reports(id bigserial PRIMARY KEY,reporter_id integer REFERENCES users(id) ON DELETE SET NULL,subject_id integer REFERENCES users(id) ON DELETE SET NULL,reporter_username text NOT NULL,reporter_display_name text NOT NULL,subject_username text NOT NULL,subject_display_name text NOT NULL,category text NOT NULL CHECK(category IN ('harassment','hate','threats','spam','scam','privacy','impersonation','other')),reason text NOT NULL CHECK(char_length(reason)<=22000),message_context jsonb NOT NULL DEFAULT '{}'::jsonb,status text NOT NULL DEFAULT 'open' CHECK(status IN ('open','in_review','resolved','dismissed','withdrawn')),priority text NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high','urgent')),assignee_id integer REFERENCES users(id) ON DELETE SET NULL,resolution text NOT NULL DEFAULT '',public_response text NOT NULL DEFAULT '',request_key text NOT NULL,request_hash text NOT NULL,revision integer NOT NULL DEFAULT 1,created_at bigint NOT NULL,updated_at bigint NOT NULL,closed_at bigint NOT NULL DEFAULT 0,evidence_purged_at bigint NOT NULL DEFAULT 0,UNIQUE(reporter_id,request_key))",
+        "CREATE INDEX IF NOT EXISTS idx_reports_queue ON moderation_reports(status,id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_reports_reporter ON moderation_reports(reporter_id,created_at DESC,id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_reports_subject ON moderation_reports(subject_id,id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_reports_assignee ON moderation_reports(assignee_id,status,id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_reports_closed ON moderation_reports(closed_at,id) WHERE closed_at>0 AND evidence_purged_at=0",
+        "CREATE TABLE IF NOT EXISTS moderation_report_evidence(id bigserial PRIMARY KEY,report_id bigint NOT NULL REFERENCES moderation_reports(id) ON DELETE CASCADE,owner_id integer NOT NULL,name text NOT NULL,content_type text NOT NULL CHECK(content_type IN ('image/png','image/jpeg')),size integer NOT NULL CHECK(size>0 AND size<=5242880),sha256 text NOT NULL,data bytea NOT NULL,stored_size bigint GENERATED ALWAYS AS (octet_length(data)) STORED,CHECK(octet_length(data)>=size AND octet_length(data)<=size*2+100))",
+        "CREATE INDEX IF NOT EXISTS idx_report_evidence_report ON moderation_report_evidence(report_id,id)",
+        "CREATE INDEX IF NOT EXISTS idx_report_evidence_owner ON moderation_report_evidence(owner_id)",
+        "CREATE TABLE IF NOT EXISTS moderation_evidence_budget(id integer PRIMARY KEY CHECK(id=1),bytes bigint NOT NULL DEFAULT 0 CHECK(bytes>=0))",
+        "INSERT INTO moderation_evidence_budget(id,bytes) VALUES(1,0) ON CONFLICT DO NOTHING",
+        "CREATE TABLE IF NOT EXISTS moderation_report_events(id bigserial PRIMARY KEY,report_id bigint NOT NULL REFERENCES moderation_reports(id) ON DELETE CASCADE,actor_id integer REFERENCES users(id) ON DELETE SET NULL,actor_username text NOT NULL,action text NOT NULL,note text NOT NULL DEFAULT '',created_at bigint NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_report_events_report ON moderation_report_events(report_id,id)"
+    ]}
 ].

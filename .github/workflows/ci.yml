@@ -18,6 +18,21 @@ jobs:
     name: OTP 29 / Node 24 / Gleam 1.18
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: plainwire_audit
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U plainwire_audit -d postgres"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      PLAINWIRE_TEST_POSTGRES_PORT: 5432
+      PLAINWIRE_TEST_POSTGRES_USER: plainwire_audit
+      PLAINWIRE_TEST_POSTGRES_DB: postgres
     steps:
       - uses: actions/checkout@v7
         with:
@@ -72,6 +87,8 @@ jobs:
         run: npm run test:browser
       - name: Browser security regression suite
         run: npm run test:security-audit
+      - name: Reporting and moderation browser regressions
+        run: npm run test:reports
       - name: WebRTC regression suite
         run: npm run test:rtc
       - name: Verify source archive construction

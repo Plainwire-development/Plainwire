@@ -317,6 +317,17 @@
 
   const friendlyApiError = (code) => ({
     forbidden: 'You do not have permission to do that.',
+    invalid_evidence: 'A screenshot is unavailable or is not a supported PNG or JPEG image.',
+    report_reason_required: 'Add a reason or at least one screenshot.',
+    report_rate_limited: 'You have reached the limit of 5 new reports per day. Try again tomorrow.',
+    report_conflict: 'This report changed. Refresh My reports before continuing.',
+    report_closed: 'This report is already closed. Refresh My reports to see its status.',
+    report_request_conflict: 'This submission changed during a retry. Close the form and submit it again.',
+    report_evidence_quota: 'Your retained screenshot evidence exceeds 32 MiB. You can submit a reason without screenshots.',
+    report_evidence_storage_full: 'Screenshot storage is full. You can submit a reason without screenshots or try later.',
+    invalid_report_message: 'This message can no longer be included. Report the account from its profile or user menu.',
+    cannot_report_self: 'You cannot report your own account.',
+    invalid_report: 'Check the report category, reason, and evidence, then try again.',
     not_found: 'That item no longer exists.',
     role_hierarchy: 'That role or member is at or above your highest manageable role.',
     owner_role_locked: 'The owner role cannot be reassigned.',
@@ -451,7 +462,7 @@
   let modalSequence = 0;
   const activeModals = new Set();
   let modalBodyWasInert = false;
-  const modalShell = (titleText, subtitle = '') => {
+  const modalShell = (titleText, subtitle = '', onDestroy = null) => {
     const trigger = document.activeElement;
     const backdrop = document.createElement('div'); backdrop.className = 'admin-modal-backdrop';
     const dialog = document.createElement('section'); dialog.className = 'admin-modal-shell'; dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-modal', 'true'); dialog.tabIndex = -1;
@@ -486,16 +497,18 @@
     const destroy = () => {
       if (!activeModals.has(backdrop)) return;
       const wasTop = isTopModal();
-      activeModals.delete(backdrop); backdrop.remove(); document.removeEventListener('keydown', keydown, true);
+      activeModals.delete(backdrop); backdrop.remove(); onDestroy?.(); document.removeEventListener('keydown', keydown, true);
       if (!activeModals.size) document.body.inert = modalBodyWasInert;
       if (wasTop && trigger?.isConnected && !trigger.closest('[inert]')) trigger.focus({ preventScroll: true });
       else if (wasTop && activeModals.size) [...activeModals].at(-1).querySelector('[role="dialog"]')?.focus();
     };
+    backdrop.addEventListener('plainwire-modal-dismiss', destroy);
     close.addEventListener('click', destroy); backdrop.addEventListener('click', event => { if (event.target === backdrop) destroy(); });
     document.addEventListener('keydown', keydown, true);
     requestAnimationFrame(() => { if (backdrop.isConnected && isTopModal() && !dialog.contains(document.activeElement)) (focusable()[0] || dialog).focus({ preventScroll: true }); });
     return { backdrop, dialog, body, destroy, setTitle(value) { title.textContent = value; } };
   };
+  const closeAllModals = () => { for (const backdrop of [...activeModals].reverse()) backdrop.dispatchEvent(new Event('plainwire-modal-dismiss')); };
   const makeField = (labelText, value = '', { multiline = false, type = 'text', placeholder = '', maxLength = null } = {}) => {
     const label = document.createElement('label'); label.className = 'admin-field'; const span = document.createElement('span'); span.textContent = labelText;
     const input = multiline ? document.createElement('textarea') : document.createElement('input');
@@ -506,6 +519,113 @@
   };
   const adminMessage = (container, message, kind = 'muted') => {
     const el = document.createElement('p'); el.className = `admin-inline-message ${kind}`; el.textContent = message; container.append(el); return el;
+  };
+
+  const reportLabels = { harassment: 'Harassment or bullying', hate: 'Hate or discrimination', threats: 'Threats or violence', spam: 'Spam', scam: 'Scam or fraud', privacy: 'Privacy violation', impersonation: 'Impersonation', other: 'Other' };
+  const reportStatus = value => ({ open: 'Awaiting review', in_review: 'Under review', resolved: 'Resolved', dismissed: 'Dismissed', withdrawn: 'Withdrawn' })[value] || value;
+  const reportNode = (tag, className, text) => {
+    const node = document.createElement(tag); node.className = className;
+    if (text !== undefined) node.textContent = String(text); return node;
+  };
+  const reportButton = (label, handler, secondary = false) => {
+    const button = reportNode('button', secondary ? 'btn secondary' : 'btn', label); button.type = 'button'; button.addEventListener('click', handler); return button;
+  };
+  const openReportDialog = data => {
+    const userId = Number(data?.user_id), messageId = Number(data?.message_id || 0);
+    if (!Number.isSafeInteger(userId) || userId <= 0) return;
+    const previews = new Set();
+    const shell = modalShell(`Report ${data?.display_name || 'account'}`, 'Reports go to this instance’s moderation team. Include a reason, screenshots, or both.', () => { for (const url of previews) URL.revokeObjectURL(url); });
+    const form = reportNode('form', 'report-form'); form.dataset.reportForm = '';
+    const categoryLabel = reportNode('label', 'admin-field'), category = reportNode('select', ''); category.name = 'category';
+    categoryLabel.append(reportNode('span', '', 'Reason category'), category);
+    for (const [value, label] of Object.entries(reportLabels)) { const option = reportNode('option', '', label); option.value = value; category.append(option); }
+    category.value = 'other';
+    const reason = makeField('What happened? (optional with screenshots)', '', { multiline: true, maxLength: 4000, placeholder: 'Describe what happened and any relevant context.' }); reason.input.name = 'reason';
+    const evidenceLabel = reportNode('label', 'admin-field'), evidence = reportNode('input', ''); evidence.type = 'file'; evidence.name = 'evidence'; evidence.multiple = true; evidence.accept = 'image/png,image/jpeg';
+    evidenceLabel.append(reportNode('span', '', 'Screenshot evidence (optional)'), evidence);
+    const gallery = reportNode('div', 'report-evidence-gallery');
+    const messageLabel = reportNode('label', 'report-message-consent'), includeMessage = reportNode('input', ''); includeMessage.type = 'checkbox'; includeMessage.name = 'include_message';
+    messageLabel.append(includeMessage, document.createTextNode('Share a copy of this message with the moderation team. Surrounding messages are not included.'));
+    const feedback = reportNode('p', 'admin-inline-message'); feedback.setAttribute('role', 'status');
+    const actions = reportNode('div', 'admin-row-actions'), submit = reportNode('button', 'btn', 'Submit report'); submit.type = 'submit';
+    const mine = reportButton('My reports', () => { shell.destroy(); openMyReports(); }, true); actions.append(mine, submit);
+    form.append(categoryLabel, reason.label, evidenceLabel, reportNode('p', 'muted', 'Up to 3 PNG or JPEG screenshots, 5 MiB each. Review screenshots for private information before sharing. Up to 5 new reports per day.'), gallery);
+    if (messageId > 0) form.append(messageLabel);
+    form.append(feedback, actions); shell.body.append(form);
+    let files = [], busy = false, requestKey = '', lastPayload = '';
+    const uploaded = new WeakMap();
+    evidence.addEventListener('change', () => {
+      for (const url of previews) URL.revokeObjectURL(url); previews.clear(); gallery.replaceChildren();
+      files = [...evidence.files]; feedback.textContent = '';
+      if (files.length > 3 || files.some(file => !['image/png', 'image/jpeg'].includes(file.type) || !file.size || file.size > 5242880)) {
+        feedback.textContent = 'Choose up to 3 PNG or JPEG screenshots, 5 MiB each.'; feedback.classList.add('error'); files = []; evidence.value = ''; return;
+      }
+      feedback.classList.remove('error');
+      for (const file of files) { const url = URL.createObjectURL(file); previews.add(url); const figure = reportNode('figure', ''); const img = reportNode('img', ''); img.src = url; img.alt = file.name; figure.append(img, reportNode('figcaption', '', file.name)); gallery.append(figure); }
+    });
+    form.addEventListener('submit', async event => {
+      event.preventDefault(); if (busy) return;
+      if (!reason.input.value.trim() && !files.length) { feedback.textContent = 'Add a reason or at least one screenshot.'; feedback.classList.add('error'); reason.input.focus(); return; }
+      busy = true; for (const input of form.querySelectorAll('input,textarea,select,button')) input.disabled = true;
+      feedback.classList.remove('error'); feedback.textContent = 'Submitting report…';
+      try {
+        const ids = [];
+        for (const file of files) {
+          if (!uploaded.has(file)) uploaded.set(file, (await uploadOne(file)).id);
+          if (!shell.backdrop.isConnected) return;
+          ids.push(uploaded.get(file));
+        }
+        const body = { user_id: userId, category: category.value, reason: reason.input.value.trim(), evidence_ids: ids, message_id: messageId, include_message: messageId > 0 && includeMessage.checked };
+        const fingerprint = JSON.stringify(body);
+        if (fingerprint !== lastPayload) { requestKey = crypto.randomUUID(); lastPayload = fingerprint; }
+        const result = await directApi('/reports', { method: 'POST', body: { ...body, request_key: requestKey } });
+        if (!shell.backdrop.isConnected) return;
+        shell.setTitle(`Report #${result.id} submitted`); shell.body.replaceChildren();
+        adminMessage(shell.body, 'Your report is awaiting review. You can track its status in My reports. Reports do not automatically restrict an account.');
+        const done = reportNode('div', 'admin-row-actions'); done.append(reportButton('My reports', () => { shell.destroy(); openMyReports(); }), reportButton('Done', shell.destroy, true)); shell.body.append(done);
+      } catch (error) {
+        if (shell.backdrop.isConnected) { feedback.textContent = friendlyApiError(error.code || error.message); feedback.classList.add('error'); }
+      } finally {
+        busy = false; if (form.isConnected) for (const input of form.querySelectorAll('input,textarea,select,button')) input.disabled = false;
+      }
+    });
+  };
+  const openMyReports = () => {
+    const shell = modalShell('My reports', 'Only you and authorized reviewers can access your submissions. Internal review notes remain private.');
+    const toolbar = reportNode('div', 'admin-row-actions'), list = reportNode('div', 'report-case-list'), status = reportNode('p', 'admin-inline-message'); status.setAttribute('role', 'status');
+    let next = null, busy = false, generation = 0;
+    const refresh = reportButton('Refresh', () => load(false), true), more = reportButton('Load older reports', () => load(true), true); more.hidden = true;
+    toolbar.append(refresh); shell.body.append(toolbar, status, list, more);
+    const load = async append => {
+      if (busy) return; busy = true; const epoch = ++generation; refresh.disabled = more.disabled = true; status.textContent = 'Loading…';
+      try {
+        const data = await directApi(`/reports?limit=30${append && next ? `&before=${next}` : ''}`);
+        if (!shell.backdrop.isConnected || epoch !== generation) return;
+        if (!append) list.replaceChildren(); status.textContent = ''; next = data.next_before; more.hidden = !next;
+        for (const report of data.items || []) {
+          const card = reportNode('section', 'admin-role-card report-case-card'); card.dataset.reportId = report.id;
+          card.append(reportNode('strong', '', `#${report.id} · ${report.subject_display_name || report.subject_username} (@${report.subject_username})`), reportNode('p', 'report-status', `${reportStatus(report.status)} · ${reportLabels[report.category] || report.category} · ${new Date(report.created_at).toLocaleString()}`));
+          if (report.reason) card.append(reportNode('p', 'report-text', report.reason));
+          if (report.public_response) card.append(reportNode('p', 'report-response', report.public_response));
+          const gallery = reportNode('div', 'report-evidence-gallery');
+          for (const image of report.evidence || []) { const img = reportNode('img', ''); img.src = `/api/reports/${report.id}/evidence/${image.id}`; img.alt = image.name; img.loading = 'lazy'; gallery.append(img); }
+          if (gallery.children.length) card.append(gallery);
+          if (report.evidence_purged_at) card.append(reportNode('p', 'muted', 'Submitted evidence expired under the retention policy.'));
+          if (['open', 'in_review'].includes(report.status)) {
+            const withdraw = reportButton('Withdraw report', async () => {
+              if (!window.confirm('Withdraw this report? It will leave the active review queue.')) return;
+              withdraw.disabled = true;
+              try { await directApi(`/reports/${report.id}/withdraw`, { method: 'POST', body: { expected_revision: report.revision } }); await load(false); }
+              catch (error) { if (shell.backdrop.isConnected) { status.textContent = error.message; status.classList.add('error'); withdraw.disabled = false; } }
+            }, true); card.append(withdraw);
+          }
+          list.append(card);
+        }
+        if (!list.children.length) adminMessage(list, 'You have not submitted any reports. Right-click a person or message to report an issue.');
+      } catch (error) { if (shell.backdrop.isConnected) { status.textContent = error.message; status.classList.add('error'); } }
+      finally { busy = false; refresh.disabled = more.disabled = false; }
+    };
+    load(false);
   };
 
   const extensionStorageKey = 'plainwire_extensions_v2';
@@ -2832,6 +2952,7 @@
       if (succeeded && ['/me', '/login', '/register'].includes(path) && json.data?.user?.id) {
         meId = json.data.user.id;
         if (extensionUserId !== meId) {
+          closeAllModals();
           extensionUserId = meId;
           applyClientExtensions().catch((error) => console.warn('[Plainwire:EXT] apply_failed', error));
         }
@@ -2859,6 +2980,7 @@
         }
       }
       if (succeeded && method === 'POST' && path === '/logout') {
+        closeAllModals();
         meId = null;
         extensionUserId = null;
         extensionGeneration++;
@@ -9123,6 +9245,13 @@
         }).catch(error => send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not ban member: ${error.message}` }));
         break;
       }
+      case 'report_user':
+        openReportDialog(data);
+        break;
+      case 'my_reports':
+        document.querySelectorAll('.workspace-menu[open]').forEach(menu => { menu.open = false; });
+        openMyReports();
+        break;
       case 'open_group_admin':
         openGroupAdmin(Number(data)).catch(error => send(app.ports.bridgeReceive, { tag: 'toast', data: `Could not open group moderation: ${error.message}` }));
         break;

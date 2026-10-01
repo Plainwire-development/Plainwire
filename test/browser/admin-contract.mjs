@@ -55,10 +55,10 @@ assert.match(db,/idx_messages_created_global ON messages\(created_at DESC\)/,'ad
 assert.match(db,/idx_messages_user ON messages\(user_id,id DESC\)/,'per-user admin message counts use a dedicated user index');
 
 const adminDb=db.slice(db.indexOf('route(admin_operator_count'),db.indexOf('route({register'));
-assert.doesNotMatch(adminDb,/SELECT[^"\n]*\bbody\b[^"\n]*FROM\s+(?:messages|threads|replies)\b/i,'admin DB surface never selects communication bodies');
-assert.doesNotMatch(adminDb,/SELECT[^"\n]*FROM\s+(?:messages|threads|replies)\b[^"\n]*\bbody\b/i,'admin DB surface never reads communication bodies through reordered SQL');
+assert.doesNotMatch(adminDb,/SELECT[^"\n]*\bbody\b[^"\n]*FROM\s+(?:messages|threads|replies)\b/i,'operational admin DB routes never select arbitrary communication bodies');
+assert.doesNotMatch(adminDb,/SELECT[^"\n]*FROM\s+(?:messages|threads|replies)\b[^"\n]*\bbody\b/i,'operational admin DB routes never read arbitrary communication bodies through reordered SQL');
 assert.doesNotMatch(adminDb,/avatar_url|banner_url|\bbio\b/,'admin DB surface avoids private/profile-content fields');
-assert.match(api,/content_access => false[\s\S]*message_bodies[\s\S]*attachment_contents[\s\S]*message_search/,'API publishes an explicit private-content blind contract');
+assert.match(api,/content_access => false[\s\S]*message_bodies[\s\S]*attachment_contents[\s\S]*message_search/,'API excludes private content from operational views');
 assert.doesNotMatch(api,/messages.*search|search.*messages/i,'admin API has no message-search route');
 assert.match(api,/same_site => strict/,'admin cookies use SameSite Strict');
 assert.match(api,/x-csrf-token/,'mutating admin requests require a separate CSRF token');
@@ -72,7 +72,7 @@ assert.doesNotMatch(js,/innerHTML|outerHTML|insertAdjacentHTML/,'admin UI does n
 assert.match(js,/Plainwire cannot recover this plaintext secret later/,'one-time operator secrets are explicitly surfaced as non-recoverable');
 assert.match(js,/modalLocked[\s\S]*closeModal\(true\)/,'one-time secret modal cannot be dismissed before explicit acknowledgement');
 assert.match(html,/Host recovery[\s\S]*local recovery token/i,'host-local recovery is visible only through its explicit emergency UI');
-assert.match(html,/Private-content blind by design/,'login surface states the privacy boundary before operator authentication');
+assert.match(html,/Private conversations stay private/,'login surface states the privacy boundary before operator authentication');
 assert.match(env,/PLAINWIRE_ADMIN_ENABLED/,'deployment example documents explicit admin enablement');
 assert.match(db,/route\(global_banners[\s\S]*starts_at<=\$1[\s\S]*ends_at=0 OR ends_at>\$1[\s\S]*LIMIT 32/,'public banner reads are bounded and expose only active announcements');
 
@@ -117,6 +117,6 @@ assert.match(api,/maps:take\(mail, Data\)[\s\S]*pw_mail:deliver_now\(Mail\)[\s\S
 assert.match(api,/admin_resend_verification[\s\S]*4, 600000[\s\S]*pw_mail:enabled/,'verification resend is operator-rate-limited and refuses when mail is off');
 assert.match(js,/Sign out everywhere[\s\S]*Reset display name[\s\S]*Remove email[\s\S]*Resend verification[\s\S]*Disable account/,'account controls are real labeled actions, not placeholder toasts');
 assert.match(clusterWire,/sessions_revoked/,'forced logout is allowed across cluster nodes');
-assert.doesNotMatch(js,/type=["']password["'][^>]{0,80}target password|impersonat/i,'admin UI does not add password-plaintext or impersonation tools');
+assert.doesNotMatch(js,/type=["']password["'][^>]{0,80}target password|el\(["']button["'][^;\n]{0,200}(?:impersonat|sign in as)/i,'admin UI does not add password-plaintext or impersonation tools');
 
 console.log('PASS: host-admin isolation/auth, global-banner and service-control persistence/realtime delivery, Erlang binding regressions, privacy boundaries, CSRF/rate limits, safe host telemetry, and DOM-safe admin UI contracts.');

@@ -26,7 +26,7 @@ route_bucket([First | _]) ->
         <<"email">>, <<"account">>, <<"sync">>, <<"profile">>, <<"notifications">>, <<"forums">>,
         <<"forum">>, <<"servers">>, <<"server">>, <<"channels">>, <<"messages">>,
         <<"conversation">>, <<"search">>, <<"friends">>, <<"friend">>, <<"users">>,
-        <<"uploads">>, <<"files">>, <<"github">>, <<"klipy">>, <<"developer">>
+        <<"uploads">>, <<"files">>, <<"reports">>, <<"github">>, <<"klipy">>, <<"developer">>
     ]) of
         true -> First;
         false -> other
@@ -294,6 +294,19 @@ authed(<<"GET">>, [<<"rtc-config">>], Req, Session, _) ->
     pw_util:ok_json(Req, #{ok=>true,data=>pw_rtc_config:get(uid(Session))});
 authed(<<"GET">>, [<<"voice-processing-config">>], Req, _Session, _) ->
     pw_util:ok_json(Req, #{ok=>true,data=>pw_rtc_config:voice_processing()});
+authed(<<"GET">>, [<<"reports">>, <<"config">>], Req, _Session, _) ->
+    result(Req, {ok, pw_reports:config()});
+authed(<<"GET">>, [<<"reports">>], Req, Session, _) ->
+    result(Req, pw_db:my_reports(uid(Session), report_options(Req)));
+authed(<<"POST">>, [<<"reports">>], Req0, Session, _) ->
+    case pw_rate:allow_shared({report_submit, uid(Session)}, 8, 60000) of
+        true -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_report(uid(Session), M)) end);
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>)
+    end;
+authed(<<"POST">>, [<<"reports">>, Id, <<"withdraw">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:withdraw_report(uid(Session), Id, M)) end);
+authed(<<"GET">>, [<<"reports">>, Id, <<"evidence">>, Evidence], Req, Session, _) ->
+    report_evidence_reply(Req, pw_db:report_evidence(reporter, uid(Session), Id, Evidence));
 authed(<<"POST">>, [<<"logout">>], Req0, _, _) ->
     Token = pw_util:cookie_value(Req0, <<"pw_session">>),
     _ = case Token of undefined -> ok; _ -> pw_db:logout(Token) end,
@@ -1049,6 +1062,20 @@ invoke_command_args(M) when is_map(M) ->
     end;
 invoke_command_args(_) -> <<>>.
 
+report_options(Req) -> maps:from_list([{K,V} || {K,V} <- cowboy_req:parse_qs(Req), lists:member(K,[<<"before">>,<<"limit">>])]).
+
+report_evidence_reply(Req, {ok, #{content_type := Type, data := Bytes}}) ->
+    Headers = maps:merge(pw_util:security_headers(), #{<<"content-type">> => Type,
+        <<"cache-control">> => <<"private, no-store">>, <<"content-disposition">> => <<"inline">>,
+        <<"content-security-policy">> => <<"default-src 'none'; frame-ancestors 'none'; sandbox">>}),
+    {ok, cowboy_req:reply(200, Headers, Bytes, Req), undefined};
+report_evidence_reply(Req, Error) -> result(Req, Error).
+
+result(Req, {error, report_evidence_unavailable}) -> pw_util:err_json(Req, 503, <<"report_evidence_unavailable">>);
+result(Req, {error, report_conflict}) -> pw_util:err_json(Req, 409, <<"report_conflict">>);
+result(Req, {error, report_request_conflict}) -> pw_util:err_json(Req, 409, <<"report_request_conflict">>);
+result(Req, {error, report_rate_limited}) -> pw_util:err_json(Req, 429, <<"report_rate_limited">>);
+result(Req, {error, report_evidence_storage_full}) -> pw_util:err_json(Req, 503, <<"report_evidence_storage_full">>);
 result(Req, {ok, Data}) -> pw_util:ok_json(Req, #{ok=>true,data=>Data});
 result(Req, ok) -> pw_util:ok_json(Req, #{ok=>true});
 result(Req, {error, database_unavailable}) -> pw_util:err_json(Req, 503, <<"database_unavailable">>);

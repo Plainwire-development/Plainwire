@@ -47,6 +47,8 @@
     admin_operators/1, admin_set_operator_role/3, admin_remove_operator/2,
     admin_overview/0, admin_users/3, admin_user/1, admin_servers/3, admin_server/1,
     admin_user_moderation/2, admin_user_moderation_history/2, admin_apply_user_moderation/4,
+    create_report/2, my_reports/2, withdraw_report/3, report_evidence/4,
+    admin_reports/2, admin_report/2, admin_update_report/3, reports_gc/0,
     admin_audit/2, admin_record_audit/6,
     global_banners/0, invalidate_global_banners_cache/0, admin_banners/0, admin_create_banner/2, admin_update_banner/3, admin_delete_banner/3,
     instance_registration_mode/0, admin_set_registration_mode/2
@@ -58,7 +60,7 @@
          normalize_ai_provider/1, normalize_ai_chat_trigger/1, normalize_ai_temperature/1,
          command_options_from_args/1, search_state/1]).
 -export([test_account_recovery/2]).
--export([test_validate_upload_refs/3, test_edit_thread/2, test_call_invite_target/4]).
+-export([test_validate_upload_refs/3, test_edit_thread/2, test_call_invite_target/4, test_reports/2]).
 -endif.
 
 -record(st, {}).
@@ -487,6 +489,14 @@ admin_user(Uid) -> call({admin_user, Uid}).
 admin_user_moderation(ActorUid, TargetUid) -> call({admin_user_moderation, ActorUid, TargetUid}).
 admin_user_moderation_history(ActorUid, TargetUid) -> call({admin_user_moderation_history, ActorUid, TargetUid}).
 admin_apply_user_moderation(ActorUid, TargetUid, Action, Patch) -> call({admin_apply_user_moderation, ActorUid, TargetUid, Action, Patch}).
+create_report(Uid, Body) -> call({create_report, Uid, Body}).
+my_reports(Uid, Options) -> call({my_reports, Uid, Options}).
+withdraw_report(Uid, Id, Body) -> call({withdraw_report, Uid, Id, Body}).
+report_evidence(Role, Uid, Id, EvidenceId) -> call({report_evidence, Role, Uid, Id, EvidenceId}).
+admin_reports(Uid, Options) -> call({admin_reports, Uid, Options}).
+admin_report(Uid, Id) -> call({admin_report, Uid, Id}).
+admin_update_report(Uid, Id, Body) -> call({admin_update_report, Uid, Id, Body}).
+reports_gc() -> call(reports_gc).
 admin_servers(Query, Limit, Offset) -> call({admin_servers, Query, Limit, Offset}).
 admin_server(Sid) -> call({admin_server, Sid}).
 admin_audit(Limit, BeforeId) -> call({admin_audit, Limit, BeforeId}).
@@ -853,6 +863,13 @@ read_msg({admin_set_registration_mode, _, _}) -> false;
 read_msg({admin_user_moderation, _, _}) -> true;
 read_msg({admin_user_moderation_history, _, _}) -> true;
 read_msg({admin_apply_user_moderation, _, _, _, _}) -> false;
+read_msg({create_report, _, _}) -> false;
+read_msg({withdraw_report, _, _, _}) -> false;
+read_msg({report_evidence, _, _, _, _}) -> false;
+read_msg({admin_reports, _, _}) -> false;
+read_msg({admin_report, _, _}) -> false;
+read_msg({admin_update_report, _, _, _}) -> false;
+read_msg(reports_gc) -> false;
 read_msg(_) -> true.
 
 safe_log_msg({register, _, _, _}) -> {register, redacted};
@@ -1346,13 +1363,29 @@ route({admin_user_moderation_history, ActorUid, TargetUid0}, Conn) ->
 route({admin_apply_user_moderation, ActorUid, TargetUid0, Action0, Patch0}, Conn) ->
     TargetUid = pw_util:int(TargetUid0),
     Action = normalize_instance_moderation_action(Action0),
-    case Action of
+    case is_map(Patch0) andalso maps:is_key(<<"report_id">>, Patch0) andalso
+         not lists:member(Action, [ban, suspend, disable]) of
+        true -> {error, invalid_report_action};
+        false -> case Action of
         revoke_sessions -> admin_account_maintenance(Conn, ActorUid, TargetUid, Action);
         clear_display_name -> admin_account_maintenance(Conn, ActorUid, TargetUid, Action);
         remove_email -> admin_account_maintenance(Conn, ActorUid, TargetUid, Action);
         resend_verification -> admin_account_maintenance(Conn, ActorUid, TargetUid, Action);
         _ -> apply_instance_moderation(Conn, ActorUid, TargetUid, Action, Patch0)
+        end
     end;
+route({create_report, Uid, Body}, Conn) ->
+    with_tx(Conn, fun() -> pw_reports:submit(Conn, Uid, Body,
+        fun(Mid, Subject, Include) -> report_message_context(Conn, Uid, Subject, Mid, Include) end) end);
+route({my_reports, Uid, Options}, Conn) -> pw_reports:mine(Conn, Uid, Options);
+route({withdraw_report, Uid, Id, Body}, Conn) ->
+    with_tx(Conn, fun() -> pw_reports:withdraw(Conn, Uid, Id, Body) end);
+route({admin_reports, Uid, Options}, Conn) -> pw_reports:list(Conn, Uid, Options);
+route({admin_report, Uid, Id}, Conn) -> pw_reports:detail(Conn, Uid, Id);
+route({admin_update_report, Uid, Id, Body}, Conn) ->
+    with_tx(Conn, fun() -> pw_reports:update(Conn, Uid, Id, Body) end);
+route({report_evidence, Role, Uid, Id, EvidenceId}, Conn) -> pw_reports:evidence(Conn, Role, Uid, Id, EvidenceId);
+route(reports_gc, Conn) -> with_tx(Conn, fun() -> pw_reports:gc(Conn) end);
 route({admin_servers, Q0, Limit0, Offset0}, Conn) ->
     Q = pw_util:clean_text(Q0, 100),
     Limit = clamp_page_limit(Limit0),
@@ -7507,6 +7540,7 @@ ensure_message_attachments_allowed(Conn, Uid, Scope, ScopeId, Body) ->
 
 -ifdef(TEST).
 test_validate_upload_refs(Conn, Uid, Body) -> ensure_upload_refs_readable(Conn, Uid, Body).
+test_reports(Op, Conn) -> route(Op, Conn).
 test_edit_thread(Op = {edit_thread, _, _, _, _}, Conn) -> route(Op, Conn).
 test_call_invite_target(Conn, Uid, Cid, Target) -> route({call_invite_target, Uid, Cid, Target}, Conn).
 -endif.
@@ -9457,6 +9491,23 @@ moderation_actor_allowed(Conn, ActorUid, TargetUid) ->
         _ -> {error, forbidden}
     end.
 
+report_message_context(Conn, Uid, Subject, Mid, Include) ->
+    case one(Conn, "SELECT user_id,scope,scope_id,body,created_at,edited_at FROM messages WHERE id=$1 AND kind='text' AND deleted_at IS NULL FOR SHARE", [Mid]) of
+        {ok, [Subject, Scope, ScopeId, Stored, Created, Edited]} ->
+            case can_read_messages(Conn, Uid, Scope, ScopeId) of
+                true ->
+                    Base = #{message_id => Mid, author_id => Subject, scope => Scope, scope_id => ScopeId, created_at => Created, edited_at => Edited},
+                    case Include of
+                        true ->
+                            Body = load_message(Stored),
+                            {ok, Base#{body => Body, sha256 => pw_util:sha256_hex(Body)}};
+                        false -> {ok, Base}
+                    end;
+                false -> {error, forbidden}
+            end;
+        _ -> {error, invalid_report_message}
+    end.
+
 apply_instance_moderation(Conn, ActorUid, TargetUid, Action, Patch0) ->
     Patch = normalize_instance_moderation_patch(Patch0, Action),
     case {Action, Patch, TargetUid} of
@@ -9471,37 +9522,42 @@ apply_instance_moderation(Conn, ActorUid, TargetUid, Action, Patch0) ->
                 case moderation_actor_allowed(Conn, ActorUid, Uid) of
                     {error, Reason} -> {error, Reason};
                     ok ->
-                        case one(Conn, "SELECT id,account_state FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
-                            {ok, [_Id, _OldState]} ->
-                                Now = pw_util:now_ms(),
-                                NewState = moderation_action_state(Action),
-                                Title = maps:get(title, Moderation), ReasonText = maps:get(reason, Moderation),
-                                Severity = maps:get(severity, Moderation), ExpiresAt = maps:get(expires_at, Moderation),
-                                case Action of
-                                    restore ->
+                        case pw_reports:lock_action(Conn, ActorUid, Uid, Patch0) of
+                            {error, _} = ReportError -> ReportError;
+                            {ok, Report} ->
+                                case one(Conn, "SELECT id,account_state FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+                                    {ok, [_Id, _OldState]} ->
+                                        Now = pw_util:now_ms(),
+                                        NewState = moderation_action_state(Action),
+                                        Title = maps:get(title, Moderation), ReasonText = maps:get(reason, Moderation),
+                                        Severity = maps:get(severity, Moderation), ExpiresAt = maps:get(expires_at, Moderation),
+                                        case Action of
+                                            restore ->
+                                                ok = exec(Conn,
+                                                    "UPDATE users SET account_state='active',disabled_at=0,moderation_title='',moderation_reason='',moderation_severity='warning',moderation_expires_at=0,moderated_by=$2,moderated_at=$3,updated_at=$3 WHERE id=$1",
+                                                    [Uid, ActorUid, Now]);
+                                            disable ->
+                                                ok = exec(Conn,
+                                                    "UPDATE users SET account_state='disabled',disabled_at=$2,moderation_title=$3,moderation_reason=$4,moderation_severity=$5,moderation_expires_at=$6,moderated_by=$7,moderated_at=$8,updated_at=$8 WHERE id=$1",
+                                                    [Uid, Now, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now]);
+                                            _ ->
+                                                ok = exec(Conn,
+                                                    "UPDATE users SET account_state=$2,moderation_title=$3,moderation_reason=$4,moderation_severity=$5,moderation_expires_at=$6,moderated_by=$7,moderated_at=$8,updated_at=$8 WHERE id=$1",
+                                                    [Uid, NewState, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now])
+                                        end,
+                                        {ok, SessionRows} = rows(Conn, "DELETE FROM sessions WHERE user_id=$1 RETURNING token_hash", [Uid]),
+                                        ok = exec(Conn, "DELETE FROM admin_sessions WHERE user_id=$1", [Uid]),
                                         ok = exec(Conn,
-                                            "UPDATE users SET account_state='active',disabled_at=0,moderation_title='',moderation_reason='',moderation_severity='warning',moderation_expires_at=0,moderated_by=$2,moderated_at=$3,updated_at=$3 WHERE id=$1",
-                                            [Uid, ActorUid, Now]);
-                                    disable ->
-                                        ok = exec(Conn,
-                                            "UPDATE users SET account_state='disabled',disabled_at=$2,moderation_title=$3,moderation_reason=$4,moderation_severity=$5,moderation_expires_at=$6,moderated_by=$7,moderated_at=$8,updated_at=$8 WHERE id=$1",
-                                            [Uid, Now, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now]);
-                                    _ ->
-                                        ok = exec(Conn,
-                                            "UPDATE users SET account_state=$2,moderation_title=$3,moderation_reason=$4,moderation_severity=$5,moderation_expires_at=$6,moderated_by=$7,moderated_at=$8,updated_at=$8 WHERE id=$1",
-                                            [Uid, NewState, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now])
-                                end,
-                                {ok, SessionRows} = rows(Conn, "DELETE FROM sessions WHERE user_id=$1 RETURNING token_hash", [Uid]),
-                                ok = exec(Conn, "DELETE FROM admin_sessions WHERE user_id=$1", [Uid]),
-                                ok = exec(Conn,
-                                    "INSERT INTO instance_account_actions(user_id,actor_user_id,action,title,reason,severity,expires_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
-                                    [Uid, ActorUid, atom_to_binary(Action, utf8), Title, ReasonText, Severity, ExpiresAt, Now]),
-                                Detail = moderation_audit_detail(Action, Title, ReasonText, Severity, ExpiresAt),
-                                admin_audit_insert(Conn, ActorUid, <<"account.", (atom_to_binary(Action, utf8))/binary>>, <<"user">>, integer_to_binary(Uid), Detail, <<>>, Now),
-                                {ok, #{user_id => Uid, account_state => NewState,
-                                    moderation => moderation_public_map(NewState, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now),
-                                    session_hashes => [only_id(R) || R <- SessionRows]}};
-                            _ -> {error, not_found}
+                                            "INSERT INTO instance_account_actions(user_id,actor_user_id,action,title,reason,severity,expires_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+                                            [Uid, ActorUid, atom_to_binary(Action, utf8), Title, ReasonText, Severity, ExpiresAt, Now]),
+                                        Detail = moderation_audit_detail(Action, Title, ReasonText, Severity, ExpiresAt),
+                                        admin_audit_insert(Conn, ActorUid, <<"account.", (atom_to_binary(Action, utf8))/binary>>, <<"user">>, integer_to_binary(Uid), Detail, <<>>, Now),
+                                        ok = pw_reports:action_done(Conn, ActorUid, Report, Action, Now),
+                                        {ok, #{user_id => Uid, account_state => NewState,
+                                            moderation => moderation_public_map(NewState, Title, ReasonText, Severity, ExpiresAt, ActorUid, Now),
+                                            session_hashes => [only_id(R) || R <- SessionRows]}};
+                                    _ -> {error, not_found}
+                                end
                         end
                 end
             end),
