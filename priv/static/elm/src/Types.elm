@@ -592,6 +592,7 @@ type alias Model =
     , currentProfileRelationship : String
     , currentProfileBlockedByMe : Bool
     , pendingMessages : Dict Int String
+    , pendingCommandDrafts : Dict Int ( ActiveRoute, String )
     , outbox : Dict Int Message
     , nextMessageId : Int
     , pendingConversationId : Maybe Int

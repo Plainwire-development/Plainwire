@@ -51,6 +51,10 @@ Every candidate search result passes current message ACL checks before Plainwire
 
 ## Sessions and account restrictions
 
+JSON API requests, including public authentication on both listeners, require `Content-Type: application/json`. Other media types receive HTTP 415. Request body limits are enforced against actual bytes received, including the final body chunk.
+
+Password reset consumes its one-time token, changes the password and revokes ordinary and host-admin sessions in one PostgreSQL transaction. Password changes also revoke outstanding password-reset links and host-admin sessions. Changing or removing the recovery email revokes previous reset links; reset checks the current verified address and account eligibility again while holding the account lock. Email verification and email changes update tokens and account state together, with cache invalidation after commit.
+
 Instance suspension or banning deletes normal sessions and admin sessions for the affected account and invalidates runtime caches. The realtime hub is notified immediately so a connected client can show the restriction state without waiting for a refresh.
 
 Host moderation follows the control-plane role hierarchy. A control-plane operator cannot use moderation to remove protection from a higher-privileged operator.
@@ -86,6 +90,10 @@ Outbound URL delivery continues to pass through Plainwire's SSRF-aware URL polic
 ## Message pins and historical context
 
 Pin/unpin operations require the ordinary **Manage messages** permission and are capped per channel. Reading pins or fetching a reply target's historical context requires the same current channel or DM access as normal message history. Historical-context fetches are deliberately bounded instead of being an unbounded history primitive.
+
+## Attachments
+
+Knowing an upload ID does not authorize publishing it. Posts, edits, forwards and forum replies check that every referenced upload is ready and currently readable by the author before creating a reference that grants readers access. Channel edits and forwards also enforce **Attach files** and **Send voice notes**, matching new message creation. A rejected attachment rolls back the content change and its new references.
 
 ## WebRTC calls
 

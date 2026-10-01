@@ -76,10 +76,13 @@ assert.match(webhook, /x-plainwire-signature/i, 'webhook delivery is signed');
 assert.match(db, /webhook_claim_due[\s\S]*SKIP LOCKED/, 'webhook workers claim durable deliveries without duplicate workers');
 assert.match(bridge, /javascriptEnabled:\s*false/, 'Less themes disable embedded JavaScript');
 assert.match(bridge, /new Worker\(/, 'client plugins execute in workers');
-assert.match(bridge, /importScripts\s*=|importScripts:/, 'plugin worker blocks importScripts');
+const pluginWorker = read('priv/static/plugin-worker.js');
+assert.match(pluginWorker, /importScripts\s*=|importScripts:/, 'plugin worker blocks importScripts');
+assert.match(read('src/pw_plugin_worker.erl'), /connect-src 'none'; worker-src 'none'/, 'plugin networking and nested workers are denied by the worker response CSP');
+assert.match(bridge, /new Worker\(`\/assets\/plugin-worker\.js/, 'plugins use the worker with an independent network policy');
 assert.match(bridge, /permissions\.apiWrite/, 'plugin API mutations require an explicit capability grant');
 assert.match(bridge, /read-only API access/, 'plugins default to read-only API access');
-assert.match(util, /worker-src 'self' blob:/, 'plugin blob workers must be allowed by the normal CSP');
+assert.match(util, /worker-src 'self' blob:/, 'the page CSP permits the same-origin plugin worker and media blob workers');
 assert.match(util, /connect-src 'self';/, 'client CSP must not grant extensions arbitrary outbound WebSocket/network destinations');
 assert.doesNotMatch(util, /connect-src 'self' ws: wss:/, 'client CSP must not use broad websocket scheme sources');
 

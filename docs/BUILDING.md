@@ -15,13 +15,24 @@ make package NATIVE=1
 
 `make check` runs syntax and manifest checks, browser UI and real RTP regressions, call-health parser tests and EUnit. `NATIVE=1` additionally runs the real Fortran numerical/protocol tests and the native EUnit integration. Install Chromium explicitly with `make browsers`, or set `CHROMIUM_EXECUTABLE` to an existing compatible Chromium binary. Test signaling and APIs are fixtures; these tests do not provision PostgreSQL or Cloudflare.
 
+`npm run test:security-audit` tests installed plugin permissions and CSP, delayed UI responses, command drafts and modal keyboard behavior in Chromium. EUnit also has optional PostgreSQL recovery and attachment regressions:
+
+```sh
+PLAINWIRE_TEST_POSTGRES_PORT=5432 \
+PLAINWIRE_TEST_POSTGRES_USER=plainwire_audit \
+PLAINWIRE_TEST_POSTGRES_DB=plainwire_test \
+rebar3 eunit
+```
+
+Use a dedicated local test database and a role that can connect and create temporary tables. The fixtures use connection-local TEMP tables and do not migrate or modify application tables. Without `PLAINWIRE_TEST_POSTGRES_PORT`, these two integration modules are skipped. The HTTP security tests still run against a temporary Cowboy listener.
+
 `make release` requires those checks before assembling the runtime release. With `NATIVE=0` (the default), the assembled runtime excludes a previously built native helper. With `NATIVE=1`, it checks that the helper is included. `make package` writes runtime and source archives plus SHA-256 files into `dist/`. `make source` verifies the tree, compiles both frontend and Erlang backend, and writes only the portable source archive; it does not certify the full runtime release. Native executables are always omitted from source packages.
 
 `PROFILE=cluster` selects the optional rebar profile. For a small single-server installation, use the default profile. `NODE`, `NPM`, `PYTHON`, `REBAR3`, `CC` and `FC` can select tool executables. `SOURCE_DATE_EPOCH` sets archive timestamps; otherwise they are zero for deterministic source archives. Identical inputs produce identical source archives. Reproducibility of an entire Erlang runtime also depends on its build environment.
 
 `make clean` removes Erlang output, Elm compiler caches, test screenshots and the compiled native helper. It preserves PostgreSQL data, uploads, configuration, secrets, source, npm dependencies and generated frontend assets. Run cleanup separately from other targets. Nothing in the Makefile installs services, restarts a running instance, downloads a browser without an explicit request, or edits a production database.
 
-For an existing deployment, back up its database, uploads and configuration before replacing the release. Follow deploy/README.md for switching releases and rollback. The checks still needed against real services are listed in BUILD_STATUS.md.
+For an existing deployment, back up its database, uploads and configuration before replacing the release. Follow deploy/README.md for switching releases and rollback. The [2.6.3 audit](SECURITY_AUDIT_2.6.3.md) records completed checks and the remaining deployment integration limits.
 
 
 ## Scalability and load tests

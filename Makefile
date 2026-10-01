@@ -36,7 +36,7 @@ endif
 VERSION := $(strip $(shell cat VERSION))
 REBAR := $(REBAR3) $(if $(filter cluster,$(PROFILE)),as cluster)
 RELEASE_ROOT := _build/$(PROFILE)/rel/plainwire_relay
-FRONTEND_INPUTS := $(wildcard web/*.js scripts/build-*.mjs priv/static/*.scss priv/static/*.less priv/static/less-plugins/*.js priv/static/elm/src/*.elm) priv/static/index.haml priv/static/elm/elm.json scripts/build-haml.sh scripts/build-elm.sh VERSION Makefile
+FRONTEND_INPUTS := $(wildcard web/*.js scripts/build-*.mjs priv/static/*.scss priv/static/*.less priv/static/less-plugins/*.js priv/static/elm/src/*.elm priv/static/elm/src/View/*.elm) priv/static/index.haml priv/static/elm/elm.json scripts/build-haml.sh scripts/build-elm.sh VERSION Makefile
 FRONTEND_OUTPUTS := priv/static/index.html priv/static/app.css priv/static/app.js priv/static/markdown.js priv/static/highlight-all.js
 NATIVE_TARGET := $(if $(filter 1,$(NATIVE)),native)
 NATIVE_TEST := $(if $(filter 1,$(NATIVE)),test-native)
@@ -145,6 +145,7 @@ test-release-contract:
 
 test-browser: frontend test-rtc-contract test-ui-contract test-admin-contract test-integrations-contract test-storage-contract test-storage-tools test-v21-contract test-v22-bot-contract test-v24-bot-contract test-v241-patch-contract test-scalability-contract test-release-contract
 	$(NPM) run test:browser
+	$(NPM) run test:security-audit
 	$(NODE) test/browser/settings-responsive.mjs
 	$(NODE) test/browser/admin-moderation.mjs
 	$(NPM) run test:rtc

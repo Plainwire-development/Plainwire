@@ -70,6 +70,8 @@ jobs:
           gleam check
       - name: Browser regression suite
         run: npm run test:browser
+      - name: Browser security regression suite
+        run: npm run test:security-audit
       - name: WebRTC regression suite
         run: npm run test:rtc
       - name: Verify source archive construction

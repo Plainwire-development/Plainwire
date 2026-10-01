@@ -107,6 +107,7 @@ http_listener_spec() ->
             {"/api/files/[...]", pw_file_hdl, []},
             {"/api/media/[...]", pw_media_hdl, []},
             {"/api/[...]", pw_api, []},
+            {"/assets/plugin-worker.js", pw_plugin_worker, []},
             {"/assets/[...]", cowboy_static, {priv_dir, plainwire_relay, "static"}},
             {"/[...]", pw_page, []}
         ]}

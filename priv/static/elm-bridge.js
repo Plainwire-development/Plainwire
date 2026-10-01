@@ -328,6 +328,7 @@
     rate_limited: 'Too many requests. Wait a moment and try again.',
     reaction_rate_limited: 'You are reacting too quickly. Wait a moment and try again.',
     invalid_reaction: 'That reaction is not supported.',
+    attachment_unavailable: 'An attached file is unavailable or you no longer have access to it.',
     confirmation_mismatch: 'The server name did not match. Type it exactly to confirm deletion.',
     database_unavailable: 'The server database is temporarily unavailable.',
     database_busy: 'The server is busy. Try again in a moment.',
@@ -447,20 +448,52 @@
     const admin = permissionBit(data, 'administrator');
     return (admin && (permissions & admin) !== 0) || (bit && (permissions & bit) !== 0);
   };
+  let modalSequence = 0;
+  const activeModals = new Set();
+  let modalBodyWasInert = false;
   const modalShell = (titleText, subtitle = '') => {
+    const trigger = document.activeElement;
     const backdrop = document.createElement('div'); backdrop.className = 'admin-modal-backdrop';
     const dialog = document.createElement('section'); dialog.className = 'admin-modal-shell'; dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-modal', 'true'); dialog.tabIndex = -1;
     const head = document.createElement('header'); head.className = 'admin-modal-head';
-    const copy = document.createElement('div'); const title = document.createElement('h2'); title.textContent = titleText; copy.append(title);
+    const copy = document.createElement('div'); const title = document.createElement('h2'); title.id = `plainwire-modal-title-${++modalSequence}`; title.textContent = titleText; copy.append(title);
+    dialog.setAttribute('aria-labelledby', title.id);
     if (subtitle) { const sub = document.createElement('p'); sub.textContent = subtitle; copy.append(sub); }
     const close = document.createElement('button'); close.type = 'button'; close.className = 'admin-modal-close'; close.textContent = '×'; close.setAttribute('aria-label', 'Close');
     head.append(copy, close);
     const body = document.createElement('div'); body.className = 'admin-modal-body';
-    dialog.append(head, body); backdrop.append(dialog); document.body.append(backdrop);
-    const destroy = () => backdrop.remove();
+    dialog.append(head, body); backdrop.append(dialog);
+    // Browser.application owns the body's children. Keep bridge overlays beside
+    // the body so Elm updates cannot replace them or lose track of its nodes.
+    document.documentElement.append(backdrop);
+    if (!activeModals.size) { modalBodyWasInert = document.body.inert; document.body.inert = true; }
+    activeModals.add(backdrop);
+    const isTopModal = () => [...activeModals].at(-1) === backdrop;
+    const focusable = () => [...dialog.querySelectorAll('button, input, textarea, select, a[href], [tabindex]')]
+      .filter(node => !node.disabled && node.tabIndex >= 0 && node.getClientRects().length && !node.closest('[inert]'));
+    const keydown = (event) => {
+      if (!isTopModal()) return;
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); destroy(); return; }
+      if (event.key !== 'Tab') return;
+      const items = focusable();
+      const first = items[0] || dialog, last = items.at(-1) || dialog;
+      if (!items.length || !dialog.contains(document.activeElement) ||
+          (event.shiftKey && (document.activeElement === first || document.activeElement === dialog)) ||
+          (!event.shiftKey && (document.activeElement === last || document.activeElement === dialog))) {
+        event.preventDefault(); (event.shiftKey ? last : first).focus();
+      }
+    };
+    const destroy = () => {
+      if (!activeModals.has(backdrop)) return;
+      const wasTop = isTopModal();
+      activeModals.delete(backdrop); backdrop.remove(); document.removeEventListener('keydown', keydown, true);
+      if (!activeModals.size) document.body.inert = modalBodyWasInert;
+      if (wasTop && trigger?.isConnected && !trigger.closest('[inert]')) trigger.focus({ preventScroll: true });
+      else if (wasTop && activeModals.size) [...activeModals].at(-1).querySelector('[role="dialog"]')?.focus();
+    };
     close.addEventListener('click', destroy); backdrop.addEventListener('click', event => { if (event.target === backdrop) destroy(); });
-    backdrop.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); destroy(); } });
-    requestAnimationFrame(() => dialog.focus({ preventScroll: true }));
+    document.addEventListener('keydown', keydown, true);
+    requestAnimationFrame(() => { if (backdrop.isConnected && isTopModal() && !dialog.contains(document.activeElement)) (focusable()[0] || dialog).focus({ preventScroll: true }); });
     return { backdrop, dialog, body, destroy, setTitle(value) { title.textContent = value; } };
   };
   const makeField = (labelText, value = '', { multiline = false, type = 'text', placeholder = '', maxLength = null } = {}) => {
@@ -476,6 +509,8 @@
   };
 
   const extensionStorageKey = 'plainwire_extensions_v2';
+  let extensionUserId = null;
+  let extensionGeneration = 0;
   const extensionWorkers = new Map();
   let lessCompilerPromise = null;
 
@@ -539,25 +574,9 @@
     const source = String(plugin.source || '');
     const permissions = Object.freeze({ apiWrite: plugin?.permissions?.apiWrite === true });
     if (!source.trim() || source.length > 262144) throw new Error('Plugin source must be between 1 byte and 256 KiB.');
-    const bootstrap = `
-      'use strict';
-      const __pending = new Map(); let __seq = 0;
-      try { self.fetch = undefined; self.XMLHttpRequest = undefined; self.WebSocket = undefined; self.EventSource = undefined; self.importScripts = undefined; } catch (_) {}
-      const rpc = (op, data={}) => new Promise((resolve,reject)=>{ const id=++__seq; __pending.set(id,{resolve,reject}); postMessage({kind:'rpc',id,op,data}); });
-      const Plainwire = Object.freeze({
-        version: ${JSON.stringify(clientConfig.version)},
-        toast(text){ postMessage({kind:'toast',text:String(text).slice(0,500)}); },
-        request(path, options={}){ return rpc('request',{path:String(path),method:String(options.method||'GET'),body:options.body??null}); },
-        insertText(text){ postMessage({kind:'insert_text',text:String(text).slice(0,5000)}); },
-        storage: Object.freeze({ get(key){ return rpc('storage_get',{key:String(key)}); }, set(key,value){ return rpc('storage_set',{key:String(key),value}); }, remove(key){ return rpc('storage_remove',{key:String(key)}); } })
-      });
-      self.onmessage = (event)=>{ const m=event.data||{}; if(m.kind==='rpc_result'){ const p=__pending.get(m.id); if(!p)return; __pending.delete(m.id); m.ok?p.resolve(m.value):p.reject(new Error(m.error||'plugin_rpc_failed')); } };
-      try { (new Function('Plainwire', ${JSON.stringify(source)}))(Plainwire); postMessage({kind:'ready'}); }
-      catch (error) { postMessage({kind:'error',error:String(error?.stack||error)}); }
-    `;
-    const url = URL.createObjectURL(new Blob([bootstrap], { type: 'text/javascript' }));
-    const worker = new Worker(url, { name: `Plainwire plugin: ${String(plugin.name || plugin.id || 'plugin').slice(0, 80)}` });
-    URL.revokeObjectURL(url);
+    const worker = new Worker(`/assets/plugin-worker.js?v=${encodeURIComponent(clientConfig.assetVersion || clientConfig.version)}`, {
+      name: `Plainwire plugin: ${String(plugin.name || plugin.id || 'plugin').slice(0, 80)}`
+    });
     worker.addEventListener('message', async (event) => {
       const msg = event.data || {};
       if (msg.kind === 'toast') { send(app.ports.bridgeReceive, { tag: 'toast', data: String(msg.text || '').slice(0, 500) }); return; }
@@ -568,7 +587,9 @@
       try {
         if (msg.op === 'request') {
           const path = String(msg.data?.path || '');
-          if (!/^\/[A-Za-z0-9_?&=.%+\-\/]*$/.test(path) || path.includes('..')) throw new Error('Only same-origin Plainwire API paths are allowed.');
+          if (!/^\/[A-Za-z0-9_?&=.%+\-\/]*$/.test(path)) throw new Error('Only same-origin Plainwire API paths are allowed.');
+          const target = new URL('/api' + path, location.origin);
+          if (target.origin !== location.origin || !target.pathname.startsWith('/api/') || /%2e|%2f|%5c/i.test(target.pathname) || path.includes('..')) throw new Error('Only same-origin Plainwire API paths are allowed.');
           const method = String(msg.data?.method || 'GET').toUpperCase();
           if (!['GET','POST','DELETE'].includes(method)) throw new Error('Unsupported plugin request method.');
           if (method !== 'GET' && !permissions.apiWrite) throw new Error('This plugin has read-only API access. Grant API write access in plugin settings to allow changes.');
@@ -582,6 +603,8 @@
         } else throw new Error('Unsupported plugin operation.');
       } catch (error) { respond(false, null, String(error?.message || error).slice(0, 500)); }
     });
+    worker.addEventListener('error', () => console.error('[Plainwire:EXT] plugin_start_failed', plugin.name));
+    worker.postMessage({ kind: 'initialize', source, version: clientConfig.version });
     return worker;
   };
   const startClientPlugins = () => {
@@ -592,7 +615,13 @@
       catch (error) { console.error('[Plainwire:EXT] plugin_start_failed', plugin?.name, error); }
     }
   };
-  const applyClientExtensions = async () => { await applyClientThemes(); startClientPlugins(); };
+  const applyClientExtensions = async () => {
+    const generation = ++extensionGeneration;
+    const userId = meId;
+    try { await applyClientThemes(); }
+    catch (error) { console.warn('[Plainwire:EXT] themes_failed', error); }
+    if (generation === extensionGeneration && userId && meId === userId) startClientPlugins();
+  };
 
   const openExtensionsManager = async () => {
     const shell = modalShell('Themes & plugins', "Client extensions live only in this browser. Themes use Less; plugins run in a Worker under Plainwire's restrictive network policy and use an explicit Plainwire capability API.");
@@ -2797,7 +2826,13 @@
       }
       if (method === 'GET' && /^\/(messages\?|thread\/|threads\?|profile\/|server\/|users\?)/.test(path) && requestRoute !== location.hash) return null;
       if (succeeded && json.data && json.data.csrf) csrf = json.data.csrf;
-      if (succeeded && json.data && json.data.user && json.data.user.id) meId = json.data.user.id;
+      if (succeeded && ['/me', '/login', '/register'].includes(path) && json.data?.user?.id) {
+        meId = json.data.user.id;
+        if (extensionUserId !== meId) {
+          extensionUserId = meId;
+          applyClientExtensions().catch((error) => console.warn('[Plainwire:EXT] apply_failed', error));
+        }
+      }
       if (succeeded && json.data) updatePresenceWatch(json.data);
       if (succeeded && path.startsWith('/sync?')) {
         const warnings = Array.isArray(json.data?.sync_warnings) ? json.data.sync_warnings.map(String) : [];
@@ -2821,6 +2856,10 @@
         }
       }
       if (succeeded && method === 'POST' && path === '/logout') {
+        meId = null;
+        extensionUserId = null;
+        extensionGeneration++;
+        stopClientPlugins();
         clearAllSyncRecovery();
         resetTypingState({ skipNetwork: true });
       }
@@ -2880,8 +2919,7 @@
     if (!meId || document.hidden || !navigator.onLine) return;
     debug('SYNC', 'visible_reconcile', { reason, route: location.hash || '#' });
     api({ method: 'GET', path: '/sync?since=0' });
-    applyClientExtensions().catch((error) => console.warn('[Plainwire:EXT] apply_failed', error));
-  refreshGlobalBanners();
+    refreshGlobalBanners();
 
     const hash = String(location.hash || '#').replace(/^#\/?/, '');
     let match = hash.match(/^dm\/(\d+)$/);

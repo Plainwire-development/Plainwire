@@ -57,6 +57,8 @@
          normalize_banner_patch/2, safe_banner_link/1, normalize_registration_mode/1,
          normalize_ai_provider/1, normalize_ai_chat_trigger/1, normalize_ai_temperature/1,
          command_options_from_args/1, search_state/1]).
+-export([test_account_recovery/2]).
+-export([test_validate_upload_refs/3, test_edit_thread/2]).
 -endif.
 
 -record(st, {}).
@@ -1678,6 +1680,8 @@ route({change_password, Uid, Token, Current0, New0}, Conn) ->
                                 Now = pw_util:now_ms(),
                                 ok = exec(Conn, "UPDATE users SET password_hash = $1, password_salt = $2, updated_at = $3 WHERE id = $4", [NewHash, NewSalt, Now, Uid]),
                                 {ok, Existing} = rows(Conn, "DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2 RETURNING token_hash", [Uid, CurrentHash]),
+                                ok = exec(Conn, "DELETE FROM admin_sessions WHERE user_id=$1", [Uid]),
+                                ok = exec(Conn, "DELETE FROM account_tokens WHERE user_id=$1 AND purpose='password_reset'", [Uid]),
                                 {ok, Existing}
                         end;
                     _ -> {error, not_found}
@@ -1921,45 +1925,69 @@ route({request_password_reset, Identity0}, Conn) ->
     end;
 route({reset_password, Token0, New0}, Conn) ->
     New = pw_util:clean_text(New0, 256),
-    case consume_account_token(Conn, Token0, password_reset) of
-        {ok, #{user_id := Uid}} ->
-            case byte_size(New) >= 10 andalso byte_size(New) =< 256 of
-                false -> {error, weak_password};
-                true ->
-                    NewSalt = pw_util:random_token(18),
-                    NewHash = pw_util:pbkdf2(New, NewSalt),
-                    Now = pw_util:now_ms(),
-                    ok = exec(Conn, "UPDATE users SET password_hash=$1, password_salt=$2, updated_at=$3 WHERE id=$4",
-                        [NewHash, NewSalt, Now, Uid]),
-                    {ok, Existing} = rows(Conn, "DELETE FROM sessions WHERE user_id=$1 RETURNING token_hash", [Uid]),
+    case byte_size(New) >= 10 andalso byte_size(New) =< 256 of
+        false -> {error, weak_password};
+        true ->
+            %% Consuming the one-time link, changing the password and revoking
+            %% sessions must commit together. A rejected password or a database
+            %% failure must leave the link usable for a retry.
+            Result = with_tx(Conn, fun() ->
+                case consume_password_reset_token(Conn, Token0) of
+                    {ok, #{user_id := Uid}} ->
+                        NewSalt = pw_util:random_token(18),
+                        NewHash = pw_util:pbkdf2(New, NewSalt),
+                        Now = pw_util:now_ms(),
+                        ok = exec(Conn, "UPDATE users SET password_hash=$1, password_salt=$2, updated_at=$3 WHERE id=$4",
+                            [NewHash, NewSalt, Now, Uid]),
+                        {ok, Existing} = rows(Conn, "DELETE FROM sessions WHERE user_id=$1 RETURNING token_hash", [Uid]),
+                        ok = exec(Conn, "DELETE FROM admin_sessions WHERE user_id=$1", [Uid]),
+                        ok = exec(Conn, "DELETE FROM account_tokens WHERE user_id=$1 AND purpose='password_reset' AND used_at IS NULL", [Uid]),
+                        {ok, Existing};
+                    {error, _} -> {error, invalid_token}
+                end
+            end),
+            case Result of
+                {ok, Existing} ->
                     [ets:delete(?SESSION_CACHE, Hash) || [Hash] <- Existing],
-                    {ok, #{reset => true, revoked_sessions => length(Existing)}}
-            end;
-        {error, _} -> {error, invalid_token}
+                    {ok, #{reset => true, revoked_sessions => length(Existing)}};
+                Error -> Error
+            end
     end;
 route({verify_email_token, Token0}, Conn) ->
-    case peek_account_token(Conn, Token0, email_verify) of
-        {ok, #{id := Id, user_id := Uid, email := Email}} ->
-            Now = pw_util:now_ms(),
-            case one(Conn, "SELECT id FROM users WHERE email_verified=true AND lower(email)=$1 AND id<>$2 LIMIT 1", [Email, Uid]) of
-                {ok, [_]} -> {error, email_taken};
-                _ ->
-                    case rows(Conn,
-                        "UPDATE account_tokens SET used_at=$2 WHERE id=$1 AND used_at IS NULL AND expires_at > $2 RETURNING id",
-                        [Id, Now]) of
-                        {ok, [[_]]} ->
-                            case rows(Conn,
-                                "UPDATE users SET email=$1, email_verified=true, email_verified_at=$2, updated_at=$2 "
-                                "WHERE id=$3 RETURNING username", [Email, Now, Uid]) of
-                                {ok, [[_Username]]} ->
-                                    invalidate_session_cache(Uid),
-                                    {ok, #{verified => true}};
-                                _ -> {error, invalid_token}
-                            end;
-                        _ -> {error, invalid_token}
-                    end
-            end;
-        {error, _} -> {error, invalid_token}
+    Result = with_tx(Conn, fun() ->
+        case peek_account_token(Conn, Token0, email_verify) of
+            {ok, #{id := Id, user_id := Uid, email := Email}} ->
+                Now = pw_util:now_ms(),
+                case one(Conn, "SELECT id FROM users WHERE email_verified=true AND lower(email)=$1 AND id<>$2 LIMIT 1", [Email, Uid]) of
+                    {ok, [_]} -> {error, email_taken};
+                    _ ->
+                        case rows(Conn,
+                            "UPDATE account_tokens SET used_at=$2 WHERE id=$1 AND used_at IS NULL AND expires_at > $2 RETURNING id",
+                            [Id, Now]) of
+                            {ok, [[_]]} ->
+                                case rows(Conn,
+                                    "UPDATE users SET email=$1, email_verified=true, email_verified_at=$2, updated_at=$2 "
+                                    "WHERE id=$3 RETURNING username", [Email, Now, Uid]) of
+                                    {ok, [[_Username]]} ->
+                                        {ok, Uid};
+                                    {error, Reason} ->
+                                        case is_unique_violation(Reason) of
+                                            true -> {error, email_taken};
+                                            false -> erlang:error({sql_error, Reason})
+                                        end;
+                                    _ -> {error, invalid_token}
+                                end;
+                            _ -> {error, invalid_token}
+                        end
+                end;
+            {error, _} -> {error, invalid_token}
+        end
+    end),
+    case Result of
+        {ok, VerifiedUid} ->
+            invalidate_session_cache(VerifiedUid),
+            {ok, #{verified => true}};
+        Error -> Error
     end;
 route({set_account_email, Uid, Email0, Password0}, Conn) ->
     Email = pw_util:normalize_email(Email0),
@@ -1967,26 +1995,33 @@ route({set_account_email, Uid, Email0, Password0}, Conn) ->
     case Email of
         <<>> -> {error, invalid_email};
         _ ->
-            case one(Conn, "SELECT username, password_hash, password_salt, email, email_verified FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
-                {ok, [Username, Hash, Salt, CurrentEmail, Verified]} ->
-                    case pw_util:verify_password(Password, Salt, Hash) of
-                        false -> {error, bad_password};
-                        true ->
-                            case one(Conn, "SELECT id FROM users WHERE email_verified=true AND lower(email)=$1 AND id<>$2 LIMIT 1", [Email, Uid]) of
-                                {ok, [_]} -> {error, email_taken};
-                                _ when CurrentEmail =:= Email andalso Verified =:= true ->
-                                    {ok, #{unchanged => true, email => Email, email_verified => true}};
-                                _ ->
-                                    Now = pw_util:now_ms(),
-                                    ok = exec(Conn,
-                                        "UPDATE users SET email=$1, email_verified=false, email_verified_at=0, updated_at=$2 WHERE id=$3",
-                                        [Email, Now, Uid]),
-                                    invalidate_session_cache(Uid),
-                                    {ok, maybe_attach_email_mail(Conn, Uid, Username, Email, #{updated => true, email => Email, email_verified => false})}
-                            end
-                    end;
-                _ -> {error, not_found}
-            end
+            Result = with_tx(Conn, fun() ->
+                case one(Conn, "SELECT username, password_hash, password_salt, email, email_verified FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+                    {ok, [Username, Hash, Salt, CurrentEmail, Verified]} ->
+                        case pw_util:verify_password(Password, Salt, Hash) of
+                            false -> {error, bad_password};
+                            true ->
+                                case one(Conn, "SELECT id FROM users WHERE email_verified=true AND lower(email)=$1 AND id<>$2 LIMIT 1", [Email, Uid]) of
+                                    {ok, [_]} -> {error, email_taken};
+                                    _ when CurrentEmail =:= Email andalso Verified =:= true ->
+                                        {ok, #{unchanged => true, email => Email, email_verified => true}};
+                                    _ ->
+                                        Now = pw_util:now_ms(),
+                                        ok = exec(Conn,
+                                            "UPDATE users SET email=$1, email_verified=false, email_verified_at=0, updated_at=$2 WHERE id=$3",
+                                            [Email, Now, Uid]),
+                                        ok = exec(Conn, "DELETE FROM account_tokens WHERE user_id=$1 AND purpose='password_reset'", [Uid]),
+                                        {ok, maybe_attach_email_mail(Conn, Uid, Username, Email, #{updated => true, email => Email, email_verified => false})}
+                                end
+                        end;
+                    _ -> {error, not_found}
+                end
+            end),
+            case Result of
+                {ok, #{updated := true}} -> invalidate_session_cache(Uid);
+                _ -> ok
+            end,
+            Result
     end;
 route({resend_email_verification, Uid}, Conn) ->
     case one(Conn, "SELECT username, email, email_verified FROM users WHERE id=$1", [Uid]) of
@@ -1998,21 +2033,27 @@ route({resend_email_verification, Uid}, Conn) ->
     end;
 route({remove_account_email, Uid, Password0}, Conn) ->
     Password = pw_util:clean_text(Password0, 256),
-    case one(Conn, "SELECT password_hash, password_salt FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
-        {ok, [Hash, Salt]} ->
-            case pw_util:verify_password(Password, Salt, Hash) of
-                false -> {error, bad_password};
-                true ->
-                    Now = pw_util:now_ms(),
-                    ok = exec(Conn,
-                        "UPDATE users SET email='', email_verified=false, email_verified_at=0, updated_at=$1 WHERE id=$2",
-                        [Now, Uid]),
-                    ok = exec(Conn, "DELETE FROM account_tokens WHERE user_id=$1 AND purpose='email_verify'", [Uid]),
-                    invalidate_session_cache(Uid),
-                    {ok, #{removed => true}}
-            end;
-        _ -> {error, not_found}
-    end;
+    Result = with_tx(Conn, fun() ->
+        case one(Conn, "SELECT password_hash, password_salt FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+            {ok, [Hash, Salt]} ->
+                case pw_util:verify_password(Password, Salt, Hash) of
+                    false -> {error, bad_password};
+                    true ->
+                        Now = pw_util:now_ms(),
+                        ok = exec(Conn,
+                            "UPDATE users SET email='', email_verified=false, email_verified_at=0, updated_at=$1 WHERE id=$2",
+                            [Now, Uid]),
+                        ok = exec(Conn, "DELETE FROM account_tokens WHERE user_id=$1", [Uid]),
+                        {ok, #{removed => true}}
+                end;
+            _ -> {error, not_found}
+        end
+    end),
+    case Result of
+        {ok, _} -> invalidate_session_cache(Uid);
+        _ -> ok
+    end,
+    Result;
 route({update_profile, Uid, Display0, Patch}, Conn) ->
     Result = with_tx(Conn, fun() ->
         Display = pw_util:clean_text(Display0, 48),
@@ -2369,6 +2410,7 @@ route({create_thread, Uid, ForumId0, Title0, Body0}, Conn) ->
                         case is_forum_member(Conn, Uid, ForumId) of
                             false -> {error, forum_membership_required};
                             true ->
+                                ensure_upload_refs_readable(Conn, Uid, Body),
                                 Now = pw_util:now_ms(),
                                 {ok, Tid} = insert_returning(Conn,
                                     "INSERT INTO threads(forum_id, user_id, title, body, raw_body, created_at, updated_at, reply_count, locked, pinned, views) "
@@ -2401,6 +2443,7 @@ route({edit_thread, Uid, ThreadId0, Title0, Body0}, Conn) ->
                         case is_forum_member(Conn, Uid, ForumId) of
                             false -> {error, forum_membership_required};
                             true ->
+                                ensure_upload_refs_readable(Conn, Uid, Body),
                                 Now = pw_util:now_ms(),
                                 ok = exec(Conn, "UPDATE threads SET title=$1,body=$2,raw_body=$2,updated_at=$3 WHERE id=$4", [Title, Body, Now, ThreadId]),
                                 case removed_upload_refs(OldBody, Body) of
@@ -2495,6 +2538,7 @@ route({reply_thread, Uid, ThreadId0, Body0}, Conn) ->
                     {ok, [true, _ForumId, _Joined]} -> {error, thread_locked};
                     {ok, [false, _ForumId, false]} -> {error, forum_membership_required};
                     {ok, [false, _ForumId, true]} ->
+                        ensure_upload_refs_readable(Conn, Uid, Body),
                         Now = pw_util:now_ms(),
                         {ok, Rid} = insert_returning(Conn,
                             "INSERT INTO replies(thread_id, user_id, body, raw_body, created_at, updated_at) VALUES($1,$2,$3,$3,$4,$5) RETURNING id",
@@ -2529,6 +2573,7 @@ route({edit_reply, Uid, ThreadId0, ReplyId0, Body0}, Conn) ->
                         case is_forum_member(Conn, Uid, ForumId) of
                             false -> {error, forum_membership_required};
                             true ->
+                                ensure_upload_refs_readable(Conn, Uid, Body),
                                 Now = pw_util:now_ms(),
                                 ok = exec(Conn, "UPDATE replies SET body=$1,raw_body=$1,updated_at=$2 WHERE id=$3 AND thread_id=$4", [Body,Now,ReplyId,ThreadId]),
                                 case removed_upload_refs(OldBody, Body) of
@@ -4980,6 +5025,7 @@ route({edit_message, Uid, Mid0, Body0}, Conn) ->
                         case can_modify_message_scope(Conn, Uid, Scope, ScopeId) of
                             false -> {error, forbidden};
                             true ->
+                                ensure_message_attachments_allowed(Conn, Uid, Scope, ScopeId, Plain),
                                 Now = pw_util:now_ms(),
                                 ok = exec(Conn, "UPDATE messages SET body=$1,edited_at=$2 WHERE id=$3", [Body, Now, Mid]),
                                 ok = storage_after_message_change(Conn, Mid, <<"message.edited">>, Uid),
@@ -5029,6 +5075,7 @@ route({forward_message, Uid, Mid0, TargetScope0, TargetId0}, Conn) ->
                         end,
                         case {CanReadSource, TargetAccess} of
                             {true, {ok, Sid}} ->
+                                ensure_message_attachments_allowed(Conn, Uid, TargetScope, TargetId, load_message(StoredBody)),
                                 LockOk = case TargetScope of
                                     <<"channel">> ->
                                         case one(Conn, "SELECT id FROM servers WHERE id=$1 FOR KEY SHARE", [Sid]) of
@@ -5094,6 +5141,7 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
                             {error, SlowReason} -> throw({plainwire_error, SlowReason});
                             ok -> ok
                         end,
+                        ensure_upload_refs_readable(Conn, Uid, Plain),
                         VoiceNoteAllowed = case is_voice_note_body(Plain) of
                             true -> has_server_permission(Conn, Uid, Sid, <<"send_voice_notes">>);
                             false -> true
@@ -5532,6 +5580,7 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
             Result = with_tx(Conn, fun() ->
                 case {conversation_can_send(Conn, Uid, Cid), valid_reply_to(Conn, <<"direct">>, Cid, ReplyTo)} of
                     {true, true} ->
+                        ensure_upload_refs_readable(Conn, Uid, Plain),
                         Now = pw_util:now_ms(),
                         Mid = new_message_id(),
                         ok = exec(Conn,
@@ -7402,6 +7451,44 @@ file_id_char(C) ->
     (C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z) orelse
     (C >= $0 andalso C =< $9) orelse C =:= $- orelse C =:= $_.
 
+%% An upload id is a locator, not permission to publish its contents. Validate
+%% before adding any new reference, including edits that rebuild a scope's refs.
+ensure_upload_refs_readable(Conn, Uid, Body) ->
+    lists:foreach(fun(Id) ->
+        case one(Conn, "SELECT user_id,status FROM uploads WHERE id=$1 FOR SHARE", [Id]) of
+            {ok, [OwnerId, <<"ready">>]} ->
+                case upload_readable(Conn, Uid, Id, OwnerId) of
+                    true -> ok;
+                    false -> throw({plainwire_error, attachment_unavailable})
+                end;
+            _ -> throw({plainwire_error, attachment_unavailable})
+        end
+    end, extract_file_ids(Body)),
+    ok.
+
+ensure_message_attachments_allowed(Conn, Uid, Scope, ScopeId, Body) ->
+    ensure_upload_refs_readable(Conn, Uid, Body),
+    case Scope of
+        <<"channel">> ->
+            case channel_server_member(Conn, Uid, ScopeId) of
+                {ok, Sid} ->
+                    VoiceAllowed = not is_voice_note_body(Body) orelse has_server_permission(Conn, Uid, Sid, <<"send_voice_notes">>),
+                    AttachmentsAllowed = extract_file_ids(Body) =:= [] orelse has_server_permission(Conn, Uid, Sid, <<"attach_files">>),
+                    case {VoiceAllowed, AttachmentsAllowed} of
+                        {false, _} -> throw({plainwire_error, voice_notes_forbidden});
+                        {true, false} -> throw({plainwire_error, attachments_forbidden});
+                        {true, true} -> ok
+                    end;
+                _ -> throw({plainwire_error, forbidden})
+            end;
+        _ -> ok
+    end.
+
+-ifdef(TEST).
+test_validate_upload_refs(Conn, Uid, Body) -> ensure_upload_refs_readable(Conn, Uid, Body).
+test_edit_thread(Op = {edit_thread, _, _, _, _}, Conn) -> route(Op, Conn).
+-endif.
+
 %% Owner access is intrinsic. Every other read must be justified by a live
 %% reference. Backfills fail closed: a not-yet-rebuilt reference can temporarily
 %% hide an old attachment, but it can never make unrelated private uploads public.
@@ -7858,14 +7945,21 @@ issue_account_mail(Conn, Uid, Username, Email, Purpose, TtlMs) ->
     #{mail => #{kind => Purpose, to => Email, username => Username, token => Token,
                 app_name => case AppName of <<>> -> <<"Plainwire">>; _ -> AppName end}}.
 
-consume_account_token(Conn, Token0, Purpose) ->
-    case peek_account_token(Conn, Token0, Purpose) of
+consume_password_reset_token(Conn, Token0) ->
+    case peek_account_token(Conn, Token0, password_reset) of
         {ok, #{id := Id, user_id := Uid, email := Email}} ->
-            Now = pw_util:now_ms(),
-            case rows(Conn,
-                "UPDATE account_tokens SET used_at=$2 WHERE id=$1 AND used_at IS NULL AND expires_at > $2 RETURNING id",
-                [Id, Now]) of
-                {ok, [[_]]} -> {ok, #{user_id => Uid, email => Email}};
+            %% Lock the account before claiming its token, matching password and
+            %% email changes. A concurrent reset request can have observed the
+            %% old address before that change, so deletion alone is insufficient.
+            case one(Conn, "SELECT email,email_verified,account_state,is_bot FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+                {ok, [Email, true, <<"active">>, false]} ->
+                    Now = pw_util:now_ms(),
+                    case rows(Conn,
+                        "UPDATE account_tokens SET used_at=$2 WHERE id=$1 AND used_at IS NULL AND expires_at > $2 RETURNING id",
+                        [Id, Now]) of
+                        {ok, [[_]]} -> {ok, #{user_id => Uid, email => Email}};
+                        _ -> {error, invalid_token}
+                    end;
                 _ -> {error, invalid_token}
             end;
         Error -> Error
@@ -7887,6 +7981,15 @@ peek_account_token(Conn, Token0, Purpose) ->
                 _ -> {error, invalid_token}
             end
     end.
+
+-ifdef(TEST).
+%% Exercise recovery transactions with connection-local temporary fixtures.
+test_account_recovery({reset_password, _, _} = Op, Conn) -> route(Op, Conn);
+test_account_recovery({change_password, _, _, _, _} = Op, Conn) -> route(Op, Conn);
+test_account_recovery({set_account_email, _, _, _} = Op, Conn) -> route(Op, Conn);
+test_account_recovery({remove_account_email, _, _} = Op, Conn) -> route(Op, Conn);
+test_account_recovery({verify_email_token, _} = Op, Conn) -> route(Op, Conn).
+-endif.
 
 forum_map([Id, Slug, Name, Desc, Pos, Owner, Tc, Rc, Last, Members, Joined]) ->
     #{id => pw_util:int(Id), slug => Slug, name => Name, description => Desc, position => pw_util:int(Pos),

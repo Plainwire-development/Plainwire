@@ -970,6 +970,15 @@ with_bot(Req0, Fun) ->
     end.
 
 with_json_public(Req0, Fun) ->
+    %% Requiring JSON prevents cross-site HTML forms (including text/plain
+    %% forms containing valid JSON) from logging a browser into another account.
+    %% Same-origin clients and bot SDKs already send application/json.
+    case pw_util:is_json_request(Req0) of
+        true -> with_json_body(Req0, Fun);
+        false -> pw_util:err_json(Req0, 415, <<"unsupported_media_type">>)
+    end.
+
+with_json_body(Req0, Fun) ->
     case pw_util:read_json(Req0) of
         {ok, M, Req} -> Fun(M, Req);
         {error, too_large, Req} -> pw_util:err_json(Req, 413, <<"body_too_large">>);

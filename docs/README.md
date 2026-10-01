@@ -1,6 +1,6 @@
 # Plainwire documentation
 
-These notes match the 2.5.0 tree. PostgreSQL is required. Redis and ScyllaDB are optional.
+These notes match the 2.6.3 tree. PostgreSQL is required. Redis and ScyllaDB are optional.
 
 ## Run it
 
@@ -25,5 +25,6 @@ These notes match the 2.5.0 tree. PostgreSQL is required. Redis and ScyllaDB are
 * [Cloudflare TURN](CLOUDFLARE_TURN.md)
 * [Client themes and plugins](CLIENT_EXTENSIONS.md)
 * [Security](SECURITY.md)
+* [2.6.3 audit and fixes](SECURITY_AUDIT_2.6.3.md)
 
 Older release notes live next to the README (`RELEASE_NOTES_*.md`). They describe the release they were written for; they are not a second copy of this index.

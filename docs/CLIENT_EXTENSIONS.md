@@ -10,8 +10,10 @@ Use existing Plainwire CSS variables and theme hooks where possible. A good them
 
 ## Plugins
 
-Plugins run in dedicated Web Workers rather than directly in the page. The worker environment removes direct `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource` and `importScripts` access. Plainwire exposes a smaller bridge for supported actions such as notifications, namespaced local storage, composer insertion and authenticated same-origin API requests.
+Plugins run in dedicated Web Workers rather than directly in the page. The worker response has a separate Content Security Policy that denies network connections, script imports and nested workers. Removing JavaScript globals alone cannot enforce that policy, since plugin code can restore them from browser prototypes. Only the worker permits JavaScript evaluation; the page retains its existing script policy. Plainwire exposes a smaller bridge for supported actions such as notifications, namespaced local storage, composer insertion and authenticated same-origin API requests. API writes require an explicit grant in the extension manager.
 
 This isolation is a safety boundary and a stability boundary: a plugin exception should not take down the Elm application or the active call UI.
+
+Enabled plugins start after authentication and stop on logout. Periodic account reconciliation keeps the existing workers running so their state and startup actions are preserved. A theme compiler failure does not prevent plugins from starting.
 
 Extensions are still user-installed code. Only install code you trust, and disable an extension first when diagnosing client-specific behavior.

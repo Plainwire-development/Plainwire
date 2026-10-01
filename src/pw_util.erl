@@ -3,7 +3,7 @@
     env_int/2, env_int_cached/2, env_bool/2, env_bool_cached/2, env_str/2, now_ms/0, random_token/1, sha256_hex/1,
     base64url/1, base64url_decode/1, pbkdf2/2, verify_password/3, password_needs_rehash/1,
     normalize_username/1, normalize_email/1, clean_text/2, int/1, bool/1, bin/1, json/1,
-    read_json/1, read_json/2, ok_json/2, err_json/3, json_reply/3, set_cookie/3, clear_cookie/1, cookie_value/2,
+    is_json_request/1, read_json/1, read_json/2, ok_json/2, err_json/3, json_reply/3, set_cookie/3, clear_cookie/1, cookie_value/2,
     require_csrf/2, ip/1, security_headers/0, proxied_image/1, safe_image_data_url/1, hex_binary/1,
     constant_time/2
 ]).
@@ -204,6 +204,11 @@ key(K) when is_atom(K) -> atom_to_binary(K, utf8);
 key(K) when is_binary(K) -> K;
 key(K) -> bin(K).
 
+is_json_request(Req) ->
+    ContentType = cowboy_req:header(<<"content-type">>, Req, <<>>),
+    MediaType = string:lowercase(string:trim(hd(binary:split(ContentType, <<";">>)))),
+    MediaType =:= <<"application/json">>.
+
 read_json(Req0) ->
     read_json_body(Req0, <<>>, 1048576).
 
@@ -212,11 +217,13 @@ read_json(Req0, MaxBytes) when is_integer(MaxBytes), MaxBytes >= 1024, MaxBytes 
 
 read_json_body(Req0, Acc, Remaining) when Remaining > 0 ->
     case cowboy_req:read_body(Req0, #{length => Remaining, period => 5000}) of
-        {ok, Body, Req1} ->
+        %% Cowboy's length option is a requested chunk size, not a hard limit.
+        %% A complete final chunk can exceed it just like a `more` chunk can.
+        {ok, Body, Req1} when byte_size(Body) =< Remaining ->
             decode_json_body(<<Acc/binary, Body/binary>>, Req1);
         {more, Body, Req1} when byte_size(Body) < Remaining ->
             read_json_body(Req1, <<Acc/binary, Body/binary>>, Remaining - byte_size(Body));
-        {more, _, Req1} ->
+        {_, _, Req1} ->
             {error, too_large, Req1}
     end;
 read_json_body(Req0, _Acc, _Remaining) ->

@@ -297,6 +297,7 @@ init flags url _ =
       , active = active
       , serverCache = Dict.empty
       , drafts = Dict.empty
+      , pendingCommandDrafts = Dict.empty
       , wsConnected = False
       , pageVisible = True
       , isLeader = False
@@ -825,7 +826,16 @@ update msg model =
 
                 ( _, _ ) ->
                     if String.startsWith "/threads?forum_id=" tag then
-                        handleList (D.list decodeThread) (\items m -> { m | threads = items }) val model
+                        case model.active of
+                            ForumView id ->
+                                if tag == "/threads?forum_id=" ++ String.fromInt id then
+                                    handleList (D.list decodeThread) (\items m -> { m | threads = items }) val model
+
+                                else
+                                    ( model, Cmd.none )
+
+                            _ ->
+                                ( model, Cmd.none )
 
                     else if String.startsWith "/thread/" tag && String.endsWith "/vote" tag then
                         handleThreadVote val model
@@ -1009,10 +1019,19 @@ update msg model =
                                 ( { model | searchMessages = [], toast = Just "Message search could not be loaded." }, Cmd.none )
 
                     else if String.startsWith "/commands?channel_id=" tag then
-                        handleList (D.list decodeBotCommand) (\items m -> { m | availableCommands = items }) val model
+                        case model.active of
+                            ChannelView id ->
+                                if tag == "/commands?channel_id=" ++ String.fromInt id then
+                                    handleList (D.list decodeBotCommand) (\items m -> { m | availableCommands = items }) val model
+
+                                else
+                                    ( model, Cmd.none )
+
+                            _ ->
+                                ( model, Cmd.none )
 
                     else if String.startsWith "/commands/" tag && String.endsWith "/invoke" tag then
-                        handleMessageSent Nothing (fromApiField "message" val) { model | inputText = "", replyTo = Nothing, drafts = Dict.remove (draftKeyFor model.active) model.drafts }
+                        handleCommandSent requestId val model
 
                     else if String.startsWith "/server/" tag && String.endsWith "/channels" tag then
                         ( { model | toast = Just "Channel created" }, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), routeCmd model.active ] )
@@ -1057,6 +1076,14 @@ update msg model =
                 -- session. Do not flash a generic request error while that transition
                 -- is already in progress; /me will render the signed-out shell.
                 ( { model | booting = False, authBusy = False }, Cmd.none )
+
+            else if String.startsWith "/commands/" tag && String.endsWith "/invoke" tag then
+                ( { model
+                    | pendingCommandDrafts = Dict.remove (Maybe.withDefault 0 requestId) model.pendingCommandDrafts
+                    , toast = Just (fmtErr err)
+                  }
+                , Cmd.none
+                )
 
             else
                 let
@@ -2690,9 +2717,13 @@ handleThread : E.Value -> Model -> ( Model, Cmd Msg )
 handleThread val model =
     case D.decodeValue threadDetailDecoder val of
         Ok detail ->
-            ( { model | currentThread = Just detail.thread, replies = detail.replies }
-            , wsSend (E.object [ ( "type", E.string "subscribe" ), ( "key", E.string ("forum:" ++ String.fromInt detail.thread.forumId) ) ])
-            )
+            if model.active == ThreadView detail.thread.id then
+                ( { model | currentThread = Just detail.thread, replies = detail.replies }
+                , wsSend (E.object [ ( "type", E.string "subscribe" ), ( "key", E.string ("forum:" ++ String.fromInt detail.thread.forumId) ) ])
+                )
+
+            else
+                ( model, Cmd.none )
 
         Err _ ->
             ( model, Cmd.none )
@@ -2719,6 +2750,53 @@ handleConversationDetail val model =
 
         _ ->
             ( { model | toast = Just "Could not load group members" }, Cmd.none )
+
+
+handleCommandSent : Maybe Int -> E.Value -> Model -> ( Model, Cmd Msg )
+handleCommandSent requestId val model =
+    let
+        id =
+            Maybe.withDefault 0 requestId
+
+        acknowledged =
+            case Dict.get id model.pendingCommandDrafts of
+                Just ( route, submitted ) ->
+                    let
+                        key =
+                            draftKeyFor route
+
+                        sameDraft =
+                            Dict.get key model.drafts == Just submitted
+
+                        clearVisible =
+                            sameDraft && model.active == route && model.inputText == submitted
+                    in
+                    { model
+                        | drafts =
+                            if sameDraft then
+                                Dict.remove key model.drafts
+
+                            else
+                                model.drafts
+                        , inputText =
+                            if clearVisible then
+                                ""
+
+                            else
+                                model.inputText
+                        , replyTo =
+                            if clearVisible then
+                                Nothing
+
+                            else
+                                model.replyTo
+                    }
+
+                Nothing ->
+                    model
+    in
+    handleMessageSent Nothing (fromApiField "message" val)
+        { acknowledged | pendingCommandDrafts = Dict.remove id acknowledged.pendingCommandDrafts }
 
 
 handleMessageSent : Maybe Int -> E.Value -> Model -> ( Model, Cmd Msg )
@@ -3147,9 +3225,18 @@ handleServerData val model =
         Ok data ->
             let
                 isVisibleServer =
-                    model.currentServer
-                        |> Maybe.map (\current -> current.server.id == data.server.id)
-                        |> Maybe.withDefault False
+                    case model.active of
+                        ServerView id ->
+                            id == data.server.id
+
+                        ChannelView id ->
+                            List.any (\channel -> channel.id == id) data.channels
+
+                        VoiceChannelView id ->
+                            List.any (\channel -> channel.id == id) data.channels
+
+                        _ ->
+                            isCurrentServer data.server.id model
 
                 roleColors =
                     Dict.fromList (List.map (\member -> ( member.user.id, member.roleColor )) data.members)
@@ -3167,7 +3254,12 @@ handleServerData val model =
                         message
             in
             ( { model
-                | currentServer = Just data
+                | currentServer =
+                    if isVisibleServer then
+                        Just data
+
+                    else
+                        model.currentServer
                 , serverCache = Dict.insert data.server.id data model.serverCache
                 , msg = List.map refreshVisibleRoleColor model.msg
               }
@@ -3203,7 +3295,11 @@ handleServerProfile : E.Value -> Model -> ( Model, Cmd Msg )
 handleServerProfile val model =
     case D.decodeValue serverProfileDecoder val of
         Ok profile ->
-            ( { model | modal = Just "server_profile", currentServerProfile = Just profile }, Cmd.none )
+            if model.modal == Just "server_profile" then
+                ( { model | currentServerProfile = Just profile }, Cmd.none )
+
+            else
+                ( model, Cmd.none )
 
         Err _ ->
             ( { model | modal = Nothing, currentServerProfile = Nothing, toast = Just "Could not load that server profile." }, Cmd.none )
@@ -3359,7 +3455,11 @@ handleProfile val model =
     in
     case userResult of
         Ok user ->
-            ( { model | currentProfile = Just user, currentProfileRelationship = rel, currentProfileBlockedByMe = blockedByMe }, Cmd.none )
+            if model.active == ProfileView user.id then
+                ( { model | currentProfile = Just user, currentProfileRelationship = rel, currentProfileBlockedByMe = blockedByMe }, Cmd.none )
+
+            else
+                ( model, Cmd.none )
 
         Err _ ->
             ( model, Cmd.none )
@@ -3918,12 +4018,19 @@ sendMessage model =
                                     , ( "args", E.string args )
                                     ]
                         in
-                        -- Keep the draft until the server acknowledges the invocation. If
-                        -- the request fails or times out, the user should never lose what
-                        -- they typed. The response handler clears it on success.
-                        ( model
-                        , apiSend (encodeApiRequest (ApiPost ("/commands/" ++ command.name ++ "/invoke") (Just commandPayload)))
-                        )
+                        -- Retain the submitted draft until acknowledgement, and
+                        -- associate it with its route so a late response cannot
+                        -- erase a newer draft or another channel's composer.
+                        if List.member ( model.active, model.inputText ) (Dict.values model.pendingCommandDrafts) then
+                            ( model, Cmd.none )
+
+                        else
+                            ( { model
+                                | pendingCommandDrafts = Dict.insert model.nextMessageId ( model.active, model.inputText ) model.pendingCommandDrafts
+                                , nextMessageId = model.nextMessageId - 1
+                              }
+                            , apiSend (messageRequest model.nextMessageId ("/commands/" ++ command.name ++ "/invoke") commandPayload)
+                            )
 
                     Nothing ->
                         let

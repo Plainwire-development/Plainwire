@@ -301,6 +301,12 @@ can_operate(Session) ->
     Role =:= <<"owner">> orelse Role =:= <<"operator">>.
 
 with_json(Req0, Fun, State) ->
+    case pw_util:is_json_request(Req0) of
+        true -> with_json_body(Req0, Fun, State);
+        false -> reply_error(Req0, 415, <<"unsupported_media_type">>, State)
+    end.
+
+with_json_body(Req0, Fun, State) ->
     case pw_util:read_json(Req0, ?MAX_BODY) of
         {ok, M, Req1} -> Fun(M, Req1);
         {error, too_large, Req1} -> reply_error(Req1, 413, <<"body_too_large">>, State);

@@ -48,7 +48,8 @@ assert.match(components,/\.bot-badge/,'bot badge follows the application style l
 assert.match(composer,/ToggleLastAttachmentSpoiler/,'composer can mark attachments as spoilers');
 assert.match(markdown,/details[\s\S]*summary/,'spoiler attachments render with accessible native disclosure controls');
 assert.match(main,/matchingCommand/,'registered slash commands integrate with the existing composer');
-assert.ok(main.includes('Keep the draft until the server acknowledges the invocation'), 'command invocation keeps the draft until server acknowledgement');
+assert.match(main, /pendingCommandDrafts = Dict\.insert model\.nextMessageId \( model\.active, model\.inputText \)/, 'command invocation retains the submitted route and draft until acknowledgement');
+assert.match(main, /clearVisible =\s*sameDraft && model\.active == route && model\.inputText == submitted/, 'command acknowledgements preserve newer drafts and other routes');
 
 assert.match(db,/\{42, \[[\s\S]*instance_account_actions[\s\S]*suspended[\s\S]*banned/,'migration 42 adds instance moderation with an audit trail');
 assert.match(admin,/moderation/,'host-admin API exposes account moderation');
