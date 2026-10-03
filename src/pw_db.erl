@@ -30,10 +30,10 @@
     search_messages/4, search_index_reconcile/1, search_index_status/0,
     create_invite/4, create_invite/5, list_invites/2, revoke_invite/3, invite_options/2, invite_preview/1, join_invite/2,
     messages/5, message_context/2, channel_pins/2, set_message_pin/3,
-    post_channel_message/4, delete_message/2, edit_message/3, forward_message/4, toggle_message_reaction/3, record_missed_call/2, record_completed_call/3,
-    conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4, enable_conversation_encryption/3,
+    post_channel_message/4, delete_message/2, edit_message/3, edit_message/4, forward_message/4, toggle_message_reaction/3, record_missed_call/2, record_completed_call/3,
+    conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4, enable_conversation_encryption/3, configure_conversation_encryption/4, disable_conversation_encryption/4,
     set_conversation_member_role/4, kick_conversation_member/3,
-    add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4,
+    add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4, post_direct_message/5,
     close_conversation/2, leave_conversation/2, accept_message_request/2, deny_message_request/2,
     mark_conversation_read/2, notifications/1, mark_notifications_seen/1, clear_notifications/1, mark_url_seen/2,
     member_of_channel/2, channel_identity/2, channel_message_identity/2, voice_access/2, stream_access/2, member_of_conversation/2, member_of_server/2, member_of_thread_forum/2, conversation_peer_ids/2, call_invite_target/3,
@@ -60,7 +60,8 @@
          normalize_ai_provider/1, normalize_ai_chat_trigger/1, normalize_ai_temperature/1,
          command_options_from_args/1, search_state/1]).
 -export([test_account_recovery/2]).
--export([test_validate_upload_refs/3, test_edit_thread/2, test_call_invite_target/4, test_reports/2, test_e2ee/2]).
+-export([test_validate_upload_refs/3, test_edit_thread/2, test_call_invite_target/4, test_reports/2, test_e2ee/2,
+         test_upload_backfill/2, test_route_with_reconnect/2]).
 -endif.
 
 -record(st, {}).
@@ -421,6 +422,7 @@ messages(Uid, Scope, ScopeId, Before, After) -> call({messages, Uid, Scope, Scop
 post_channel_message(Uid, ChannelId, Body, ReplyTo) -> call({post_channel_message, Uid, ChannelId, Body, ReplyTo}).
 delete_message(Uid, Mid) -> call({delete_message, Uid, Mid}).
 edit_message(Uid, Mid, Body) -> call({edit_message, Uid, Mid, Body}).
+edit_message(Uid, Mid, Body, Options) -> call({edit_message, Uid, Mid, Body, Options}).
 forward_message(Uid, Mid, TargetScope, TargetId) -> call({forward_message, Uid, Mid, TargetScope, TargetId}).
 toggle_message_reaction(Uid, Mid, Emoji) -> call({toggle_message_reaction, Uid, Mid, Emoji}).
 conversations(Uid) -> call({conversations, Uid}).
@@ -428,6 +430,8 @@ create_conversation(Uid, Name, UserIds) -> call({create_conversation, Uid, Name,
 create_conversation_usernames(Uid, Name, Usernames) -> call({create_conversation_usernames, Uid, Name, Usernames}).
 update_conversation(Uid, Cid, Name, Patch) -> call({update_conversation, Uid, Cid, Name, Patch}).
 enable_conversation_encryption(Uid, Cid, KeyId) -> call({enable_conversation_encryption, Uid, Cid, KeyId}).
+configure_conversation_encryption(Uid, Cid, KeyId, Enabled) -> call({configure_conversation_encryption, Uid, Cid, KeyId, Enabled}).
+disable_conversation_encryption(Uid, Cid, Action, Revision) -> call({disable_conversation_encryption, Uid, Cid, Action, Revision}).
 set_conversation_member_role(Uid, Cid, TargetUid, Role) -> call({set_conversation_member_role, Uid, Cid, TargetUid, Role}).
 kick_conversation_member(Uid, Cid, TargetUid) -> call({kick_conversation_member, Uid, Cid, TargetUid}).
 add_conversation_members(Uid, Cid, UserIds) -> call({add_conversation_members, Uid, Cid, UserIds}).
@@ -439,6 +443,7 @@ accept_message_request(Uid, Cid) -> call({accept_message_request, Uid, Cid}).
 deny_message_request(Uid, Cid) -> call({deny_message_request, Uid, Cid}).
 mark_conversation_read(Uid, Cid) -> call({mark_conversation_read, Uid, Cid}).
 post_direct_message(Uid, Cid, Body, ReplyTo) -> call({post_direct_message, Uid, Cid, Body, ReplyTo}).
+post_direct_message(Uid, Cid, Body, ReplyTo, Revision) -> call({post_direct_message, Uid, Cid, Body, ReplyTo, Revision}).
 record_missed_call(Uid, Cid) -> call({record_missed_call, Uid, Cid}).
 record_completed_call(Uid, Cid, Seconds) when is_integer(Seconds), Seconds >= 0 ->
     Duration = iolist_to_binary(io_lib:format("~B:~2..0B", [Seconds div 60, Seconds rem 60])),
@@ -660,7 +665,7 @@ route_with_reconnect(Msg, Conn) ->
             {{error, Reason}, Conn};
         C:R:S ->
             error_logger:error_msg("DB route failed ~p:~p ~p for ~p~n", [C, R, S, safe_log_msg(Msg)]),
-            case db_error(R) of
+            case db_error(R) orelse not erlang:is_process_alive(Conn) of
                 true ->
                     case reconnect(Conn) of
                         {ok, Conn1} -> maybe_retry_read(Msg, Conn1, R);
@@ -810,6 +815,7 @@ read_msg({join_invite, _, _}) -> false;
 read_msg({post_channel_message, _, _, _, _}) -> false;
 read_msg({delete_message, _, _}) -> false;
 read_msg({edit_message, _, _, _}) -> false;
+read_msg({edit_message, _, _, _, _}) -> false;
 read_msg({forward_message, _, _, _, _}) -> false;
 read_msg({toggle_message_reaction, _, _, _}) -> false;
 read_msg({record_missed_call, _, _}) -> false;
@@ -818,6 +824,8 @@ read_msg({create_conversation, _, _, _}) -> false;
 read_msg({create_conversation_usernames, _, _, _}) -> false;
 read_msg({update_conversation, _, _, _, _}) -> false;
 read_msg({enable_conversation_encryption, _, _, _}) -> false;
+read_msg({configure_conversation_encryption, _, _, _, _}) -> false;
+read_msg({disable_conversation_encryption, _, _, _, _}) -> false;
 read_msg({set_conversation_member_role, _, _, _, _}) -> false;
 read_msg({kick_conversation_member, _, _, _}) -> false;
 read_msg({add_conversation_members, _, _, _}) -> false;
@@ -829,6 +837,7 @@ read_msg({accept_message_request, _, _}) -> false;
 read_msg({deny_message_request, _, _}) -> false;
 read_msg({mark_conversation_read, _, _}) -> false;
 read_msg({post_direct_message, _, _, _, _}) -> false;
+read_msg({post_direct_message, _, _, _, _, _}) -> false;
 read_msg({mark_notifications_seen, _}) -> false;
 read_msg({clear_notifications, _}) -> false;
 read_msg({mark_url_seen, _, _}) -> false;
@@ -5048,6 +5057,8 @@ route({delete_message, Uid, Mid0}, Conn) ->
         Other -> Other
     end;
 route({edit_message, Uid, Mid0, Body0}, Conn) ->
+    route({edit_message, Uid, Mid0, Body0, #{}}, Conn);
+route({edit_message, Uid, Mid0, Body0, Options}, Conn) ->
     Mid = pw_util:int(Mid0),
     Plain = clean_message_input(Body0),
     Body = store_message(Plain),
@@ -5061,7 +5072,10 @@ route({edit_message, Uid, Mid0, Body0}, Conn) ->
                         case can_modify_message_scope(Conn, Uid, Scope, ScopeId) of
                             false -> {error, forbidden};
                             true ->
+                                ensure_encryption_revision(Conn, Scope, ScopeId, maps:get(revision, Options, undefined)),
                                 ensure_message_encryption(Conn, Scope, ScopeId, Plain),
+                                ensure_encrypted_edit(load_message(OldStoredBody), Plain, Options),
+                                bind_encrypted_message(Conn, Mid, Plain),
                                 ensure_message_attachments_allowed(Conn, Uid, Scope, ScopeId, Plain),
                                 Now = pw_util:now_ms(),
                                 ok = exec(Conn, "UPDATE messages SET body=$1,edited_at=$2 WHERE id=$3", [Body, Now, Mid]),
@@ -5296,7 +5310,7 @@ route({conversations, Uid}, Conn) ->
           "CASE WHEN block.blocked THEN NULL ELSE lm.body END, lm.id, COALESCE(lm.user_id, 0), COALESCE(lm.display_name, ''), COALESCE(lm.username, ''), "
           "CASE WHEN block.blocked THEN 0 ELSE (SELECT count(*) FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL "
           "AND id > dm.last_read_message_id AND user_id <> $1) END, "
-          "COALESCE(peer.id, 0), COALESCE(peer.display_name, ''), COALESCE(peer.avatar_url, ''), COALESCE(peer.username, ''), dt.e2ee_key_id "
+          "COALESCE(peer.id, 0), COALESCE(peer.display_name, ''), COALESCE(peer.avatar_url, ''), COALESCE(peer.username, ''), dt.e2ee_key_id, dt.e2ee_enabled, dt.e2ee_revision, dt.e2ee_disable_requested_by "
           "FROM direct_threads dt JOIN direct_members dm ON dm.thread_id = dt.id AND dm.user_id = $1 "
           "LEFT JOIN LATERAL (SELECT m.id, m.body, m.user_id, u.display_name, u.username "
           "FROM messages m JOIN users u ON u.id = m.user_id WHERE m.scope = 'direct' AND m.scope_id = dt.id "
@@ -5607,7 +5621,7 @@ route({conversation, Uid, Cid0}, Conn) ->
     Cid = pw_util:int(Cid0),
     case is_conversation_member(Conn, Uid, Cid) of
         true ->
-            {ok, Info} = one(Conn, "SELECT id, name, avatar_url, owner_id, created_at, updated_at, e2ee_key_id FROM direct_threads WHERE id = $1", [Cid]),
+            {ok, Info} = one(Conn, "SELECT id, name, avatar_url, owner_id, created_at, updated_at, e2ee_key_id,e2ee_enabled,e2ee_revision,e2ee_disable_requested_by FROM direct_threads WHERE id = $1", [Cid]),
             {ok, Members} = rows(Conn,
                 "SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.banner_url, u.status, u.theme, "
                 "u.created_at, u.last_seen, dm.last_read_message_id, dm.muted, dm.nickname, dm.joined_at, dm.group_role "
@@ -5618,37 +5632,53 @@ route({conversation, Uid, Cid0}, Conn) ->
             {error, forbidden}
     end;
 route({enable_conversation_encryption, Uid, Cid0, KeyId}, Conn) ->
+    route({configure_conversation_encryption, Uid, Cid0, KeyId, true}, Conn);
+route({configure_conversation_encryption, Uid, Cid0, KeyId, Enabled}, Conn) ->
     Cid = pw_util:int(Cid0),
-    case pw_e2ee:valid_key_id(KeyId) of
+    case pw_e2ee:valid_key_id(KeyId) andalso is_boolean(Enabled) of
         false -> {error, invalid_encryption_key_id};
         true ->
             Result = with_tx(Conn, fun() ->
-                case one(Conn, "SELECT e2ee_key_id FROM direct_threads WHERE id=$1 FOR UPDATE", [Cid]) of
-                    {ok, [Existing]} ->
-                        {ok, Members} = rows(Conn,
-                            "SELECT dm.user_id,dm.request_state,u.is_bot FROM direct_members dm JOIN users u ON u.id=dm.user_id WHERE dm.thread_id=$1", [Cid]),
-                        Eligible = length(Members) =:= 2 andalso lists:member([Uid, <<"accepted">>, false], Members)
-                            andalso lists:all(fun([_, State, Bot]) -> State =:= <<"accepted">> andalso Bot =:= false end, Members)
-                            andalso conversation_can_send(Conn, Uid, Cid),
-                        case {Eligible, Existing} of
-                            {false, _} -> {error, encryption_requires_private_dm};
-                            {true, KeyId} -> {ok, #{conversation_id => Cid, e2ee_key_id => KeyId}};
-                            {true, <<>>} ->
-                                ok = exec(Conn, "UPDATE direct_threads SET e2ee_key_id=$1 WHERE id=$2", [KeyId, Cid]),
-                                {ok, #{conversation_id => Cid, e2ee_key_id => KeyId}};
+                case encryption_policy(Conn, Cid) of
+                    {ok, [Existing, CurrentEnabled, Revision, _] = Current} ->
+                        ensure_private_encryption_members(Conn, Uid, Cid),
+                        case {Existing, CurrentEnabled, Enabled} of
+                            {KeyId, Enabled, Enabled} -> {ok, encryption_policy_map(Cid, Current)};
+                            {KeyId, true, false} -> {error, encryption_disable_requires_consent};
+                            {Existing, _, _} when Existing =:= <<>>; Existing =:= KeyId ->
+                                ok = exec(Conn, "UPDATE direct_threads SET e2ee_key_id=$1,e2ee_enabled=$2,e2ee_revision=$3,e2ee_disable_requested_by=0 WHERE id=$4", [KeyId, Enabled, Revision + 1, Cid]),
+                                {ok, encryption_policy_map(Cid, [KeyId, Enabled, Revision + 1, 0])};
                             _ -> {error, encryption_key_locked}
                         end;
                     _ -> {error, forbidden}
                 end
             end),
-            case Result of
-                {ok, _} ->
-                    publish_conversation_event(Conn, Cid, #{type => conversation_updated, conversation_id => Cid, e2ee_key_id => KeyId}),
-                    Result;
-                _ -> Result
-            end
+            publish_encryption_policy(Conn, Cid, Result)
     end;
+route({disable_conversation_encryption, Uid, Cid0, Action, ExpectedRevision}, Conn) ->
+    Cid = pw_util:int(Cid0),
+    Result = with_tx(Conn, fun() ->
+        case encryption_policy(Conn, Cid) of
+            {ok, [KeyId, Enabled, Revision, Requester] = Current} ->
+                ensure_private_encryption_members(Conn, Uid, Cid),
+                case {ExpectedRevision =:= Revision, Enabled, Action, Requester} of
+                    {false, _, _, _} -> {error, encryption_settings_changed};
+                    {true, true, <<"request">>, 0} ->
+                        update_encryption_policy(Conn, Cid, KeyId, true, Revision + 1, Uid);
+                    {true, true, <<"request">>, Uid} -> {ok, encryption_policy_map(Cid, Current)};
+                    {true, true, <<"approve">>, Other} when Other > 0, Other =/= Uid ->
+                        update_encryption_policy(Conn, Cid, KeyId, false, Revision + 1, 0);
+                    {true, _, <<"cancel">>, 0} -> {ok, encryption_policy_map(Cid, Current)};
+                    {true, _, <<"cancel">>, _} -> update_encryption_policy(Conn, Cid, KeyId, Enabled, Revision + 1, 0);
+                    _ -> {error, encryption_consent_required}
+                end;
+            _ -> {error, forbidden}
+        end
+    end),
+    publish_encryption_policy(Conn, Cid, Result);
 route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
+    route({post_direct_message, Uid, Cid0, Body0, ReplyTo0, undefined}, Conn);
+route({post_direct_message, Uid, Cid0, Body0, ReplyTo0, Revision}, Conn) ->
     Cid = pw_util:int(Cid0),
     Plain = clean_message_input(Body0),
     Body = store_message(Plain),
@@ -5657,6 +5687,7 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
         false -> {error, invalid_message};
         true ->
             Result = with_tx(Conn, fun() ->
+                ensure_encryption_revision(Conn, <<"direct">>, Cid, Revision),
                 ensure_message_encryption(Conn, <<"direct">>, Cid, Plain),
                 case {conversation_can_send(Conn, Uid, Cid), valid_reply_to(Conn, <<"direct">>, Cid, ReplyTo)} of
                     {true, true} ->
@@ -5666,6 +5697,7 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
                         ok = exec(Conn,
                             "INSERT INTO messages(id,scope,scope_id,user_id,body,reply_to_id,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)",
                             [Mid, <<"direct">>, Cid, Uid, Body, ReplyTo, Now]),
+                        bind_encrypted_message(Conn, Mid, Plain),
                         insert_upload_refs(Conn, Plain, <<"direct">>, Cid, Now),
                         ok = exec(Conn, "UPDATE direct_threads SET updated_at=$1 WHERE id=$2", [Now, Cid]),
                         ok = exec(Conn, "UPDATE direct_members SET last_read_message_id=$1 WHERE thread_id=$2 AND user_id=$3", [Mid, Cid, Uid]),
@@ -5773,9 +5805,8 @@ route({upload_ref_backfill, Batch0}, Conn) ->
     Batch = min(2000, max(1, pw_util:int(Batch0))),
     %% No parameters, so rows/3 takes the simple-query path (epgsql:squery) and
     %% `done` arrives as text: <<"t">>, never the atom true. Without accepting
-    %% both, a finished backfill re-walks messages forever and dies writing a
-    %% 64-bit message id into the int4 cursor column, killing a pool connection
-    %% every 30 seconds.
+    %% both, a finished backfill re-walks messages forever. Migration 57 also
+    %% widens the cursor so an unfinished backfill can handle 64-bit message IDs.
     case one(Conn, "SELECT cursor, done FROM upload_ref_backfill WHERE id = 1", []) of
         {ok, [_, Done]} when Done =:= true; Done =:= <<"t">> -> {ok, done};
         {ok, [Cursor0, _]} ->
@@ -7510,9 +7541,9 @@ insert_returning(Conn, Sql, Params) ->
 %% a non-empty envelope even for <<>>, so checking ciphertext length would let
 %% empty messages through whenever encryption-at-rest is enabled.
 message_body_valid(Body) when is_binary(Body) ->
-    case binary:split(Body, <<":">>, [global]) of
-        [<<"pw-e2ee-v1">>, KeyId, _, _] -> pw_e2ee:valid_envelope(Body, KeyId);
-        _ -> byte_size(Body) > 0 andalso byte_size(Body) =< ?MAX_MSG
+    case pw_e2ee:is_envelope(Body) of
+        true -> pw_e2ee:valid_envelope(Body, pw_e2ee:key_id(Body));
+        false -> byte_size(Body) > 0 andalso byte_size(Body) =< ?MAX_MSG
              andalso not pw_e2ee:is_envelope(Body)
              andalso re:run(Body, <<"\\S">>, [{capture, none}, unicode]) =:= match
     end;
@@ -7524,16 +7555,16 @@ clean_message_input(_) -> <<>>.
 ensure_message_encryption(Conn, <<"direct">>, Cid, Body) ->
     %% Serialize activation with posts, edits, forwards and member additions.
     %% An older client can never silently send plaintext after activation.
-    case one(Conn, "SELECT e2ee_key_id FROM direct_threads WHERE id=$1 FOR UPDATE", [Cid]) of
-        {ok, [<<>>]} ->
-            case pw_e2ee:is_envelope(Body) of
-                true -> throw({plainwire_error, encryption_not_enabled});
-                false -> ok
-            end;
-        {ok, [KeyId]} ->
-            case pw_e2ee:valid_envelope(Body, KeyId) of
-                true -> ok;
-                false -> throw({plainwire_error, encrypted_message_required})
+    case encryption_policy(Conn, Cid) of
+        {ok, [KeyId, Enabled, _, _]} ->
+            case {pw_e2ee:is_envelope(Body), Enabled} of
+                {false, false} -> ok;
+                {false, true} -> throw({plainwire_error, encrypted_message_required});
+                {true, _} ->
+                    case pw_e2ee:valid_envelope(Body, KeyId) andalso pw_e2ee:nonce(Body) =/= <<>> of
+                        true -> ok;
+                        false -> throw({plainwire_error, encrypted_message_required})
+                    end
             end;
         _ -> throw({plainwire_error, forbidden})
     end;
@@ -7541,6 +7572,78 @@ ensure_message_encryption(_, _, _, Body) ->
     case pw_e2ee:is_envelope(Body) of
         true -> throw({plainwire_error, encryption_requires_private_dm});
         false -> ok
+    end.
+
+encryption_policy(Conn, Cid) ->
+    one(Conn, "SELECT e2ee_key_id,e2ee_enabled,e2ee_revision,e2ee_disable_requested_by FROM direct_threads WHERE id=$1 FOR UPDATE", [Cid]).
+
+encryption_policy_map(Cid, [KeyId, Enabled, Revision, Requester]) ->
+    #{conversation_id => Cid, e2ee_key_id => KeyId, e2ee_enabled => Enabled,
+      e2ee_revision => Revision, e2ee_disable_requested_by => Requester}.
+
+ensure_private_encryption_members(Conn, Uid, Cid) ->
+    {ok, Members} = rows(Conn, "SELECT dm.user_id,dm.request_state,u.is_bot FROM direct_members dm JOIN users u ON u.id=dm.user_id WHERE dm.thread_id=$1", [Cid]),
+    Eligible = length(Members) =:= 2 andalso lists:member([Uid, <<"accepted">>, false], Members)
+        andalso lists:all(fun([_, State, Bot]) -> State =:= <<"accepted">> andalso Bot =:= false end, Members)
+        andalso conversation_can_send(Conn, Uid, Cid),
+    case Eligible of true -> ok; false -> throw({plainwire_error, encryption_requires_private_dm}) end.
+
+update_encryption_policy(Conn, Cid, KeyId, Enabled, Revision, Requester) ->
+    ok = exec(Conn, "UPDATE direct_threads SET e2ee_enabled=$1,e2ee_revision=$2,e2ee_disable_requested_by=$3 WHERE id=$4", [Enabled, Revision, Requester, Cid]),
+    {ok, encryption_policy_map(Cid, [KeyId, Enabled, Revision, Requester])}.
+
+publish_encryption_policy(Conn, Cid, Result = {ok, Data}) ->
+    publish_conversation_event(Conn, Cid, Data#{type => conversation_updated}),
+    Result;
+publish_encryption_policy(_, _, Result) -> Result.
+
+ensure_encryption_revision(Conn, <<"direct">>, Cid, Expected) ->
+    case encryption_policy(Conn, Cid) of
+        {ok, [<<>>, _, _, _]} -> ok;
+        {ok, [_, _, Expected, _]} when is_integer(Expected) -> ok;
+        {ok, _} -> throw({plainwire_error, encryption_settings_changed});
+        _ -> throw({plainwire_error, forbidden})
+    end;
+ensure_encryption_revision(_, _, _, _) -> ok.
+
+ensure_encrypted_edit(Old, New, Options) ->
+    OldEncrypted = pw_e2ee:is_envelope(Old), NewEncrypted = pw_e2ee:is_envelope(New),
+    Action = maps:get(encryption_action, Options, normal),
+    case {Action, OldEncrypted, NewEncrypted} of
+        {normal, true, false} -> throw({plainwire_error, encrypted_message_unlock_required});
+        {normal, _, _} -> ok;
+        {<<"unlock">>, true, false} ->
+            ensure_encryption_edit_current(Old, Options);
+        {<<"lock">>, false, true} ->
+            ensure_encryption_edit_current(Old, Options),
+            case extract_file_ids(Old) of [] -> ok; _ -> throw({plainwire_error, encrypted_text_only}) end;
+        _ -> throw({plainwire_error, invalid_encryption_action})
+    end,
+    case {pw_e2ee:nonce(Old), pw_e2ee:nonce(New), NewEncrypted} of
+        {OldNonce, NewNonce, true} when OldNonce =/= <<>>, OldNonce =/= NewNonce ->
+            throw({plainwire_error, encrypted_message_context_changed});
+        _ -> ok
+    end.
+
+ensure_encryption_edit_current(Old, Options) ->
+    case maps:get(expected_body, Options, undefined) =:= Old of
+        true -> ok;
+        false -> throw({plainwire_error, message_changed})
+    end.
+
+bind_encrypted_message(Conn, Mid, Body) ->
+    case pw_e2ee:nonce(Body) of
+        <<>> -> ok;
+        Nonce ->
+            case one(Conn, "SELECT message_id FROM encrypted_message_bindings WHERE nonce=$1", [Nonce]) of
+                {ok, [Mid]} -> ok;
+                {ok, [_]} -> throw({plainwire_error, encrypted_message_replay});
+                _ ->
+                    case one(Conn, "INSERT INTO encrypted_message_bindings(message_id,nonce) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING message_id", [Mid, Nonce]) of
+                        {ok, [Mid]} -> ok;
+                        _ -> throw({plainwire_error, encrypted_message_replay})
+                    end
+            end
     end.
 
 store_message(Body) -> pw_crypto:encrypt(Body).
@@ -7618,10 +7721,15 @@ ensure_message_attachments_allowed(Conn, Uid, Scope, ScopeId, Body) ->
 test_validate_upload_refs(Conn, Uid, Body) -> ensure_upload_refs_readable(Conn, Uid, Body).
 test_e2ee({validate, Scope, Cid, Body}, Conn) -> ensure_message_encryption(Conn, Scope, Cid, Body);
 test_e2ee({body, Body}, _) -> message_body_valid(clean_message_input(Body));
+test_e2ee({edit_rule, Old, New, Options}, _) -> ensure_encrypted_edit(Old, New, Options);
+test_e2ee({revision, Cid, Revision}, Conn) -> ensure_encryption_revision(Conn, <<"direct">>, Cid, Revision);
+test_e2ee({binding, Mid, Body}, Conn) -> bind_encrypted_message(Conn, Mid, Body);
 test_e2ee(Msg, Conn) -> route(Msg, Conn).
 test_reports(Op, Conn) -> route(Op, Conn).
 test_edit_thread(Op = {edit_thread, _, _, _, _}, Conn) -> route(Op, Conn).
 test_call_invite_target(Conn, Uid, Cid, Target) -> route({call_invite_target, Uid, Cid, Target}, Conn).
+test_upload_backfill(Conn, Batch) -> route({upload_ref_backfill, Batch}, Conn).
+test_route_with_reconnect(Msg, Conn) -> route_with_reconnect(Msg, Conn).
 -endif.
 
 %% Owner access is intrinsic. Every other read must be justified by a live
@@ -8432,13 +8540,17 @@ conversation_row_map([Id, Name, Avatar, Owner, Created, Updated, LastRead, Muted
       last_sender_id => LastSenderId, last_sender_name => LastSenderName, last_sender_username => LastSenderUsername,
       peer_id => PeerId, peer_name => PeerName, peer_avatar_url => pw_util:proxied_image(PeerAvatar), peer_username => PeerUsername};
 conversation_row_map(Row) when length(Row) =:= 22 ->
-    (conversation_row_map(lists:sublist(Row, 21)))#{e2ee_key_id => lists:last(Row)}.
+    (conversation_row_map(lists:sublist(Row, 21)))#{e2ee_key_id => lists:last(Row)};
+conversation_row_map(Row) when length(Row) =:= 25 ->
+    maps:merge(conversation_row_map(lists:sublist(Row, 21)), maps:remove(conversation_id, encryption_policy_map(hd(Row), lists:nthtail(21, Row)))).
 
 conversation_full_map([Id, Name, Avatar, Owner, Created, Updated]) ->
     #{id => Id, name => Name, avatar_url => pw_util:proxied_image(Avatar),
       owner_id => Owner, created_at => Created, updated_at => Updated};
 conversation_full_map([Id, Name, Avatar, Owner, Created, Updated, KeyId]) ->
-    (conversation_full_map([Id, Name, Avatar, Owner, Created, Updated]))#{e2ee_key_id => KeyId}.
+    (conversation_full_map([Id, Name, Avatar, Owner, Created, Updated]))#{e2ee_key_id => KeyId};
+conversation_full_map([Id, Name, Avatar, Owner, Created, Updated, KeyId, Enabled, Revision, Requester]) ->
+    maps:merge(conversation_full_map([Id, Name, Avatar, Owner, Created, Updated]), maps:remove(conversation_id, encryption_policy_map(Id, [KeyId, Enabled, Revision, Requester]))).
 
 conversation_member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, LastRead, Muted, Nick, Joined]) ->
     #{user => user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last]),

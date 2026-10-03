@@ -597,4 +597,15 @@ migrations() -> [
         "ALTER TABLE direct_threads ADD COLUMN IF NOT EXISTS e2ee_key_id text NOT NULL DEFAULT ''",
         "ALTER TABLE direct_threads ADD CONSTRAINT direct_threads_e2ee_key_id_check CHECK(e2ee_key_id='' OR e2ee_key_id ~ '^[0-9a-f]{64}$')"
     ]}
+    ,{56, [
+        "ALTER TABLE direct_threads ADD COLUMN IF NOT EXISTS e2ee_enabled boolean NOT NULL DEFAULT false",
+        "ALTER TABLE direct_threads ADD COLUMN IF NOT EXISTS e2ee_revision integer NOT NULL DEFAULT 0 CHECK(e2ee_revision>=0)",
+        "ALTER TABLE direct_threads ADD COLUMN IF NOT EXISTS e2ee_disable_requested_by integer NOT NULL DEFAULT 0",
+        "UPDATE direct_threads SET e2ee_enabled=true,e2ee_revision=1 WHERE e2ee_key_id<>''",
+        "CREATE TABLE IF NOT EXISTS encrypted_message_bindings(nonce text PRIMARY KEY CHECK(nonce ~ '^[A-Za-z0-9_-]{22}$'),message_id bigint NOT NULL REFERENCES messages(id) ON DELETE CASCADE)",
+        "CREATE INDEX IF NOT EXISTS idx_encrypted_message_bindings_message ON encrypted_message_bindings(message_id)"
+    ]}
+    ,{57, [
+        "ALTER TABLE upload_ref_backfill ALTER COLUMN cursor TYPE bigint USING cursor::bigint"
+    ]}
 ].

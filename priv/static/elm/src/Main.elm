@@ -189,6 +189,9 @@ bridgeDecoder =
                     "compact_messages" ->
                         D.map SetCompactMessages (D.field "data" D.bool)
 
+                    "message_lock" ->
+                        D.map2 SetMessageLock (D.at [ "data", "conversation_id" ] D.int) (D.at [ "data", "enabled" ] D.bool)
+
                     "media_preload_enabled" ->
                         D.map SetMediaPreloadEnabled (D.field "data" D.bool)
 
@@ -325,6 +328,7 @@ init flags url _ =
       , linkPreviewsEnabled = True
       , animatedMediaEnabled = True
       , compactMessages = False
+      , encryptedDrafts = Set.empty
       , mediaPreloadEnabled = True
       , uiDensity = "comfortable"
       , uiFontScale = "default"
@@ -1198,7 +1202,7 @@ update msg model =
             sendMessage model
 
         StartEditMessage m ->
-            if m.id > 0 && Maybe.map .id model.me == Just m.userId && m.forwardedFrom == Nothing then
+            if m.id > 0 && Maybe.map .id model.me == Just m.userId && m.forwardedFrom == Nothing && m.encryptionState /= "locked" then
                 ( { model | editingMessageId = Just m.id, editingMessageText = m.body, ctxMenu = Nothing }, Cmd.none )
 
             else
@@ -1237,7 +1241,7 @@ update msg model =
             )
 
         OpenForwardModal m ->
-            if m.id > 0 then
+            if m.id > 0 && String.isEmpty m.encryptionState then
                 ( { model | modal = Just ("forward_message:" ++ String.fromInt m.id), modalTitle = "", modalBody = "", ctxMenu = Nothing }, Cmd.none )
 
             else
@@ -1378,7 +1382,7 @@ update msg model =
                                     ""
 
                         payload =
-                            encodeMessage { body = m.body, replyToId = m.replyToId }
+                            encodeMessage { body = m.body, replyToId = m.replyToId, encrypt = m.encryptionState == "encrypted" }
                     in
                     if String.isEmpty path then
                         ( model, Cmd.none )
@@ -1542,6 +1546,9 @@ update msg model =
             ( { model | compactMessages = enabled }
             , bridgeSend (E.object [ ( "tag", E.string "chat_set_compact_messages" ), ( "data", E.bool enabled ) ])
             )
+
+        SetMessageLock cid enabled ->
+            ( { model | encryptedDrafts = if enabled then Set.insert cid model.encryptedDrafts else Set.remove cid model.encryptedDrafts }, Cmd.none )
 
         SetMediaPreloadEnabled enabled ->
             ( { model | mediaPreloadEnabled = enabled }
@@ -2599,9 +2606,15 @@ mergeConversationDetails : List Conversation -> List Conversation -> List Conver
 mergeConversationDetails previous summaries =
     let
         preserveMembers summary =
-            case List.filter (\old -> old.id == summary.id && not (List.isEmpty old.members)) previous |> List.head of
+            case List.filter (\old -> old.id == summary.id) previous |> List.head of
                 Just old ->
-                    { summary | members = old.members, memberCount = Basics.max summary.memberCount (List.length old.members) }
+                    let
+                        next = { summary | members = old.members, memberCount = Basics.max summary.memberCount (List.length old.members) }
+                    in
+                    if old.e2eeRevision > summary.e2eeRevision then
+                        { next | e2eeKeyId = old.e2eeKeyId, e2eeEnabled = old.e2eeEnabled, e2eeRevision = old.e2eeRevision, e2eeDisableRequester = old.e2eeDisableRequester }
+                    else
+                        next
 
                 Nothing ->
                     summary
@@ -2779,7 +2792,17 @@ handleConversationDetail val model =
             let
                 updateConversation conversation =
                     if conversation.id == conversationId then
-                        { conversation | members = members, memberCount = List.length members, e2eeKeyId = D.decodeValue (D.at [ "conversation", "e2ee_key_id" ] D.string) val |> Result.withDefault conversation.e2eeKeyId }
+                        let
+                            current = D.decodeValue (D.at [ "conversation", "e2ee_revision" ] D.int) val |> Result.withDefault conversation.e2eeRevision
+                            fresh = current >= conversation.e2eeRevision
+                        in
+                        { conversation
+                            | members = members, memberCount = List.length members
+                            , e2eeKeyId = if fresh then D.decodeValue (D.at [ "conversation", "e2ee_key_id" ] D.string) val |> Result.withDefault conversation.e2eeKeyId else conversation.e2eeKeyId
+                            , e2eeEnabled = if fresh then D.decodeValue (D.at [ "conversation", "e2ee_enabled" ] D.bool) val |> Result.withDefault conversation.e2eeEnabled else conversation.e2eeEnabled
+                            , e2eeRevision = Basics.max current conversation.e2eeRevision
+                            , e2eeDisableRequester = if fresh then D.decodeValue (D.at [ "conversation", "e2ee_disable_requested_by" ] D.int) val |> Result.withDefault conversation.e2eeDisableRequester else conversation.e2eeDisableRequester
+                        }
 
                     else
                         conversation
@@ -2866,7 +2889,7 @@ handleMessageSent requestId val model =
                 updateConversation conversation =
                     if message.scope == "direct" && conversation.id == message.scopeId then
                         { conversation
-                            | lastBody = Just message.body
+                            | lastBody = Just (if String.isEmpty message.encryptionState then message.body else "Encrypted text message")
                             , lastMessageId = Just message.id
                             , lastSenderId = message.userId
                             , lastSenderName = message.displayName
@@ -4021,7 +4044,9 @@ sendMessage model =
             Maybe.map .id model.replyTo
 
         payload =
-            encodeMessage { body = body, replyToId = replyField }
+            encodeMessage { body = body, replyToId = replyField, encrypt = case model.active of
+                DmView cid -> Set.member cid model.encryptedDrafts || List.any (\c -> c.id == cid && c.e2eeEnabled) model.convs
+                _ -> False }
 
         scrollToBottom =
             bridgeSend (E.object [ ( "tag", E.string "scroll_messages_to_bottom" ), ( "data", E.bool True ) ])
@@ -4169,7 +4194,7 @@ appendOptimisticMessage scope scopeId body model =
                         user.isBot
                         False
                         []
-                        (if scope == "direct" && List.any (\c -> c.id == scopeId && not (String.isEmpty c.e2eeKeyId)) model.convs then "encrypted" else "")
+                        (if scope == "direct" && (Set.member scopeId model.encryptedDrafts || List.any (\c -> c.id == scopeId && c.e2eeEnabled) model.convs) then "encrypted" else "")
             in
             { model | msg = model.msg ++ [ optimistic ], inputText = "", replyTo = Nothing, drafts = Dict.remove (draftKeyFor model.active) model.drafts, outbox = Dict.insert optimistic.id optimistic model.outbox, nextMessageId = model.nextMessageId - 1 }
 

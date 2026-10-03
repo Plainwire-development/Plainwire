@@ -36,6 +36,9 @@ setup(Port) ->
     sql(Conn, "CREATE TEMP TABLE users(id integer PRIMARY KEY, account_state text, is_bot boolean)"),
     sql(Conn, "CREATE TEMP TABLE direct_members(thread_id integer, user_id integer, request_state text)"),
     sql(Conn, "CREATE TEMP TABLE friendships(user_low integer,user_high integer,requester_id integer,status text)"),
+    %% The unavailable-table case must not fall back to a real public table
+    %% when this suite runs against an already initialized development database.
+    sql(Conn, "SET search_path=pg_temp"),
     sql(Conn, "INSERT INTO users VALUES(1,'active',false),(2,'active',false),(3,'active',false),(4,'active',false)"),
     sql(Conn, "INSERT INTO direct_members VALUES(10,1,'accepted'),(10,2,'accepted'),(10,3,'accepted'),(20,1,'accepted'),(20,2,'accepted')"),
     Conn.

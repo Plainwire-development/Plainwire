@@ -1328,8 +1328,21 @@ messageContext model message x y =
 
             else
                 []
+
+        lockItems =
+            if mine && message.id > 0 && message.scope == "direct" && message.kind == "text" && message.forwardedFrom == Nothing && message.encryptionState /= "locked" then
+                if message.encryptionState == "encrypted" && List.any (\conversation -> conversation.id == message.scopeId && conversation.e2eeEnabled) model.convs then
+                    []
+                else
+                    [ { label = if message.encryptionState == "encrypted" then "Remove message lock" else "Lock message"
+                      , icon = Just "🔒", danger = message.encryptionState == "encrypted", sep = True
+                      , msg = BridgeEvent "change_message_lock" (E.object [ ( "message_id", E.int message.id ), ( "lock", E.bool (String.isEmpty message.encryptionState) ) ])
+                      }
+                    ]
+            else
+                []
     in
-    { items = base ++ reactionItems ++ pinItems ++ authorItems ++ mineItems ++
+    { items = base ++ reactionItems ++ pinItems ++ authorItems ++ lockItems ++ mineItems ++
         (if not mine && message.id > 0 && message.kind == "text" && message.deletedAt == Nothing then
             [ { label = "Report message", icon = Just "⚑", danger = True, sep = True, msg = BridgeEvent "report_user" (E.object [ ( "user_id", E.int message.userId ), ( "display_name", E.string message.displayName ), ( "message_id", E.int message.id ) ]) } ]
          else
@@ -2478,7 +2491,7 @@ renderCallUser model u =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "2.7.0", attribute "data-ui-revision" "interface-5" ]
+    div [ class "layout", attribute "data-ui-version" "2.8.0", attribute "data-ui-revision" "interface-5" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]

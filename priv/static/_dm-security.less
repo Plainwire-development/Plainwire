@@ -19,6 +19,9 @@ pw-dm-security {
   cursor: pointer;
 }
 .dm-security-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.dm-security-button[aria-pressed="true"] { color: var(--text); font-weight: 700; }
+.dm-security-button:disabled { cursor: default; opacity: 0.7; }
+pw-message-security { display: contents; }
 .dm-key-setup { display: grid; gap: 14px; }
 .dm-key-setup p { margin: 0; line-height: 1.6; }
 .dm-key-setup label { display: grid; gap: 8px; font-size: 13px; }
@@ -28,7 +31,14 @@ pw-dm-security {
 .dm-key-confirm input { width: 20px; height: 20px; flex: 0 0 20px; margin: 0; }
 .dm-key-status { overflow-wrap: anywhere; font: 12px monospace; }
 .dm-key-actions { display: flex; flex-wrap: wrap; gap: 10px; }
-.encrypted-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.encrypted-text { overflow-wrap: anywhere; }
+.encrypted-text > div { white-space: pre-wrap; }
+.private-link-embed { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; max-width: min(100%, 480px); }
+.private-link-embed .message-image, .private-media { max-width: 100%; max-height: 320px; border-radius: 8px; }
+.private-link-embed .link-video-frame { width: 100%; }
+.private-embed-note, .gif-picker-privacy { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.private-media-load { min-height: 44px; }
+.gif-picker-privacy { display: block; max-width: 100%; }
 .encrypted-message-label { display: block; color: var(--muted); font-size: 11px; margin-bottom: 5px; white-space: normal; }
 
 @media (max-width: 760px) {
@@ -55,7 +65,7 @@ pw-dm-security {
   .route-chat .composer-hint { display: none; }
   pw-dm-security { padding: 5px 12px; }
   pw-dm-security small { display: none; }
-  .dm-security-button { min-height: 36px; }
+  .dm-security-button { min-height: 44px; }
   .dm-key-input { flex-wrap: wrap; }
   .dm-key-input input { font-size: 16px; }
   .dm-key-actions .btn { width: 100%; min-height: 44px; }

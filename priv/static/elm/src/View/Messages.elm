@@ -190,6 +190,7 @@ textMessageView model grouped m =
             )
         , attribute "data-mid" (String.fromInt m.id)
         , attribute "data-long-context" "true"
+        , tabindex 0
         , onContextMenu (OpenMessageCtx m)
         ]
         [ if grouped then
@@ -290,7 +291,10 @@ textMessageView model grouped m =
               else if not (String.isEmpty m.encryptionState) then
                 div [ class "msg-body encrypted-text" ]
                     [ small [ class "encrypted-message-label" ] [ text (if m.encryptionState == "encrypted" then "Encrypted text" else "Encrypted text unavailable") ]
-                    , div [] [ text m.body ]
+                    , if m.encryptionState == "encrypted" then
+                        Html.node "pw-markdown" [ attribute "source" m.body, attribute "private-embeds" "", attribute "no-mentions" "" ] []
+                      else
+                        div [] [ text m.body ]
                     ]
 
               else
@@ -319,6 +323,10 @@ textMessageView model grouped m =
                     , button [ class "msg-action", disabled (m.id < 0), onClick (SetReplyTo m) ] [ text "Reply" ]
                     , button [ class "msg-action", disabled (m.id < 0 || not (String.isEmpty m.encryptionState)), onClick (OpenForwardModal m) ] [ text "Forward" ]
                     , button [ class "msg-action", onClick (CopyText m.body) ] [ text "Copy" ]
+                    , if mine && m.id > 0 && m.scope == "direct" && m.kind == "text" && m.forwardedFrom == Nothing then
+                        Html.node "pw-message-security" [ attribute "data-mid" (String.fromInt m.id), attribute "data-state" m.encryptionState ] []
+                      else
+                        text ""
                     , if mine && m.id > 0 && m.forwardedFrom == Nothing && m.encryptionState /= "locked" then
                         button [ class "msg-action", onClick (StartEditMessage m) ] [ text "Edit" ]
 

@@ -68,7 +68,7 @@ assert.doesNotMatch(sourceHub, /\.innerHTML\s*=/, 'Source Hub never injects GitH
 assert.match(sourceHub, /PLAINWIRE|Plainwire Source|Source tour/, 'Source Hub includes the guided architecture experience');
 assert.match(sourceLess, /\.source-tour-guide\.is-visible/, 'Source tour uses the established Plainwire tour transition');
 assert.match(sourceLess, /@media \(max-width: 760px\)/, 'Source Hub has an explicit mobile layout');
-assert.match(util, /https:\/\/avatars\.githubusercontent\.com/, 'CSP permits only GitHub’s canonical avatar CDN for mirrored profiles');
+assert.match(util, /img-src 'self' data: blob: https:;/, 'CSP permits HTTPS mirrored avatars and reader-loaded private media');
 assert.match(sourceHub, /githubOnly[\s\S]*hostname\.toLowerCase\(\) !== 'github\.com'/, 'GitHub action links are restricted to canonical github.com HTTPS URLs');
 assert.match(sourceHub, /Cached · refresh incomplete/, 'Source Hub labels partial upstream failures as cached/degraded instead of falsely live');
 assert.match(sourceHub, /validGitHubLogin/, 'Source Hub validates profile route names before issuing requests');

@@ -14,7 +14,7 @@ const types = read('priv/static/elm/src/Types.elm');
 const env = read('.env.example');
 const appSrc = read('src/plainwire_relay.app.src');
 
-assert.match(version, /^2\.(?:5|6|7)\.\d+(?:-\d+)?$/);
+assert.match(version, /^2\.(?:5|6|7|8)\.\d+(?:-\d+)?$/);
 assert.ok(appSrc.includes(`{vsn, "${version}"}`));
 assert.doesNotMatch(mail, /41844184/);
 assert.doesNotMatch(env, /41844184/);

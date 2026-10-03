@@ -18,10 +18,10 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
   tokens[idx].attrSet('class', 'message-link');
   return self.renderToken(tokens, idx, options);
 };
-md.renderer.rules.image = (tokens, idx) => {
+md.renderer.rules.image = (tokens, idx, options, env) => {
   const token = tokens[idx], url = token.attrGet('src') || '';
   const label = token.content || 'Image';
-  if (md.validateLink(url) && firstPartyImage(url)) {
+  if (!env?.privateEmbeds && md.validateLink(url) && firstPartyImage(url)) {
     const animated = /\.gif$/i.test(label);
     return `<a href="${escape(url)}" target="_blank" rel="noopener noreferrer ugc" class="message-image-link${animated ? ' message-gif-link' : ''}"><img src="${escape(url)}" alt="${escape(label)}" class="message-image${animated ? ' animated-image' : ''}" loading="lazy" decoding="async"></a>`;
   }
@@ -207,12 +207,12 @@ function embedIframe(kind) {
   return iframe;
 }
 
-function videoCard(kind, href) {
+function videoCard(kind, href, privateEmbeds = false) {
   const root = document.createElement('div');
   root.className = 'link-video';
   const frame = document.createElement('div');
   frame.className = 'link-video-frame';
-  if (kind.kind === 'youtube') {
+  if (kind.kind === 'youtube' && !privateEmbeds) {
     const img = document.createElement('img');
     img.className = 'link-video-thumb';
     img.src = `https://i.ytimg.com/vi/${encodeURIComponent(kind.id)}/hqdefault.jpg`;
@@ -418,6 +418,53 @@ function safeHost(href) {
   try { return new URL(href).hostname.replace(/^www\./, ''); } catch { return href; }
 }
 
+// Private URLs never pass through the relay's unfurler. Cards use local URL
+// information; remote media starts only after the reader chooses to load it.
+function privateEmbed(root, link) {
+  const url = new URL(link.href);
+  const kind = embedKind(url.href);
+  if (kind) {
+    const card = videoCard(kind, url.href, true);
+    card.classList.add('private-link-embed');
+    const note = document.createElement('small'); note.className = 'private-embed-note';
+    note.textContent = 'Playing contacts the video host. The relay does not receive this private link.';
+    card.append(note);
+    root.append(card);
+    return;
+  }
+  const card = document.createElement('div');
+  card.className = 'link-embed private-link-embed';
+  const site = document.createElement('small'); site.className = 'link-embed-site'; site.textContent = safeHost(url.href);
+  const destination = document.createElement('a'); destination.className = 'link-embed-title';
+  destination.href = url.href; destination.target = '_blank'; destination.rel = 'noopener noreferrer ugc';
+  destination.textContent = link.classList.contains('message-image-source') ? link.textContent : url.pathname === '/' ? url.hostname : url.pathname;
+  card.append(site, destination);
+  const image = link.classList.contains('message-image-source') || /\.(?:gif|png|jpe?g|webp|avif)(?:$)/i.test(url.pathname);
+  const video = /\.(?:mp4|webm|ogv)$/i.test(url.pathname);
+  const audio = /\.(?:mp3|m4a|wav|oga|opus)$/i.test(url.pathname);
+  const host = url.hostname.toLowerCase();
+  const localAddress = /^(?:localhost|.+\.localhost|.+\.local|0\.|10\.|127\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.|\[)/i.test(host);
+  if ((image || video || audio) && url.protocol === 'https:' && !url.username && !url.password && !localAddress) {
+    const note = document.createElement('small'); note.className = 'private-embed-note';
+    note.textContent = 'Loading contacts this host. The relay does not receive this private link.';
+    const load = document.createElement('button'); load.type = 'button'; load.className = 'btn secondary private-media-load';
+    load.textContent = image ? /\.gif$/i.test(url.pathname) ? 'Load GIF' : 'Load image' : video ? 'Load video' : 'Load audio';
+    load.addEventListener('click', () => {
+      if (!card.isConnected) return;
+      load.remove();
+      const media = document.createElement(image ? 'img' : video ? 'video' : 'audio');
+      media.className = image ? 'message-image' : 'private-media';
+      media.referrerPolicy = 'no-referrer';
+      if (image) { media.alt = link.textContent || 'Private image'; media.decoding = 'async'; }
+      else { media.controls = true; media.preload = 'metadata'; }
+      media.addEventListener('error', () => { media.remove(); note.textContent = 'Media could not load. Open the link to view it.'; }, {once: true});
+      media.src = url.href; card.append(media);
+    }, {once: true});
+    card.append(note, load);
+  }
+  root.append(card);
+}
+
 function embedFetch(href) {
   const wireCode = wireCodeForUrl(href);
   const key = wireCode ? `wire:${wireCode}` : href.split('#')[0];
@@ -469,6 +516,7 @@ const embedObserver = 'IntersectionObserver' in globalThis ? new IntersectionObs
 }, { rootMargin: '700px 0px' }) : null;
 
 function emitEmbed(root, a) {
+  if (root.hasAttribute('private-embeds') || root.closest('.encrypted-text')) { privateEmbed(root, a); return; }
   const kind = embedKind(a.href);
   if (kind && (kind.kind === 'youtube' || kind.kind === 'vimeo')) {
     root.append(videoCard(kind, a.href));
@@ -569,12 +617,12 @@ document.addEventListener('click', (event) => {
 });
 
 class PlainwireMarkdown extends HTMLElement {
-  static observedAttributes = ['source', 'compact', 'data-me', 'no-embeds', 'no-mentions'];
+  static observedAttributes = ['source', 'compact', 'data-me', 'no-embeds', 'no-mentions', 'private-embeds'];
   connectedCallback() { this.render(); }
   attributeChangedCallback() { if (this.isConnected) this.render(); }
   disconnectedCallback() { for (const code of this.querySelectorAll('code[data-language]')) observer?.unobserve(code); }
   refreshEmbeds() {
-    for (const embed of this.querySelectorAll('.link-embed-wrap, .link-video, .remote-image-embed')) embed.remove();
+    for (const embed of this.querySelectorAll('.link-embed-wrap, .link-video, .remote-image-embed, .private-link-embed')) embed.remove();
     for (const source of this.querySelectorAll('.embedded-image-source')) source.classList.remove('embedded-image-source');
     delete this.dataset.embeds;
     if (!this.hasAttribute('compact') && !this.hasAttribute('no-embeds') && document.documentElement.dataset.linkPreviews !== 'false') enhanceLinks(this);
@@ -583,13 +631,14 @@ class PlainwireMarkdown extends HTMLElement {
     const source = this.getAttribute('source') || '';
     const compact = this.hasAttribute('compact');
     const currentUser = this.getAttribute('data-me') || this.closest('[data-me]')?.getAttribute('data-me') || '';
-    const renderKey = `${compact ? 'compact' : 'full'}:${this.hasAttribute('no-embeds') ? 'no-embeds' : 'embeds'}:${this.hasAttribute('no-mentions') ? 'no-mentions' : 'mentions'}:${currentUser}:${source}`;
+    const privateEmbeds = this.hasAttribute('private-embeds') || !!this.closest('.encrypted-text');
+    const renderKey = `${compact ? 'compact' : 'full'}:${this.hasAttribute('no-embeds') ? 'no-embeds' : 'embeds'}:${this.hasAttribute('no-mentions') ? 'no-mentions' : 'mentions'}:${privateEmbeds}:${currentUser}:${source}`;
     if (this.lastSource === renderKey) return;
     this.lastSource = renderKey;
     for (const code of this.querySelectorAll('code[data-language]')) observer?.unobserve(code);
     this.innerHTML = compact
-      ? md.renderInline(source.slice(0, 1000).replace(/\s+/g, ' ').trim())
-      : md.render(source.slice(0, 20000));
+      ? md.renderInline(source.slice(0, 1000).replace(/\s+/g, ' ').trim(), {privateEmbeds})
+      : md.render(source.slice(0, 20000), {privateEmbeds});
     for (const table of this.querySelectorAll('table')) {
       const wrap = document.createElement('div'); wrap.className = 'markdown-table'; wrap.tabIndex = 0;
       table.before(wrap); wrap.append(table);

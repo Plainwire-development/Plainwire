@@ -63,7 +63,6 @@
     }).catch(() => {});
   };
   const openGifPicker = () => {
-    if (dmEncryption.activeEncrypted()) return;
     if (!clientConfig.gifSearchEnabled) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'GIF search is not configured on this Plainwire server.' });
       return;
@@ -137,6 +136,12 @@
     loadMore.textContent = 'Load more';
     loadMore.hidden = true;
     footer.append(loadMore);
+
+    if (dmEncryption.activeEncrypted()) {
+      const privacy = document.createElement('small'); privacy.className = 'gif-picker-privacy';
+      privacy.textContent = 'GIF searches go to the relay and KLIPY. The selected GIF link is encrypted when sent; readers choose when to load it.';
+      footer.append(privacy);
+    }
 
     picker.append(head, search, chips, status, grid, footer);
     backdrop.append(picker);
@@ -4297,6 +4302,7 @@
 
   const upgradeVoiceNoteLinks = (root = document) => {
     matchingNodes(root, 'a[href*="#plainwire-voice-note"]:not([data-voice-upgraded])').forEach((link) => {
+      if (link.closest('pw-markdown[private-embeds], .encrypted-text')) return;
       link.dataset.voiceUpgraded = 'true';
       const href = link.getAttribute('href') || '';
       if (!href.startsWith('/api/files/')) return;
@@ -7906,8 +7912,10 @@
     showDialog: options => showAccountDialog(options),
     closeDialog: () => closeAccountDialog(),
     toast: data => send(app.ports.bridgeReceive, {tag: 'toast', data}),
+    draftChanged: (cid, enabled) => send(app.ports.bridgeReceive, {tag: 'message_lock', data: {conversation_id: cid, enabled}}),
     refresh: cid => {
       api({method: 'GET', path: '/conversations'});
+      if (!new RegExp(`^#/?dm/${cid}(?:$|[/?])`).test(location.hash)) return;
       api({method: 'GET', path: `/conversation/${cid}`});
       api({method: 'GET', path: `/messages?scope=direct&scope_id=${cid}`});
     }
@@ -9309,6 +9317,9 @@
         break;
       case 'open_gif_picker':
         openGifPicker();
+        break;
+      case 'change_message_lock':
+        dmEncryption.changeMessageLock(data?.message_id, data?.lock === true).catch(error => send(app.ports.bridgeReceive, {tag: 'toast', data: error.message}));
         break;
       case 'account_change_username':
       case 'change_username':

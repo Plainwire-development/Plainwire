@@ -148,6 +148,9 @@ type alias Conversation =
     , peerAvatarUrl : String
     , peerUsername : String
     , e2eeKeyId : String
+    , e2eeEnabled : Bool
+    , e2eeRevision : Int
+    , e2eeDisableRequester : Int
     }
 
 
@@ -546,6 +549,7 @@ type alias Model =
     , linkPreviewsEnabled : Bool
     , animatedMediaEnabled : Bool
     , compactMessages : Bool
+    , encryptedDrafts : Set Int
     , mediaPreloadEnabled : Bool
     , uiDensity : String
     , uiFontScale : String
@@ -753,6 +757,7 @@ type Msg
     | SetLinkPreviewsEnabled Bool
     | SetAnimatedMediaEnabled Bool
     | SetCompactMessages Bool
+    | SetMessageLock Int Bool
     | SetMediaPreloadEnabled Bool
     | UiPreferences E.Value
     | Logout
@@ -857,6 +862,9 @@ decodeConversation =
         |> andMap (D.field "peer_avatar_url" D.string |> defaultValue "")
         |> andMap (D.field "peer_username" D.string |> defaultValue "")
         |> andMap (D.field "e2ee_key_id" D.string |> defaultValue "")
+        |> andMap (D.field "e2ee_enabled" D.bool |> defaultValue False)
+        |> andMap (D.field "e2ee_revision" D.int |> defaultValue 0)
+        |> andMap (D.field "e2ee_disable_requested_by" D.int |> defaultValue 0)
 
 
 decodeMemberUser : D.Decoder MemberUser
@@ -1129,11 +1137,12 @@ decodeCallUser =
         |> andMap (D.field "screen_audio" D.bool |> defaultValue False)
 
 
-encodeMessage : { body : String, replyToId : Maybe Int } -> E.Value
+encodeMessage : { body : String, replyToId : Maybe Int, encrypt : Bool } -> E.Value
 encodeMessage m =
     E.object
         (List.filterMap identity
             [ Just ( "body", E.string m.body )
+            , Just ( "encrypt_message", E.bool m.encrypt )
             , Maybe.map (\rid -> ( "reply_to_id", E.int rid )) m.replyToId
             ]
         )

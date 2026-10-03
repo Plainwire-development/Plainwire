@@ -19,13 +19,18 @@ view key placeholderText model =
                 _ -> Nothing
 
         encrypted =
-            conversation |> Maybe.map (\c -> not (String.isEmpty c.e2eeKeyId)) |> Maybe.withDefault False
+            conversation |> Maybe.map (\c -> c.e2eeEnabled || Set.member c.id model.encryptedDrafts) |> Maybe.withDefault False
     in
     div [ class "composer", attribute "data-draft" key ]
         [ case conversation of
             Just c ->
                 if (c.memberCount == 2 && c.requestState == "accepted") || encrypted then
-                    Html.node "pw-dm-security" [ attribute "data-conversation" (String.fromInt c.id), attribute "data-key-id" c.e2eeKeyId ] []
+                    Html.node "pw-dm-security"
+                        [ attribute "data-conversation" (String.fromInt c.id), attribute "data-key-id" c.e2eeKeyId
+                        , attribute "data-enabled" (if c.e2eeEnabled then "true" else "false")
+                        , attribute "data-revision" (String.fromInt c.e2eeRevision)
+                        , attribute "data-requester" (String.fromInt c.e2eeDisableRequester)
+                        ] []
                 else
                     text ""
             Nothing -> text ""
@@ -102,7 +107,6 @@ view key placeholderText model =
                 , title "Search GIFs (Ctrl / Cmd + G)"
                 , attribute "aria-label" "Search GIFs"
                 , onClick (BridgeEvent "open_gif_picker" E.null)
-                , disabled encrypted
                 ]
                 [ span [ class "composer-action-gif", attribute "aria-hidden" "true" ] [ text "GIF" ]
                 , span [ class "composer-action-label" ] [ text "GIF" ]
@@ -129,7 +133,7 @@ view key placeholderText model =
                             p [ class "muted" ] [ text "Your formatted message will appear here." ]
 
                           else if encrypted then
-                            p [ class "encrypted-text" ] [ text model.inputText ]
+                            Html.node "pw-markdown" [ attribute "source" model.inputText, attribute "private-embeds" "", attribute "no-mentions" "" ] []
 
                           else
                             Html.node "pw-markdown" [ attribute "source" model.inputText ] []

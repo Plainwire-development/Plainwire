@@ -276,9 +276,10 @@ security_headers() ->
         true -> <<"script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; ">>;
         false -> <<"script-src 'self'; worker-src 'self' blob:; ">>
     end,
-    %% YouTube/Vimeo link cards load a poster and, after a click, the player frame.
+    %% Private message media loads directly over HTTPS after the reader opts in,
+    %% without sending its decrypted URL through the relay's preview service.
     Csp = <<"default-src 'self'; ", ScriptPolicy/binary,
-        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://i.ytimg.com https://avatars.githubusercontent.com; media-src 'self' blob:; ",
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' blob: https:; ",
         "frame-src https://www.youtube-nocookie.com https://player.vimeo.com; ",
         "connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'">>,
     #{
