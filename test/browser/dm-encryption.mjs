@@ -169,7 +169,14 @@ try {
   await mkdir('test-results', {recursive: true});
   await page.setViewportSize({width: 390, height: 740}); await page.screenshot({path: 'test-results/encrypted-dm-mobile.png'});
   await page.setViewportSize({width: 390, height: 420});
-  const composer = await page.locator('#compose').boundingBox(); assert(composer.y >= 0 && composer.y + composer.height <= 420, 'composer fits short keyboard viewport');
+  // Playwright can return before the visual-viewport resize event updates the
+  // keyboard layout. Wait for that observable layout, preserving the bounds.
+  await page.waitForFunction(() => {
+    const box = document.querySelector('#compose')?.getBoundingClientRect();
+    return document.documentElement.style.getPropertyValue('--pw-visual-height') === '420px'
+      && box && box.top >= 0 && box.bottom <= 420;
+  }, null, {timeout: 5000});
+  const composer = await page.locator('#compose').boundingBox(); assert(composer.y >= 0 && composer.y + composer.height <= 420, `composer fits short keyboard viewport: ${JSON.stringify(composer)}`);
   assert.deepEqual(errors, [], 'no browser exceptions');
   console.log('PASS: private DM setup/unlock, independent AES-GCM decryption, key persistence/isolation, tamper/context checks, encrypted edits, UTF-8 limits, no key/plaintext API leak or private embeds, and mobile touch targets.');
 } finally { await browser.close(); await new Promise(r => server.close(r)); }
