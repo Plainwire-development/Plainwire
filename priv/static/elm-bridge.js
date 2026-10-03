@@ -10,6 +10,8 @@
   };
   const root = document.getElementById('app');
   if (!root || !window.Elm || !window.Elm.Main) return;
+  const dmEncryption = window.PlainwireE2EE;
+  if (!dmEncryption) { root.textContent = 'Plainwire could not load its encryption support. Refresh to try again.'; return; }
 
   const rawClientConfig = window.PLAINWIRE_CLIENT_CONFIG || {};
   const finiteInt = (value, fallback, min, max) => {
@@ -61,6 +63,7 @@
     }).catch(() => {});
   };
   const openGifPicker = () => {
+    if (dmEncryption.activeEncrypted()) return;
     if (!clientConfig.gifSearchEnabled) {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'GIF search is not configured on this Plainwire server.' });
       return;
@@ -1634,7 +1637,9 @@
   const peerRepairHistory = new Map();
   const RTC_PEER_REBUILD_WINDOW_MS = 90000;
   const RTC_MAX_PEER_REBUILDS = 2;
-  const defaultRtcConfig = { iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }] };
+  // Until the server's transport policy is known, do not expose candidates to
+  // peers or contact a public STUN service. Relay-only with no servers fails closed.
+  const defaultRtcConfig = { iceServers: [], iceTransportPolicy: 'relay', turnStatus: 'unavailable' };
   const RTC_CONNECT_CHECK_MS = 7000;
   // Relay (TURN over TCP/TLS) paths can take well over one check interval. An ICE
   // restart discards in-progress checks, so give checking time to finish first.
@@ -1839,7 +1844,7 @@
       })
       .catch(error => {
         rtcConfigNextRefresh = Date.now() + 30000;
-        if (Date.now() >= rtcConfigValidUntil) rtcConfig = { ...rtcConfig, iceServers: defaultRtcConfig.iceServers, turnStatus: 'unavailable' };
+        if (Date.now() >= rtcConfigValidUntil) rtcConfig = { ...rtcConfig, iceServers: [], iceTransportPolicy: 'relay', turnStatus: 'unavailable' };
         debug('RTC', 'config_fetch_failed', { error: error.message }, 'warn');
         return rtcConfig;
       }).finally(() => { clearTimeout(timeout); rtcConfigRequest = null; });
@@ -2860,8 +2865,11 @@
 
   const debugApiBody = (path, body) => {
     if (path === '/login' || path === '/register' || path === '/password' || path === '/password/forgot' || path === '/password/reset' || path === '/email' || path === '/email/verify' || path === '/email/resend' || path === '/email/remove') return '[redacted]';
-    return body;
+    // Diagnostics can be exported. Never retain message text, moderation
+    // evidence, connector secrets, or DM keys in the in-memory debug ring.
+    return body == null ? null : '[redacted]';
   };
+  const debugWsMessage = (value) => ({type: value?.type, scope: value?.scope, scope_id: value?.scope_id, message_id: value?.message?.id});
 
   const clearSyncRecovery = (component) => {
     const state = syncRecovery.get(component);
@@ -2950,6 +2958,7 @@
     }
 
     try {
+      if (body !== null && body !== undefined) options.body = JSON.stringify(await dmEncryption.encodeRequest({method, path, body}));
       if (method === 'POST' && (/^\/channels\/\d+\/messages$/.test(path) || /^\/conversation\/\d+\/messages$/.test(path))) {
         stopTypingForCurrentComposer();
       }
@@ -2972,6 +2981,7 @@
       if (succeeded && json.data && json.data.csrf) csrf = json.data.csrf;
       if (succeeded && ['/me', '/login', '/register'].includes(path) && json.data?.user?.id) {
         meId = json.data.user.id;
+        dmEncryption.setUser(meId);
         if (extensionUserId !== meId) {
           closeAllModals();
           extensionUserId = meId;
@@ -3003,6 +3013,7 @@
       if (succeeded && method === 'POST' && path === '/logout') {
         closeAllModals();
         meId = null;
+        dmEncryption.setUser(null);
         extensionUserId = null;
         extensionGeneration++;
         stopClientPlugins();
@@ -3013,6 +3024,7 @@
         json.data.url = new URL(json.data.url.replace('#invite/', '#wire/'), location.origin + '/').href;
       }
       if (succeeded || !silent) {
+        if (succeeded && json.data) json.data = await dmEncryption.decodeData(json.data);
         send(app.ports.apiReceive, {
           path,
           method,
@@ -3028,6 +3040,7 @@
       const recoveryComponent = method === 'GET' ? syncRecoveryComponentsByPath[path] : undefined;
       if (!silent && recoveryComponent && !authReloadScheduled) scheduleSyncRecovery(recoveryComponent, 500);
       if (!silent) {
+        if (body?.body && (path.startsWith('/conversation/') || path.startsWith('/edit_message/'))) send(app.ports.bridgeReceive, {tag: 'toast', data: error.message});
         send(app.ports.apiReceive, { path, method, request_id, ok: false, data: null, error: error.name === 'AbortError' ? 'request_timeout' : 'request_failed' });
       }
       return null;
@@ -4085,6 +4098,7 @@
   });
 
   const uploadFiles = async (files) => {
+    if (dmEncryption.activeEncrypted()) { send(app.ports.bridgeReceive, {tag: 'toast', data: 'Encrypted DMs currently support text only.'}); return; }
     const selected = Array.from(files || []);
     const uploadRoute = location.hash;
     const uploadComposer = activeComposer();
@@ -4184,6 +4198,7 @@
   };
 
   const openVoiceNoteRecorder = async () => {
+    if (dmEncryption.activeEncrypted()) { send(app.ports.bridgeReceive, {tag: 'toast', data: 'Encrypted DMs currently support text only.'}); return; }
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== 'function') {
       send(app.ports.bridgeReceive, { tag: 'toast', data: 'Voice notes are not supported by this browser.' });
       return;
@@ -4347,6 +4362,7 @@
     debug('WS', 'connecting', { url, queued: wsQueue.length });
     ws = new WebSocket(url);
     const socket = ws;
+    let chatEvents = Promise.resolve();
     ws.onopen = () => {
       if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
       const reconnected = wsEverConnected;
@@ -4420,14 +4436,20 @@
       try {
         wsLastMessageAt = Date.now();
         const msg = JSON.parse(event.data);
-        debug('WS', 'received', { message: msg });
-        if (msg.session && msg.session.user && msg.session.user.id) meId = msg.session.user.id;
+        debug('WS', 'received', debugWsMessage(msg));
+        if (msg.session && msg.session.user && msg.session.user.id) { meId = msg.session.user.id; dmEncryption.setUser(meId); }
         if (msg.type === 'hello') maybeResumeRtcRoom();
         const systemConsumed = handleSystemEvent(msg) === true;
         handlePresenceEvent(msg);
         const typingConsumed = handleTypingEvent(msg) === true;
         const rtcConsumed = handleRtcEvent(msg) === true;
-        if (!systemConsumed && !typingConsumed && !rtcConsumed) send(app.ports.wsReceive, msg);
+        if (!systemConsumed && !typingConsumed && !rtcConsumed) {
+          chatEvents = chatEvents.catch(() => {}).then(async () => {
+            if (ws !== socket) return;
+            const decoded = await dmEncryption.decodeData(msg);
+            if (ws === socket) send(app.ports.wsReceive, decoded);
+          });
+        }
       } catch (error) { debug('WS', 'invalid_message', { error: error.message, bytes: String(event.data).length }, 'error'); }
     };
     ws.onerror = () => debug('WS', 'transport_error', { ready_state: ws?.readyState }, 'error');
@@ -4474,7 +4496,7 @@
   const sendWs = (value) => {
     connectWs();
     if (ws && ws.readyState === WebSocket.OPEN) {
-      debug('WS', 'sent', { message: value });
+      debug('WS', 'sent', debugWsMessage(value));
       ws.send(JSON.stringify(value));
     } else {
       queueWs(value);
@@ -6693,11 +6715,13 @@
     // one offerer per pair. two is how glare happens.
     if (!pc || !pc._offerer || !room || pc._roomEpoch !== room.epoch || pc.signalingState !== 'stable' || pc._makingOffer) return;
     pc._makingOffer = true;
+    pc._holdLocalCandidates = true;
     debug('RTC', 'offer_creating', { peer_user_id: uid, ice_restart: !!options.iceRestart, signaling: pc.signalingState });
     try {
       const offer = await pc.createOffer(options);
       if (!room || pc._roomEpoch !== room.epoch || pc.signalingState === 'closed') return;
       await pc.setLocalDescription(offer);
+      if (!room || pc._roomEpoch !== room.epoch || peers.get(uid) !== pc || pc.signalingState === 'closed') return;
       pc._offerSentAt = Date.now();
       debug('RTC', 'offer_ready', { peer_user_id: uid });
       sendSignal(uid, { kind: 'offer', sdp: pc.localDescription });
@@ -6866,6 +6890,7 @@
     pc._holdLocalCandidates = true;
     pc._heldLocalCandidates = [];
     pc._releaseLocalCandidates = () => {
+      if (!room || room.epoch !== epoch || peers.get(uid) !== pc || pc.signalingState === 'closed') return;
       pc._holdLocalCandidates = false;
       const queued = pc._heldLocalCandidates.splice(0);
       queued.forEach((candidate) => sendSignal(uid, { kind: 'candidate', candidate }));
@@ -6886,6 +6911,7 @@
       });
     };
     pc.onicecandidate = (ev) => {
+      if (!room || room.epoch !== epoch || peers.get(uid) !== pc || pc.signalingState === 'closed') return;
       if (ev.candidate) {
         debug('RTC', 'ice_candidate', { peer_user_id: uid, protocol: ev.candidate.protocol, type: ev.candidate.type });
         if (pc._holdLocalCandidates) pc._heldLocalCandidates.push(ev.candidate);
@@ -7200,11 +7226,11 @@
     return (await peerPromises.get(`${epoch}:${uid}:${peerGenerations.get(uid) || 0}`)) || null;
   };
 
-  const applySignal = async (msg, generation) => {
+  const applySignal = async (msg, generation, epoch) => {
     const uid = Number(msg.from_user_id || msg.user_id || 0);
     const signal = msg.signal || {};
     debug('RTC', 'signal_received', { peer_user_id: uid, kind: signal.kind, message_type: msg.type });
-    if (!uid || uid === meId || !room || !eventMatchesRoom(msg) || (peerGenerations.get(uid) || 0) !== generation) {
+    if (!uid || uid === meId || !room || room.epoch !== epoch || !eventMatchesRoom(msg) || (peerGenerations.get(uid) || 0) !== generation) {
       debug('RTC', 'stale_signal_ignored', { peer_user_id: uid, event_room: rtcEventRoom(msg), room });
       return;
     }
@@ -7212,18 +7238,20 @@
     // candidate or answer from someone who already left must not create a
     // zombie peer that retries and then reports failure.
     const pc = signal.kind === 'offer' || signal.kind === 'renegotiate' ? await ensurePeer(uid) : await existingPeer(uid);
+    if (!room || room.epoch !== epoch || (peerGenerations.get(uid) || 0) !== generation) return;
     if (!pc) {
       // The offer that creates the peer may still be behind this candidate.
       if (signal.kind === 'candidate' && signal.candidate) rememberEarlyCandidate(uid, signal.candidate);
       else if (signal.kind === 'offer' && (identityRetries.get(uid) || 0) > 0 && (identityRetries.get(uid) || 0) < 8) {
         setTimeout(() => {
-          if ((peerGenerations.get(uid) || 0) === generation) handleSignal(msg).catch(() => {});
+          if (room?.epoch === epoch && (peerGenerations.get(uid) || 0) === generation) handleSignal(msg).catch(() => {});
         }, 450);
       }
       return;
     }
     takeEarlyCandidates(uid, pc);
     if (pc.remoteDescription) await drainPendingCandidates(uid, pc);
+    if (!room || room.epoch !== epoch || peers.get(uid) !== pc || pc.signalingState === 'closed') return;
     try {
       if (signal.kind === 'renegotiate') {
         if (pc._offerer) {
@@ -7241,6 +7269,7 @@
           if (pc.signalingState === 'stable') makeOffer(uid, pc, { iceRestart: true }).catch(() => {});
           return;
         }
+        pc._holdLocalCandidates = true;
         const readyForOffer = !pc._makingOffer &&
           (pc.signalingState === 'stable' || pc._isSettingRemoteAnswerPending);
         const offerCollision = !readyForOffer;
@@ -7249,8 +7278,9 @@
         try {
           await pc.setRemoteDescription(signal.sdp);
         } catch (error) {
+          if (!room || room.epoch !== epoch || peers.get(uid) !== pc || pc.signalingState === 'closed') return;
           // The offerer missed our answer and sent the same description again.
-          if (pc.signalingState === 'stable' && pc.localDescription?.type === 'answer') {
+          if (pc.signalingState === 'stable' && pc.localDescription?.type === 'answer' && pc.remoteDescription?.sdp === signal.sdp?.sdp) {
             debug('RTC', 'offer_already_answered', { peer_user_id: uid });
             sendSignal(uid, { kind: 'answer', sdp: pc.localDescription });
             pc._releaseLocalCandidates?.();
@@ -7261,6 +7291,7 @@
           await pc.setLocalDescription({ type: 'rollback' });
           await pc.setRemoteDescription(signal.sdp);
         }
+        if (!room || room.epoch !== epoch || peers.get(uid) !== pc || pc.signalingState === 'closed') return;
         pc._ignoreOffer = false;
         pc._failureReported = false;
         reportPeerFailure(uid, pc, false);
@@ -7272,8 +7303,11 @@
         }
         if (!room || room.epoch !== pc._roomEpoch || pc.signalingState === 'closed') return;
         await drainPendingCandidates(uid, pc);
+        if (!room || room.epoch !== epoch || peers.get(uid) !== pc || pc.signalingState === 'closed') return;
         const answer = await pc.createAnswer();
+        if (!room || room.epoch !== epoch || peers.get(uid) !== pc || pc.signalingState === 'closed') return;
         await pc.setLocalDescription(answer);
+        if (!room || room.epoch !== epoch || peers.get(uid) !== pc || pc.signalingState === 'closed') return;
         markNegotiated(pc);
         debug('RTC', 'answer_ready', { peer_user_id: uid });
         sendSignal(uid, { kind: 'answer', sdp: pc.localDescription });
@@ -7286,6 +7320,7 @@
           } finally {
             pc._isSettingRemoteAnswerPending = false;
           }
+          if (!room || room.epoch !== epoch || peers.get(uid) !== pc || pc.signalingState === 'closed') return;
           pc._ignoreOffer = false;
           markNegotiated(pc);
           debug('RTC', 'remote_answer_applied', { peer_user_id: uid });
@@ -7317,8 +7352,9 @@
     const uid = Number(msg?.from_user_id || msg?.user_id || 0);
     const key = `${room?.epoch || 0}:${uid}`;
     const generation = peerGenerations.get(uid) || 0;
+    const epoch = room?.epoch;
     const previous = signalQueues.get(key) || Promise.resolve();
-    const queued = previous.catch(() => {}).then(() => applySignal(msg, generation));
+    const queued = previous.catch(() => {}).then(() => applySignal(msg, generation, epoch));
     signalQueues.set(key, queued);
     return queued.finally(() => {
       if (signalQueues.get(key) === queued) signalQueues.delete(key);
@@ -7483,7 +7519,7 @@
       if (route) api({ method: 'GET', path: `/messages?scope=${route[1] === 'dm' ? 'direct' : 'channel'}&scope_id=${route[2]}` });
       return;
     }
-    if (/^(voice|call)_/.test(msg.type || '')) debug('RTC', 'server_event', { message: msg });
+    if (/^(voice|call)_/.test(msg.type || '')) debug('RTC', 'server_event', debugWsMessage(msg));
     if (['voice_state', 'call_state', 'voice_peer_joined', 'call_peer_joined', 'call_ringing', 'call_incoming'].includes(msg.type)) markActive();
     if (msg.type === 'call_ringing' && eventMatchesRoom(msg)) {
       room.ringing = true;
@@ -7854,6 +7890,28 @@
     applySaved();
   };
 
+  dmEncryption.configure({
+    request: async (method, path, body) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+      try {
+        const response = await fetch('/api' + path, {method, cache: 'no-store', signal: controller.signal,
+          headers: {'accept': 'application/json', 'content-type': 'application/json', 'x-csrf-token': csrf},
+          ...(body === undefined ? {} : {body: JSON.stringify(body)})});
+        const json = await response.json();
+        if (!response.ok || json.ok !== true) throw new Error(json.error || 'Could not update encryption settings');
+        return json.data;
+      } finally { clearTimeout(timeout); }
+    },
+    showDialog: options => showAccountDialog(options),
+    closeDialog: () => closeAccountDialog(),
+    toast: data => send(app.ports.bridgeReceive, {tag: 'toast', data}),
+    refresh: cid => {
+      api({method: 'GET', path: '/conversations'});
+      api({method: 'GET', path: `/conversation/${cid}`});
+      api({method: 'GET', path: `/messages?scope=direct&scope_id=${cid}`});
+    }
+  });
   recv(app.ports.apiSend, api);
   recv(app.ports.wsSend, (value) => {
     sendWs(value);
@@ -9246,6 +9304,7 @@
         send(app.ports.bridgeReceive, { tag: 'toast', data });
         break;
       case 'pick_attachments':
+        if (dmEncryption.activeEncrypted()) break;
         attachmentInput.click();
         break;
       case 'open_gif_picker':

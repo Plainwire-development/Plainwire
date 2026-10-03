@@ -14,6 +14,8 @@ The host control plane is separate from per-server moderation. Operational views
 
 ## Message encryption at rest
 
+Shipped release VM arguments disable native Erlang distribution and EPMD. Production startup rejects a named node unless both are explicitly disabled. Manage the foreground service through the operating-system service manager; keep remote Erlang distribution ports closed.
+
 `PLAINWIRE_ENC_KEY` is a base64-encoded 32-byte AES-256-GCM key. Production configuration validation requires a usable encryption key.
 
 Generate a key with a cryptographically secure tool, for example:
@@ -37,7 +39,9 @@ PLAINWIRE_ENC_PREVIOUS_KEYS=<old base64 key>,<older base64 key>
 
 New values use the primary key. Reads try the primary key and then previous keys. Keep old keys backed up until all content that depends on them has been migrated or aged out.
 
-Plainwire does not claim end-to-end encryption. The application server can decrypt messages while providing server-side features.
+Private two-person DMs can explicitly enable end-to-end encrypted text. The browser creates AES-256-GCM ciphertext using a shared key that is never submitted to the relay. The server permanently requires encrypted envelopes for new text and edits in that DM. See [encrypted private DMs](END_TO_END_ENCRYPTION.md) for key exchange, device setup, and the threat model. This mode has no forward secrecy and does not encrypt earlier messages, calls, files, or metadata. Other content remains readable by the application server while it provides server-side features.
+
+New content writes fail if a configured at-rest key is invalid, or if the key is missing in production. Invalid or unauthenticated at-rest envelopes produce empty content rather than being treated as plaintext. Keep backups of the instance keys and test rotations before removing previous keys.
 
 ## Message search
 

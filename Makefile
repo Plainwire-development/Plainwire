@@ -146,6 +146,7 @@ test-release-contract:
 test-browser: frontend test-rtc-contract test-ui-contract test-admin-contract test-integrations-contract test-storage-contract test-storage-tools test-v21-contract test-v22-bot-contract test-v24-bot-contract test-v241-patch-contract test-scalability-contract test-release-contract
 	$(NPM) run test:browser
 	$(NPM) run test:security-audit
+	$(NPM) run test:e2ee
 	$(NPM) run test:reports
 	$(NODE) test/browser/settings-responsive.mjs
 	$(NODE) test/browser/admin-moderation.mjs
@@ -173,6 +174,7 @@ endif
 # A source archive contains authoritative inputs only; generated UI bundles are rebuilt by `make build`.
 # It is not proof that the host-specific release build passed.
 source: verify frontend backend
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) test/archive_tests.py
 	$(PYTHON) scripts/archive.py source
 
 package: release source

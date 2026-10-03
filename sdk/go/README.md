@@ -21,3 +21,5 @@ err = bot.RunCommandWorker(ctx, map[string]plainwirebot.CommandHandler{
 ```
 
 Claim tokens are lease capabilities. Keep them in memory, never log them, and respond or fail before `lease_until`.
+
+The worker limits claims to available concurrency and renews leases during handlers. Handler errors send a generic failure to users and remain detailed in `OnError`. Cancellation stops renewal; handlers should respect their context.

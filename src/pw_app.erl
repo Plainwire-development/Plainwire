@@ -2,6 +2,10 @@
 -behaviour(application).
 -export([start/2, stop/1]).
 
+-ifdef(TEST).
+-export([distribution_allowed/4]).
+-endif.
+
 start(_Type, _Args) ->
     case pw_cluster_config:validate(pw_cluster_config:get()) of
         ok -> ok;
@@ -34,6 +38,10 @@ ensure_storage_config() ->
 
 ensure_secure_config() ->
     Production = production_env(),
+    case distribution_allowed(Production, node(), init:get_argument(dist_listen), init:get_argument(start_epmd)) of
+        true -> ok;
+        false -> erlang:error({insecure_production_config, native_distribution})
+    end,
     ensure_upload_config(Production),
     ensure_admin_config(Production),
     case Production of
@@ -48,6 +56,11 @@ ensure_secure_config() ->
             true = password_cost_configured(),
             ensure_rtc_config(Production)
     end.
+
+distribution_allowed(false, _, _, _) -> true;
+distribution_allowed(true, nonode@nohost, _, _) -> true;
+distribution_allowed(true, _, {ok, [["false"]]}, {ok, [["false"]]}) -> true;
+distribution_allowed(_, _, _, _) -> false.
 
 ensure_admin_config(Production) ->
     case pw_util:env_bool("PLAINWIRE_ADMIN_ENABLED", false) of

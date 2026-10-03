@@ -50,8 +50,11 @@ encrypt(Plain0) when is_binary(Plain0) ->
             AAD = <<>>,
             {Cipher, Tag} = crypto:crypto_one_time_aead(aes_256_gcm, Key, IV, Plain0, AAD, true),
             <<$e, $1, $:, (base64:encode(<<IV/binary, Tag/binary, Cipher/binary>>))/binary>>;
-        _ ->
-            Plain0
+        {error, no_key} ->
+            Production = lists:member(os:getenv("PLAINWIRE_ENV"), ["prod", "production"])
+                orelse lists:member(os:getenv("NODE_ENV"), ["prod", "production"]),
+            case Production of true -> erlang:error(no_encryption_key); false -> Plain0 end;
+        {error, bad_key} -> erlang:error(invalid_encryption_key)
     end;
 encrypt(Plain) -> encrypt(pw_util:bin(Plain)).
 
@@ -67,7 +70,7 @@ decrypt(Bin0) when is_binary(Bin0) ->
                         %% could be reused as a webhook secret or API key.
                         error -> <<>>
                     end;
-                _ -> Bin0
+                _ -> <<>>
             end;
         _ -> Bin0
     end;

@@ -626,6 +626,8 @@ authed(<<"POST">>, [<<"conversations">>], Req0, Session, _) -> with_json(Req0, f
     result(Req, Result)
 end);
 authed(<<"GET">>, [<<"conversation">>, Id], Req, Session, _) -> result(Req, pw_db:conversation(uid(Session), Id));
+authed(<<"POST">>, [<<"conversation">>, Id, <<"encryption">>], Req0, Session, _) ->
+    with_json(Req0, fun(M, Req) -> result(Req, pw_db:enable_conversation_encryption(uid(Session), Id, maps:get(<<"key_id">>, M, undefined))) end);
 authed(<<"POST">>, [<<"conversation">>, Id], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_conversation(uid(Session), Id, maps:get(<<"name">>,M,<<>>), M)) end);
 authed(<<"POST">>, [<<"conversation">>, Id, <<"members">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) ->
     Result = case maps:get(<<"usernames">>, M, []) of

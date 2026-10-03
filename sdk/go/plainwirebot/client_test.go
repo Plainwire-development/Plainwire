@@ -2,8 +2,11 @@ package plainwirebot
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -60,5 +63,60 @@ func TestCommandClaimOption(t *testing.T) {
 	value, ok := claim.Option("text")
 	if !ok || value != "hello" {
 		t.Fatalf("expected named option, got %v %v", value, ok)
+	}
+}
+
+func TestWorkerProtectsErrorsAndCapsClaims(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var claimLimit string
+	var failure string
+	var renewals atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/bot/v1/commands/claims":
+			if claimLimit != "" {
+				_, _ = w.Write([]byte(`{"ok":true,"data":[]}`))
+				return
+			}
+			claimLimit = r.URL.Query().Get("limit")
+			_, _ = w.Write([]byte(`{"ok":true,"data":[{"id":7,"command":"ping","claim_token":"pwc_x"}]}`))
+		case "/api/bot/v1/commands/claims/7/defer":
+			renewals.Add(1)
+			_, _ = w.Write([]byte(`{"ok":true,"data":{}}`))
+		case "/api/bot/v1/commands/claims/7/fail":
+			var body struct {
+				Reason string `json:"reason"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			failure = body.Reason
+			_, _ = w.Write([]byte(`{"ok":true,"data":{}}`))
+		time.AfterFunc(50*time.Millisecond, cancel)
+		}
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "pwb_1234567890123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reported error
+	err = client.RunCommandWorker(ctx, map[string]CommandHandler{
+		"ping": func(context.Context, CommandClaim, *Client) (string, error) {
+			time.Sleep(2700 * time.Millisecond)
+			return "", errors.New("secret-provider-key")
+		},
+	}, WorkerOptions{BatchSize: 20, Concurrency: 2, Lease: 5 * time.Second, OnError: func(err error, _ *CommandClaim) { reported = err }})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation: %v", err)
+	}
+	if claimLimit != "2" || failure != "Command failed" {
+		t.Fatalf("limit=%q failure=%q", claimLimit, failure)
+	}
+	if renewals.Load() < 2 {
+		t.Fatal("active lease was not renewed during handler")
+	}
+	if reported == nil || reported.Error() != "secret-provider-key" {
+		t.Fatalf("local error missing: %v", reported)
 	}
 }

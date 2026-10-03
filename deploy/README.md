@@ -1,6 +1,6 @@
 # Deploy Plainwire
 
-Plainwire 2.5.0 needs a Linux host, Erlang/OTP 27, 28, or 29, PostgreSQL, an HTTPS reverse proxy, and durable space for uploads. PostgreSQL is mandatory. Redis and ScyllaDB are optional and stay off unless you set `PLAINWIRE_REDIS_ENABLED` or `PLAINWIRE_SCYLLA_ENABLED`. Calls between different networks also need a TURN server. The supplied service file is for systemd; existing OpenRC deployments can continue using the OpenRC scripts.
+Plainwire 2.7.0 needs a Linux host, Erlang/OTP 27, 28, or 29, PostgreSQL, an HTTPS reverse proxy, and durable space for uploads. PostgreSQL is mandatory. Redis and ScyllaDB are optional and stay off unless you set `PLAINWIRE_REDIS_ENABLED` or `PLAINWIRE_SCYLLA_ENABLED`. Calls between different networks also need a TURN server. The supplied service file is for systemd; existing OpenRC deployments can continue using the OpenRC scripts.
 
 OTP 29 compiles through `scripts/compile-erlcass.sh`. If the native Scylla driver cannot be built, PostgreSQL messaging still builds. See [BUILDING.md](../docs/BUILDING.md), [REDIS.md](../docs/REDIS.md), and [SCYLLA.md](../docs/SCYLLA.md).
 
@@ -16,7 +16,9 @@ rebar3 eunit
 rebar3 release
 ```
 
-Copy `_build/default/rel/plainwire_relay` to a versioned directory such as `/opt/plainwire/releases/2.5.0`. Make `/opt/plainwire/current` a symlink to that directory. Create a dedicated `plainwire` service account with no login shell. The release should be readable and executable by that account, but owned by the administrator.
+Copy `_build/default/rel/plainwire_relay` to a versioned directory such as `/opt/plainwire/releases/2.7.0`. Make `/opt/plainwire/current` a symlink to that directory. Create a dedicated `plainwire` service account with no login shell. The release should be readable and executable by that account, but owned by the administrator.
+
+The shipped VM arguments disable native Erlang distribution and EPMD. Keep `-dist_listen false` and `-start_epmd false` if replacing `vm.args`; production startup rejects a named VM without both. Manage startup, shutdown, and restart through systemd/OpenRC. Remote release-launcher `rpc`, `eval`, `ping`, and `stop` commands require distribution and are intentionally unavailable with these defaults. Partisan clustering uses its separate authenticated transport and requires the configured node identity; see [Clustering](../docs/CLUSTERING.md).
 
 Copy `.env.example` to `/etc/plainwire/plainwire.env`, replace the example values, and restrict the file to root. Set the public URL, database credentials, encryption key, and TURN credentials. Keep this environment file, the database, and uploads when upgrading. Losing or changing the encryption key makes previously encrypted messages unreadable.
 
@@ -64,3 +66,7 @@ Cloudflare TURN setup is in [CLOUDFLARE_TURN.md](../docs/CLOUDFLARE_TURN.md). It
 Redis and Scylla stay disabled until their environment flags are set. PostgreSQL still has to be up for the node to serve accounts. The host control plane is also optional: `PLAINWIRE_ADMIN_ENABLED=true` starts it on `127.0.0.1:8090` unless you change the bind. Operators can suspend, ban, disable, restore, and sign accounts out, and can reset a display name or clear email, but the panel does not show message bodies or email addresses. Details are in [ADMIN.md](../docs/ADMIN.md).
 
 Upgrades from older databases still apply the numbered migrations, including the invite `welcome_message` column and the 24-hour default for newly created invites. Back up before upgrading and verify creation, joining and revocation against PostgreSQL.
+
+## Optional native drivers
+
+The release launcher loads modules on demand through `bin/hooks/code-loading.sh`. This keeps PostgreSQL deployments working when the optional Scylla native driver was not built; enabling Scylla still requires its driver and libraries.

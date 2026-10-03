@@ -47,11 +47,22 @@ missing_key_does_not_return_ciphertext_test() ->
         ?assertEqual(<<>>, pw_crypto:decrypt(Cipher))
     end).
 
-bad_key_leaves_plaintext_test() ->
+malformed_envelopes_fail_closed_test() ->
+    lists:foreach(fun(Value) -> ?assertEqual(<<>>, pw_crypto:decrypt(Value)) end,
+        [<<"e1:">>, <<"e1:invalid-base64">>, <<"e1:", (base64:encode(<<0:128>>))/binary>>]).
+
+bad_key_never_writes_plaintext_test() ->
     with_env("PLAINWIRE_ENC_KEY", "bad-key", fun() ->
         Plain = <<"hello">>,
-        ?assertEqual(Plain, pw_crypto:encrypt(Plain)),
+        ?assertError(invalid_encryption_key, pw_crypto:encrypt(Plain)),
         ?assertEqual(Plain, pw_crypto:decrypt(Plain))
+    end).
+
+missing_production_key_never_writes_plaintext_test() ->
+    with_env("PLAINWIRE_ENV", "production", fun() ->
+        with_env("PLAINWIRE_ENC_KEY", unset, fun() ->
+            ?assertError(no_encryption_key, pw_crypto:encrypt(<<"private text">>))
+        end)
     end).
 
 test_key() ->

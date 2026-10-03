@@ -1,6 +1,6 @@
 import unittest
 from unittest.mock import Mock
-from plainwire_bot import Client, Response, command_option, command_options
+from plainwire_bot import Client, Response, PlainwireError, command_option, command_options
 
 TOKEN = "pwb_" + "x" * 32
 
@@ -51,5 +51,39 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(command_option(claim, "text"), "hello there")
         self.assertEqual(command_option({"args": {"prompt": "hi"}}, "prompt"), "hi")
         self.assertEqual(command_option({"args": {}}, "missing", "fallback"), "fallback")
+
+    def test_normalized_path_cannot_escape_bot_api(self):
+        client = Client("https://plainwire.example", TOKEN)
+        client._opener.open = Mock()
+        for path in ["/me", "/api/bot/v1/../admin", "/api/bot/v1/%2e%2e/admin", "/api/bot/v1/%252e%252e/admin", "/api/bot/v1/%2fadmin", "/api/bot/v1/me#fragment"]:
+            with self.assertRaises(ValueError): client.request("GET", path)
+        client._opener.open.assert_not_called()
+
+    def test_response_always_closed(self):
+        client = Client("https://plainwire.example", TOKEN, max_response_bytes=1024)
+        for body in [b"{}", b"x" * 1025]:
+            fp = Mock(status=200)
+            fp.read.return_value = body
+            if len(body) > 1024:
+                with self.assertRaises(PlainwireError): client._read(fp)
+            else:
+                self.assertEqual(client._read(fp).body, body)
+            fp.close.assert_called_once()
+
+    def test_worker_error_does_not_publish_secret_and_caps_claims(self):
+        client = Client("https://plainwire.example", TOKEN)
+        client.claim_commands = Mock(return_value=Response(200, b'{"data":[{"id":7,"command":"ping","claim_token":"pwc_x"}]}'))
+        client.defer_command = Mock()
+        client.fail_command = Mock()
+        def fail(_claim, _bot): raise RuntimeError("secret-api-key")
+        errors = []
+        client.command_worker({"ping": fail}, batch_size=20, concurrency=2, on_error=lambda error, claim: errors.append(error)).run_once()
+        client.claim_commands.assert_called_once_with(2)
+        client.fail_command.assert_called_once_with(7, "pwc_x", "Command failed")
+        self.assertEqual(str(errors[0]), "secret-api-key")
+
+    def test_limits_reject_unbounded_values(self):
+        for timeout in [float('nan'), float('inf'), 301]:
+            with self.assertRaises(ValueError): Client("https://plainwire.example", TOKEN, timeout=timeout)
 
 if __name__ == "__main__": unittest.main()

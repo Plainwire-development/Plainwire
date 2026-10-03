@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import ssl
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -66,7 +68,7 @@ class Client:
             raise ValueError("Plainwire bots require HTTPS except on loopback")
         if not token.startswith("pwb_") or not 16 <= len(token) <= 256 or "\r" in token or "\n" in token:
             raise ValueError("invalid Plainwire bot token")
-        if timeout <= 0 or max_response_bytes < 1024:
+        if not math.isfinite(timeout) or not 0 < timeout <= 300 or not isinstance(max_response_bytes, int) or not 1024 <= max_response_bytes <= 16 * 1024 * 1024:
             raise ValueError("invalid client limits")
         self._base = base_url.rstrip("/")
         self._token = token
@@ -80,13 +82,19 @@ class Client:
         )
 
     def request(self, method: str, path: str, payload: Any | None = None) -> Response:
-        if not path.startswith("/") or "://" in path or "\r" in path or "\n" in path:
+        route = urllib.parse.urlsplit(path)
+        decoded = urllib.parse.unquote(route.path)
+        if (not (route.path == API_PREFIX or route.path.startswith(API_PREFIX + "/"))
+                or route.scheme or route.netloc or route.fragment
+                or any(c in path for c in "\\\r\n")
+                or any(segment in {".", ".."} for segment in decoded.split("/"))
+                or any(code in route.path.lower() for code in ("%2f", "%5c", "%25"))):
             raise ValueError("invalid Plainwire API path")
         data = None
         headers = {
             "Authorization": f"Bot {self._token}",
             "Accept": "application/json",
-            "User-Agent": "plainwire-python-bot/2.4",
+            "User-Agent": "plainwire-python-bot/2.7",
         }
         if payload is not None:
             data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -101,11 +109,14 @@ class Client:
             raise PlainwireAPIError(response.status, response.body) from None
 
     def _read(self, fp) -> Response:
-        status = int(getattr(fp, "status", getattr(fp, "code", 0)))
-        body = fp.read(self.max_response_bytes + 1)
-        if len(body) > self.max_response_bytes:
-            raise PlainwireError("Plainwire response too large")
-        return Response(status, body)
+        try:
+            status = int(getattr(fp, "status", getattr(fp, "code", 0)))
+            body = fp.read(self.max_response_bytes + 1)
+            if len(body) > self.max_response_bytes:
+                raise PlainwireError("Plainwire response too large")
+            return Response(status, body)
+        finally:
+            fp.close()
 
     def capabilities(self): return self.request("GET", API_PREFIX)
     def me(self): return self.request("GET", API_PREFIX + "/me")
@@ -242,8 +253,19 @@ class CommandWorker:
         if handler is None:
             self.client.fail_command(invocation_id, token, f"No handler registered for /{claim.get('command', '')}")
             return
+        stopped = threading.Event()
+        def renew():
+            while not stopped.wait(self.lease_ms / 2000):
+                try:
+                    self.client.defer_command(invocation_id, token, self.lease_ms)
+                except Exception as error:
+                    self.on_error(error, claim)
+                    return
+        renewer = None
         try:
             self.client.defer_command(invocation_id, token, self.lease_ms)
+            renewer = threading.Thread(target=renew, daemon=True)
+            renewer.start()
             result = handler(claim, self.client)
             body = result if isinstance(result, str) else result.get("body") if isinstance(result, Mapping) else None
             if isinstance(body, str) and body.strip():
@@ -251,12 +273,16 @@ class CommandWorker:
         except Exception as error:
             self.on_error(error, claim)
             try:
-                self.client.fail_command(invocation_id, token, str(error or "command failed")[:240])
+                self.client.fail_command(invocation_id, token, "Command failed")
             except Exception as failure:
                 self.on_error(failure, claim)
+        finally:
+            stopped.set()
+            if renewer is not None:
+                renewer.join()
 
     def run_once(self) -> int:
-        claims = self.client.claim_commands(self.batch_size).json().get("data", [])
+        claims = self.client.claim_commands(min(self.batch_size, self.concurrency)).json().get("data", [])
         if not isinstance(claims, list):
             raise PlainwireError("Plainwire returned an invalid command envelope")
         with ThreadPoolExecutor(max_workers=min(self.concurrency, max(1, len(claims)))) as pool:

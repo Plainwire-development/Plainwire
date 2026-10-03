@@ -593,4 +593,8 @@ migrations() -> [
         "CREATE TABLE IF NOT EXISTS moderation_report_events(id bigserial PRIMARY KEY,report_id bigint NOT NULL REFERENCES moderation_reports(id) ON DELETE CASCADE,actor_id integer REFERENCES users(id) ON DELETE SET NULL,actor_username text NOT NULL,action text NOT NULL,note text NOT NULL DEFAULT '',created_at bigint NOT NULL)",
         "CREATE INDEX IF NOT EXISTS idx_report_events_report ON moderation_report_events(report_id,id)"
     ]}
+    ,{55, [
+        "ALTER TABLE direct_threads ADD COLUMN IF NOT EXISTS e2ee_key_id text NOT NULL DEFAULT ''",
+        "ALTER TABLE direct_threads ADD CONSTRAINT direct_threads_e2ee_key_id_check CHECK(e2ee_key_id='' OR e2ee_key_id ~ '^[0-9a-f]{64}$')"
+    ]}
 ].

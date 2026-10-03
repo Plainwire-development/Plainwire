@@ -255,7 +255,11 @@ ok_json(Req0, Data) ->
     {ok, Req, undefined}.
 
 err_json(Req0, Code, Error) ->
-    Req = cowboy_req:reply(Code, headers(), json(#{ok=>false,error=>Error}), Req0),
+    Headers = case {Code, Error} of
+        {429, <<"bot_rate_limited">>} -> (headers())#{<<"retry-after">> => <<"60">>};
+        _ -> headers()
+    end,
+    Req = cowboy_req:reply(Code, Headers, json(#{ok=>false,error=>Error}), Req0),
     {ok, Req, undefined}.
 
 json_reply(Req0, Code, Data) ->

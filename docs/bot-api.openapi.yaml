@@ -651,6 +651,10 @@ components:
               data: {}
     Error:
       description: Plainwire API error envelope
+      headers:
+        Retry-After:
+          description: Bot rate-limit rejections include the wait in seconds before retrying.
+          schema: { type: integer, minimum: 1 }
       content:
         application/json:
           schema:

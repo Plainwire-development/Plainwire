@@ -9,6 +9,11 @@ const root=resolve('priv/static');
 const server=createServer(async(req,res)=>{try{const url=new URL(req.url,'http://localhost');const file=url.pathname==='/'?'index.html':url.pathname.replace(/^\/assets\//,'');const path=resolve(root,file);if(!path.startsWith(root+'/'))throw Error('path');const bytes=await readFile(path);res.writeHead(200,{'content-type':({'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml'})[extname(path)]||'application/octet-stream'});res.end(bytes);}catch{res.writeHead(404);res.end();}});
 await new Promise(r=>server.listen(0,'127.0.0.1',r));
 const origin=`http://127.0.0.1:${server.address().port}`;
+const waitUntil = async predicate => {
+ const deadline=Date.now()+5000;
+ while(!predicate() && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,20));
+ assert(predicate(),'expected asynchronous fixture request did not arrive');
+};
 const previewGif=Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==','base64');
 previewGif.writeUInt16LE(320,6);previewGif.writeUInt16LE(180,8);
 const browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_EXECUTABLE||undefined,args:['--no-sandbox','--disable-dev-shm-usage']});
@@ -354,12 +359,12 @@ try {
  await page.waitForSelector('.msg.pending .msg-body strong');
  await page.locator('#compose').fill('Second in flight');await page.locator('.composer-send').click();
  await page.locator('#compose').fill('Keep this new draft');await page.waitForFunction(()=>document.querySelectorAll('.msg.pending').length===2);
- assert.equal(delayed.length,2);await delayed[1]();await page.waitForFunction(()=>document.querySelectorAll('.msg.pending').length===1);assert.equal(await page.locator('#compose').inputValue(),'Keep this new draft');
+ await waitUntil(()=>delayed.length===2);assert.equal(delayed.length,2);await delayed[1]();await page.waitForFunction(()=>document.querySelectorAll('.msg.pending').length===1);assert.equal(await page.locator('#compose').inputValue(),'Keep this new draft');
  await page.evaluate(()=>location.hash='#dm/2');await page.waitForFunction(()=>document.querySelector('.chat-header h2')?.textContent==='Sam Rivera');await delayed[0]();await page.waitForTimeout(100);
  assert.equal(await page.locator('#compose').inputValue(),'Draft for Sam');assert.equal(await page.locator('.msg').count(),0,'late response must not leak into another chat');
  delayed=[];
  failNext=true;await page.locator('#compose').fill('Retry me');await page.locator('.composer-send').click();await page.waitForSelector('.msg.failed');
- await page.getByRole('button',{name:'Retry',exact:true}).click();await page.waitForTimeout(50);assert.equal(delayed.length,1);await delayed[0]();await page.waitForFunction(()=>!document.querySelector('.msg.pending, .msg.failed'));
+ await page.getByRole('button',{name:'Retry',exact:true}).click();await waitUntil(()=>delayed.length===1);assert.equal(delayed.length,1);await delayed[0]();await page.waitForFunction(()=>!document.querySelector('.msg.pending, .msg.failed'));
  await page.locator('.toast-close').click({timeout:1000}).catch(()=>{});
  await page.evaluate(()=>location.hash='#settings');await page.waitForSelector('.settings-page');await page.screenshot({path:'test-results/settings-desktop.png'});
  await page.locator('.settings-content').evaluate(el=>{el.scrollTop=el.scrollHeight;});

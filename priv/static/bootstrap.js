@@ -90,6 +90,7 @@
     try {
       await loadStyles(config);
       await loadScript(assetUrl('/assets/app.js', config));
+      await loadScript(assetUrl('/assets/dm-encryption.js', config));
       // Optional diagnostics must never prevent the chat client from starting.
       await Promise.all(['/assets/call-health.js', '/assets/markdown.js'].map(path =>
         Promise.race([loadScript(assetUrl(path, config)).catch(() => {}), new Promise(resolve => setTimeout(resolve, 2500))])));

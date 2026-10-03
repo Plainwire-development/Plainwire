@@ -87,6 +87,8 @@ jobs:
         run: npm run test:browser
       - name: Browser security regression suite
         run: npm run test:security-audit
+      - name: Encrypted private DM regressions
+        run: npm run test:e2ee
       - name: Reporting and moderation browser regressions
         run: npm run test:reports
       - name: Responsive settings and admin moderation regressions
@@ -94,4 +96,4 @@ jobs:
       - name: WebRTC regression suite
         run: npm run test:rtc
       - name: Verify source archive construction
-        run: python3 scripts/archive.py source && tar -tzf dist/Plainwire-$(cat VERSION).tar.gz >/dev/null
+        run: PYTHONDONTWRITEBYTECODE=1 python3 test/archive_tests.py && python3 scripts/archive.py source && tar -tzf dist/Plainwire-$(cat VERSION).tar.gz >/dev/null

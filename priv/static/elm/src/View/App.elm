@@ -1260,9 +1260,13 @@ messageContext model message x y =
 
         base =
             [ { label = "Reply", icon = Just "↩", danger = False, sep = False, msg = SetReplyTo message }
-            , { label = "Forward", icon = Just "➜", danger = False, sep = False, msg = OpenForwardModal message }
             , { label = "Copy text", icon = Just "⧉", danger = False, sep = False, msg = CopyText message.body }
             ]
+                ++ (if String.isEmpty message.encryptionState then
+                        [ { label = "Forward", icon = Just "➜", danger = False, sep = False, msg = OpenForwardModal message } ]
+                    else
+                        []
+                   )
 
         reactionItems =
             if message.id <= 0 then
@@ -1313,7 +1317,7 @@ messageContext model message x y =
 
         mineItems =
             if mine then
-                (if message.forwardedFrom == Nothing then
+                (if message.forwardedFrom == Nothing && message.encryptionState /= "locked" then
                     [ { label = "Edit message", icon = Just "✎", danger = False, sep = True, msg = StartEditMessage message }
                     , { label = "Delete message", icon = Just "×", danger = True, sep = False, msg = DeleteMessage message.id }
                     ]
@@ -2474,7 +2478,7 @@ renderCallUser model u =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "2.6.5-1", attribute "data-ui-revision" "interface-5" ]
+    div [ class "layout", attribute "data-ui-version" "2.7.0", attribute "data-ui-revision" "interface-5" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]

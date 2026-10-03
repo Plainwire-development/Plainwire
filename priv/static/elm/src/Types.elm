@@ -147,6 +147,7 @@ type alias Conversation =
     , peerName : String
     , peerAvatarUrl : String
     , peerUsername : String
+    , e2eeKeyId : String
     }
 
 
@@ -174,6 +175,7 @@ type alias Message =
     , isBot : Bool
     , pinned : Bool
     , reactions : List Reaction
+    , encryptionState : String
     }
 
 
@@ -854,6 +856,7 @@ decodeConversation =
         |> andMap (D.field "peer_name" D.string |> defaultValue "")
         |> andMap (D.field "peer_avatar_url" D.string |> defaultValue "")
         |> andMap (D.field "peer_username" D.string |> defaultValue "")
+        |> andMap (D.field "e2ee_key_id" D.string |> defaultValue "")
 
 
 decodeMemberUser : D.Decoder MemberUser
@@ -887,6 +890,7 @@ decodeMessage =
         |> andMap (D.field "is_bot" D.bool |> defaultValue False)
         |> andMap (D.field "pinned" D.bool |> defaultValue False)
         |> andMap (D.field "reactions" (D.list decodeReaction) |> defaultValue [])
+        |> andMap (D.field "encryption_state" D.string |> defaultValue "")
 
 
 decodeReaction : D.Decoder Reaction
@@ -1103,7 +1107,7 @@ type alias SyncData r =
 
 defaultMsg : Message
 defaultMsg =
-    Message 0 "" 0 0 "" "" "" "" "text" Nothing Nothing 0 Nothing Nothing Nothing "" False False []
+    Message 0 "" 0 0 "" "" "" "" "text" Nothing Nothing 0 Nothing Nothing Nothing "" False False [] ""
 
 
 

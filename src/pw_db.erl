@@ -31,7 +31,7 @@
     create_invite/4, create_invite/5, list_invites/2, revoke_invite/3, invite_options/2, invite_preview/1, join_invite/2,
     messages/5, message_context/2, channel_pins/2, set_message_pin/3,
     post_channel_message/4, delete_message/2, edit_message/3, forward_message/4, toggle_message_reaction/3, record_missed_call/2, record_completed_call/3,
-    conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4,
+    conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4, enable_conversation_encryption/3,
     set_conversation_member_role/4, kick_conversation_member/3,
     add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4,
     close_conversation/2, leave_conversation/2, accept_message_request/2, deny_message_request/2,
@@ -60,7 +60,7 @@
          normalize_ai_provider/1, normalize_ai_chat_trigger/1, normalize_ai_temperature/1,
          command_options_from_args/1, search_state/1]).
 -export([test_account_recovery/2]).
--export([test_validate_upload_refs/3, test_edit_thread/2, test_call_invite_target/4, test_reports/2]).
+-export([test_validate_upload_refs/3, test_edit_thread/2, test_call_invite_target/4, test_reports/2, test_e2ee/2]).
 -endif.
 
 -record(st, {}).
@@ -427,6 +427,7 @@ conversations(Uid) -> call({conversations, Uid}).
 create_conversation(Uid, Name, UserIds) -> call({create_conversation, Uid, Name, UserIds}).
 create_conversation_usernames(Uid, Name, Usernames) -> call({create_conversation_usernames, Uid, Name, Usernames}).
 update_conversation(Uid, Cid, Name, Patch) -> call({update_conversation, Uid, Cid, Name, Patch}).
+enable_conversation_encryption(Uid, Cid, KeyId) -> call({enable_conversation_encryption, Uid, Cid, KeyId}).
 set_conversation_member_role(Uid, Cid, TargetUid, Role) -> call({set_conversation_member_role, Uid, Cid, TargetUid, Role}).
 kick_conversation_member(Uid, Cid, TargetUid) -> call({kick_conversation_member, Uid, Cid, TargetUid}).
 add_conversation_members(Uid, Cid, UserIds) -> call({add_conversation_members, Uid, Cid, UserIds}).
@@ -816,6 +817,7 @@ read_msg({record_call_event, _, _, _, _}) -> false;
 read_msg({create_conversation, _, _, _}) -> false;
 read_msg({create_conversation_usernames, _, _, _}) -> false;
 read_msg({update_conversation, _, _, _, _}) -> false;
+read_msg({enable_conversation_encryption, _, _, _}) -> false;
 read_msg({set_conversation_member_role, _, _, _, _}) -> false;
 read_msg({kick_conversation_member, _, _, _}) -> false;
 read_msg({add_conversation_members, _, _, _}) -> false;
@@ -3663,7 +3665,7 @@ route({delete_incoming_webhook, Uid, Sid0, WebhookId0}, Conn) ->
     end);
 route({execute_incoming_webhook, WebhookId0, Token0, Body0, ReplyTo0}, Conn) ->
     WebhookId = pw_util:int(WebhookId0), Token = pw_util:clean_text(Token0, 256), Plain = pw_util:clean_text(Body0, ?MAX_MSG), ReplyTo = pw_util:int(ReplyTo0),
-    case message_body_valid(Plain) andalso extract_file_ids(Plain) =:= [] of
+    case message_body_valid(Plain) andalso not pw_e2ee:is_envelope(Plain) andalso extract_file_ids(Plain) =:= [] of
         false -> {error, invalid_message};
         true ->
             Result = with_tx(Conn, fun() ->
@@ -4726,8 +4728,8 @@ route({bot_defer_command, BotId0, InvocationId0, ClaimToken0, LeaseMs0}, Conn) -
     end);
 route({bot_respond_command, BotId0, InvocationId0, ClaimToken0, Body0}, Conn) ->
     BotId = pw_util:int(BotId0), InvocationId = pw_util:int(InvocationId0),
-    ClaimToken = pw_util:clean_text(ClaimToken0, 256), Plain = pw_util:clean_text(Body0, ?MAX_MSG),
-    case message_body_valid(Plain) of
+    ClaimToken = pw_util:clean_text(ClaimToken0, 256), Plain = clean_message_input(Body0),
+    case message_body_valid(Plain) andalso not pw_e2ee:is_envelope(Plain) of
         false -> {error, invalid_message};
         true ->
             Result = with_tx(Conn, fun() ->
@@ -5047,7 +5049,7 @@ route({delete_message, Uid, Mid0}, Conn) ->
     end;
 route({edit_message, Uid, Mid0, Body0}, Conn) ->
     Mid = pw_util:int(Mid0),
-    Plain = pw_util:clean_text(Body0, ?MAX_MSG),
+    Plain = clean_message_input(Body0),
     Body = store_message(Plain),
     case message_body_valid(Plain) of
         false -> {error, invalid_message};
@@ -5059,6 +5061,7 @@ route({edit_message, Uid, Mid0, Body0}, Conn) ->
                         case can_modify_message_scope(Conn, Uid, Scope, ScopeId) of
                             false -> {error, forbidden};
                             true ->
+                                ensure_message_encryption(Conn, Scope, ScopeId, Plain),
                                 ensure_message_attachments_allowed(Conn, Uid, Scope, ScopeId, Plain),
                                 Now = pw_util:now_ms(),
                                 ok = exec(Conn, "UPDATE messages SET body=$1,edited_at=$2 WHERE id=$3", [Body, Now, Mid]),
@@ -5109,6 +5112,11 @@ route({forward_message, Uid, Mid0, TargetScope0, TargetId0}, Conn) ->
                         end,
                         case {CanReadSource, TargetAccess} of
                             {true, {ok, Sid}} ->
+                                case pw_e2ee:is_envelope(load_message(StoredBody)) of
+                                    true -> throw({plainwire_error, encrypted_message_cannot_be_forwarded});
+                                    false -> ok
+                                end,
+                                ensure_message_encryption(Conn, TargetScope, TargetId, load_message(StoredBody)),
                                 ensure_message_attachments_allowed(Conn, Uid, TargetScope, TargetId, load_message(StoredBody)),
                                 LockOk = case TargetScope of
                                     <<"channel">> ->
@@ -5162,7 +5170,7 @@ route({forward_message, Uid, Mid0, TargetScope0, TargetId0}, Conn) ->
     end;
 route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
     Cid = pw_util:int(ChannelId0),
-    Plain = pw_util:clean_text(Body0, ?MAX_MSG),
+    Plain = clean_message_input(Body0),
     Body = store_message(Plain),
     ReplyTo = pw_util:int(ReplyTo0),
     case message_body_valid(Plain) of
@@ -5171,6 +5179,7 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
             Result = with_tx(Conn, fun() ->
                 case channel_message_access(Conn, Uid, Cid) of
                     {ok, Sid} ->
+                        ensure_message_encryption(Conn, <<"channel">>, Cid, Plain),
                         case enforce_channel_slowmode(Conn, Uid, Cid, Sid) of
                             {error, SlowReason} -> throw({plainwire_error, SlowReason});
                             ok -> ok
@@ -5287,7 +5296,7 @@ route({conversations, Uid}, Conn) ->
           "CASE WHEN block.blocked THEN NULL ELSE lm.body END, lm.id, COALESCE(lm.user_id, 0), COALESCE(lm.display_name, ''), COALESCE(lm.username, ''), "
           "CASE WHEN block.blocked THEN 0 ELSE (SELECT count(*) FROM messages WHERE scope = 'direct' AND scope_id = dt.id AND deleted_at IS NULL "
           "AND id > dm.last_read_message_id AND user_id <> $1) END, "
-          "COALESCE(peer.id, 0), COALESCE(peer.display_name, ''), COALESCE(peer.avatar_url, ''), COALESCE(peer.username, '') "
+          "COALESCE(peer.id, 0), COALESCE(peer.display_name, ''), COALESCE(peer.avatar_url, ''), COALESCE(peer.username, ''), dt.e2ee_key_id "
           "FROM direct_threads dt JOIN direct_members dm ON dm.thread_id = dt.id AND dm.user_id = $1 "
           "LEFT JOIN LATERAL (SELECT m.id, m.body, m.user_id, u.display_name, u.username "
           "FROM messages m JOIN users u ON u.id = m.user_id WHERE m.scope = 'direct' AND m.scope_id = dt.id "
@@ -5434,6 +5443,11 @@ route({add_conversation_members, Uid, Cid0, UserIds0}, Conn) ->
     end;
 route({add_conversation_members_locked, Uid, Cid0, UserIds0}, Conn) ->
     Cid = pw_util:int(Cid0),
+    case one(Conn, "SELECT e2ee_key_id FROM direct_threads WHERE id=$1 FOR UPDATE", [Cid]) of
+        {ok, [<<>>]} -> ok;
+        {ok, [_]} -> throw({plainwire_error, encrypted_dm_members_locked});
+        _ -> throw({plainwire_error, forbidden})
+    end,
     RequestedIds = lists:usort([X || X <- [pw_util:int(Y) || Y <- ensure_list(UserIds0)], is_integer(X), X =/= Uid]),
     UserIds = new_conversation_member_ids(Conn, Cid, RequestedIds),
     ExistingCount = conversation_member_count(Conn, Cid),
@@ -5593,7 +5607,7 @@ route({conversation, Uid, Cid0}, Conn) ->
     Cid = pw_util:int(Cid0),
     case is_conversation_member(Conn, Uid, Cid) of
         true ->
-            {ok, Info} = one(Conn, "SELECT id, name, avatar_url, owner_id, created_at, updated_at FROM direct_threads WHERE id = $1", [Cid]),
+            {ok, Info} = one(Conn, "SELECT id, name, avatar_url, owner_id, created_at, updated_at, e2ee_key_id FROM direct_threads WHERE id = $1", [Cid]),
             {ok, Members} = rows(Conn,
                 "SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.banner_url, u.status, u.theme, "
                 "u.created_at, u.last_seen, dm.last_read_message_id, dm.muted, dm.nickname, dm.joined_at, dm.group_role "
@@ -5603,15 +5617,47 @@ route({conversation, Uid, Cid0}, Conn) ->
         false ->
             {error, forbidden}
     end;
+route({enable_conversation_encryption, Uid, Cid0, KeyId}, Conn) ->
+    Cid = pw_util:int(Cid0),
+    case pw_e2ee:valid_key_id(KeyId) of
+        false -> {error, invalid_encryption_key_id};
+        true ->
+            Result = with_tx(Conn, fun() ->
+                case one(Conn, "SELECT e2ee_key_id FROM direct_threads WHERE id=$1 FOR UPDATE", [Cid]) of
+                    {ok, [Existing]} ->
+                        {ok, Members} = rows(Conn,
+                            "SELECT dm.user_id,dm.request_state,u.is_bot FROM direct_members dm JOIN users u ON u.id=dm.user_id WHERE dm.thread_id=$1", [Cid]),
+                        Eligible = length(Members) =:= 2 andalso lists:member([Uid, <<"accepted">>, false], Members)
+                            andalso lists:all(fun([_, State, Bot]) -> State =:= <<"accepted">> andalso Bot =:= false end, Members)
+                            andalso conversation_can_send(Conn, Uid, Cid),
+                        case {Eligible, Existing} of
+                            {false, _} -> {error, encryption_requires_private_dm};
+                            {true, KeyId} -> {ok, #{conversation_id => Cid, e2ee_key_id => KeyId}};
+                            {true, <<>>} ->
+                                ok = exec(Conn, "UPDATE direct_threads SET e2ee_key_id=$1 WHERE id=$2", [KeyId, Cid]),
+                                {ok, #{conversation_id => Cid, e2ee_key_id => KeyId}};
+                            _ -> {error, encryption_key_locked}
+                        end;
+                    _ -> {error, forbidden}
+                end
+            end),
+            case Result of
+                {ok, _} ->
+                    publish_conversation_event(Conn, Cid, #{type => conversation_updated, conversation_id => Cid, e2ee_key_id => KeyId}),
+                    Result;
+                _ -> Result
+            end
+    end;
 route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
     Cid = pw_util:int(Cid0),
-    Plain = pw_util:clean_text(Body0, ?MAX_MSG),
+    Plain = clean_message_input(Body0),
     Body = store_message(Plain),
     ReplyTo = pw_util:int(ReplyTo0),
     case message_body_valid(Plain) of
         false -> {error, invalid_message};
         true ->
             Result = with_tx(Conn, fun() ->
+                ensure_message_encryption(Conn, <<"direct">>, Cid, Plain),
                 case {conversation_can_send(Conn, Uid, Cid), valid_reply_to(Conn, <<"direct">>, Cid, ReplyTo)} of
                     {true, true} ->
                         ensure_upload_refs_readable(Conn, Uid, Plain),
@@ -6025,7 +6071,7 @@ search_state([Fingerprint, LastId, Complete | _]) ->
 search_state(_) -> {<<>>, 0, false}.
 
 replace_message_search_tokens(Conn, Mid, Plain) ->
-    Hashes = pw_crypto:search_hashes(Plain),
+    Hashes = case pw_e2ee:is_envelope(Plain) of true -> []; false -> pw_crypto:search_hashes(Plain) end,
     ok = exec(Conn, "DELETE FROM message_search_tokens WHERE message_id=$1", [Mid]),
     [ok = exec(Conn,
         "INSERT INTO message_search_tokens(message_id,token) VALUES($1,$2) ON CONFLICT DO NOTHING",
@@ -6619,7 +6665,7 @@ finish_internal_app_claim(Conn, InvocationId, Cid, RequestMid, BotUid, UserId, _
             ok = exec(Conn, "UPDATE bot_command_invocations SET status='completed',claim_token_hash='',lease_until=0,completed_at=$1,updated_at=$1 WHERE id=$2", [Now, InvocationId]),
             {ok, #{completed => true, message_id => null}};
         _ ->
-            case {message_body_valid(Body), channel_message_access(Conn, BotUid, Cid)} of
+            case {message_body_valid(Body) andalso not pw_e2ee:is_envelope(Body), channel_message_access(Conn, BotUid, Cid)} of
                 {true, {ok, Sid}} ->
                     Mid = new_message_id(),
                     ok = exec(Conn,
@@ -7464,8 +7510,38 @@ insert_returning(Conn, Sql, Params) ->
 %% a non-empty envelope even for <<>>, so checking ciphertext length would let
 %% empty messages through whenever encryption-at-rest is enabled.
 message_body_valid(Body) when is_binary(Body) ->
-    byte_size(Body) > 0 andalso re:run(Body, <<"\\S">>, [{capture, none}, unicode]) =:= match;
+    case binary:split(Body, <<":">>, [global]) of
+        [<<"pw-e2ee-v1">>, KeyId, _, _] -> pw_e2ee:valid_envelope(Body, KeyId);
+        _ -> byte_size(Body) > 0 andalso byte_size(Body) =< ?MAX_MSG
+             andalso not pw_e2ee:is_envelope(Body)
+             andalso re:run(Body, <<"\\S">>, [{capture, none}, unicode]) =:= match
+    end;
 message_body_valid(_) -> false.
+
+clean_message_input(Body) when is_binary(Body), byte_size(Body) =< 8192 -> pw_util:clean_text(Body, 8192);
+clean_message_input(_) -> <<>>.
+
+ensure_message_encryption(Conn, <<"direct">>, Cid, Body) ->
+    %% Serialize activation with posts, edits, forwards and member additions.
+    %% An older client can never silently send plaintext after activation.
+    case one(Conn, "SELECT e2ee_key_id FROM direct_threads WHERE id=$1 FOR UPDATE", [Cid]) of
+        {ok, [<<>>]} ->
+            case pw_e2ee:is_envelope(Body) of
+                true -> throw({plainwire_error, encryption_not_enabled});
+                false -> ok
+            end;
+        {ok, [KeyId]} ->
+            case pw_e2ee:valid_envelope(Body, KeyId) of
+                true -> ok;
+                false -> throw({plainwire_error, encrypted_message_required})
+            end;
+        _ -> throw({plainwire_error, forbidden})
+    end;
+ensure_message_encryption(_, _, _, Body) ->
+    case pw_e2ee:is_envelope(Body) of
+        true -> throw({plainwire_error, encryption_requires_private_dm});
+        false -> ok
+    end.
 
 store_message(Body) -> pw_crypto:encrypt(Body).
 load_message(undefined) -> <<>>;
@@ -7476,7 +7552,7 @@ load_message(Body) -> pw_crypto:decrypt(Body).
 %% the message table and is fetched only for the open conversation; sync/sidebar
 %% payloads should never carry an entire large markdown/attachment body.
 conversation_preview_body(StoredBody) ->
-    pw_util:clean_text(load_message(StoredBody), 512).
+    pw_util:clean_text(pw_e2ee:preview(load_message(StoredBody)), 512).
 
 store_image_url(Url0) ->
     Url = pw_util:clean_text(Url0, 17825792),
@@ -7540,6 +7616,9 @@ ensure_message_attachments_allowed(Conn, Uid, Scope, ScopeId, Body) ->
 
 -ifdef(TEST).
 test_validate_upload_refs(Conn, Uid, Body) -> ensure_upload_refs_readable(Conn, Uid, Body).
+test_e2ee({validate, Scope, Cid, Body}, Conn) -> ensure_message_encryption(Conn, Scope, Cid, Body);
+test_e2ee({body, Body}, _) -> message_body_valid(clean_message_input(Body));
+test_e2ee(Msg, Conn) -> route(Msg, Conn).
 test_reports(Op, Conn) -> route(Op, Conn).
 test_edit_thread(Op = {edit_thread, _, _, _, _}, Conn) -> route(Op, Conn).
 test_call_invite_target(Conn, Uid, Cid, Target) -> route({call_invite_target, Uid, Cid, Target}, Conn).
@@ -8351,11 +8430,15 @@ conversation_row_map([Id, Name, Avatar, Owner, Created, Updated, LastRead, Muted
       created_at => Created, updated_at => Updated, last_read_message_id => LastRead, muted => Muted, request_state => RequestState, group_role => GroupRole,
       member_count => Count, last_body => conversation_preview_body(LastBody), last_message_id => LastMsg, unread => Unread,
       last_sender_id => LastSenderId, last_sender_name => LastSenderName, last_sender_username => LastSenderUsername,
-      peer_id => PeerId, peer_name => PeerName, peer_avatar_url => pw_util:proxied_image(PeerAvatar), peer_username => PeerUsername}.
+      peer_id => PeerId, peer_name => PeerName, peer_avatar_url => pw_util:proxied_image(PeerAvatar), peer_username => PeerUsername};
+conversation_row_map(Row) when length(Row) =:= 22 ->
+    (conversation_row_map(lists:sublist(Row, 21)))#{e2ee_key_id => lists:last(Row)}.
 
 conversation_full_map([Id, Name, Avatar, Owner, Created, Updated]) ->
     #{id => Id, name => Name, avatar_url => pw_util:proxied_image(Avatar),
-      owner_id => Owner, created_at => Created, updated_at => Updated}.
+      owner_id => Owner, created_at => Created, updated_at => Updated};
+conversation_full_map([Id, Name, Avatar, Owner, Created, Updated, KeyId]) ->
+    (conversation_full_map([Id, Name, Avatar, Owner, Created, Updated]))#{e2ee_key_id => KeyId}.
 
 conversation_member_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last, LastRead, Muted, Nick, Joined]) ->
     #{user => user_map([Id, U, D, Bio, Avatar, Banner, Status, Theme, Created, Last]),
@@ -9051,10 +9134,14 @@ notify_direct_members(Conn, Cid, Sender, Event, Now, SuppressMentions) ->
     Msg = maps:get(message, Event, #{}),
     PlainBody = maps:get(body, Msg, <<>>),
     {ok, Rows} = rows(Conn, "SELECT user_id, request_state FROM direct_members WHERE thread_id = $1 AND user_id <> $2 AND muted = false", [Cid, Sender]),
-    {ok, Roster} = rows(Conn,
-        "SELECT u.id, u.username FROM users u JOIN direct_members dm ON dm.user_id = u.id "
-        "WHERE dm.thread_id = $1 AND dm.request_state = 'accepted' AND u.id <> $2", [Cid, Sender]),
-    Mentioned = case SuppressMentions of true -> []; false -> pw_mention:resolve(PlainBody, Roster) end,
+    Mentioned = case SuppressMentions orelse pw_e2ee:is_envelope(PlainBody) of
+        true -> [];
+        false ->
+            {ok, Roster} = rows(Conn,
+                "SELECT u.id, u.username FROM users u JOIN direct_members dm ON dm.user_id = u.id "
+                "WHERE dm.thread_id = $1 AND dm.request_state = 'accepted' AND u.id <> $2", [Cid, Sender]),
+            pw_mention:resolve(PlainBody, Roster)
+    end,
     Url = <<"#/dm/", (integer_to_binary(Cid))/binary>>,
     [begin
          [U, RequestState] = R,

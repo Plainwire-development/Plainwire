@@ -11,7 +11,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED = {'.git', 'node_modules', '_build', 'elm-stuff', 'test-results', 'dist',
-            'data', 'uploads', 'tooling', '__pycache__', '.venv', '.build'}
+            'data', 'uploads', 'tooling', '__pycache__', '.venv', '.build', 'build', 'target'}
 # Source archives ship the authoritative inputs, not potentially stale bundles.
 # `make build` (or scripts/start.sh when assets are absent) recreates these from
 # package-lock.json and VERSION on the target machine.
@@ -27,7 +27,7 @@ SOURCE_GENERATED = {
 def source_files():
     # Only project-owned roots are eligible: backups beside the checkout cannot
     # accidentally enter a release. Reject links instead of dereferencing them.
-    roots = ['src', 'priv', 'web', 'native', 'scripts', 'test', 'deploy', 'docs', 'sdk', '.github']
+    roots = ['src', 'priv', 'web', 'native', 'scripts', 'test', 'deploy', 'docs', 'sdk', 'tools', '.github']
     files = [p for p in ROOT.iterdir() if p.name in {
         'Makefile', 'VERSION', 'LICENSE', 'README.md', 'BUILD_STATUS.md',
         'rebar.config', 'rebar.lock', 'package.json', 'package-lock.json',
@@ -44,6 +44,8 @@ def source_files():
                 if rel in SOURCE_GENERATED:
                     continue
                 if name.startswith('.env') or name == 'erl_crash.dump' or name.startswith('.pw-media-quality.'):
+                    continue
+                if rel.startswith('tools/load/') and (name.endswith('.sessions.jsonl') or name.endswith('-load-result.json')):
                     continue
                 if p.suffix.lower() in {'.pem', '.key', '.p12', '.pfx', '.beam', '.pyc', '.log', '.dump', '.bak', '.gz', '.zip'}:
                     continue

@@ -1,5 +1,7 @@
 # Plainwire Bot SDK for Rust
 
+The checked-in Cargo lockfile pins the resolved dependency graph for reproducible source builds and SDK checks. Run `cargo test --locked` to validate that graph.
+
 Blocking Rust client for Bot API v1 using rustls-backed `reqwest`. It verifies TLS, refuses redirects, caps responses and allows plaintext HTTP only on loopback.
 
 ```rust

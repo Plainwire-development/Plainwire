@@ -1,0 +1,7 @@
+## Named identity for the release launcher; no native Erlang distribution.
+## Service lifecycle is managed by systemd/OpenRC, not remote Erlang RPC.
+-sname plainwire_relay
+-setcookie plainwire_distribution_disabled
+-dist_listen false
+-start_epmd false
++C multi_time_warp

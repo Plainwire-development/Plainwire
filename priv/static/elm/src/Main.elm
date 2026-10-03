@@ -2779,7 +2779,7 @@ handleConversationDetail val model =
             let
                 updateConversation conversation =
                     if conversation.id == conversationId then
-                        { conversation | members = members, memberCount = List.length members }
+                        { conversation | members = members, memberCount = List.length members, e2eeKeyId = D.decodeValue (D.at [ "conversation", "e2ee_key_id" ] D.string) val |> Result.withDefault conversation.e2eeKeyId }
 
                     else
                         conversation
@@ -4169,6 +4169,7 @@ appendOptimisticMessage scope scopeId body model =
                         user.isBot
                         False
                         []
+                        (if scope == "direct" && List.any (\c -> c.id == scopeId && not (String.isEmpty c.e2eeKeyId)) model.convs then "encrypted" else "")
             in
             { model | msg = model.msg ++ [ optimistic ], inputText = "", replyTo = Nothing, drafts = Dict.remove (draftKeyFor model.active) model.drafts, outbox = Dict.insert optimistic.id optimistic model.outbox, nextMessageId = model.nextMessageId - 1 }
 
@@ -5518,7 +5519,7 @@ updateConversationPreview : Message -> Conversation -> Conversation
 updateConversationPreview message conversation =
     if message.scope == "direct" && conversation.id == message.scopeId then
         { conversation
-            | lastBody = Just message.body
+            | lastBody = Just (if String.isEmpty message.encryptionState then message.body else "Encrypted text message")
             , lastMessageId = Just message.id
             , lastSenderId = message.userId
             , lastSenderName = message.displayName

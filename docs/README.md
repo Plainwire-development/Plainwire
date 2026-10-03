@@ -1,6 +1,6 @@
 # Plainwire documentation
 
-These notes match the 2.6.5-1 tree. PostgreSQL is required. Redis and ScyllaDB are optional.
+These notes match the 2.7.0 tree. PostgreSQL is required. Redis and ScyllaDB are optional.
 
 ## Run it
 
@@ -27,10 +27,12 @@ These notes match the 2.6.5-1 tree. PostgreSQL is required. Redis and ScyllaDB a
 * [Cloudflare TURN](CLOUDFLARE_TURN.md)
 * [Client themes and plugins](CLIENT_EXTENSIONS.md)
 * [Security](SECURITY.md)
+* [Encrypted private DMs](END_TO_END_ENCRYPTION.md) — opt-in text, manual key exchange, and device access
+* [2.7.0 security review](SECURITY_AUDIT_2.7.0.md)
 * [2.6.3 audit and fixes](SECURITY_AUDIT_2.6.3.md)
 
 Older release notes live next to the README (`RELEASE_NOTES_*.md`). They describe the release they were written for; they are not a second copy of this index.
 
 The [2.6.5 audit record](SECURITY_AUDIT_2.6.5.md) documents the latest permission, admin lifecycle, and call-window fixes.
 
-The [2.6.5-1 patch notes](../RELEASE_NOTES_2.6.5-1.md) cover same-account report visibility and background queue refresh.
+The [2.7.0 release notes](../RELEASE_NOTES_2.7.0.md) cover encrypted private text, call signaling, mobile layout, and bot SDK improvements.

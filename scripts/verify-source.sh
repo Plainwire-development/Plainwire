@@ -4,6 +4,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "${ROOT}"
 node --check priv/static/bootstrap.js
 node --check priv/static/elm-bridge.js
+node --check priv/static/dm-encryption.js
+node --check test/browser/dm-encryption.mjs
 node --check priv/static/plugin-worker.js
 node --check priv/static/call-health.js
 node --check priv/admin/admin.js

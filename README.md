@@ -51,7 +51,7 @@ If you just want to use Plainwire, you should not need to worry about any of tha
 * A resumable, mobile-aware first-run Plainwire guide for new accounts
 * Realtime state recovery and self-healing call audio designed to avoid routine page refreshes
 
-Plainwire is not end-to-end encrypted. Messages may be encrypted at rest, but the server must still be able to read them while operating the service.
+Private, accepted two-person DMs offer an explicitly enabled end-to-end encrypted **text** mode. Both people exchange and back up a generated shared key through a trusted external channel. The server receives ciphertext for new text in that DM. Earlier messages, attachments, calls, and metadata are outside this mode; server channels and bots keep their existing features. See [encrypted private DMs](docs/END_TO_END_ENCRYPTION.md) for setup, device access, and limits, including the absence of forward secrecy. Other content remains readable by the application server and can be encrypted at rest.
 
 ## Self-hosting
 
@@ -307,10 +307,11 @@ Deployment and update instructions are kept in [deploy/README.md](deploy/README.
 
 ## Version
 
-Current release: **2.6.5-1**
+Current release: **2.7.0**
 
 Release-specific changes are kept in the release notes rather than this README. Older changes remain available in Git history.
 
+* [2.7.0 release notes](RELEASE_NOTES_2.7.0.md)
 * [2.6.5-1 release notes](RELEASE_NOTES_2.6.5-1.md)
 * [2.6.5 release notes](RELEASE_NOTES_2.6.5.md)
 * [2.6.4-1 release notes](RELEASE_NOTES_2.6.4-1.md)

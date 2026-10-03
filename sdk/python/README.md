@@ -21,4 +21,6 @@ bot.command_worker({"echo": lambda claim, client: client.option(claim, "text", "
 
 The worker has bounded batch and concurrency settings, renews live claims, and reports handler failures through `on_error`.
 
+Workers claim only immediately available work and renew leases during long handlers. Exceptions send a generic failure to users; details remain in `on_error`. Request paths must remain under `/api/bot/v1`, responses are always closed, and oversized bodies are rejected. Do not log bot tokens or claim tokens.
+
 Run the transport-policy tests after an editable install with `python -m unittest discover -s sdk/python/tests -v` from the Plainwire repository root.

@@ -12,8 +12,24 @@ import Types exposing (ActiveRoute(..), BotCommand, Model, Msg(..), User)
 
 view : String -> String -> Model -> Html Msg
 view key placeholderText model =
+    let
+        conversation =
+            case model.active of
+                DmView cid -> List.filter (\c -> c.id == cid) model.convs |> List.head
+                _ -> Nothing
+
+        encrypted =
+            conversation |> Maybe.map (\c -> not (String.isEmpty c.e2eeKeyId)) |> Maybe.withDefault False
+    in
     div [ class "composer", attribute "data-draft" key ]
-        [ case model.replyTo of
+        [ case conversation of
+            Just c ->
+                if (c.memberCount == 2 && c.requestState == "accepted") || encrypted then
+                    Html.node "pw-dm-security" [ attribute "data-conversation" (String.fromInt c.id), attribute "data-key-id" c.e2eeKeyId ] []
+                else
+                    text ""
+            Nothing -> text ""
+        , case model.replyTo of
             Just reply ->
                 div [ class "reply-bar" ]
                     [ span [ class "reply-to-label" ] [ text ("Replying to " ++ reply.displayName) ]
@@ -53,6 +69,7 @@ view key placeholderText model =
                 , title "Attach files or images"
                 , attribute "aria-label" "Attach files or images"
                 , onClick (BridgeEvent "pick_attachments" E.null)
+                , disabled encrypted
                 ]
                 [ span [ class "ui-icon ui-icon-attach", attribute "aria-hidden" "true" ] []
                 , span [ class "composer-action-label" ] [ text "Attach" ]
@@ -63,6 +80,7 @@ view key placeholderText model =
                 , title "Hide or reveal the latest attachment as a spoiler"
                 , attribute "aria-label" "Toggle spoiler on latest attachment"
                 , onClick ToggleLastAttachmentSpoiler
+                , disabled encrypted
                 ]
                 [ span [ class "composer-action-spoiler", attribute "aria-hidden" "true" ] [ text "◐" ]
                 , span [ class "composer-action-label" ] [ text "Spoiler" ]
@@ -73,6 +91,7 @@ view key placeholderText model =
                 , title "Record a voice note"
                 , attribute "aria-label" "Record a voice note"
                 , onClick (BridgeEvent "record_voice_note" E.null)
+                , disabled encrypted
                 ]
                 [ span [ class "composer-action-voice", attribute "aria-hidden" "true" ] [ text "●" ]
                 , span [ class "composer-action-label" ] [ text "Voice" ]
@@ -83,6 +102,7 @@ view key placeholderText model =
                 , title "Search GIFs (Ctrl / Cmd + G)"
                 , attribute "aria-label" "Search GIFs"
                 , onClick (BridgeEvent "open_gif_picker" E.null)
+                , disabled encrypted
                 ]
                 [ span [ class "composer-action-gif", attribute "aria-hidden" "true" ] [ text "GIF" ]
                 , span [ class "composer-action-label" ] [ text "GIF" ]
@@ -107,6 +127,9 @@ view key placeholderText model =
                         [ small [] [ text "MESSAGE PREVIEW" ]
                         , if String.isEmpty model.inputText then
                             p [ class "muted" ] [ text "Your formatted message will appear here." ]
+
+                          else if encrypted then
+                            p [ class "encrypted-text" ] [ text model.inputText ]
 
                           else
                             Html.node "pw-markdown" [ attribute "source" model.inputText ] []

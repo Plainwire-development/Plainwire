@@ -376,12 +376,21 @@ func (c *Client) RunCommandWorker(ctx context.Context, handlers map[string]Comma
 	if concurrency > 32 {
 		concurrency = 32
 	}
+	if batch > concurrency {
+		batch = concurrency
+	}
 	idle := options.IdleDelay
 	if idle <= 0 {
 		idle = 500 * time.Millisecond
 	}
 	lease := options.Lease
 	if lease <= 0 {
+		lease = 120 * time.Second
+	}
+	if lease < 5*time.Second {
+		lease = 5 * time.Second
+	}
+	if lease > 120*time.Second {
 		lease = 120 * time.Second
 	}
 	report := options.OnError
@@ -433,14 +442,32 @@ func (c *Client) RunCommandWorker(ctx context.Context, handlers map[string]Comma
 						report(err, &claim)
 						continue
 					}
+					renewCtx, stopRenewal := context.WithCancel(ctx)
+					renewed := make(chan struct{})
+					go func(claim CommandClaim) {
+						defer close(renewed)
+						ticker := time.NewTicker(lease / 2)
+						defer ticker.Stop()
+						for {
+							select {
+							case <-renewCtx.Done():
+								return
+							case <-ticker.C:
+								if _, err := c.DeferCommand(renewCtx, claim, lease); err != nil {
+									if renewCtx.Err() == nil {
+										report(err, &claim)
+									}
+									return
+								}
+							}
+						}
+					}(claim)
 					body, err := handler(ctx, claim, c)
+					stopRenewal()
+					<-renewed
 					if err != nil {
 						report(err, &claim)
-						reason := err.Error()
-						if len(reason) > 240 {
-							reason = reason[:240]
-						}
-						if _, failErr := c.FailCommand(ctx, claim, reason); failErr != nil {
+						if _, failErr := c.FailCommand(ctx, claim, "Command failed"); failErr != nil {
 							report(failErr, &claim)
 						}
 					} else if strings.TrimSpace(body) != "" {

@@ -287,6 +287,12 @@ textMessageView model grouped m =
                         ]
                     ]
 
+              else if not (String.isEmpty m.encryptionState) then
+                div [ class "msg-body encrypted-text" ]
+                    [ small [ class "encrypted-message-label" ] [ text (if m.encryptionState == "encrypted" then "Encrypted text" else "Encrypted text unavailable") ]
+                    , div [] [ text m.body ]
+                    ]
+
               else
                 Lazy.lazy2 Markdown.body (Maybe.withDefault "" (Maybe.map .username model.me)) m.body
             , if m.editedAt /= Nothing && model.editingMessageId /= Just m.id then
@@ -311,9 +317,9 @@ textMessageView model grouped m =
                 div [ class "msg-actions" ]
                     [ button [ class "msg-action", disabled (m.id < 0), onClick (OpenReactionPicker m.id), title "Add reaction" ] [ text "React" ]
                     , button [ class "msg-action", disabled (m.id < 0), onClick (SetReplyTo m) ] [ text "Reply" ]
-                    , button [ class "msg-action", disabled (m.id < 0), onClick (OpenForwardModal m) ] [ text "Forward" ]
+                    , button [ class "msg-action", disabled (m.id < 0 || not (String.isEmpty m.encryptionState)), onClick (OpenForwardModal m) ] [ text "Forward" ]
                     , button [ class "msg-action", onClick (CopyText m.body) ] [ text "Copy" ]
-                    , if mine && m.id > 0 && m.forwardedFrom == Nothing then
+                    , if mine && m.id > 0 && m.forwardedFrom == Nothing && m.encryptionState /= "locked" then
                         button [ class "msg-action", onClick (StartEditMessage m) ] [ text "Edit" ]
 
                       else
@@ -436,4 +442,3 @@ timestampText model m =
 
     else
         agoAt model.serverTime m.createdAt ++ " ago"
-

@@ -105,7 +105,7 @@ assert.match(elm, /dm-preview-sender/, 'DM sidebar renders the latest sender');
 assert.match(elm, /conversationPreviewSummary[\s\S]*attachmentCount[\s\S]*String\.left 117 plain \+\+ "…"/, 'DM previews collapse whitespace, bound text, and summarize attachment floods');
 assert.match(elm, /text \(conversationPreviewSummary lastText\)/, 'DM navigation renders a plain-text bounded preview instead of rich Markdown embeds');
 assert.doesNotMatch(elm, /class "muted dm-preview"[\s\S]{0,240}Markdown\.preview lastText/, 'DM navigation never renders message media or rich Markdown');
-assert.match(db, /conversation_preview_body\(StoredBody\)[\s\S]*clean_text\(load_message\(StoredBody\), 512\)/, 'conversation sync bounds last-message preview payloads server-side');
+assert.match(db, /conversation_preview_body\(StoredBody\)[\s\S]*clean_text\(pw_e2ee:preview\(load_message\(StoredBody\)\), 512\)/, 'conversation sync bounds previews and hides encrypted text server-side');
 assert.match(elm, /StartEditMessage/, 'message editing is wired into Elm');
 assert.match(elm, /OpenForwardModal/, 'message forwarding is wired into Elm');
 assert.match(elm, /Find a destination/, 'forwarding UI provides destination search');
