@@ -1,0 +1,33 @@
+.server-folder { min-width: 0; }
+.rail-folder { width: 56px; flex-shrink: 0; padding: 4px; border-radius: 18px; background: var(--bg3); }
+.server-folder-toggle { position: relative; display: flex; align-items: center; justify-content: center; gap: 12px; width: 48px; min-height: 48px; border: 1px solid var(--line); border-radius: 15px; background: var(--bg2); color: var(--text); cursor: pointer; }
+.server-folder-toggle:hover { border-color: var(--accent); }
+.server-folder-toggle[aria-expanded="true"] { background: var(--bg4); }
+.folder-icon-grid { display: grid; grid-template-columns: repeat(2, 16px); gap: 3px; width: 35px; min-height: 35px; align-content: center; }
+.folder-icon-grid .server-icon { width: 16px; height: 16px; min-width: 16px; min-height: 16px; border-radius: 5px; font-size: 10px; padding: 0; }
+.folder-icon-grid .server-icon img { width: 100%; height: 100%; }
+.rail-folder .server-folder-members { display: flex; flex-direction: column; gap: 8px; padding-top: 8px; }
+.rail-folder .rail-btn { width: 48px; height: 48px; margin: 0; }
+.sheet-folder { padding: 8px; border: 1px solid var(--line); border-radius: 14px; }
+.sheet-folder .server-folder-toggle { width: 100%; justify-content: flex-start; padding: 8px 12px; }
+.folder-label { flex: 1; text-align: left; overflow-wrap: anywhere; }
+.sheet-folder .server-folder-members { display: grid; gap: 6px; padding-top: 8px; }
+.server-organizer, pw-server-template-picker { display: grid; gap: 14px; min-width: 0; }
+.server-organizer label, pw-server-template-picker label { display: grid; gap: 8px; }
+.server-organizer input, .server-organizer select, pw-server-template-picker input, pw-server-template-picker select { width: 100%; min-width: 0; min-height: 44px; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; color: var(--text); background-color: var(--bg3); font: inherit; }
+.server-organizer-folder { display: flex; flex-wrap: wrap; gap: 10px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; }
+.server-organizer-folder label, .server-organizer-folder p { width: 100%; margin: 0; overflow-wrap: anywhere; }
+.template-import { display: grid; gap: 14px; }
+.template-import[hidden], .server-organizer [hidden] { display: none; }
+.template-preview { border: 1px solid var(--line); padding: 16px; border-radius: 14px; overflow-wrap: anywhere; }
+.template-channel-list { display: grid; gap: 6px; max-height: 220px; overflow-y: auto; padding-left: 20px; }
+.template-status { font-size: 14px; overflow-wrap: anywhere; }
+.template-warning { padding: 12px; border-left: 3px solid var(--accent); background: var(--bg3); border-radius: 4px; }
+.server-create-form { min-width: 0; }
+.server-create-actions { flex-wrap: wrap; }
+@media (max-width: 760px) {
+  .servers-sheet-actions { flex-wrap: wrap; }
+  .server-create-form { padding: 18px; }
+  .server-create-actions .btn { flex: 1 1 140px; min-height: 44px; }
+  .server-organizer-folder { padding: 12px; }
+}

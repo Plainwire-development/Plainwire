@@ -2,6 +2,12 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+json_preserves_null_and_boolean_values_test() ->
+    Wire = pw_util:json(#{category => null, unset => undefined, entries => [null, true, false],
+        literal => <<"null">>, status => healthy}),
+    ?assertEqual(#{<<"category">> => null, <<"unset">> => null, <<"entries">> => [null, true, false],
+        <<"literal">> => <<"null">>, <<"status">> => <<"healthy">>}, jsx:decode(Wire, [return_maps])).
+
 base64url_round_trip_test() ->
     Bin = <<0, 1, 2, 250, 251, 252, 253, 254, 255>>,
     Enc = pw_util:base64url(Bin),

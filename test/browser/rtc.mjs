@@ -258,7 +258,7 @@ async function audioPower(page, label) {
 }
 try {
   const [a, b] = await Promise.all([setup(1), setup(2)]);
-  if (!process.env.PLAINWIRE_TEST_GROUP_CALL_ONLY) {
+  if (!process.env.PLAINWIRE_TEST_GROUP_CALL_ONLY && !process.env.PLAINWIRE_TEST_LISTEN_ONLY) {
   await a.getByRole('button', { name: 'Start call', exact: true }).click();
   await b.getByRole('button', { name: 'Accept', exact: true }).click();
   await a.waitForFunction(() => window.__pcs.some(p => p.connectionState === 'connected'), null, { timeout: 15000 }).catch(async e => { console.log(await stats(a), await stats(b)); throw e; });
@@ -666,9 +666,73 @@ try {
   await a.screenshot({ path: 'test-results/voice-refresh-roster.png' });
   await a.getByRole('button', { name: 'Leave', exact: true }).click();
   }
-  groupMode = true;
-  await testGroupInvitations({ a, b, setup, origin, send, clientMessages, finishInvitation });
+  if (!process.env.PLAINWIRE_TEST_GROUP_CALL_ONLY) {
+    await a.goto(origin + '/#dm/1'); await a.waitForSelector('#compose');
+    for (const unavailable of ['NotFoundError', 'NotAllowedError']) {
+      await a.evaluate(name => {
+        window.__normalGum = navigator.mediaDevices.getUserMedia;
+        navigator.mediaDevices.getUserMedia = async () => { throw new DOMException('Microphone unavailable', name); };
+      }, unavailable);
+      await a.getByRole('button', { name: 'Start call', exact: true }).click();
+      await b.getByRole('button', { name: 'Accept', exact: true }).click();
+      await a.getByRole('button', { name: 'Open call details', exact: true }).click();
+      await a.getByRole('button', { name: 'Enable microphone', exact: true }).waitFor();
+      await a.waitForFunction(() => window.__pcs.at(-1)?.connectionState === 'connected');
+      const audioDeadline = Date.now() + 15000;
+      while (!(await stats(a))?.inbound.some(r => r.energy > .005) && Date.now() < audioDeadline) await new Promise(resolve => setTimeout(resolve, 100));
+      assert(await audioPower(a, 'listening without a microphone') > .0001, unavailable + ': listener receives audible RTP');
+      const peerCount = await a.evaluate(() => window.__pcs.length);
+      await a.getByRole('button', { name: 'Enable microphone', exact: true }).click();
+      await a.getByText(/Microphone still unavailable/).waitFor();
+      assert.equal((await stats(a)).connection, 'connected', unavailable + ': failed microphone retry preserves the call');
+      if (unavailable === 'NotFoundError') {
+        await a.getByRole('button', { name: 'Share', exact: true }).click();
+        await a.waitForSelector('.call-sharing-row');
+        await b.getByRole('button', { name: 'Open call details', exact: true }).click();
+        await b.getByText('Sharing screen · audio included', { exact: true }).waitFor();
+        await b.getByRole('button', { name: 'Watch screen', exact: true }).click();
+        await b.waitForFunction(() => document.querySelector('#pw-float-stage-1 video')?.videoWidth > 0);
+        assert(await audioPower(b, 'screen audio without microphone hardware') > .0001, 'microphone-free listener can share audible screen media');
+        await a.getByRole('button', { name: 'Stop share', exact: true }).click();
+        await a.getByRole('button', { name: 'Enable microphone', exact: true }).waitFor();
+      }
+      await a.getByRole('button', { name: 'Deafen', exact: true }).click();
+      await a.getByRole('button', { name: 'Undeafen', exact: true }).click();
+      await a.getByRole('button', { name: 'Enable microphone', exact: true }).waitFor();
+      await a.evaluate(() => { navigator.mediaDevices.getUserMedia = window.__normalGum; });
+      if (unavailable === 'NotAllowedError') {
+        await a.evaluate(() => {
+          navigator.mediaDevices.getUserMedia = constraints => new Promise((resolve, reject) => {
+            window.__finishMicrophone = () => window.__normalGum(constraints).then(resolve, reject);
+          });
+        });
+      }
+      await a.getByRole('button', { name: 'Enable microphone', exact: true }).click();
+      if (unavailable === 'NotAllowedError') {
+        await a.waitForFunction(() => typeof window.__finishMicrophone === 'function');
+        await a.getByRole('button', { name: 'Deafen', exact: true }).click();
+        await a.evaluate(() => window.__finishMicrophone());
+        await a.getByRole('button', { name: 'Unmute', exact: true }).waitFor();
+        assert.equal(await a.evaluate(() => window.__pcs.at(-1)._audioSender.track.enabled), false, 'microphone permission finishing while deafened never transmits audio');
+        await a.getByRole('button', { name: 'Undeafen', exact: true }).click();
+        await a.getByRole('button', { name: 'Unmute', exact: true }).click();
+        await a.evaluate(() => { navigator.mediaDevices.getUserMedia = window.__normalGum; });
+      }
+      await a.getByRole('button', { name: 'Mute', exact: true }).waitFor();
+      assert(await audioPower(b, 'microphone enabled after listening') > .0001, unavailable + ': enabling the microphone sends audible RTP');
+      assert.equal(await a.evaluate(() => window.__pcs.length), peerCount, 'enabling microphone keeps the existing peer connection');
+      await a.locator('.call-overlay').getByRole('button', { name: 'Leave', exact: true }).click();
+      await b.waitForFunction(() => window.__pcs.every(pc => pc.connectionState === 'closed'));
+      if (await b.locator('.call-overlay.expanded').count()) await b.locator('.call-overlay').getByRole('button', { name: 'Leave', exact: true }).click();
+      else await b.locator('.call-bar [title="Leave call"]').click();
+    }
+  }
+  if (!process.env.PLAINWIRE_TEST_LISTEN_ONLY) {
+    groupMode = true;
+    await testGroupInvitations({ a, b, setup, origin, send, clientMessages, finishInvitation });
+  }
   assert.deepEqual(errors, [], 'no browser exceptions during calls and screen sharing');
-  if (process.env.PLAINWIRE_TEST_GROUP_CALL_ONLY) console.log('PASS: targeted group invitations, decline/expiry isolation, stale notifications, mobile long press, and real three-peer audio without interrupting the original call.');
+  if (process.env.PLAINWIRE_TEST_LISTEN_ONLY) console.log('PASS: missing microphone and denied permission join real calls, receive audible RTP, preserve the call on a failed microphone retry, restore listening after deafen, and enable a microphone without replacing peers.');
+  else if (process.env.PLAINWIRE_TEST_GROUP_CALL_ONLY) console.log('PASS: targeted group invitations, decline/expiry isolation, stale notifications, mobile long press, and real three-peer audio without interrupting the original call.');
   else  console.log('PASS: real bidirectional RTP; signaling reconnect and pending call replay; physical and processed microphone recovery; missing device fallback; live input meter; mute/unmute; deafen state restoration; microphone swap and failed-swap recovery; screen sharing with mixed audio in both directions; hide/show and reopen viewing; quality presets; source replacement/cancellation/rollback/stop race; fullscreen and colour metadata; pointer/keyboard resizing; mobile viewer expansion; call-health measurements; mobile controls; call cleanup; refreshed voice profile roster; direct audio settings; all sound previews and disabled ringing; targeted group invitations, decline/expiry isolation, mobile long press, and three-peer audio without interrupting the original call.');
 } finally { await browser.close(); server.close(); }

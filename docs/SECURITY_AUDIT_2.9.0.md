@@ -1,0 +1,24 @@
+# Plainwire 2.9.0 review
+
+This review covers call microphone state during permission/device transitions, group creation, clocks and stale navigation, profile layout, account-owned folder persistence, template validation and import/export permissions. Existing account recovery, uploads, reports, bots, server/message authorization, URL safety, sanitized rich text, encrypted DMs and dependency checks remain part of release validation.
+
+| Finding or behavior | Change |
+| --- | --- |
+| Calls required microphone hardware or permission to receive audio | Use a managed silent media source when microphone capture fails; expose listening state and an explicit microphone retry without replacing the connection. |
+| Microphone replacement could finish after mute/deafen and send an enabled replacement | Keep replacement microphone output disabled during asynchronous swaps; apply the current mute state at commit. Finishing microphone activation while deafened keeps the microphone muted. Cancelled room transitions do not emit stale retry notices. |
+| Fast client clocks made fresh group messages appear older | Calibrate periodic ticks against server time; `/me` always returns a fresh clock even when session data is cached. Render fresh messages as `Just now`. |
+| Changing servers temporarily exposed the previous server's creation controls | Clear or select matching cached server data during navigation; ignore non-matching server responses. |
+| Channel creation failures lost the form | Preserve the draft until success, block repeated submissions during the request, refresh the current structure after success, and reject unsupported kinds explicitly. |
+| New account folder state could be overwritten or contain another account's server IDs | Check membership, duplicate IDs, sizes, names and types; update using an account row lock and exact revision. Prune departed memberships and append newly joined servers on reads. |
+| Discord permission imports could accidentally expose private channels or grant administration | Omit restricted/unsupported Discord structures. Start all custom imports with zero member and role permissions; ignore supplied permission fields and require owner review. |
+| Import fetches could introduce arbitrary URL fetching | Accept bounded codes and two exact official template link prefixes. Use a fixed Discord API URL, public address pinning, TLS verification, no redirects, bounded bodies and per-account/global limits. |
+| Import previews could render names as HTML or race a later selection | Render with text nodes and invalidate stale previews across selections, disconnects and account changes. Disable creation while previewing or after import failure. |
+| Profile banners tiled and long names escaped the preview | Preserve background sizing in the theme, center a non-repeating cover image, and allow profile names to wrap. |
+| Exported uncategorized channels failed to import | Preserve JSON null values at the HTTP serialization boundary and verify export/preview round trips through that boundary. |
+| Disabled Scylla emitted shutdown errors on PostgreSQL deployments | Skip stopping an unused driver, cancel retry timers, and tolerate application-controller termination during shutdown. |
+
+Validation includes PostgreSQL-backed ownership, revision, rollback, export and import checks; strict template/code input cases; browser drag, reload, mobile, preview race and retry cases; real microphone-free WebRTC, failed retry and pending-permission/deafen cases; responsive banner checks; and the existing complete suite. The locked npm application dependency advisory audit reported zero known vulnerabilities on the release review date.
+
+The full local package check passed 298 backend tests and the complete browser suites. The 250-user realtime test delivered 172,616 frames with zero ephemeral drops, evictions or queued deliveries; the separate live-load self-test connected all 25 clients with no errors. Extracted source contracts and runtime checks passed, including startup without the build Erlang tree, HTTP authorization, imported member access restrictions, consent and sender-only encrypted message unlocking.
+
+Templates are structure imports rather than a full Discord migration, and Plainwire does not implement Discord channel permission overrides. Existing opt-in E2EE still covers text in accepted two-person human DMs; group DMs, calls, uploads and metadata are outside that mode. Read the existing [E2EE threat model](END_TO_END_ENCRYPTION.md). Regression tests and source review do not prove the absence of every vulnerability or constitute an independent security or cryptographic audit.

@@ -448,5 +448,8 @@ timestampText model m =
     else if model.absoluteTimestamps then
         absoluteTime model.timeZone m.createdAt
 
+    else if model.serverTime - m.createdAt < 5000 then
+        "Just now"
+
     else
         agoAt model.serverTime m.createdAt ++ " ago"

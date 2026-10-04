@@ -608,4 +608,12 @@ migrations() -> [
     ,{57, [
         "ALTER TABLE upload_ref_backfill ALTER COLUMN cursor TYPE bigint USING cursor::bigint"
     ]}
+    ,{58, [
+        "ALTER TABLE users ADD COLUMN group_dm_count bigint NOT NULL DEFAULT 0 CHECK(group_dm_count>=0)",
+        "UPDATE users u SET group_dm_count=g.total FROM (SELECT dt.owner_id,count(*) AS total FROM direct_threads dt WHERE dt.name<>'' OR EXISTS(SELECT 1 FROM direct_members dm WHERE dm.thread_id=dt.id OFFSET 2 LIMIT 1) GROUP BY dt.owner_id) g WHERE u.id=g.owner_id"
+    ]}
+    ,{59, [
+        "ALTER TABLE users ADD COLUMN server_layout text NOT NULL DEFAULT '[]'",
+        "ALTER TABLE users ADD COLUMN server_layout_revision integer NOT NULL DEFAULT 0 CHECK(server_layout_revision>=0)"
+    ]}
 ].

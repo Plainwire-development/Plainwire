@@ -18,6 +18,7 @@ import Set exposing (Set)
 import Task
 import Time
 import Types exposing (..)
+import ServerLayout
 import Url exposing (Url)
 import View.App exposing (..)
 import View.Ui exposing (..)
@@ -81,6 +82,9 @@ bridgeDecoder =
                     "clear_drafts" ->
                         D.succeed ClearDrafts
 
+                    "server_layout_updated" ->
+                        D.map ReceiveServerLayout (D.field "data" D.value)
+
                     "attachment_ready" ->
                         D.map2 AttachmentReady (D.field "route" D.string) (D.field "data" D.string)
 
@@ -120,9 +124,10 @@ bridgeDecoder =
                             (D.field "failed" D.bool)
 
                     "rtc_audio_state" ->
-                        D.map2 RtcAudioState
+                        D.map3 RtcAudioState
                             (D.field "muted" D.bool)
                             (D.field "deafened" D.bool)
+                            (D.oneOf [ D.field "listen_only" D.bool, D.succeed False ])
 
                     "tick" ->
                         D.succeed (Tick (Time.millisToPosix 0))
@@ -272,6 +277,7 @@ init flags url _ =
       , me = Nothing
       , csrf = ""
       , serverTime = 0
+      , serverClockOffset = 0
       , timeZone = Time.utc
       , absoluteTimestamps = False
       , forums = []
@@ -279,6 +285,11 @@ init flags url _ =
       , currentThread = Nothing
       , replies = []
       , servers = []
+      , serverLayout = []
+      , serverLayoutRevision = 0
+      , serverLayoutLoaded = False
+      , serverLayoutBusy = False
+      , draggingServer = Nothing
       , convs = []
       , conversationMembers = Dict.empty
       , friends = []
@@ -317,6 +328,7 @@ init flags url _ =
             , muted = False
             , deafened = False
             , mutedBeforeDeafen = False
+            , listenOnly = False
             , screenShare = False
             }
       , callUI = { incoming = Nothing, outgoing = Nothing, active = Nothing }
@@ -367,6 +379,10 @@ init flags url _ =
       , authResetToken = authTokenFromFragment (Maybe.withDefault "" url.fragment)
       , authNotice = ""
       , serverName = ""
+      , serverTemplate = Nothing
+      , serverTemplateReady = True
+      , serverCreateBusy = False
+      , channelCreateBusy = False
       , serverDescription = ""
       , booting = True
       , userStatuses = Dict.empty
@@ -489,6 +505,7 @@ update msg model =
             in
             ( { model
                 | active = active
+                , currentServer = serverForRoute active model
                 , msg =
                     if clearMessages then
                         Dict.values model.outbox |> List.filter (messageApplies active) |> List.sortBy .createdAt
@@ -777,6 +794,12 @@ update msg model =
                 ( "/servers", "GET" ) ->
                     handleList (D.list (D.maybe decodeServer) |> D.map (List.filterMap identity)) (\items m -> { m | servers = items }) val model
 
+                ( "/server-layout", _ ) ->
+                    if method == "GET" && model.serverLayoutBusy then
+                        ( model, Cmd.none )
+                    else
+                        receiveServerLayout val model
+
                 ( "/notifications", "GET" ) ->
                     handleList (D.list (D.maybe decodeNotification) |> D.map (List.filterMap identity)) (\items m -> { m | notifs = items }) val model
 
@@ -1039,7 +1062,9 @@ update msg model =
                         handleCommandSent requestId val model
 
                     else if String.startsWith "/server/" tag && String.endsWith "/channels" tag then
-                        ( { model | toast = Just "Channel created" }, Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), routeCmd model.active ] )
+                        ( { model | toast = Just "Channel created", channelCreateBusy = False, modal = if model.modal == Just ("channel:" ++ (String.split "/" tag |> List.drop 2 |> List.head |> Maybe.withDefault "")) then Nothing else model.modal }
+                        , Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), refreshCurrentServer model, routeCmd model.active ]
+                        )
 
                     else if String.startsWith "/server/" tag && String.endsWith "/wires" tag then
                         handleInviteCreated val model
@@ -1063,7 +1088,18 @@ update msg model =
                         ( model, Cmd.none )
 
         ApiError tag method requestId err ->
-            if String.startsWith "/wires/" tag && not (String.endsWith "/join" tag) then
+            if method == "POST" && String.startsWith "/server/" tag && String.endsWith "/channels" tag then
+                ( { model | channelCreateBusy = False, toast = Just (fmtErr err) }, Cmd.none )
+
+            else if tag == "/server-layout" then
+                ( { model | serverLayoutBusy = False, draggingServer = Nothing, toast = if method == "POST" then Just (if err == "server_layout_changed" then "Your folders changed on another device. Reloaded the latest layout; try again." else fmtErr err) else model.toast }
+                , if method == "POST" then apiSend (encodeApiRequest (ApiGet "/server-layout")) else Cmd.none
+                )
+
+            else if tag == "/servers" && method == "POST" then
+                ( { model | serverCreateBusy = False, toast = Just (fmtErr err) }, Cmd.none )
+
+            else if String.startsWith "/wires/" tag && not (String.endsWith "/join" tag) then
                 ( { model | invitePreview = Nothing, toast = Just (fmtErr err), modal = Just "join_invite", modalUserIds = "" }, setHash "#" )
 
             else if String.startsWith "/users?q=" tag then
@@ -1428,13 +1464,17 @@ update msg model =
                 Cmd.none
 
               else
-                apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
+                Cmd.batch [ apiSend (encodeApiRequest (ApiGet "/sync?since=0")), apiSend (encodeApiRequest (ApiGet "/server-layout")) ]
             )
 
         Tick now ->
             let
                 time =
-                    Time.posixToMillis now
+                    if Time.posixToMillis now <= 0 then
+                        model.serverTime
+
+                    else
+                        Time.posixToMillis now + model.serverClockOffset
 
                 next =
                     { model | serverTime = time, callInvites = Dict.map (\_ -> Dict.filter (\_ invitation -> invitation.expiresAt > time)) model.callInvites }
@@ -1710,9 +1750,41 @@ update msg model =
             ( model, apiSend (encodeApiRequest (ApiPost "/notifications/clear" (Just (E.object [])))) )
 
         CreateServer name description ->
-            ( model
-            , apiSend (encodeApiRequest (ApiPost "/servers" (Just (E.object [ ( "name", E.string name ), ( "description", E.string description ) ]))))
-            )
+            if model.serverCreateBusy || not model.serverTemplateReady || String.length (String.trim name) < 2 then
+                ( model, Cmd.none )
+            else
+                ( { model | serverCreateBusy = True }
+                , apiSend (encodeApiRequest (ApiPost "/servers" (Just (E.object [ ( "name", E.string name ), ( "description", E.string description ), ( "template", Maybe.withDefault E.null model.serverTemplate ) ]))))
+                )
+
+        SetServerTemplate template ready ->
+            ( { model | serverTemplate = Just template, serverTemplateReady = ready }, Cmd.none )
+
+        ReceiveServerLayout val ->
+            receiveServerLayout val model
+
+        DragServer sid ->
+            ( { model | draggingServer = Just sid }, Cmd.none )
+
+        EndServerDrag ->
+            ( { model | draggingServer = Nothing }, Cmd.none )
+
+        DropServerOnServer target ->
+            case model.draggingServer of
+                Just sid ->
+                    saveServerLayout (ServerLayout.dropOnServer ("folder-" ++ String.fromInt sid ++ "-" ++ String.fromInt model.serverLayoutRevision ++ "-" ++ String.fromInt model.serverTime) sid target (ServerLayout.reconcile (List.map .id model.servers) model.serverLayout)) model
+                Nothing ->
+                    ( model, Cmd.none )
+
+        DropServerOnFolder target ->
+            case model.draggingServer of
+                Just sid ->
+                    saveServerLayout (ServerLayout.dropOnFolder sid target (ServerLayout.reconcile (List.map .id model.servers) model.serverLayout)) model
+                Nothing ->
+                    ( model, Cmd.none )
+
+        ToggleServerFolder id ->
+            saveServerLayout (ServerLayout.toggle id (ServerLayout.reconcile (List.map .id model.servers) model.serverLayout)) model
 
         JoinInvite ->
             case model.invitePreview of
@@ -1814,13 +1886,13 @@ update msg model =
         SetCallPeerFailed roomKind roomId userId failed ->
             ( setRtcPeerFailed roomKind roomId userId failed model, Cmd.none )
 
-        RtcAudioState muted deafened ->
+        RtcAudioState muted deafened listenOnly ->
             -- The bridge owns the real microphone and playback state; mirror it.
             let
                 voice0 =
                     model.voice
             in
-            ( { model | voice = { voice0 | muted = muted, deafened = deafened } }, Cmd.none )
+            ( { model | voice = { voice0 | muted = muted, deafened = deafened, listenOnly = listenOnly } }, Cmd.none )
 
         RetryCallPeer userId ->
             case ( model.voice.mode, model.voice.id ) of
@@ -2510,6 +2582,7 @@ handleMe val model =
                 | me = Just user
                 , csrf = fromApiFieldStr "csrf" val
                 , serverTime = fromApiFieldInt "server_time" val
+                , serverClockOffset = clockOffset (fromApiFieldInt "server_time" val) val model.serverClockOffset
                 , booting = False
                 , authBusy = False
                 , profileDisplayName = user.displayName
@@ -2530,11 +2603,25 @@ handleMe val model =
                 , bridgeSend (E.object [ ( "tag", E.string "set_theme" ), ( "data", E.string user.theme ) ])
                 , apiSend (encodeApiRequest (ApiGet "/sync?since=0"))
                 , routeCmd model.active
+                , apiSend (encodeApiRequest (ApiGet "/server-layout"))
                 ]
             )
 
         Err _ ->
             ( model, Cmd.none )
+
+
+clockOffset : Int -> E.Value -> Int -> Int
+clockOffset serverNow val previous =
+    let
+        received =
+            fromApiFieldInt "client_received_at" val
+    in
+    if serverNow > 0 && received > 0 then
+        serverNow - received
+
+    else
+        previous
 
 
 handleSync : E.Value -> Model -> ( Model, Cmd Msg )
@@ -2574,6 +2661,7 @@ handleSync val model =
                             else
                                 data.friends
                         , serverTime = data.now
+                        , serverClockOffset = clockOffset data.now val model.serverClockOffset
                     }
 
                 redirectIfGone =
@@ -3036,11 +3124,14 @@ submitModal model =
             else if String.startsWith "channel:" kind then
                 case String.toInt (String.dropLeft 8 kind) of
                     Just serverId ->
-                        if String.isEmpty (String.trim model.modalTitle) then
+                        if model.channelCreateBusy then
+                            ( model, Cmd.none )
+
+                        else if String.isEmpty (String.trim model.modalTitle) then
                             ( { model | toast = Just "Add a channel name" }, Cmd.none )
 
                         else
-                            ( { model | modal = Nothing }
+                            ( { model | channelCreateBusy = True }
                             , apiSend
                                 (encodeApiRequest
                                     (ApiPost ("/server/" ++ String.fromInt serverId ++ "/channels")
@@ -3283,6 +3374,19 @@ threadDetailDecoder =
     D.map2 (\thread replies -> { thread = thread, replies = replies })
         (D.field "thread" decodeThread)
         (D.field "replies" (D.list decodeReply))
+
+
+serverForRoute : ActiveRoute -> Model -> Maybe ServerData
+serverForRoute active model =
+    let
+        forChannel id =
+            Dict.values model.serverCache |> List.filter (\data -> List.any (\channel -> channel.id == id) data.channels) |> List.head
+    in
+    case active of
+        ServerView id -> Dict.get id model.serverCache
+        ChannelView id -> forChannel id
+        VoiceChannelView id -> forChannel id
+        _ -> model.currentServer
 
 
 handleServerData : E.Value -> Model -> ( Model, Cmd Msg )
@@ -3562,14 +3666,38 @@ invitePreviewRawDecoder =
         (D.oneOf [ D.at [ "server", "member_count" ] D.int, D.succeed 0 ])
 
 
+receiveServerLayout : E.Value -> Model -> ( Model, Cmd Msg )
+receiveServerLayout val model =
+    case D.decodeValue (D.map2 Tuple.pair (D.field "items" ServerLayout.decode) (D.field "revision" D.int)) val of
+        Ok ( items, revision ) ->
+            if revision < model.serverLayoutRevision then
+                ( model, Cmd.none )
+            else
+                ( { model | serverLayout = items, serverLayoutRevision = revision, serverLayoutLoaded = True, serverLayoutBusy = False, draggingServer = Nothing }, Cmd.none )
+        Err _ ->
+            ( { model | serverLayoutBusy = False }, Cmd.none )
+
+
+saveServerLayout : List ServerLayoutItem -> Model -> ( Model, Cmd Msg )
+saveServerLayout items model =
+    if not model.serverLayoutLoaded || model.serverLayoutBusy || items == model.serverLayout then
+        ( { model | draggingServer = Nothing }, Cmd.none )
+    else
+        ( { model | serverLayout = items, serverLayoutBusy = True, draggingServer = Nothing }
+        , apiSend (encodeApiRequest (ApiPost "/server-layout" (Just (E.object [ ( "items", ServerLayout.encode items ), ( "revision", E.int model.serverLayoutRevision ) ]))))
+        )
+
+
 handleCreateServer : E.Value -> Model -> ( Model, Cmd Msg )
 handleCreateServer val model =
     case D.decodeValue (D.field "id" D.int) val of
         Ok id ->
-            ( { model | serverName = "", serverDescription = "" }, setHash ("#server/" ++ String.fromInt id) )
+            ( { model | serverName = "", serverDescription = "", serverCreateBusy = False, serverTemplate = Nothing, serverTemplateReady = True }
+            , Cmd.batch [ setHash ("#server/" ++ String.fromInt id), apiSend (encodeApiRequest (ApiGet "/sync?since=0")), apiSend (encodeApiRequest (ApiGet "/server-layout")) ]
+            )
 
         Err _ ->
-            ( model, Cmd.none )
+            ( { model | serverCreateBusy = False }, Cmd.none )
 
 
 handleInviteJoin : E.Value -> Model -> ( Model, Cmd Msg )
@@ -3778,6 +3906,7 @@ updateVoiceMode mode id voice =
             , muted = False
             , deafened = False
             , mutedBeforeDeafen = False
+            , listenOnly = False
             , screenShare = False
         }
 
@@ -3795,6 +3924,7 @@ clearVoice voice =
         , muted = False
         , deafened = False
         , mutedBeforeDeafen = False
+        , listenOnly = False
     }
 
 

@@ -774,7 +774,7 @@ renderProfileSettings : User -> Model -> Html Msg
 renderProfileSettings u model =
     div [ class "settings-card profile-settings-card" ]
         [ div
-            [ class "settings-banner"
+            [ class ("settings-banner" ++ (if String.isEmpty model.profileBannerPreviewUrl then "" else " has-image"))
             , style "background-image"
                 (if String.isEmpty model.profileBannerPreviewUrl then
                     "none"
@@ -909,4 +909,3 @@ renderProfileSettings u model =
                 ]
             ]
         ]
-

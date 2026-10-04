@@ -193,6 +193,7 @@ jsonable(L) when is_list(L) -> [jsonable(X) || X <- L];
 jsonable(T) when is_tuple(T) -> jsonable(tuple_to_list(T));
 jsonable(true) -> true;
 jsonable(false) -> false;
+jsonable(null) -> null;
 jsonable(undefined) -> null;
 jsonable(A) when is_atom(A) -> atom_to_binary(A, utf8);
 jsonable(B) when is_binary(B) -> B;

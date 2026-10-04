@@ -18,6 +18,7 @@ import Set exposing (Set)
 import Task
 import Time
 import Types exposing (..)
+import ServerLayout
 import Url exposing (Url)
 import View.Messages exposing (groupedMessageViews)
 import View.Settings exposing (renderSettingsPage)
@@ -482,7 +483,10 @@ modalContent kind model =
                         )
                     ]
             ]
-        , modalActions "Create channel"
+        , div [ class "modal-actions" ]
+            [ button [ class "btn secondary", type_ "button", onClick CloseModal ] [ text "Cancel" ]
+            , button [ class "btn", type_ "button", disabled (model.channelCreateBusy || String.isEmpty (String.trim model.modalTitle)), onClick SubmitModal ] [ text (if model.channelCreateBusy then "Creating…" else "Create channel") ]
+            ]
         ]
 
     else if kind == "join_invite" then
@@ -2061,7 +2065,7 @@ renderCompactCallBar active model =
             ]
             [ div [ class "call-bar-icon" ] [ callIcon "audio" ]
             , div [ class "call-bar-info" ]
-                [ span [ class "call-bar-title" ] [ text "Voice call" ]
+                [ span [ class "call-bar-title" ] [ text (if model.voice.listenOnly then "Listening · microphone off" else "Voice call") ]
                 , span [ class "call-bar-sub" ] [ text countText ]
                 ]
             , div [ class "call-bar-avatars" ]
@@ -2086,7 +2090,10 @@ renderCompactCallBar active model =
                            )
                     )
                 , title
-                    (if model.voice.muted then
+                    (if model.voice.listenOnly then
+                        "Enable microphone"
+
+                     else if model.voice.muted then
                         "Unmute"
 
                      else
@@ -2323,7 +2330,10 @@ renderExpandedCallOverlay active model =
                  else
                     "mic"
                 )
-                (if model.voice.muted then
+                (if model.voice.listenOnly then
+                    "Enable microphone"
+
+                 else if model.voice.muted then
                     "Unmute"
 
                  else
@@ -2491,7 +2501,7 @@ renderCallUser model u =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "2.8.0", attribute "data-ui-revision" "interface-5" ]
+    div [ class "layout", attribute "data-ui-version" "2.9.0", attribute "data-ui-revision" "interface-5" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -2573,10 +2583,11 @@ renderServersSheet model =
                         [ div [ class "empty" ] [ text "You have not joined a server yet." ] ]
 
                      else
-                        List.map (\s -> serverSheetRow s model) model.servers
+                        List.map (renderServerLayoutItem True model) (ServerLayout.reconcile (List.map .id model.servers) model.serverLayout)
                     )
                 , div [ class "servers-sheet-actions" ]
                     [ button [ class "btn secondary", onClick (Go "#new-server") ] [ text "Create server" ]
+                    , organizeServersButton model
                     , button [ class "btn secondary", onClick (InviteModal 0) ] [ text "Join with Wire" ]
                     , button [ class "btn secondary", onClick (BridgeEvent "my_reports" E.null) ] [ text "My reports" ]
                     ]
@@ -2602,7 +2613,7 @@ serverSheetRow s model =
                     False
     in
     button
-        [ type_ "button"
+        (serverDragAttributes s.id model ++ [ type_ "button"
         , class
             ("server-sheet-row"
                 ++ (if isActive then
@@ -2621,7 +2632,7 @@ serverSheetRow s model =
              else
                 "false"
             )
-        ]
+        ])
         [ serverIcon s
         , div [ class "grow" ]
             [ b [] [ text s.name ]
@@ -2631,14 +2642,68 @@ serverSheetRow s model =
         ]
 
 
+organizeServersButton : Model -> Html Msg
+organizeServersButton model =
+    button [ class "btn secondary", type_ "button", disabled model.serverLayoutBusy, onClick (BridgeEvent "organize_servers" (E.list (\server -> E.object [ ( "id", E.int server.id ), ( "name", E.string server.name ) ]) model.servers)) ] [ text "Organize servers" ]
+
+
+serverDragAttributes : Int -> Model -> List (Html.Attribute Msg)
+serverDragAttributes sid model =
+    if not model.serverLayoutLoaded || model.serverLayoutBusy then
+        []
+    else
+        [ attribute "draggable" "true"
+        , attribute "data-server-id" (String.fromInt sid)
+        , on "dragstart" (D.succeed (DragServer sid))
+        , on "dragend" (D.succeed EndServerDrag)
+        , preventDefaultOn "dragover" (D.succeed ( NoOp, True ))
+        , custom "drop" (D.succeed { message = DropServerOnServer sid, stopPropagation = True, preventDefault = True })
+        ]
+
+
+renderServerLayoutItem : Bool -> Model -> ServerLayoutItem -> Html Msg
+renderServerLayoutItem sheet model item =
+    let
+        find sid = List.filter (\s -> s.id == sid) model.servers |> List.head
+        render server = if sheet then serverSheetRow server model else renderServerIcon server model
+    in
+    case item of
+        ServerEntry sid ->
+            find sid |> Maybe.map render |> Maybe.withDefault (text "")
+
+        ServerFolder folder ->
+            let
+                servers = List.filterMap find folder.serverIds
+                unread = List.sum (List.map (serverNotificationCount model) servers)
+            in
+            div [ class (if sheet then "server-folder sheet-folder" else "server-folder rail-folder") ]
+                [ button
+                    [ class "server-folder-toggle"
+                    , type_ "button"
+                    , title (folder.name ++ " · " ++ String.fromInt (List.length servers) ++ " servers")
+                    , attribute "aria-label" (notificationLabel (folder.name ++ " folder") unread)
+                    , attribute "aria-expanded" (if folder.collapsed then "false" else "true")
+                    , disabled (not model.serverLayoutLoaded || model.serverLayoutBusy)
+                    , onClick (ToggleServerFolder folder.id)
+                    , preventDefaultOn "dragover" (D.succeed ( NoOp, True ))
+                    , custom "drop" (D.succeed { message = DropServerOnFolder folder.id, stopPropagation = True, preventDefault = True })
+                    ]
+                    [ span [ class "folder-icon-grid", attribute "aria-hidden" "true" ] (List.map serverIcon (List.take 4 servers))
+                    , if sheet then span [ class "folder-label" ] [ text folder.name ] else text ""
+                    , notificationBadge unread
+                    ]
+                , if folder.collapsed then text "" else div [ class "server-folder-members" ] (List.map render servers)
+                ]
+
+
 renderRail : Model -> Html Msg
 renderRail model =
     let
         serverButtons =
-            List.map (\server -> renderServerIcon server model) (List.take 8 model.servers)
+            List.map (renderServerLayoutItem False model) (ServerLayout.reconcile (List.map .id model.servers) model.serverLayout)
 
         moreServers =
-            if List.length model.servers > 8 then
+            if not (List.isEmpty model.servers) then
                 [ railBtn "servers" "More servers" model.serversSheetOpen ToggleServersSheet ]
 
             else
@@ -2699,7 +2764,7 @@ renderServerIcon s model =
             serverIsActive s model
     in
     button
-        [ class
+        (serverDragAttributes s.id model ++ [ class
             ("rail-btn"
                 ++ (if isActive then
                         " active"
@@ -2719,7 +2784,7 @@ renderServerIcon s model =
              else
                 "false"
             )
-        ]
+        ])
         [ serverIcon s
         , notificationBadge (serverNotificationCount model s)
         ]
@@ -2965,8 +3030,8 @@ renderServerSide model data =
                             []
                        )
                     ++ (if canManageChannels then
-                            [ button [ class "btn secondary", onClick (ChannelModal data.server.id) ] [ text "Channel" ]
-                            , button [ class "btn secondary", onClick (CreateCategoryModal data.server.id) ] [ text "Category" ]
+                            [ button [ class "btn secondary", onClick (ChannelModal data.server.id), title "Add a text or voice channel" ] [ text "Add channel" ]
+                            , button [ class "btn secondary", onClick (CreateCategoryModal data.server.id) ] [ text "Add category" ]
                             ]
 
                         else
@@ -4948,7 +5013,10 @@ renderVoicePage channelId model =
                     , onClick (BridgeEvent "toggle_mute" E.null)
                     ]
                     [ text
-                        (if model.voice.muted then
+                        (if model.voice.listenOnly then
+                            "Enable microphone"
+
+                         else if model.voice.muted then
                             "Unmute"
 
                          else
@@ -5339,13 +5407,13 @@ renderNewServerPage model =
         , section [ class "card server-create-form" ]
             [ div [ class "field" ] [ label [] [ text "Server name" ], input [ value model.serverName, maxlength 80, placeholder "Weekend crew", onInput ServerName ] [] ]
             , div [ class "field" ] [ label [] [ text "What is it for?" ], textarea [ value model.serverDescription, maxlength 280, placeholder "Games, projects, hanging out…", onInput ServerDescription ] [] ]
-            , div [ class "server-create-defaults" ]
-                [ div [] [ span [ class "server-default-icon" ] [ text "T" ], span [] [ b [] [ text "general" ], small [ class "muted" ] [ text "Text channel" ] ] ]
-                , div [] [ span [ class "server-default-icon" ] [ text "V" ], span [] [ b [] [ text "Lounge" ], small [ class "muted" ] [ text "Voice ready" ] ] ]
-                ]
+            , Html.node "pw-server-template-picker"
+                [ attribute "account-id" (Maybe.map (.id >> String.fromInt) model.me |> Maybe.withDefault "")
+                , on "templatechange" (D.map2 SetServerTemplate (D.at [ "detail", "template" ] D.value) (D.at [ "detail", "ready" ] D.bool))
+                ] []
             , div [ class "modal-actions server-create-actions" ]
                 [ button [ class "btn secondary", onClick (Go "#") ] [ text "Cancel" ]
-                , button [ class "btn", disabled (String.length (String.trim model.serverName) < 2), onClick (CreateServer model.serverName model.serverDescription) ] [ text "Create server" ]
+                , button [ class "btn", disabled (model.serverCreateBusy || not model.serverTemplateReady || String.length (String.trim model.serverName) < 2), onClick (CreateServer model.serverName model.serverDescription) ] [ text (if model.serverCreateBusy then "Creating…" else "Create server") ]
                 ]
             ]
         ]

@@ -15,6 +15,7 @@ await mkdir('test-results',{recursive:true});
 async function setup(context) {
  await context.route('**/api/**',route=>{
   const path=new URL(route.request().url()).pathname;
+  if(path==='/api/media/banner-preview') return route.fulfill({contentType:'image/svg+xml',body:'<svg xmlns="http://www.w3.org/2000/svg" width="320" height="90" viewBox="0 0 320 90"><rect width="320" height="90" fill="#326b98"/><circle cx="220" cy="45" r="38" fill="#99c4df"/><path d="M0 90L80 10L160 90" fill="#164063"/></svg>'});
   const data=path==='/api/me'?{user:me,csrf:'test',server_time:now}:path==='/api/sync'?sync:path==='/api/messages'?messages:[];
   return route.fulfill({json:path==='/api/client-config'?{app_name:'Plainwire',version:'2.1.0',registration_enabled:true}:{ok:true,data}});
  });
@@ -32,6 +33,16 @@ try {
   for(const section of ['profile','appearance','chat','voice','sound','privacy','account','developer']) {
    if(width>760) await page.locator(`[data-setting="${section}"]`).click();
    else await page.locator('.settings-mobile-nav button').nth(['profile','appearance','chat','voice','sound','privacy','account','developer'].indexOf(section)).click();
+   if(section==='profile') {
+    await page.getByLabel('Banner URL',{exact:true}).fill('/api/media/banner-preview');
+    await page.getByLabel('Display name',{exact:true}).fill('LongUnbrokenProfileNameThatNeedsToWrapOnMobile');
+    const banner=await page.locator('.profile-settings-card .settings-banner').evaluate(el=>{const css=getComputedStyle(el);return {repeat:css.backgroundRepeat,size:css.backgroundSize,position:css.backgroundPosition,width:el.clientWidth,scroll:el.scrollWidth}});
+    assert.equal(banner.repeat,'no-repeat','profile banner never tiles');
+    assert.equal(banner.size,'cover','profile banner fills its preview');
+    assert.equal(banner.position,'50% 50%','profile banner crops from the center');
+    assert(banner.scroll<=banner.width+1,`${width} banner name stays inside its preview`);
+    if(width===390) await page.screenshot({path:'test-results/profile-banner-mobile.png'});
+   }
    if(section==='developer') {
     await page.waitForSelector('.developer-tabs');
     for(const tab of ['General','Installations','Commands','Interactions','AI assistant']) {

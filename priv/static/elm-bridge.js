@@ -348,6 +348,12 @@
     reaction_rate_limited: 'You are reacting too quickly. Wait a moment and try again.',
     invalid_reaction: 'That reaction is not supported.',
     attachment_unavailable: 'An attached file is unavailable or you no longer have access to it.',
+    invalid_server_template: 'This template has invalid, duplicate, unsupported, or too many channels, categories or roles. Import up to 100 channels, 25 categories and 50 roles.',
+    invalid_discord_template: 'Enter a Discord template code or a https://discord.new/ template link.',
+    template_not_found: 'This Discord template does not exist or is no longer available.',
+    template_rate_limited: 'Discord is limiting template requests. Try again in a minute.',
+    template_unavailable: 'Discord could not be reached. Try again or import a saved JSON template.',
+    server_layout_changed: 'Your folders changed on another device. Reloaded the latest layout; try again.',
     confirmation_mismatch: 'The server name did not match. Type it exactly to confirm deletion.',
     database_unavailable: 'The server database is temporarily unavailable.',
     database_busy: 'The server is busy. Try again in a moment.',
@@ -968,6 +974,17 @@
     const renderOverview = () => {
       const server = serverData?.server || {}; const canManage = hasPermission(state, 'manage_server');
       const wrap = document.createElement('div'); wrap.className = 'admin-form-stack';
+      if (canManage) wrap.append(actionButton('Export server template', async event => {
+        const button = event.currentTarget; button.disabled = true;
+        try {
+          const template = await directApi(`/server/${serverId}/template`);
+          const blob = new Blob([JSON.stringify(template, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob); const link = document.createElement('a');
+          link.href = url; link.download = 'plainwire-server-template.json'; link.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch (error) { send(app.ports.bridgeReceive, { tag: 'toast', data: error.message }); }
+        finally { button.disabled = false; }
+      }));
       const name = makeField('Server name', server.name || '', { maxLength: 80 }); const description = makeField('Description', server.description || '', { multiline: true, maxLength: 280 });
       const icon = makeField('Icon URL', server.icon_url || '', { placeholder: 'https://…' }); const banner = makeField('Banner URL', server.banner_url || '', { placeholder: 'https://…' }); const accent = makeField('Accent color', server.accent_color || '#5865f2', { type: 'color' }); const welcome = makeField('Welcome message', server.welcome_message || '', { multiline: true, maxLength: 2000 });
       [name,description,icon,banner,accent,welcome].forEach(field => { field.input.disabled = !canManage; wrap.append(field.label); });
@@ -1517,6 +1534,22 @@
   let outgoingTimer = null;
   let audioCtx = null;
   let meId = null;
+  document.addEventListener('dragstart', event => {
+    const server = event.target.closest?.('button[draggable="true"][data-server-id]');
+    if (server && event.dataTransfer) { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', server.dataset.serverId); }
+  });
+  document.addEventListener('plainwire-workspace-request', async event => {
+    const request = event.detail;
+    const accountId = Number(request?.accountId);
+    if (!request || !meId || accountId !== Number(meId)) { request?.reject?.(new Error('Sign in to preview templates.')); return; }
+    const allowed = request.method === 'POST' && ['/server-templates/preview', '/server-templates/discord'].includes(request.path);
+    if (!allowed) { request.reject?.(new Error('Invalid workspace request.')); return; }
+    try {
+      const value = await directApi(request.path, { method: request.method, body: request.body });
+      if (Number(meId) !== accountId) throw new Error('The signed-in account changed.');
+      request.resolve?.(value);
+    } catch (error) { request.reject?.(error); }
+  });
   let localStream = null;
   let localMicrophoneLease = null;
   let microphoneRequest = null;
@@ -1549,6 +1582,7 @@
     ...(pendingRtcInvitation?.id === Number(id) ? { invite_id: pendingRtcInvitation.token } : {}) });
   let speakerOn = true;
   let micMuted = false;
+  let listenOnly = false;
   let deafened = false;
   // Deafening also mutes; undeafening restores whatever the microphone was before.
   let mutedBeforeDeafen = false;
@@ -2969,6 +3003,10 @@
       }
       const res = await fetch('/api' + path, options);
       const json = await res.json().catch(() => ({ ok: false, error: 'bad_json' }));
+      if (json.data && typeof json.data === 'object' && !Array.isArray(json.data) &&
+          (path === '/me' || path.startsWith('/sync?'))) {
+        json.data.client_received_at = Date.now();
+      }
       // HTTP and application envelopes must agree. Keeping one success bit avoids
       // clearing recovery state on a non-2xx response while telling Elm the same
       // request failed.
@@ -4979,21 +5017,53 @@
       releaseCurrentMicrophone();
       const requestEpoch = microphoneEpoch;
       try {
-        const lease = await prepareMicrophone();
+        let lease;
+        try {
+          lease = await prepareMicrophone();
+        } catch (error) {
+          if (requestEpoch !== microphoneEpoch || error.message === 'microphone_request_cancelled') throw error;
+          const ctx = audioContext();
+          if (!ctx) throw error;
+          await ctx.resume();
+          const destination = ctx.createMediaStreamDestination();
+          const source = ctx.createConstantSource();
+          const gain = ctx.createGain();
+          gain.gain.value = 0;
+          source.connect(gain).connect(destination);
+          source.start();
+          let released = false;
+          // A silent track keeps the audio transceiver available for receiving
+          // and later microphone activation without rebuilding the call.
+          lease = {stream: destination.stream, rawStream: destination.stream,
+            mode: voiceProcessingMode, listenOnly: true, release: async () => {
+              if (released) return;
+              released = true;
+              source.stop(); source.disconnect(); gain.disconnect(); destination.disconnect();
+              stopStream(destination.stream);
+            }};
+          debug('MEDIA', 'listen_only_fallback', {name: error.name, error: error.message}, 'warn');
+        }
         if (requestEpoch !== microphoneEpoch) {
           await lease.release();
           throw new Error('microphone_request_cancelled');
         }
         localMicrophoneLease = lease;
         localStream = lease.stream;
+        listenOnly = lease.listenOnly === true;
+        if (listenOnly) {
+          micMuted = true;
+          mutedBeforeDeafen = true;
+          publishAudioState();
+          send(app.ports.bridgeReceive, {tag: 'toast', data: 'Microphone unavailable. You can still listen and share your screen. Use Enable microphone to try again.'});
+        }
         observeMicrophoneTracks(localStream);
-        startVoiceDetection(localStream);
+        if (!listenOnly) startVoiceDetection(localStream);
         publishAudioDevices();
         return localStream;
       } catch (error) {
         debug('MEDIA', 'microphone_failed', { name: error.name, error: error.message, processing_mode: voiceProcessingMode }, error.message === 'microphone_request_cancelled' ? 'warn' : 'error');
         if (error.message !== 'microphone_request_cancelled') {
-          send(app.ports.bridgeReceive, { tag: 'toast', data: voiceProcessingMode === 'krisp' ? 'Krisp could not start. Choose another microphone mode.' : 'Microphone access is needed for calls.' });
+          send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call audio could not start. Check your browser audio settings.' });
         }
         throw error;
       }
@@ -5041,7 +5111,9 @@
       await replacementLease.release();
       throw new Error('No microphone track');
     }
-    track.enabled = !micMuted;
+    // Keep a replacement microphone silent until every asynchronous swap has
+    // finished. A mute/deafen click during that swap applies to the old stream.
+    track.enabled = false;
     const screenAtMix = screenStream;
     const mixerAtMix = screenAudioMixer;
     let replacementMixer = null;
@@ -5073,6 +5145,9 @@
     screenAudioMixer = replacementMixer;
     localMicrophoneLease = replacementLease;
     localStream = replacementLease.stream;
+    track.enabled = !micMuted;
+    listenOnly = false;
+    publishAudioState();
     observeMicrophoneTracks(localStream);
     startVoiceDetection(localStream);
     disposeScreenAudioMixer(previousMixer);
@@ -5092,6 +5167,22 @@
       microphoneRebuildRequest = performMicrophoneRebuild().finally(() => { microphoneRebuildRequest = null; });
     }
     return microphoneRebuildRequest;
+  };
+
+  const enableCallMicrophone = async () => {
+    if (!room || !listenOnly || deafened) return publishAudioState();
+    const epoch = room.epoch;
+    try {
+      if (!await rebuildLocalMicrophone() || room?.epoch !== epoch) return;
+      setMuted(deafened);
+      sendWs({type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: {muted: micMuted}});
+      send(app.ports.bridgeReceive, {tag: 'toast', data: deafened ? 'Microphone ready. Undeafen and unmute when you want to speak.' : 'Microphone enabled.'});
+    } catch (error) {
+      if (room?.epoch !== epoch) return;
+      debug('MEDIA', 'listen_only_microphone_failed', {name: error.name}, 'warn');
+      publishAudioState();
+      send(app.ports.bridgeReceive, {tag: 'toast', data: 'Microphone still unavailable. You can keep listening; check permission or select another input in Audio settings.'});
+    }
   };
 
   const scheduleMicrophoneRecovery = () => {
@@ -6639,6 +6730,7 @@
     // way so its buttons can never disagree with the real audio state.
     if (previous) {
       micMuted = false;
+      listenOnly = false;
       deafened = false;
       mutedBeforeDeafen = false;
     }
@@ -7394,7 +7486,7 @@
         debug('RTC', 'room_media_failed', { kind, id, name: error.name, error: error.message }, 'warn');
         leaveRtcRoom({ notifyServer: true });
         send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: kind });
-        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not start the microphone. Check permission or choose another input, then rejoin.' });
+        send(app.ports.bridgeReceive, { tag: 'toast', data: 'Could not start call audio. Check your browser audio settings, then rejoin.' });
       }
       return;
     }
@@ -7611,7 +7703,7 @@
   };
 
   const publishAudioState = () => {
-    send(app.ports.bridgeReceive, { tag: 'rtc_audio_state', muted: micMuted, deafened });
+    send(app.ports.bridgeReceive, { tag: 'rtc_audio_state', muted: micMuted, deafened, listen_only: listenOnly });
   };
 
   const setMuted = (muted) => {
@@ -9226,9 +9318,90 @@
   }
   if (!customElements.get('pw-developer-portal')) customElements.define('pw-developer-portal', PlainwireDeveloperPortal);
 
+  const openServerOrganizer = async (servers) => {
+    const accountId = meId;
+    if (!accountId || !Array.isArray(servers)) return;
+    const shell = modalShell('Organize servers', 'Drag servers onto each other on desktop, or move them here. Folders sync with your account.');
+    let state; let busy = false;
+    const status = document.createElement('p'); status.setAttribute('role', 'status'); status.className = 'muted';
+    const content = document.createElement('div'); content.className = 'server-organizer'; shell.body.append(status, content);
+    const current = () => accountId === meId && shell.body.isConnected;
+    const refresh = async () => {
+      const fresh = await directApi('/server-layout');
+      if (current()) { state = fresh; send(app.ports.bridgeReceive, { tag: 'server_layout_updated', data: fresh }); }
+    };
+    const save = async items => {
+      if (busy || !state || !current()) return;
+      busy = true; for (const control of content.querySelectorAll('button, input, select')) control.disabled = true;
+      status.textContent = 'Saving…';
+      try {
+        const saved = await directApi('/server-layout', { method: 'POST', body: { items, revision: state.revision } });
+        if (!current()) return;
+        state = saved; send(app.ports.bridgeReceive, { tag: 'server_layout_updated', data: saved }); status.textContent = 'Folders saved.';
+      } catch (error) {
+        if (!current()) return;
+        status.textContent = error.message;
+        try { await refresh(); } catch (_) {}
+      } finally { busy = false; if (current()) render(); }
+    };
+    const node = (tag, text) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; return n; };
+    const control = (name, input) => { const label = node('label', name); label.append(input); return label; };
+    const action = (label, fn) => { const button = node('button', label); button.type = 'button'; button.className = 'btn secondary'; button.addEventListener('click', fn); return button; };
+    const remove = (sid) => state.items.flatMap(item => {
+      if ('server_id' in item) return item.server_id === sid ? [] : [item];
+      const ids = item.server_ids.filter(id => id !== sid); return ids.length ? [{ ...item, server_ids: ids }] : [];
+    });
+    const render = () => {
+      content.replaceChildren();
+      if (!state) return;
+      const source = node('select'); source.setAttribute('aria-label', 'Server to move');
+      for (const server of servers) { const option = node('option', server.name); option.value = String(server.id); source.append(option); }
+      const destination = node('select'); destination.setAttribute('aria-label', 'Destination folder');
+      for (const [id, name] of [['@loose','Outside a folder'],['@new','New folder'], ...state.items.filter(item => item.server_ids).map(item => [item.id, item.name])]) {
+        const option = node('option', name); option.value = id; destination.append(option);
+      }
+      const name = node('input'); name.maxLength = 48; name.value = 'New folder'; name.setAttribute('aria-label', 'New folder name');
+      const nameControl = control('New folder name', name); nameControl.hidden = true;
+      destination.addEventListener('change', () => { nameControl.hidden = destination.value !== '@new'; });
+      const move = action('Move server', () => {
+        const sid = Number(source.value); if (!Number.isSafeInteger(sid) || sid <= 0) return;
+        let items = remove(sid);
+        if (destination.value === '@loose') items.push({ server_id: sid });
+        else if (destination.value === '@new') {
+          if (!name.value.trim()) { status.textContent = 'Give the folder a name.'; return; }
+          items.push({ id: 'folder-' + crypto.randomUUID(), name: name.value.trim(), server_ids: [sid], collapsed: false });
+        } else {
+          const old = state.items.find(item => item.id === destination.value);
+          if (!old || old.server_ids.includes(sid)) return;
+          if (old.server_ids.length >= 100) { status.textContent = 'This folder already contains 100 servers.'; return; }
+          items = items.map(item => item.id === old.id ? { ...item, server_ids: [...item.server_ids, sid] } : item);
+        }
+        save(items);
+      });
+      move.disabled = !servers.length;
+      content.append(control('Server', source), control('Move to', destination), nameControl, move);
+      for (const folder of state.items.filter(item => item.server_ids)) {
+        const section = node('section'); section.className = 'server-organizer-folder';
+        const input = node('input'); input.maxLength = 48; input.value = folder.name; input.setAttribute('aria-label', 'Rename ' + folder.name);
+        const names = folder.server_ids.map(id => servers.find(s => s.id === id)?.name || 'Server ' + id).join(', ');
+        section.append(control('Folder name', input), node('p', names), action('Save name', () => {
+          if (!input.value.trim()) { status.textContent = 'Give the folder a name.'; return; }
+          save(state.items.map(item => item.id === folder.id ? { ...item, name: input.value.trim() } : item));
+        }), action('Ungroup servers', () => save(state.items.flatMap(item => item.id === folder.id ? item.server_ids.map(server_id => ({ server_id })) : [item]))));
+        content.append(section);
+      }
+    };
+    status.textContent = 'Loading folders…';
+    try { await refresh(); if (current()) { status.textContent = ''; render(); } }
+    catch (error) { if (current()) status.textContent = error.message; }
+  };
+
   recv(app.ports.bridgeSend, ({ tag, data }) => {
     debug('ELM', 'command', { tag, data });
     switch (tag) {
+      case 'organize_servers':
+        openServerOrganizer(data);
+        break;
       case 'preserve_message_scroll': {
         const list = document.getElementById('messages');
         messageScrollSnapshot = list ? { element: list, route: location.hash, height: list.scrollHeight, top: list.scrollTop } : null;
@@ -9436,7 +9609,7 @@
                 if (room?.epoch === epoch) leaveRtcRoom();
                 stopRingtones();
                 send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'call' });
-                send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for calls.' });
+                send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call audio could not start. Check your browser audio settings.' });
               });
           }
         });
@@ -9474,7 +9647,7 @@
             if (room?.epoch === epoch) leaveRtcRoom();
             stopRingtones();
             send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'call' });
-            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for calls.' });
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call audio could not start. Check your browser audio settings.' });
           });
         break;
         }
@@ -9487,7 +9660,7 @@
           .catch(() => {
             if (room?.epoch === epoch) leaveRtcRoom();
             send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'voice' });
-            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for voice.' });
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Voice audio could not start. Check your browser audio settings.' });
           });
         break;
         }
@@ -9508,7 +9681,7 @@
             if (room?.epoch === epoch) leaveRtcRoom();
             stopRingtones();
             send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'call' });
-            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for calls.' });
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call audio could not start. Check your browser audio settings.' });
           });
         break;
         }
@@ -9524,7 +9697,7 @@
           .catch(() => {
             if (room?.epoch === epoch) leaveRtcRoom();
             send(app.ports.bridgeReceive, { tag: 'rtc_join_failed', data: 'call' });
-            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Microphone permission is required for calls.' });
+            send(app.ports.bridgeReceive, { tag: 'toast', data: 'Call audio could not start. Check your browser audio settings.' });
           });
         break;
         }
@@ -9542,6 +9715,7 @@
         stopRingtones();
         break;
       case 'voice_mute':
+        if (!data && listenOnly) { enableCallMicrophone(); break; }
         setMuted(!!data);
         if (room) sendWs({ type: room.kind === 'voice' ? 'voice_state' : 'call_state', patch: { muted: !!data } });
         break;

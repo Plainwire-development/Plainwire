@@ -122,7 +122,11 @@ try {
   assert.deepEqual(workerResult, { fetch: 'blocked', import: 'blocked', worker: 'blocked' });
   assert.equal(escapedRequests, 0);
 
-  const navigate = async hash => page.evaluate(value => { location.hash = value; }, hash);
+  const navigate = async hash => {
+    await page.evaluate(value => { location.hash = value; }, hash);
+    const channel = hash.match(/^#channel\/(\d+)$/);
+    if (channel) await page.locator(`.composer[data-draft="channel:${channel[1]}"]`).waitFor();
+  };
   const waitDelayed = async key => { for (let i = 0; i < 100 && !delayed.has(key); i++) await page.waitForTimeout(20); assert(delayed.has(key), `request ${key} arrived`); };
   const release = async key => { await delayed.get(key)(); await page.waitForTimeout(100); };
   await navigate('#server/1'); await waitDelayed('server');

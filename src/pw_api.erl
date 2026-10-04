@@ -24,7 +24,7 @@ route_bucket([First | _]) ->
         <<"health">>, <<"version">>, <<"apps">>, <<"me">>, <<"rtc-config">>,
         <<"voice-processing-config">>, <<"logout">>, <<"sessions">>, <<"password">>,
         <<"email">>, <<"account">>, <<"sync">>, <<"profile">>, <<"notifications">>, <<"forums">>,
-        <<"forum">>, <<"servers">>, <<"server">>, <<"channels">>, <<"messages">>,
+        <<"forum">>, <<"servers">>, <<"server">>, <<"server-layout">>, <<"server-templates">>, <<"channels">>, <<"messages">>,
         <<"conversation">>, <<"search">>, <<"friends">>, <<"friend">>, <<"users">>,
         <<"uploads">>, <<"files">>, <<"reports">>, <<"github">>, <<"klipy">>, <<"developer">>
     ]) of
@@ -289,7 +289,8 @@ auth(Req) ->
     end.
 uid(Session) -> maps:get(id, maps:get(user, Session)).
 
-authed(<<"GET">>, [<<"me">>], Req, Session, _) -> pw_util:ok_json(Req, #{ok=>true,data=>Session});
+authed(<<"GET">>, [<<"me">>], Req, Session, _) ->
+    pw_util:ok_json(Req, #{ok=>true,data=>(maps:remove(token, Session))#{server_time => pw_util:now_ms()}});
 authed(<<"GET">>, [<<"rtc-config">>], Req, Session, _) ->
     pw_util:ok_json(Req, #{ok=>true,data=>pw_rtc_config:get(uid(Session))});
 authed(<<"GET">>, [<<"voice-processing-config">>], Req, _Session, _) ->
@@ -423,8 +424,26 @@ authed(<<"POST">>, [<<"friends">>, <<"accept">>], Req0, Session, _) -> with_json
 authed(<<"POST">>, [<<"friends">>, <<"remove">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:friend_remove(uid(Session), maps:get(<<"user_id">>,M,undefined))) end);
 authed(<<"POST">>, [<<"friends">>, <<"block">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:friend_block(uid(Session), maps:get(<<"user_id">>,M,undefined))) end);
 authed(<<"GET">>, [<<"servers">>], Req, Session, _) -> result(Req, pw_db:servers(uid(Session)));
-authed(<<"POST">>, [<<"servers">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_server(uid(Session), maps:get(<<"name">>,M,<<>>), maps:get(<<"description">>,M,<<>>))) end);
+authed(<<"GET">>, [<<"server-layout">>], Req, Session, _) -> result(Req, pw_db:server_layout(uid(Session)));
+authed(<<"POST">>, [<<"server-layout">>], Req0, Session, _) ->
+    case pw_rate:allow_shared({server_layout, uid(Session)}, 120, 60000) of
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+        true -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:save_server_layout(uid(Session), maps:get(<<"items">>, M, undefined), maps:get(<<"revision">>, M, undefined))) end)
+    end;
+authed(<<"POST">>, [<<"servers">>], Req0, Session, _) -> with_json(Req0, fun(M, Req) -> result(Req, pw_db:create_server(uid(Session), maps:get(<<"name">>,M,<<>>), maps:get(<<"description">>,M,<<>>), maps:get(<<"template">>,M,null))) end);
+authed(<<"POST">>, [<<"server-templates">>, <<"preview">>], Req0, Session, _) ->
+    case pw_rate:allow_shared({server_template_preview, uid(Session)}, 60, 60000) of
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+        true -> with_json(Req0, fun(M, Req) -> result(Req, pw_server_template:preview(maps:get(<<"template">>, M, null))) end)
+    end;
+authed(<<"POST">>, [<<"server-templates">>, <<"discord">>], Req0, Session, _) ->
+    case pw_rate:allow_shared({server_template_discord, uid(Session)}, 10, 60000) andalso
+         pw_rate:allow_shared(server_template_discord_total, 120, 60000) of
+        false -> pw_util:err_json(Req0, 429, <<"rate_limited">>);
+        true -> with_json(Req0, fun(M, Req) -> result(Req, pw_server_template:fetch_discord(maps:get(<<"code">>, M, <<>>))) end)
+    end;
 authed(<<"GET">>, [<<"server">>, Id], Req, Session, _) -> result(Req, pw_db:server(uid(Session), Id));
+authed(<<"GET">>, [<<"server">>, Id, <<"template">>], Req, Session, _) -> result(Req, pw_db:server_template(uid(Session), Id));
 authed(<<"POST">>, [<<"server">>, Id], Req0, Session, _) ->
     with_json(Req0, fun(M, Req) -> result(Req, pw_db:update_server(uid(Session), Id, M)) end);
 authed(<<"GET">>, [<<"server">>, Id, <<"permissions">>], Req, Session, _) -> result(Req, pw_db:server_permissions(uid(Session), Id));
@@ -1090,6 +1109,10 @@ result(Req, {error, database_busy}) -> pw_util:err_json(Req, 503, <<"database_bu
 result(Req, {error, timeout}) -> pw_util:err_json(Req, 503, <<"database_timeout">>);
 result(Req, {error, internal_error}) -> pw_util:err_json(Req, 500, <<"internal_error">>);
 result(Req, {error, forbidden}) -> pw_util:err_json(Req, 403, <<"forbidden">>);
+result(Req, {error, server_layout_changed}) -> pw_util:err_json(Req, 409, <<"server_layout_changed">>);
+result(Req, {error, template_not_found}) -> pw_util:err_json(Req, 404, <<"template_not_found">>);
+result(Req, {error, template_rate_limited}) -> pw_util:err_json(Req, 429, <<"template_rate_limited">>);
+result(Req, {error, template_unavailable}) -> pw_util:err_json(Req, 502, <<"template_unavailable">>);
 result(Req, {error, username_changed_elsewhere}) -> pw_util:err_json(Req, 409, <<"username_changed_elsewhere">>);
 result(Req, {error, email_taken}) -> pw_util:err_json(Req, 409, <<"email_taken">>);
 result(Req, {error, bad_password}) -> pw_util:err_json(Req, 401, <<"bad_password">>);

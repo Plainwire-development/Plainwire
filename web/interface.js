@@ -1,4 +1,5 @@
 import './source-hub.js';
+import './server-templates.js';
 // UI-only controls. Each component owns and releases its listeners and observers.
 const element = (tag, cls, text) => {
   const el = document.createElement(tag);

@@ -83,8 +83,15 @@ handle_info(connect, S0 = #st{cfg = Cfg}) ->
     end;
 handle_info(_Info, S) -> {noreply, S}.
 
-terminate(_Reason, _S) ->
-    case application:stop(erlcass) of _ -> ok end,
+terminate(_Reason, #st{cfg = Cfg, reconnect_ref = Ref}) ->
+    cancel_retry(Ref),
+    case maps:get(enabled, Cfg, false) of
+        false -> ok;
+        true ->
+            %% The application controller may already be terminating during
+            %% VM shutdown. Disabled PostgreSQL deployments have no driver.
+            try application:stop(erlcass) of _ -> ok catch _:_ -> ok end
+    end,
     ok.
 code_change(_Old, State, _Extra) -> {ok, State}.
 

@@ -29,6 +29,7 @@ module Types exposing
     , Route(..)
     , Server
     , ServerData
+    , ServerLayoutItem(..)
     , ServerMember
     , ServerProfile
     , ServerProfileRole
@@ -374,6 +375,7 @@ type alias VoiceState =
     , muted : Bool
     , deafened : Bool
     , mutedBeforeDeafen : Bool
+    , listenOnly : Bool
     , screenShare : Bool
     }
 
@@ -496,6 +498,11 @@ type alias Drafts =
     Dict String String
 
 
+type ServerLayoutItem
+    = ServerEntry Int
+    | ServerFolder { id : String, name : String, serverIds : List Int, collapsed : Bool }
+
+
 type alias Model =
     { appName : String
     , registrationEnabled : Bool
@@ -505,6 +512,7 @@ type alias Model =
     , me : Maybe User
     , csrf : String
     , serverTime : Int
+    , serverClockOffset : Int
     , timeZone : Time.Zone
     , absoluteTimestamps : Bool
     , forums : List Forum
@@ -512,6 +520,11 @@ type alias Model =
     , currentThread : Maybe ForumThread
     , replies : List Reply
     , servers : List Server
+    , serverLayout : List ServerLayoutItem
+    , serverLayoutRevision : Int
+    , serverLayoutLoaded : Bool
+    , serverLayoutBusy : Bool
+    , draggingServer : Maybe Int
     , convs : List Conversation
     , conversationMembers : Dict Int (List MemberUser)
     , friends : List Friend
@@ -591,6 +604,10 @@ type alias Model =
     , profileTheme : String
     , serverName : String
     , serverDescription : String
+    , serverTemplate : Maybe E.Value
+    , serverTemplateReady : Bool
+    , serverCreateBusy : Bool
+    , channelCreateBusy : Bool
     , modalTitle : String
     , modalBody : String
     , modalPeopleQuery : String
@@ -742,6 +759,13 @@ type Msg
     | LeaveForum Int
     | VoteThread Int Int
     | CreateServer String String
+    | SetServerTemplate E.Value Bool
+    | ReceiveServerLayout E.Value
+    | DragServer Int
+    | EndServerDrag
+    | DropServerOnServer Int
+    | DropServerOnFolder String
+    | ToggleServerFolder String
     | ProfileDisplayName String
     | ProfileBio String
     | ProfileAvatarUrl String
@@ -789,7 +813,7 @@ type Msg
     | ToggleCallOverlay
     | SetCallPeerConnected String Int Int Bool
     | SetCallPeerFailed String Int Int Bool
-    | RtcAudioState Bool Bool
+    | RtcAudioState Bool Bool Bool
     | RetryCallPeer Int
     | PresenceState E.Value
     | PresenceOnline Int String

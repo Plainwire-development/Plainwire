@@ -230,12 +230,16 @@ pw-scroll-tools { display: contents; }
 .setting-row { min-height: 78px; gap: 22px; padding: 18px 0; }
 .setting-row b { font-size: 13px; font-weight: 600; }
 .setting-row small { line-height: 1.6; font-size: 12px; }
-.profile-settings-card .settings-banner { min-height: 132px; height: auto; padding: 24px; display: flex; align-items: center; gap: 16px; background-color: var(--bg); border-bottom: 1px solid var(--line); }
+.profile-settings-card .settings-banner { min-height: 132px; height: auto; padding: 24px; display: flex; align-items: center; gap: 16px; background-color: var(--bg); background-size: cover; background-position: center; background-repeat: no-repeat; border-bottom: 1px solid var(--line); }
 .profile-settings-card .settings-avatar-wrap { position: static; flex: 0 0 auto; margin: 0; }
 .profile-settings-card .settings-avatar-wrap .avatar { width: 64px; height: 64px; border-radius: 18px; border: 3px solid var(--bg2); }
-.profile-settings-card .settings-name-block { position: static; margin: 0; padding: 0; }
+.profile-settings-card .settings-name-block { position: static; margin: 0; padding: 0; min-width: 0; flex: 1; overflow-wrap: anywhere; }
 .profile-settings-card .settings-name-block h2 { font-size: 20px; margin: 0 0 5px; }
 .profile-settings-card .settings-name-block p { font-size: 12px; margin: 0; }
+.profile-settings-card .settings-banner.has-image { position: relative; isolation: isolate; }
+.profile-settings-card .settings-banner.has-image::before { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, rgba(0,0,0,.58), rgba(0,0,0,.38)); z-index: -1; }
+.profile-settings-card .settings-banner.has-image .settings-name-block h2 { color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.25); }
+.profile-settings-card .settings-banner.has-image .settings-name-block p { color: rgba(255,255,255,.9); }
 .profile-settings-card .settings-fields { padding: 24px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
 .profile-settings-card .field { margin: 0; min-width: 0; }
 .profile-settings-card .field:nth-child(1), .profile-settings-card .field:nth-child(2), .profile-settings-card .field:nth-child(5), .profile-settings-card .nav-actions { grid-column: 1 / -1; }

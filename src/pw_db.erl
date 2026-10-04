@@ -9,7 +9,7 @@
     sync/2, users/1, profile/2, profile_by_username/2,
     friend_request/2, friend_accept/2, friend_remove/2, friend_block/2, friend_unblock/2, friends/1,
     forums/1, create_forum/4, delete_forum/2, join_forum/2, leave_forum/2, threads/3, thread/2, create_thread/4, edit_thread/4, moderate_thread/4, delete_thread/2, reply_thread/3, edit_reply/4, delete_reply/3, vote_thread/3,
-    servers/1, create_server/3, update_server/3, delete_server/3, server/2, update_channel_settings/3, server_member_profile/3, create_channel/4, create_channel/5,
+    servers/1, server_layout/1, save_server_layout/3, server_template/2, create_server/3, create_server/4, update_server/3, delete_server/3, server/2, update_channel_settings/3, server_member_profile/3, create_channel/4, create_channel/5,
     server_roles/2, create_server_role/4, update_server_role/4, delete_server_role/3, set_server_member_roles/4,
     kick_server_member/3, ban_server_member/4, unban_server_member/3, server_bans/2, update_server_member_profile/4, server_permissions/2, update_server_default_permissions/3,
     server_webhooks/2, create_server_webhook/5, update_server_webhook/5, delete_server_webhook/3, rotate_server_webhook/3, test_server_webhook/3,
@@ -61,7 +61,7 @@
          command_options_from_args/1, search_state/1]).
 -export([test_account_recovery/2]).
 -export([test_validate_upload_refs/3, test_edit_thread/2, test_call_invite_target/4, test_reports/2, test_e2ee/2,
-         test_upload_backfill/2, test_route_with_reconnect/2]).
+         test_upload_backfill/2, test_route_with_reconnect/2, test_server_workspace/2]).
 -endif.
 
 -record(st, {}).
@@ -305,6 +305,10 @@ edit_reply(Uid, ThreadId, ReplyId, Body) -> call({edit_reply, Uid, ThreadId, Rep
 delete_reply(Uid, ThreadId, ReplyId) -> call({delete_reply, Uid, ThreadId, ReplyId}).
 servers(Uid) -> call({servers, Uid}).
 create_server(Uid, Name, Desc) -> call({create_server, Uid, Name, Desc}).
+create_server(Uid, Name, Desc, Template) -> call({create_server, Uid, Name, Desc, Template}).
+server_template(Uid, Sid) -> call({server_template, Uid, Sid}).
+server_layout(Uid) -> call({server_layout, Uid}).
+save_server_layout(Uid, Items, Revision) -> call({save_server_layout, Uid, Items, Revision}).
 update_server(Uid, Sid, Patch) -> call({update_server, Uid, Sid, Patch}).
 delete_server(Uid, Sid, ConfirmName) -> call({delete_server, Uid, Sid, ConfirmName}).
 server(Uid, ServerId) -> call({server, Uid, ServerId}).
@@ -741,6 +745,8 @@ read_msg({delete_forum, _, _}) -> false;
 read_msg({reply_thread, _, _, _}) -> false;
 read_msg({vote_thread, _, _, _}) -> false;
 read_msg({create_server, _, _, _}) -> false;
+read_msg({create_server, _, _, _, _}) -> false;
+read_msg({save_server_layout, _, _, _}) -> false;
 read_msg({update_server, _, _, _}) -> false;
 read_msg({delete_server, _, _, _}) -> false;
 read_msg({create_channel, _, _, _, _, _}) -> false;
@@ -2699,13 +2705,55 @@ route({servers, Uid}, Conn) ->
           "ORDER BY sm.joined_at ASC",
     {ok, Rows} = rows(Conn, Sql, [Uid, pw_permissions:all()]),
     {ok, map_rows_resilient(servers, Rows, fun server_row_map/1)};
-route({create_server, Uid, Name0, Desc0}, Conn) ->
-    Name = pw_util:clean_text(Name0, 80),
-    Desc = pw_util:clean_text(Desc0, 280),
-    case byte_size(Name) >= 2 of
-        false ->
-            {error, invalid_server_name};
+route({server_layout, Uid}, Conn) ->
+    case one(Conn, "SELECT server_layout,server_layout_revision FROM users WHERE id=$1", [Uid]) of
+        {ok, [Stored, Revision]} ->
+            Members = layout_members(Conn, Uid),
+            Items = try jsx:decode(pw_crypto:decrypt(Stored), [return_maps]) catch _:_ -> [] end,
+            Valid = case pw_server_layout:validate(Items, layout_server_ids(Items)) of {ok, Clean} -> Clean; _ -> [] end,
+            {ok, #{items => pw_server_layout:reconcile(Valid, Members), revision => Revision}};
+        _ -> {error, forbidden}
+    end;
+route({save_server_layout, Uid, Items, Expected}, Conn) ->
+    with_tx(Conn, fun() ->
+        case one(Conn, "SELECT server_layout_revision FROM users WHERE id=$1 FOR UPDATE", [Uid]) of
+            {ok, [Expected]} when is_integer(Expected) ->
+                case pw_server_layout:validate(Items, layout_members(Conn, Uid)) of
+                    {ok, Clean} ->
+                        Stored = pw_crypto:encrypt(jsx:encode(Clean)),
+                        ok = exec(Conn, "UPDATE users SET server_layout=$1,server_layout_revision=server_layout_revision+1 WHERE id=$2", [Stored, Uid]),
+                        {ok, #{items => Clean, revision => Expected + 1}};
+                    Error -> Error
+                end;
+            {ok, [_]} -> {error, server_layout_changed};
+            _ -> {error, forbidden}
+        end
+    end);
+route({server_template, Uid, Sid0}, Conn) ->
+    Sid = pw_util:int(Sid0),
+    case can_manage_server(Conn, Uid, Sid) of
+        false -> {error, forbidden};
         true ->
+            {ok, [Name]} = one(Conn, "SELECT name FROM servers WHERE id=$1", [Sid]),
+            {ok, Cats} = rows(Conn, "SELECT id,name FROM channel_categories WHERE server_id=$1 ORDER BY position,id", [Sid]),
+            Index = maps:from_list(lists:zip([Id || [Id,_] <- Cats], lists:seq(0, length(Cats)-1))),
+            {ok, Chans} = rows(Conn, "SELECT name,kind,category_id,topic,slowmode_seconds FROM channels WHERE server_id=$1 ORDER BY position,id", [Sid]),
+            {ok, Roles} = rows(Conn, "SELECT name,color FROM server_roles WHERE server_id=$1 ORDER BY position DESC,id", [Sid]),
+            {ok, #{format => <<"plainwire-server-template-v1">>, name => Name,
+                   categories => [#{name => N} || [_,N] <- Cats],
+                   channels => [#{name => N, kind => K, category => maps:get(C, Index, null), topic => T, slowmode_seconds => S} || [N,K,C,T,S] <- Chans],
+                   roles => [#{name => N, color => case C of <<>> -> <<"#99aab5">>; _ -> C end} || [N,C] <- Roles]}}
+    end;
+route({create_server, Uid, Name0, Desc0}, Conn) ->
+    route({create_server, Uid, Name0, Desc0, null}, Conn);
+route({create_server, Uid, Name0, Desc0, Template0}, Conn) ->
+    Name = string:trim(pw_util:clean_text(Name0, 80)),
+    Desc = pw_util:clean_text(Desc0, 280),
+    case {byte_size(Name) >= 2, pw_server_template:normalize(Template0)} of
+        {false, _} ->
+            {error, invalid_server_name};
+        {_, {error, _} = Error} -> Error;
+        {true, {ok, Template, Review}} ->
             %% Lock the owner row so two API nodes cannot simultaneously pass the
             %% duplicate-name check for the same account.
             with_tx(Conn, fun() ->
@@ -2721,11 +2769,19 @@ route({create_server, Uid, Name0, Desc0}, Conn) ->
                             [Uid, Name, Desc, <<>>, Now, Now]),
                         ok = exec(Conn, "INSERT INTO server_members(server_id, user_id, role, muted, joined_at) VALUES($1,$2,$3,$4,$5)",
                             [Sid, Uid, <<"owner">>, false, Now]),
-                        ok = exec(Conn, "INSERT INTO channels(server_id, name, kind, position, topic, created_at) VALUES($1,$2,$3,$4,$5,$6)",
-                            [Sid, <<"general">>, <<"text">>, 1, <<>>, Now]),
-                        ok = exec(Conn, "INSERT INTO channels(server_id, name, kind, position, topic, created_at) VALUES($1,$2,$3,$4,$5,$6)",
-                            [Sid, <<"Lounge">>, <<"voice">>, 2, <<>>, Now]),
-                        {ok, #{id => Sid}}
+                        case Template0 =:= null orelse Template0 =:= undefined of
+                            true ->
+                                ok = exec(Conn, "INSERT INTO channels(server_id, name, kind, position, topic, created_at) VALUES($1,$2,$3,$4,$5,$6)",
+                                    [Sid, <<"general">>, <<"text">>, 1, <<>>, Now]),
+                                ok = exec(Conn, "INSERT INTO channels(server_id, name, kind, position, topic, created_at) VALUES($1,$2,$3,$4,$5,$6)",
+                                    [Sid, <<"Lounge">>, <<"voice">>, 2, <<>>, Now]);
+                            false -> apply_server_template(Conn, Sid, Template, Now)
+                        end,
+                        case Review of
+                            true -> ok = exec(Conn, "UPDATE servers SET default_permissions=0 WHERE id=$1", [Sid]);
+                            false -> ok
+                        end,
+                        {ok, #{id => Sid, permissions_review => Review}}
                 end
             end)
     end;
@@ -3245,12 +3301,13 @@ route({update_server_member_profile, Uid, Sid0, Target0, Patch}, Conn) ->
 
 route({create_channel, Uid, Sid0, Name0, Kind0, CategoryId0}, Conn) ->
     Sid = pw_util:int(Sid0),
-    Name = pw_util:clean_text(Name0, 40),
-    Kind = case pw_util:clean_text(Kind0, 10) of <<"voice">> -> <<"voice">>; _ -> <<"text">> end,
+    Name = string:trim(pw_util:clean_text(Name0, 40)),
+    Kind = case pw_util:clean_text(Kind0, 10) of <<"voice">> -> <<"voice">>; <<"text">> -> <<"text">>; _ -> invalid end,
     CategoryId = optional_id(CategoryId0),
-    case byte_size(Name) >= 1 of
-        false -> {error, invalid_channel_name};
-        true ->
+    case {byte_size(Name) >= 1, Kind} of
+        {false, _} -> {error, invalid_channel_name};
+        {_, invalid} -> {error, invalid_channel_kind};
+        {true, _} ->
             Result = with_tx(Conn, fun() ->
                 %% Serialize channel naming/position assignment across API nodes.
                 _ = one(Conn, "SELECT id FROM servers WHERE id = $1 FOR UPDATE", [Sid]),
@@ -5331,7 +5388,7 @@ route({conversations, Uid}, Conn) ->
 route({create_conversation, Uid, Name0, UserIds0}, Conn) ->
     UserIds1 = [pw_util:int(X) || X <- ensure_list(UserIds0)],
     UserIds = lists:usort([X || X <- UserIds1, is_integer(X), X =/= Uid]),
-    Name = pw_util:clean_text(Name0, 80),
+    Name = string:trim(pw_util:clean_text(Name0, 80)),
     case {UserIds, length(UserIds) =< 49, users_exist(Conn, UserIds), users_not_blocked(Conn, Uid, UserIds)} of
         {[], _, _, _} ->
             {error, invalid_members};
@@ -7730,6 +7787,9 @@ test_edit_thread(Op = {edit_thread, _, _, _, _}, Conn) -> route(Op, Conn).
 test_call_invite_target(Conn, Uid, Cid, Target) -> route({call_invite_target, Uid, Cid, Target}, Conn).
 test_upload_backfill(Conn, Batch) -> route({upload_ref_backfill, Batch}, Conn).
 test_route_with_reconnect(Msg, Conn) -> route_with_reconnect(Msg, Conn).
+test_server_workspace({create_group, Uid, Name, Ids}, Conn) ->
+    with_tx(Conn, fun() -> create_conversation_tx(Conn, Uid, Name, Ids) end);
+test_server_workspace(Msg, Conn) -> route(Msg, Conn).
 -endif.
 
 %% Owner access is intrinsic. Every other read must be justified by a live
@@ -8122,11 +8182,51 @@ create_conversation0(Conn, Uid, Name, UserIds) ->
     Result = with_tx(Conn, fun() -> create_conversation_tx(Conn, Uid, Name, UserIds) end),
     finish_conversation_create(Conn, Uid, Result).
 
+apply_server_template(Conn, Sid, Template, Now) ->
+    Categories = maps:get(<<"categories">>, Template),
+    CatIds = [begin
+        {ok, Id} = insert_returning(Conn, "INSERT INTO channel_categories(server_id,name,position,created_at) VALUES($1,$2,$3,$4) RETURNING id",
+            [Sid, maps:get(<<"name">>, Cat), Position, Now]),
+        Id
+    end || {Cat, Position} <- lists:zip(Categories, lists:seq(1, length(Categories)))],
+    CatIndex = maps:from_list(lists:zip(lists:seq(0, length(CatIds)-1), CatIds)),
+    Channels = maps:get(<<"channels">>, Template),
+    [ok = exec(Conn, "INSERT INTO channels(server_id,name,kind,position,topic,created_at,category_id,slowmode_seconds) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+        [Sid, maps:get(<<"name">>, C), maps:get(<<"kind">>, C), P, maps:get(<<"topic">>, C), Now,
+         maps:get(maps:get(<<"category">>, C), CatIndex, null), maps:get(<<"slowmode_seconds">>, C)])
+     || {C, P} <- lists:zip(Channels, lists:seq(1, length(Channels)))],
+    Roles = maps:get(<<"roles">>, Template),
+    [ok = exec(Conn, "INSERT INTO server_roles(server_id,name,color,permissions,position,hoist,mentionable,created_at,updated_at) VALUES($1,$2,$3,0,$4,false,false,$5,$5)",
+        [Sid, maps:get(<<"name">>, R), maps:get(<<"color">>, R), P, Now])
+     || {R, P} <- lists:zip(Roles, lists:seq(1, length(Roles)))],
+    ok.
+
+layout_members(Conn, Uid) ->
+    {ok, Rows} = rows(Conn, "SELECT server_id FROM server_members WHERE user_id=$1 ORDER BY joined_at,server_id", [Uid]),
+    [Sid || [Sid] <- Rows].
+
+layout_server_ids(Items) when is_list(Items) ->
+    lists:flatmap(fun
+        (#{<<"server_id">> := Sid}) when is_integer(Sid) -> [Sid];
+        (#{<<"server_ids">> := Ids}) when is_list(Ids) -> [Sid || Sid <- Ids, is_integer(Sid)];
+        (_) -> []
+    end, Items);
+layout_server_ids(_) -> [].
+
 create_conversation_tx(Conn, Uid, Name, UserIds) ->
     Now = pw_util:now_ms(),
+    GroupName = case Name =/= <<>> orelse length(UserIds) > 1 of
+        true ->
+            {ok, [Number]} = one(Conn, "UPDATE users SET group_dm_count=group_dm_count+1 WHERE id=$1 RETURNING group_dm_count", [Uid]),
+            case Name of
+                <<>> -> <<"group dm ", (integer_to_binary(Number))/binary>>;
+                _ -> Name
+            end;
+        false -> Name
+    end,
     {ok, Tid} = insert_returning(Conn,
         "INSERT INTO direct_threads(name, avatar_url, owner_id, created_at, updated_at) VALUES($1,$2,$3,$4,$5) RETURNING id",
-        [Name, <<>>, Uid, Now, Now]),
+        [GroupName, <<>>, Uid, Now, Now]),
     IsRequest = case UserIds of [OnlyPeer] -> not is_friend(Conn, Uid, OnlyPeer); _ -> false end,
     [begin
         RequestState = case U =:= Uid orelse not IsRequest of true -> <<"accepted">>; false -> <<"pending">> end,
