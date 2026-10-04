@@ -8,6 +8,7 @@
 - Clear stale server controls during navigation, refresh the server list immediately after creation, and preserve channel creation forms on errors. Make **Add channel**/**Add category** easier to find on existing servers and reject unsupported channel kinds.
 - Display profile editing banners as centered, non-repeating cover images. Wrap long names within the preview on small screens.
 - Preserve JSON null values so exported uncategorized channels can be imported again. Avoid optional Scylla driver shutdown errors in PostgreSQL deployments.
+- Fix the pinned HTTP GET transport used for media proxies and Discord template fetching. Exercise real requests, original-host routing, response limits and blocked private addresses.
 
 ## Server folders and template imports
 
@@ -22,4 +23,4 @@ Migrations 58 and 59 add the group counter and account server layouts. Upgrade f
 
 ## Validation and artifacts
 
-The full package check passed with 298 backend tests and the complete browser, security, encryption and WebRTC suites. A 250-user realtime smoke and the live-load harness passed; the locked npm dependency audit reported zero advisories. The extracted runtime passed real PostgreSQL, authorization, template round-trip and encrypted DM checks with the build toolchain unavailable. Source and Linux x86_64 OTP runtime archives include SHA-256 checksums. The runtime omits the optional native call-health worker and Scylla native driver; those features require their documented native builds.
+The full package check passed with 300 backend tests and the complete browser, security, encryption and WebRTC suites. A 250-user realtime smoke and the live-load harness passed; the locked npm dependency audit reported zero advisories. The extracted runtime passed real PostgreSQL, authorization, template round-trip and encrypted DM checks with the build toolchain unavailable. Live Discord template fetching also passed. Source and Linux x86_64 OTP runtime archives include SHA-256 checksums. The runtime omits the optional native call-health worker and Scylla native driver; those features require their documented native builds.

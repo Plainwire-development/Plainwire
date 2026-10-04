@@ -1,7 +1,7 @@
 -module(pw_http_fetch).
 -export([get/2, get/3, get_pinned/4]).
 -ifdef(TEST).
--export([test_normalize_extra_headers/1]).
+-export([test_normalize_extra_headers/1, test_get_pinned_loopback/3]).
 -endif.
 
 get(Url, MaxBytes) -> get(Url, MaxBytes, #{}).
@@ -63,7 +63,7 @@ pinned_request(#{scheme := Scheme, host := Host, port := Port, path := Path, add
             try
                 case gun:await_up(ConnPid, ConnectTimeout) of
                     {ok, _Protocol} ->
-                        Ref = gun:request(ConnPid, <<"GET">>, Path, Headers),
+                        Ref = gun:request(ConnPid, <<"GET">>, Path, Headers, <<>>),
                         pinned_await_response(ConnPid, Ref, Deadline, MaxBytes, Truncate);
                     {error, Reason} -> {error, Reason}
                 end
@@ -292,4 +292,7 @@ safe_extra_header_name(Name0) ->
 
 -ifdef(TEST).
 test_normalize_extra_headers(Headers) -> normalize_extra_headers(Headers).
+test_get_pinned_loopback(Url, MaxBytes, Opts) ->
+    {ok, Target} = pinned_target(Url),
+    pinned_request(Target#{address => {127,0,0,1}}, MaxBytes, maps:get(truncate, Opts, false), Opts).
 -endif.

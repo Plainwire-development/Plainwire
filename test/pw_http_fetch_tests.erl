@@ -2,6 +2,48 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+pinned_get_uses_original_authority_without_dns_test() ->
+    {ok, _} = application:ensure_all_started(gun),
+    Parent = self(),
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}, {ip, {127,0,0,1}}]),
+    {ok, Port} = inet:port(Listen),
+    Server = spawn(fun() -> serve_once(Listen, Parent) end),
+    Url = <<"http://template.invalid:", (integer_to_binary(Port))/binary, "/template?preview=1">>,
+    try
+        ?assertEqual({error, blocked_address}, pw_http_fetch:get_pinned(Url, {127,0,0,1}, 4096, #{})),
+        {ok, 200, _, <<"{}">>} = pw_http_fetch:test_get_pinned_loopback(Url, 4096, #{
+            accept => <<"application/json">>, headers => [{<<"host">>, <<"injected.invalid">>}]
+        }),
+        receive
+            {captured_request, Request} ->
+                Lower = string:lowercase(Request),
+                ?assertNotEqual(nomatch, binary:match(Lower, <<"get /template?preview=1 http/1.1">>)),
+                ?assertNotEqual(nomatch, binary:match(Lower, <<"host: template.invalid:", (integer_to_binary(Port))/binary>>)),
+                ?assertNotEqual(nomatch, binary:match(Lower, <<"accept: application/json">>)),
+                ?assertEqual(nomatch, binary:match(Lower, <<"injected.invalid">>))
+        after 1000 -> ?assert(false)
+        end
+    after
+        exit(Server, kill),
+        gen_tcp:close(Listen)
+    end.
+
+pinned_response_limits_and_prefix_test() ->
+    {ok, _} = application:ensure_all_started(gun),
+    Body = binary:copy(<<"x">>, 9000),
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}, {ip, {127,0,0,1}}]),
+    {ok, Port} = inet:port(Listen),
+    Server = spawn(fun() -> serve(Listen, Body) end),
+    Url = <<"http://template.invalid:", (integer_to_binary(Port))/binary, "/body">>,
+    try
+        ?assertEqual({error, too_large}, pw_http_fetch:test_get_pinned_loopback(Url, 4096, #{})),
+        {ok, 200, _, Prefix} = pw_http_fetch:test_get_pinned_loopback(Url, 4096, #{truncate => true}),
+        ?assertEqual(binary:part(Body, 0, 4096), Prefix)
+    after
+        exit(Server, kill),
+        gen_tcp:close(Listen)
+    end.
+
 oversized_pages_can_be_read_as_a_prefix_test() ->
     {ok, _} = application:ensure_all_started(inets),
     Body = <<"<html><head><meta property=\"og:title\" content=\"Big\"></head><body>",
