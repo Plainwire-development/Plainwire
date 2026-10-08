@@ -109,6 +109,7 @@ bot_authorization(Req) ->
 websocket_init(State=#{uid:=Uid, status:=Status, platform:=Platform}) ->
     process_flag(message_queue_data, off_heap),
     debug(info, "connected", #{uid => Uid, status => Status}),
+    pw_realtime_registry:register(Uid, self()),
     pw_hub:connect(Uid, self(), Status, Platform),
     erlang:send_after(60000, self(), revalidate_auth),
     Session = strip_session_urls(maps:get(session, State)),
@@ -181,9 +182,11 @@ handle_msg(#{<<"type">> := <<"subscribe">>, <<"key">> := Key0}, State=#{uid:=Uid
             case length(Subs) >= ?MAX_SUBS andalso not lists:member(Key, Subs) of
                 true -> reply_error(State, too_many_subscriptions);
                 false ->
-                    case can_subscribe(Uid, Key) of
-                        true -> pw_hub:subscribe(self(), Key), {ok, State#{subs=>lists:usort([Key|Subs])}};
-                        false -> reply_error(State, forbidden)
+                    Epoch = pw_realtime_registry:access_epoch(self()),
+                    case {is_integer(Epoch), can_subscribe(Uid, Key)} of
+                        {true, true} -> pw_hub:subscribe(self(), Key, Epoch), {ok, State#{subs=>lists:usort([Key|Subs])}};
+                        {false, _} -> reply_error(State, overloaded);
+                        _ -> reply_error(State, forbidden)
                     end
             end
     end;
@@ -429,6 +432,18 @@ websocket_info({hub_json, Event=#{type := Type}}, State=#{uid:=Uid, auth_kind:=u
     deliver_hub_payload(pw_util:json(Event), Type, Uid, State#{last_auth_check => 0});
 websocket_info(close_restricted_session, State) ->
     {stop, State};
+websocket_info({retry_subscription, Key}, State=#{uid:=Uid, subs:=Subs}) ->
+    %% An access change invalidates queued authorizations, including unrelated
+    %% chats. Recheck only a subscription the socket still wants.
+    case lists:member(Key, Subs) of
+        false -> {ok, State};
+        true ->
+            Epoch = pw_realtime_registry:access_epoch(self()),
+            case {is_integer(Epoch), can_subscribe(Uid, Key)} of
+                {true, true} -> pw_hub:subscribe(self(), Key, Epoch), {ok, State};
+                _ -> {ok, State#{subs=>lists:delete(Key, Subs)}}
+            end
+    end;
 websocket_info({hub_json, Event}, State=#{uid:=Uid}) ->
     deliver_hub_payload(pw_util:json(Event), event_type(Event), Uid, State);
 websocket_info({hub_text, Payload, Type}, State=#{uid:=Uid}) ->
@@ -581,12 +596,13 @@ force_revalidate_session(State=#{token := Token, uid := Uid}) ->
     end.
 
 revalidate_subscriptions(State=#{uid:=Uid, subs:=Subs}) ->
+    Epoch = pw_realtime_registry:access_epoch(self()),
     Allowed = [Key || Key <- Subs, can_subscribe(Uid, Key) =:= true],
     case Allowed =:= Subs of
         true -> State;
         false ->
             pw_hub:unsubscribe_all(self()),
-            lists:foreach(fun(Key) -> pw_hub:subscribe(self(), Key) end, Allowed),
+            lists:foreach(fun(Key) -> pw_hub:subscribe(self(), Key, Epoch) end, Allowed),
             State#{subs => Allowed}
     end.
 

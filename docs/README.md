@@ -1,6 +1,6 @@
 # Plainwire documentation
 
-These notes match the 2.9.0 tree. PostgreSQL is required. Redis and ScyllaDB are optional.
+These notes match the 2.9.1 tree. PostgreSQL is required. Redis and ScyllaDB are optional.
 
 ## Run it
 
@@ -29,6 +29,7 @@ These notes match the 2.9.0 tree. PostgreSQL is required. Redis and ScyllaDB are
 * [Client themes and plugins](CLIENT_EXTENSIONS.md)
 * [Security](SECURITY.md)
 * [Encrypted private DMs](END_TO_END_ENCRYPTION.md) — DM-wide and individual locks, private embeds, key exchange, and device access
+* [2.9.1 security review](SECURITY_AUDIT_2.9.1.md)
 * [2.9.0 security review](SECURITY_AUDIT_2.9.0.md)
 * [2.8.0 security review](SECURITY_AUDIT_2.8.0.md)
 * [2.7.0 security review](SECURITY_AUDIT_2.7.0.md)
@@ -38,4 +39,4 @@ Older release notes live next to the README (`RELEASE_NOTES_*.md`). They describ
 
 The [2.6.5 audit record](SECURITY_AUDIT_2.6.5.md) documents the latest permission, admin lifecycle, and call-window fixes.
 
-The [2.9.0 release notes](../RELEASE_NOTES_2.9.0.md) cover group naming, microphone-free calls, clock and banner fixes, server folders, and permission-safe template imports. The [2.8.0 release notes](../RELEASE_NOTES_2.8.0.md) cover reversible DM encryption, individual locks, authenticated message identities, device controls, and encrypted link/GIF previews. The [2.7.0 release notes](../RELEASE_NOTES_2.7.0.md) cover the preceding call, mobile, and bot SDK improvements.
+The [2.9.1 release notes](../RELEASE_NOTES_2.9.1.md) cover first-send recovery, retry identities, blocked-user privacy, storage resilience, and chat layout. The [2.9.0 release notes](../RELEASE_NOTES_2.9.0.md) cover group naming, microphone-free calls, clock and banner fixes, server folders, and permission-safe template imports. The [2.8.0 release notes](../RELEASE_NOTES_2.8.0.md) cover reversible DM encryption, individual locks, authenticated message identities, device controls, and encrypted link/GIF previews. The [2.7.0 release notes](../RELEASE_NOTES_2.7.0.md) cover the preceding call, mobile, and bot SDK improvements.

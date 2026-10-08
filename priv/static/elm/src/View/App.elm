@@ -2501,7 +2501,7 @@ renderCallUser model u =
 
 renderApp : Model -> Html Msg
 renderApp model =
-    div [ class "layout", attribute "data-ui-version" "2.9.0", attribute "data-ui-revision" "interface-5" ]
+    div [ class "layout", attribute "data-ui-version" "2.9.1", attribute "data-ui-revision" "interface-6" ]
         [ renderRail model
         , renderSideForRoute model
         , main_ [ class (mainClass model.active) ]
@@ -6478,6 +6478,21 @@ fmtErr err =
 
         "database_timeout" ->
             "The server database timed out. Please try again."
+
+        "database_busy" ->
+            "The server is busy. Your message is kept here; try again in a moment."
+
+        "request_timeout" ->
+            "The request timed out. Checking whether your message arrived."
+
+        "bad_csrf" ->
+            "Your session needs to reconnect. Try again in a moment."
+
+        "client_nonce_conflict" ->
+            "This message changed while sending. Check the conversation before trying again."
+
+        "message_removed" ->
+            "This message was removed and will not be sent again."
 
         "rate_limited" ->
             "Too many attempts. Wait a moment and try again."

@@ -10,7 +10,7 @@
     "dev": "npm run build:haml && npm run build:css && bash scripts/build-elm.sh",
     "start": "bash scripts/start.sh",
     "start:build": "bash scripts/start.sh --build",
-    "test:browser": "node test/browser/run.mjs && node test/browser/workspace.mjs",
+    "test:browser": "node test/browser/run.mjs && node test/browser/workspace.mjs && node test/browser/chat-resilience.mjs",
     "test:reports": "node test/browser/reports-contract.mjs && node test/browser/reports.mjs",
     "test:security-audit": "node test/browser/security-audit.mjs",
     "test:e2ee": "node test/browser/dm-encryption.mjs",

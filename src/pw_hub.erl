@@ -1,7 +1,7 @@
 -module(pw_hub).
 -behaviour(gen_server).
 -export([
-    start_link/0, connect/2, connect/3, connect/4, disconnect/1, disconnect/2, subscribe/2, unsubscribe_all/1, watch_presence/2,
+    start_link/0, connect/2, connect/3, connect/4, disconnect/1, disconnect/2, subscribe/2, subscribe/3, unsubscribe_all/1, watch_presence/2,
     revoke_server_access/3, revoke_conversation_access/2,
     notify_user/2, broadcast/2, status_update/2,
     voice_join/4, voice_leave/3, voice_state/5, voice_signal/5, voice_activity/5,
@@ -40,10 +40,15 @@ disconnect(Pid, RtcMemberships) when is_list(RtcMemberships) ->
     gen_server:cast(?MODULE, {disconnect, Pid, RtcMemberships});
 disconnect(Pid, _) -> disconnect(Pid).
 subscribe(Pid, Key) -> gen_server:cast(?MODULE, {subscribe, Pid, Key}).
+subscribe(Pid, Key, Epoch) -> gen_server:cast(?MODULE, {subscribe, Pid, Key, Epoch}).
 unsubscribe_all(Pid) -> gen_server:cast(?MODULE, {unsubscribe_all, Pid}).
 watch_presence(Pid, Uids) -> gen_server:cast(?MODULE, {watch_presence, Pid, Uids}).
-revoke_server_access(Uid, ServerId, ChannelIds) -> gen_server:cast(?MODULE, {revoke_server_access, Uid, ServerId, ChannelIds}).
-revoke_conversation_access(Uid, ConversationId) -> gen_server:cast(?MODULE, {revoke_conversation_access, Uid, ConversationId}).
+revoke_server_access(Uid, ServerId, ChannelIds) ->
+    pw_realtime_registry:revoke_access(Uid, [{server, ServerId} | [{channel, Id} || Id <- ChannelIds]]),
+    gen_server:cast(?MODULE, {revoke_server_access, Uid, ServerId, ChannelIds}).
+revoke_conversation_access(Uid, ConversationId) ->
+    pw_realtime_registry:revoke_access(Uid, [{direct, ConversationId}]),
+    gen_server:cast(?MODULE, {revoke_conversation_access, Uid, ConversationId}).
 notify_user(Uid, Event) -> pw_cluster:send_user(Uid, Event).
 broadcast(Key, Event) -> pw_cluster:broadcast(Key, Event).
 status_update(Uid, Status) -> gen_server:cast(?MODULE, {status_update, Uid, undefined, Status}).
@@ -342,6 +347,11 @@ handle_cast({unsubscribe_all, Pid}, St) ->
         _ -> remove_pid_from_keys(Pid, Keys, St#st.subs)
     end,
     {noreply, St#st{subs = Subs}};
+handle_cast({subscribe, Pid, Key, Epoch}, St) ->
+    case pw_realtime_registry:subscribe(Pid, Key, Epoch) of
+        ok -> {noreply, St#st{subs = add_to_set(Key, Pid, St#st.subs)}};
+        _ -> Pid ! {retry_subscription, Key}, {noreply, St}
+    end;
 handle_cast({subscribe, Pid, Key}, St) ->
     pw_realtime_registry:subscribe(Pid, Key),
     {noreply, St#st{subs = add_to_set(Key, Pid, St#st.subs)}};

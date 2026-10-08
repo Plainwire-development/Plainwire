@@ -9,6 +9,7 @@ import Set
 import Time
 import Types exposing (..)
 import View.Markdown as Markdown
+import View.Composer as Composer
 import View.Ui exposing (..)
 
 
@@ -204,8 +205,10 @@ textMessageView model grouped m =
 
               else
                 div [ class "msg-head" ]
-                    [ b
+                    [ button
                         ([ class "msg-name"
+                         , type_ "button"
+                         , attribute "aria-label" ("Open profile for " ++ m.displayName)
                          , onClick
                             (case ( m.scope, model.currentServer ) of
                                 ( "channel", Just data ) ->
@@ -284,7 +287,7 @@ textMessageView model grouped m =
                     , div [ class "message-edit-actions" ]
                         [ small [ class "muted" ] [ text "Enter to save · Esc to cancel" ]
                         , button [ class "btn ghost", type_ "button", onClick CancelEditMessage, attribute "data-edit-cancel" "true" ] [ text "Cancel" ]
-                        , button [ class "btn", type_ "button", onClick (SaveEditMessage m.id), disabled (String.isEmpty (String.trim model.editingMessageText)), attribute "data-edit-save" "true" ] [ text "Save" ]
+                        , button [ class "btn", type_ "button", onClick (SaveEditMessage m.id), disabled (String.isEmpty (String.trim model.editingMessageText) || Composer.utf8Length (String.trim model.editingMessageText) > 5000), attribute "data-edit-save" "true" ] [ text "Save" ]
                         ]
                     ]
 
@@ -296,6 +299,10 @@ textMessageView model grouped m =
                       else
                         div [] [ text m.body ]
                     ]
+
+              else if m.id < 0 then
+                div [ class "msg-body" ]
+                    [ Html.node "pw-markdown" [ attribute "source" m.body, attribute "private-embeds" "", attribute "no-mentions" "" ] [] ]
 
               else
                 Lazy.lazy2 Markdown.body (Maybe.withDefault "" (Maybe.map .username model.me)) m.body

@@ -1,4 +1,4 @@
-module View.Composer exposing (view)
+module View.Composer exposing (view, utf8Length)
 
 import Dict
 import Html exposing (Attribute, Html, button, div, p, small, span, text, textarea)
@@ -20,6 +20,9 @@ view key placeholderText model =
 
         encrypted =
             conversation |> Maybe.map (\c -> c.e2eeEnabled || Set.member c.id model.encryptedDrafts) |> Maybe.withDefault False
+
+        bytes =
+            utf8Length (String.trim model.inputText)
     in
     div [ class "composer", attribute "data-draft" key ]
         [ case conversation of
@@ -132,7 +135,9 @@ view key placeholderText model =
                         , if String.isEmpty model.inputText then
                             p [ class "muted" ] [ text "Your formatted message will appear here." ]
 
-                          else if encrypted then
+                          else if encrypted || (case model.active of
+                                                    DmView _ -> True
+                                                    _ -> False) then
                             Html.node "pw-markdown" [ attribute "source" model.inputText, attribute "private-embeds" "", attribute "no-mentions" "" ] []
 
                           else
@@ -141,10 +146,10 @@ view key placeholderText model =
                     , p [ class "format-tip" ] [ text "Markdown supports lists, links, tables, and fenced code. Add a language after the opening ``` to highlight code." ]
                     ]
                 ]
-            , small [ class "composer-count", attribute "aria-label" "Message character count" ]
+            , small [ class (if bytes > 5000 then "composer-count over-limit" else "composer-count"), attribute "aria-label" "Message byte count", attribute "aria-live" "polite" ]
                 [ text
-                    (if String.length model.inputText >= 4000 then
-                        String.fromInt (String.length model.inputText) ++ " / 5000"
+                    (if bytes >= 4000 then
+                        String.fromInt bytes ++ " / 5000 bytes"
 
                      else
                         ""
@@ -161,7 +166,7 @@ view key placeholderText model =
                 ]
             , button
                 [ class "btn composer-send composer-action"
-                , disabled (String.isEmpty (String.trim model.inputText))
+                , disabled (String.isEmpty (String.trim model.inputText) || bytes > 5000)
                 , onClick SendMessage
                 , attribute "aria-label" "Send message"
                 ]
@@ -170,6 +175,19 @@ view key placeholderText model =
                 ]
             ]
         ]
+
+
+utf8Length : String -> Int
+utf8Length source =
+    String.foldl
+        (\char total ->
+            let
+                code = Char.toCode char
+            in
+            total + (if code <= 127 then 1 else if code <= 2047 then 2 else if code <= 65535 then 3 else 4)
+        )
+        0
+        source
 
 
 commandSuggestions : Model -> Html Msg

@@ -25,6 +25,6 @@ deliver({topic, Key}, Event) ->
         _ -> gen_server:cast(pw_hub, {broadcast, Key, Event})
     end;
 deliver({control, revoke_server_access}, #{uid := Uid, server_id := ServerId, channel_ids := ChannelIds}) ->
-    gen_server:cast(pw_hub, {revoke_server_access, Uid, ServerId, ChannelIds});
+    pw_hub:revoke_server_access(Uid, ServerId, ChannelIds);
 deliver({control, revoke_conversation_access}, #{uid := Uid, conversation_id := ConversationId}) ->
-    gen_server:cast(pw_hub, {revoke_conversation_access, Uid, ConversationId}).
+    pw_hub:revoke_conversation_access(Uid, ConversationId).

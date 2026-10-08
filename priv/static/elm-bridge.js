@@ -367,7 +367,7 @@
     const options = { method, headers, cache: 'no-store', signal: controller.signal };
     if (body !== null) { headers['content-type'] = 'application/json'; options.body = JSON.stringify(body); }
     try {
-      const response = await fetch('/api' + path, options);
+      const response = await authenticatedFetch(path, options);
       const payload = await response.json().catch(() => ({ ok: false, error: 'bad_json' }));
       if (!response.ok || !payload.ok) {
         const code = payload.error || `HTTP ${response.status}`;
@@ -1521,7 +1521,8 @@
       passwordResetEnabled: clientConfig.passwordResetEnabled,
       instanceDescription: clientConfig.instanceDescription,
       defaultTheme: clientConfig.defaultTheme,
-      version: clientConfig.version
+      version: clientConfig.version,
+      messageNoncePrefix: Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')
     }
   });
   let csrf = '';
@@ -1534,6 +1535,60 @@
   let outgoingTimer = null;
   let audioCtx = null;
   let meId = null;
+  let sessionGeneration = 0;
+  let routeEpoch = 0;
+  let csrfRefresh = null;
+  const publicSessionPaths = new Set(['/me', '/login', '/register', '/password/forgot', '/password/reset', '/email/verify']);
+  const sessionChanged = () => {
+    const error = new Error('Your signed-in account changed. Reloading to protect your messages.');
+    error.code = 'account_changed';
+    scheduleAuthReload();
+    return error;
+  };
+  const refreshSessionCsrf = async (accountId, epoch) => {
+    if (!accountId || epoch !== sessionGeneration || meId !== accountId) throw sessionChanged();
+    if (!csrfRefresh) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      const loading = (async () => {
+        const response = await fetch('/api/me', {headers: {accept: 'application/json'}, cache: 'no-store', signal: controller.signal});
+        const json = await response.json();
+        if (epoch !== sessionGeneration || response.status === 401 || (response.ok && json.ok === true && json.data?.user?.id !== accountId)) throw sessionChanged();
+        if (!response.ok || json.ok !== true) throw new Error('Could not reconnect your session. Your message is kept here; try again in a moment.');
+        if (typeof json.data.csrf !== 'string' || !json.data.csrf) throw new Error('Could not refresh your session. Try again.');
+        csrf = json.data.csrf;
+      })().finally(() => {
+        clearTimeout(timeout);
+        if (csrfRefresh === loading) csrfRefresh = null;
+      });
+      csrfRefresh = loading;
+    }
+    await csrfRefresh;
+    if (epoch !== sessionGeneration || meId !== accountId) throw sessionChanged();
+  };
+  const authenticatedFetch = async (path, options = {}) => {
+    const accountId = meId, epoch = sessionGeneration;
+    const protectedRequest = !publicSessionPaths.has(path);
+    const headers = new Headers(options.headers);
+    const token = headers.get('x-csrf-token');
+    const request = () => fetch('/api' + path, {...options, headers});
+    let response = await request();
+    if (protectedRequest && (epoch !== sessionGeneration || accountId !== meId)) throw sessionChanged();
+    if (protectedRequest && response.status === 401) scheduleAuthReload();
+    // bad_csrf is rejected by the server before route dispatch or mutation.
+    // It is the only failed write we replay, once, and only for the same user.
+    if (protectedRequest && accountId && response.status === 403 && (options.method || 'GET') !== 'GET') {
+      const rejected = await response.clone().json().catch(() => null);
+      if (rejected?.ok === false && rejected.error === 'bad_csrf') {
+        if (csrf === token) await refreshSessionCsrf(accountId, epoch);
+        if (epoch !== sessionGeneration || meId !== accountId) throw sessionChanged();
+        headers.set('x-csrf-token', csrf);
+        response = await request();
+      }
+    }
+    if (protectedRequest && (epoch !== sessionGeneration || accountId !== meId)) throw sessionChanged();
+    return response;
+  };
   document.addEventListener('dragstart', event => {
     const server = event.target.closest?.('button[draggable="true"][data-server-id]');
     if (server && event.dataTransfer) { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', server.dataset.serverId); }
@@ -2984,7 +3039,9 @@
   };
 
   const performApi = async ({ method = 'GET', path, body, request_id = null, silent = false }) => {
+    const accountEpoch = sessionGeneration;
     const requestRoute = location.hash;
+    const requestRouteEpoch = routeEpoch;
     const requestStarted = performance.now();
     debug('API', 'request', { method, path, body: debugApiBody(path, body) });
     const headers = { accept: 'application/json', 'x-csrf-token': csrf };
@@ -3001,8 +3058,9 @@
       if (method === 'POST' && (/^\/channels\/\d+\/messages$/.test(path) || /^\/conversation\/\d+\/messages$/.test(path))) {
         stopTypingForCurrentComposer();
       }
-      const res = await fetch('/api' + path, options);
+      const res = await authenticatedFetch(path, options);
       const json = await res.json().catch(() => ({ ok: false, error: 'bad_json' }));
+      if (accountEpoch !== sessionGeneration) return null;
       if (json.data && typeof json.data === 'object' && !Array.isArray(json.data) &&
           (path === '/me' || path.startsWith('/sync?'))) {
         json.data.client_received_at = Date.now();
@@ -3020,9 +3078,10 @@
         // to avoid a reload loop on the login screen.
         scheduleAuthReload();
       }
-      if (method === 'GET' && /^\/(messages\?|thread\/|threads\?|profile\/|server\/|users\?)/.test(path) && requestRoute !== location.hash) return null;
+      if (method === 'GET' && /^\/(messages\?|thread\/|threads\?|profile\/|server\/|users\?|commands\?)/.test(path) && (requestRoute !== location.hash || requestRouteEpoch !== routeEpoch)) return null;
       if (succeeded && json.data && json.data.csrf) csrf = json.data.csrf;
       if (succeeded && ['/me', '/login', '/register'].includes(path) && json.data?.user?.id) {
+        if (meId !== json.data.user.id) sessionGeneration++;
         meId = json.data.user.id;
         dmEncryption.setUser(meId);
         if (extensionUserId !== meId) {
@@ -3055,6 +3114,8 @@
       }
       if (succeeded && method === 'POST' && path === '/logout') {
         closeAllModals();
+        sessionGeneration++;
+        csrf = '';
         meId = null;
         dmEncryption.setUser(null);
         extensionUserId = null;
@@ -3084,7 +3145,7 @@
       if (!silent && recoveryComponent && !authReloadScheduled) scheduleSyncRecovery(recoveryComponent, 500);
       if (!silent) {
         if (body?.body && (path.startsWith('/conversation/') || path.startsWith('/edit_message/'))) send(app.ports.bridgeReceive, {tag: 'toast', data: error.message});
-        send(app.ports.apiReceive, { path, method, request_id, ok: false, data: null, error: error.name === 'AbortError' ? 'request_timeout' : 'request_failed' });
+        send(app.ports.apiReceive, { path, method, request_id, ok: false, data: null, error: error.name === 'AbortError' ? 'request_timeout' : (body?.body && (path.startsWith('/conversation/') || path.startsWith('/edit_message/')) ? error.message : 'request_failed') });
       }
       return null;
     } finally {
@@ -4108,10 +4169,11 @@
     throw new Error('compression_failed');
   };
 
-  const uploadOne = (file) => new Promise((resolve, reject) => {
+  const uploadOne = (file, recovered = false, accountId = meId, epoch = sessionGeneration) => new Promise((resolve, reject) => {
     if (!file || file.size <= 0) return reject(new Error('empty_file'));
     if (file.size > clientConfig.uploadMaxBytes) return reject(new Error('file_too_large'));
     const xhr = new XMLHttpRequest();
+    const token = csrf;
     xhr.open('POST', '/api/uploads');
     xhr.responseType = 'json';
     xhr.timeout = 10 * 60 * 1000;
@@ -4129,8 +4191,17 @@
       lastProgress = progress;
       send(app.ports.bridgeReceive, { tag: 'toast', data: `Uploading ${file.name || 'image'}... ${progress}%` });
     };
-    xhr.onload = () => {
+    xhr.onload = async () => {
       const json = xhr.response;
+      if (epoch !== sessionGeneration || accountId !== meId) { reject(sessionChanged()); return; }
+      if (xhr.status === 403 && json?.ok === false && json.error === 'bad_csrf' && !recovered) {
+        try {
+          if (csrf === token) await refreshSessionCsrf(accountId, epoch);
+          if (epoch !== sessionGeneration || accountId !== meId) throw sessionChanged();
+          resolve(await uploadOne(file, true, accountId, epoch));
+        } catch (error) { reject(error); }
+        return;
+      }
       if (xhr.status >= 200 && xhr.status < 300 && json?.ok && json.data) resolve(json.data);
       else reject(new Error(json?.error || 'upload_failed'));
     };
@@ -4481,7 +4552,10 @@
         wsLastMessageAt = Date.now();
         const msg = JSON.parse(event.data);
         debug('WS', 'received', debugWsMessage(msg));
-        if (msg.session && msg.session.user && msg.session.user.id) { meId = msg.session.user.id; dmEncryption.setUser(meId); }
+        if (msg.type === 'hello' && msg.session?.user?.id && meId !== msg.session.user.id) {
+          scheduleAuthReload();
+          return;
+        }
         if (msg.type === 'hello') maybeResumeRtcRoom();
         const systemConsumed = handleSystemEvent(msg) === true;
         handlePresenceEvent(msg);
@@ -7993,7 +8067,7 @@
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 30000);
       try {
-        const response = await fetch('/api' + path, {method, cache: 'no-store', signal: controller.signal,
+        const response = await authenticatedFetch(path, {method, cache: 'no-store', signal: controller.signal,
           headers: {'accept': 'application/json', 'content-type': 'application/json', 'x-csrf-token': csrf},
           ...(body === undefined ? {} : {body: JSON.stringify(body)})});
         const json = await response.json();
@@ -8434,16 +8508,20 @@
     }
   });
   const accountApi = async (method, path, body) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
     const headers = { accept: 'application/json', 'x-csrf-token': csrf };
-    const options = { method, headers, credentials: 'same-origin' };
+    const options = { method, headers, credentials: 'same-origin', signal: controller.signal };
     if (body !== undefined) {
       headers['content-type'] = 'application/json';
       options.body = JSON.stringify(body);
     }
-    const response = await fetch('/api' + path, options);
-    const json = await response.json().catch(() => ({ ok: false, error: 'bad_json' }));
-    if (!response.ok || !json.ok) throw new Error(json.error || 'request_failed');
-    return json.data;
+    try {
+      const response = await authenticatedFetch(path, options);
+      const json = await response.json().catch(() => ({ ok: false, error: 'bad_json' }));
+      if (!response.ok || !json.ok) throw new Error(json.error || 'request_failed');
+      return json.data;
+    } finally { clearTimeout(timeout); }
   };
 
   const closeAccountDialog = () => {
@@ -9921,6 +9999,7 @@
   });
 
   window.addEventListener('hashchange', () => {
+    routeEpoch++;
     closeTouchMessageActions();
     syncMobileViewport();
     send(app.ports.onHashChange, location.hash);

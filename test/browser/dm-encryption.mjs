@@ -66,7 +66,7 @@ async function setup(person = me) {
       const data = req.postDataJSON(); posts.push({path, data});
       assert.equal(data.encryption_revision, revision);
       if (wideEnabled || data.encrypt_message) assert.match(data.body, /^pw-e2ee-v2:/, 'locked text travels as ciphertext');
-      const msg = {...message(stored.length + 1, data.body, 1, person), reply_to_id: data.reply_to_id ?? null}; stored.push(msg);
+      const msg = {...message(stored.length + 1, data.body, 1, person), client_nonce: data.client_nonce, reply_to_id: data.reply_to_id ?? null}; stored.push(msg);
       return reply(msg);
     }
     if (/^\/api\/edit_message\/\d+$/.test(path)) {
@@ -132,6 +132,18 @@ try {
   await page.waitForSelector('.msg[data-mid="2"] .encrypted-text');
   await waitForBody(page, 2, privateText);
   const wire = stored.at(-1).body;
+  const retried = await page.evaluate(async () => {
+    const request = {method: 'POST', path: '/conversation/1/messages', body: {body: 'A retry must retain its encrypted identity', encrypt_message: true, client_nonce: 'audit-encrypted-retry-0001'}};
+    const first = await window.PlainwireE2EE.encodeRequest(request);
+    const element = document.querySelector('pw-dm-security');
+    const attributes = ['data-key-id', 'data-enabled', 'data-revision'].map(name => [name, element.getAttribute(name)]);
+    element.setAttribute('data-key-id', ''); element.setAttribute('data-enabled', 'false'); element.setAttribute('data-revision', '9999');
+    const second = await window.PlainwireE2EE.encodeRequest(request);
+    attributes.forEach(([name, value]) => element.setAttribute(name, value));
+    return [first, second];
+  });
+  assert.equal(retried[0].body, retried[1].body, 'retry keeps the ciphertext, IV and nonce stable');
+  assert.equal(retried[0].encryption_revision, revision, 'DOM patches cannot replace the authoritative encryption policy');
   assert(!wire.includes('Private text') && !JSON.stringify(posts).includes(secret));
   const [, actualKey, nonce, iv64, cipher64] = wire.split(':');
   assert.equal(actualKey, keyId);

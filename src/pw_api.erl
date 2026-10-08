@@ -615,7 +615,7 @@ authed(<<"GET">>, [<<"embed">>], Req, Session, _) ->
     end;
 authed(<<"GET">>, [<<"messages">>], Req, Session, _) -> result(Req, pw_db:messages(uid(Session), qs(Req, <<"scope">>), qs(Req, <<"scope_id">>), qs(Req, <<"before">>), qs(Req, <<"after">>)));
 authed(<<"POST">>, [<<"channels">>, Id, <<"messages">>], Req0, Session, _) ->
-    with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:post_channel_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined))) end);
+    with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:post_channel_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined), maps:get(<<"client_nonce">>,M,undefined))) end);
 authed(<<"POST">>, [<<"delete_message">>, MsgId], Req, Session, _) -> result(Req, pw_db:delete_message(uid(Session), MsgId));
 authed(<<"POST">>, [<<"edit_message">>, MsgId], Req0, Session, _) ->
     with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:edit_message(uid(Session), MsgId, maps:get(<<"body">>, M, <<>>), #{revision => maps:get(<<"encryption_revision">>, M, undefined)})) end);
@@ -662,7 +662,7 @@ authed(<<"POST">>, [<<"conversation">>, Id, <<"members">>], Req0, Session, _) ->
 end);
 authed(<<"POST">>, [<<"conversation">>, Id, <<"read">>], Req, Session, _) -> result(Req, pw_db:mark_conversation_read(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"messages">>], Req0, Session, _) ->
-    with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:post_direct_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined), maps:get(<<"encryption_revision">>,M,undefined))) end);
+    with_message_limit(Req0, uid(Session), fun(M, Req) -> result(Req, pw_db:post_direct_message(uid(Session), Id, maps:get(<<"body">>,M,<<>>), maps:get(<<"reply_to_id">>,M,undefined), maps:get(<<"encryption_revision">>,M,undefined), maps:get(<<"client_nonce">>,M,undefined))) end);
 authed(<<"POST">>, [<<"conversation">>, Id, <<"leave">>], Req, Session, _) -> result(Req, pw_db:leave_conversation(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"close">>], Req, Session, _) -> result(Req, pw_db:close_conversation(uid(Session), Id));
 authed(<<"POST">>, [<<"conversation">>, Id, <<"member">>, UserId, <<"role">>], Req0, Session, _) ->

@@ -7,6 +7,7 @@
   const messages = new Map();
   const keys = new Map();
   const decrypted = new Map();
+  const encodedRequests = new Map();
   const policyLoads = new Map(), deviceLocks = new Map(), deviceEpochs = new Map(), drafts = new Map();
   let userId = null, generation = 0, database, hooks;
   let deviceChannel;
@@ -32,7 +33,7 @@
   const deviceToken = cid => `${generation}:${deviceEpochs.get(cid) || 0}`;
   const applyDeviceState = (cid, locked) => {
     deviceEpochs.set(cid, (deviceEpochs.get(cid) || 0) + 1);
-    deviceLocks.set(cid, locked); keys.clear(); decrypted.clear();
+    deviceLocks.set(cid, locked); keys.clear(); decrypted.clear(); encodedRequests.clear();
   };
   const notifyDeviceState = (cid, locked) => deviceChannel?.postMessage({userId, cid, locked});
   if (deviceChannel) deviceChannel.onmessage = event => {
@@ -70,14 +71,23 @@
   function openDatabase() {
     if (!database) database = new Promise((resolve, reject) => {
       const request = indexedDB.open('plainwire-e2ee-v1', 1);
+      let finished = false;
+      const fail = message => {
+        if (finished) return;
+        finished = true; clearTimeout(timeout); reject(new Error(message));
+      };
+      const timeout = setTimeout(() => fail('Encryption key storage is unavailable. Close other Plainwire tabs and try again.'), 5000);
       request.onupgradeneeded = () => request.result.createObjectStore('keys');
       request.onsuccess = () => {
         const db = request.result;
+        if (finished) { db.close(); return; }
+        finished = true; clearTimeout(timeout);
         db.onversionchange = () => { db.close(); database = undefined; };
         resolve(db);
       };
-      request.onerror = () => reject(new Error('This browser cannot store an encryption key'));
-      request.onblocked = () => reject(new Error('Close other Plainwire tabs and try again'));
+      request.onerror = () => fail('This browser cannot store an encryption key');
+      // Give another tab time to close its connection on versionchange.
+      // A late successful open after a timeout must be closed, not leaked.
     }).catch(error => { database = undefined; throw error; });
     return database;
   }
@@ -144,12 +154,13 @@
     if (next === userId) return;
     for (const cid of drafts.keys()) hooks?.draftChanged(cid, false);
     userId = next; generation++;
-    keys.clear(); modes.clear(); messages.clear(); decrypted.clear(); policyLoads.clear(); deviceLocks.clear(); deviceEpochs.clear(); drafts.clear();
+    keys.clear(); modes.clear(); messages.clear(); decrypted.clear(); encodedRequests.clear(); policyLoads.clear(); deviceLocks.clear(); deviceEpochs.clear(); drafts.clear();
   }
 
   function remember(data) {
     if (!data || typeof data !== 'object') return;
     if (Array.isArray(data)) { data.forEach(remember); return; }
+    if (data.conversation && Array.isArray(data.members)) remember({...data.conversation, member_count: data.members.length});
     const cid = data.conversation_id || data.id;
     if (validId(cid) && typeof data.e2ee_key_id === 'string') {
       const previous = modes.get(cid);
@@ -179,6 +190,7 @@
       if (!modes.has(cid)) throw new Error('Could not verify DM encryption settings');
     }
     const mode = modes.get(cid);
+    if (!mode.keyId && !mode.enabled && mode.memberCount > 2 && !mode.invalid) return mode;
     const pinned = await storageOperation('readonly', store => store.get(pinName(cid)));
     if (epoch !== generation) throw new Error('Account changed while checking encryption');
     if (mode.invalid || (pinned && ((typeof pinned === 'string' ? pinned : pinned.keyId) !== mode.keyId || (pinned.revision || 0) > mode.revision))) throw new Error('DM encryption settings changed unexpectedly. Sending is blocked; refresh and verify with your contact');
@@ -285,8 +297,16 @@
     if (!cid) return body;
     const mode = await modeFor(cid);
     const force = !!(direct ? typeof body.encrypt_message === 'boolean' ? body.encrypt_message : drafts.get(cid) : meta.encrypted);
+    const identity = direct && typeof body.client_nonce === 'string' ? `${generation}:${cid}:${body.client_nonce}` : null;
+    const cached = identity && encodedRequests.get(identity);
+    if (cached && cached.text === body.body && cached.reply === replyId(body.reply_to_id) && cached.keyId === mode.keyId && (mode.enabled || force)) {
+      if (!(await getKey(cid, mode.keyId))) throw new Error('Unlock this encrypted DM with its key before sending');
+      return {...body, encryption_revision: mode.revision, body: cached.body};
+    }
+    const encoded = await seal(cid, userId, body.body, direct ? body.reply_to_id : meta.replyTo, force, direct ? null : nonceOf(meta.body));
+    if (identity && isEnvelope(encoded)) boundedSet(encodedRequests, identity, {text: body.body, reply: replyId(body.reply_to_id), keyId: mode.keyId, body: encoded}, 64);
     return {...body, encryption_revision: mode.revision,
-      body: await seal(cid, userId, body.body, direct ? body.reply_to_id : meta.replyTo, force, direct ? null : nonceOf(meta.body))};
+      body: encoded};
   }
 
   const activeEncrypted = () => {
@@ -475,8 +495,9 @@
         const cid = Number(this.getAttribute('data-conversation'));
         if (!validId(cid)) return;
         const keyId = this.getAttribute('data-key-id') || '';
-        remember({id: cid, e2ee_key_id: keyId, e2ee_enabled: this.getAttribute('data-enabled') === 'true', e2ee_revision: Number(this.getAttribute('data-revision') || 0), e2ee_disable_requested_by: Number(this.getAttribute('data-requester') || 0)});
-        const mode = modes.get(cid);
+        // DOM attributes can change one at a time during an Elm patch. They
+        // describe presentation; only complete API/WS data sets sending policy.
+        const mode = modes.get(cid) || {keyId, enabled: this.getAttribute('data-enabled') === 'true'};
         const button = document.createElement('button'); button.type = 'button'; button.className = 'dm-security-button';
         button.textContent = mode?.keyId ? `DM encryption: ${mode.enabled ? 'On' : 'Off'}${mode.requester ? ' · approval pending' : ''}` : 'Enable encrypted text';
         button.onclick = () => (mode?.keyId ? openSettings(cid) : openKeyDialog(cid)).catch(error => hooks.toast(error.message));

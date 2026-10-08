@@ -30,10 +30,10 @@
     search_messages/4, search_index_reconcile/1, search_index_status/0,
     create_invite/4, create_invite/5, list_invites/2, revoke_invite/3, invite_options/2, invite_preview/1, join_invite/2,
     messages/5, message_context/2, channel_pins/2, set_message_pin/3,
-    post_channel_message/4, delete_message/2, edit_message/3, edit_message/4, forward_message/4, toggle_message_reaction/3, record_missed_call/2, record_completed_call/3,
+    post_channel_message/4, post_channel_message/5, delete_message/2, edit_message/3, edit_message/4, forward_message/4, toggle_message_reaction/3, record_missed_call/2, record_completed_call/3,
     conversations/1, create_conversation/3, create_conversation_usernames/3, update_conversation/4, enable_conversation_encryption/3, configure_conversation_encryption/4, disable_conversation_encryption/4,
     set_conversation_member_role/4, kick_conversation_member/3,
-    add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4, post_direct_message/5,
+    add_conversation_members/3, add_conversation_members_usernames/3, conversation/2, post_direct_message/4, post_direct_message/5, post_direct_message/6,
     close_conversation/2, leave_conversation/2, accept_message_request/2, deny_message_request/2,
     mark_conversation_read/2, notifications/1, mark_notifications_seen/1, clear_notifications/1, mark_url_seen/2,
     member_of_channel/2, channel_identity/2, channel_message_identity/2, voice_access/2, stream_access/2, member_of_conversation/2, member_of_server/2, member_of_thread_forum/2, conversation_peer_ids/2, call_invite_target/3,
@@ -62,6 +62,7 @@
 -export([test_account_recovery/2]).
 -export([test_validate_upload_refs/3, test_edit_thread/2, test_call_invite_target/4, test_reports/2, test_e2ee/2,
          test_upload_backfill/2, test_route_with_reconnect/2, test_server_workspace/2]).
+-export([test_message_nonce/1, test_message_nonce_state/7, test_overlay_scylla_row/2, test_direct_notification_members/3, test_chat_route/2]).
 -endif.
 
 -record(st, {}).
@@ -424,6 +425,7 @@ invite_preview(Code) -> call({invite_preview, Code}).
 join_invite(Uid, Code) -> call({join_invite, Uid, Code}).
 messages(Uid, Scope, ScopeId, Before, After) -> call({messages, Uid, Scope, ScopeId, Before, After}).
 post_channel_message(Uid, ChannelId, Body, ReplyTo) -> call({post_channel_message, Uid, ChannelId, Body, ReplyTo}).
+post_channel_message(Uid, ChannelId, Body, ReplyTo, Nonce) -> call({post_channel_message, Uid, ChannelId, Body, ReplyTo, Nonce}).
 delete_message(Uid, Mid) -> call({delete_message, Uid, Mid}).
 edit_message(Uid, Mid, Body) -> call({edit_message, Uid, Mid, Body}).
 edit_message(Uid, Mid, Body, Options) -> call({edit_message, Uid, Mid, Body, Options}).
@@ -448,6 +450,7 @@ deny_message_request(Uid, Cid) -> call({deny_message_request, Uid, Cid}).
 mark_conversation_read(Uid, Cid) -> call({mark_conversation_read, Uid, Cid}).
 post_direct_message(Uid, Cid, Body, ReplyTo) -> call({post_direct_message, Uid, Cid, Body, ReplyTo}).
 post_direct_message(Uid, Cid, Body, ReplyTo, Revision) -> call({post_direct_message, Uid, Cid, Body, ReplyTo, Revision}).
+post_direct_message(Uid, Cid, Body, ReplyTo, Revision, Nonce) -> call({post_direct_message, Uid, Cid, Body, ReplyTo, Revision, Nonce}).
 record_missed_call(Uid, Cid) -> call({record_missed_call, Uid, Cid}).
 record_completed_call(Uid, Cid, Seconds) when is_integer(Seconds), Seconds >= 0 ->
     Duration = iolist_to_binary(io_lib:format("~B:~2..0B", [Seconds div 60, Seconds rem 60])),
@@ -819,6 +822,7 @@ read_msg({create_invite, _, _, _, _, _}) -> false;
 read_msg({revoke_invite, _, _, _}) -> false;
 read_msg({join_invite, _, _}) -> false;
 read_msg({post_channel_message, _, _, _, _}) -> false;
+read_msg({post_channel_message, _, _, _, _, _}) -> false;
 read_msg({delete_message, _, _}) -> false;
 read_msg({edit_message, _, _, _}) -> false;
 read_msg({edit_message, _, _, _, _}) -> false;
@@ -844,6 +848,7 @@ read_msg({deny_message_request, _, _}) -> false;
 read_msg({mark_conversation_read, _, _}) -> false;
 read_msg({post_direct_message, _, _, _, _}) -> false;
 read_msg({post_direct_message, _, _, _, _, _}) -> false;
+read_msg({post_direct_message, _, _, _, _, _, _}) -> false;
 read_msg({mark_notifications_seen, _}) -> false;
 read_msg({clear_notifications, _}) -> false;
 read_msg({mark_url_seen, _, _}) -> false;
@@ -2284,11 +2289,22 @@ route({friend_block, Uid, Target0}, Conn) ->
                   "VALUES($1,$2,$3,$4,$5,$6,$7) "
                   "ON CONFLICT (user_low, user_high) DO UPDATE SET "
                   "requester_id = EXCLUDED.requester_id, addressee_id = EXCLUDED.addressee_id, "
-                  "status = 'blocked', updated_at = EXCLUDED.updated_at",
-            ok = exec(Conn, Sql, [A, B, Uid, Target, <<"blocked">>, Now, Now]),
-            pw_upload_gc:invalidate_user(Uid),
-            pw_upload_gc:invalidate_user(Target),
-            {ok, #{status => blocked}}
+                  "status = 'blocked', updated_at = EXCLUDED.updated_at "
+                  "WHERE friendships.status<>'blocked' OR friendships.requester_id=EXCLUDED.requester_id "
+                  "RETURNING requester_id",
+            case rows(Conn, Sql, [A, B, Uid, Target, <<"blocked">>, Now, Now]) of
+                {ok, [[Uid]]} ->
+                    pw_upload_gc:invalidate_user(Uid),
+                    pw_upload_gc:invalidate_user(Target),
+                    {ok, Shared} = rows(Conn, "SELECT a.thread_id FROM direct_members a JOIN direct_members b ON a.thread_id=b.thread_id WHERE a.user_id=$1 AND b.user_id=$2", [Uid, Target]),
+                    lists:foreach(fun([Cid]) ->
+                        pw_cluster:revoke_conversation_access(Uid, Cid),
+                        pw_cluster:revoke_conversation_access(Target, Cid)
+                    end, Shared),
+                    {ok, #{status => blocked}};
+                {ok, []} -> {error, forbidden};
+                Error -> Error
+            end
     end;
 route({friend_unblock, Uid, Target0}, Conn) ->
     Target = pw_util:int(Target0),
@@ -5240,6 +5256,9 @@ route({forward_message, Uid, Mid0, TargetScope0, TargetId0}, Conn) ->
             end
     end;
 route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
+    route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0, undefined}, Conn);
+route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0, Nonce0}, Conn) ->
+    Nonce = message_nonce(Nonce0),
     Cid = pw_util:int(ChannelId0),
     Plain = clean_message_input(Body0),
     Body = store_message(Plain),
@@ -5247,7 +5266,7 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
     case message_body_valid(Plain) of
         false -> {error, invalid_message};
         true ->
-            Result = with_tx(Conn, fun() ->
+            Result = with_tx(Conn, fun() -> with_message_nonce(Conn, Uid, <<"channel">>, Cid, Plain, ReplyTo, Nonce, fun() ->
                 case channel_message_access(Conn, Uid, Cid) of
                     {ok, Sid} ->
                         ensure_message_encryption(Conn, <<"channel">>, Cid, Plain),
@@ -5271,8 +5290,8 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
                         Now = pw_util:now_ms(),
                         Mid = new_message_id(),
                         ok = exec(Conn,
-                            "INSERT INTO messages(id,scope,scope_id,user_id,body,reply_to_id,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)",
-                            [Mid, <<"channel">>, Cid, Uid, Body, ReplyTo, Now]),
+                            "INSERT INTO messages(id,scope,scope_id,user_id,body,reply_to_id,created_at,client_nonce) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+                            [Mid, <<"channel">>, Cid, Uid, Body, ReplyTo, Now, db_value(Nonce)]),
                         insert_upload_refs(Conn, Plain, <<"channel">>, Cid, Now),
                         ok = storage_after_message_change(Conn, Mid, <<"message.created">>, Uid),
                         {ok, Row} = one(Conn, message_select() ++ " WHERE m.id = $1", [Mid]),
@@ -5288,8 +5307,9 @@ route({post_channel_message, Uid, ChannelId0, Body0, ReplyTo0}, Conn) ->
                         end;
                     _ -> {error, forbidden}
                 end
-            end),
+            end) end),
             case Result of
+                {ok, #{message := Msg, replayed := true}} -> {ok, Msg};
                 {ok, #{message := Msg, server_id := Sid, notify_at := Now, ai_queued := AiQueued}} ->
                     invalidate_message_cache(<<"channel">>, Cid),
                     pw_hub:broadcast({channel, Cid}, #{type => message_created, scope => channel, scope_id => Cid, message => Msg}),
@@ -5736,6 +5756,9 @@ route({disable_conversation_encryption, Uid, Cid0, Action, ExpectedRevision}, Co
 route({post_direct_message, Uid, Cid0, Body0, ReplyTo0}, Conn) ->
     route({post_direct_message, Uid, Cid0, Body0, ReplyTo0, undefined}, Conn);
 route({post_direct_message, Uid, Cid0, Body0, ReplyTo0, Revision}, Conn) ->
+    route({post_direct_message, Uid, Cid0, Body0, ReplyTo0, Revision, undefined}, Conn);
+route({post_direct_message, Uid, Cid0, Body0, ReplyTo0, Revision, Nonce0}, Conn) ->
+    Nonce = message_nonce(Nonce0),
     Cid = pw_util:int(Cid0),
     Plain = clean_message_input(Body0),
     Body = store_message(Plain),
@@ -5743,7 +5766,7 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0, Revision}, Conn) ->
     case message_body_valid(Plain) of
         false -> {error, invalid_message};
         true ->
-            Result = with_tx(Conn, fun() ->
+            Result = with_tx(Conn, fun() -> with_message_nonce(Conn, Uid, <<"direct">>, Cid, Plain, ReplyTo, Nonce, fun() ->
                 ensure_encryption_revision(Conn, <<"direct">>, Cid, Revision),
                 ensure_message_encryption(Conn, <<"direct">>, Cid, Plain),
                 case {conversation_can_send(Conn, Uid, Cid), valid_reply_to(Conn, <<"direct">>, Cid, ReplyTo)} of
@@ -5752,8 +5775,8 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0, Revision}, Conn) ->
                         Now = pw_util:now_ms(),
                         Mid = new_message_id(),
                         ok = exec(Conn,
-                            "INSERT INTO messages(id,scope,scope_id,user_id,body,reply_to_id,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)",
-                            [Mid, <<"direct">>, Cid, Uid, Body, ReplyTo, Now]),
+                            "INSERT INTO messages(id,scope,scope_id,user_id,body,reply_to_id,created_at,client_nonce) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+                            [Mid, <<"direct">>, Cid, Uid, Body, ReplyTo, Now, db_value(Nonce)]),
                         bind_encrypted_message(Conn, Mid, Plain),
                         insert_upload_refs(Conn, Plain, <<"direct">>, Cid, Now),
                         ok = exec(Conn, "UPDATE direct_threads SET updated_at=$1 WHERE id=$2", [Now, Cid]),
@@ -5765,8 +5788,9 @@ route({post_direct_message, Uid, Cid0, Body0, ReplyTo0, Revision}, Conn) ->
                     {false, _} -> {error, forbidden};
                     _ -> {error, invalid_message}
                 end
-            end),
+            end) end),
             case Result of
+                {ok, #{message := Msg, replayed := true}} -> {ok, Msg};
                 {ok, #{message := Msg, notify_at := Now}} ->
                     invalidate_message_cache(<<"direct">>, Cid),
                     pw_hub:broadcast({direct, Cid}, #{type => message_created, scope => direct, scope_id => Cid, message => Msg}),
@@ -7606,6 +7630,57 @@ message_body_valid(Body) when is_binary(Body) ->
     end;
 message_body_valid(_) -> false.
 
+message_nonce(undefined) -> undefined;
+message_nonce(null) -> undefined;
+message_nonce(Nonce) when is_binary(Nonce), byte_size(Nonce) >= 16, byte_size(Nonce) =< 96 ->
+    case re:run(Nonce, <<"\\A[A-Za-z0-9:_-]+\\z">>, [{capture, none}]) of
+        match -> Nonce;
+        _ -> invalid
+    end;
+message_nonce(_) -> invalid.
+
+with_message_nonce(_Conn, _Uid, _Scope, _Cid, _Plain, _Reply, undefined, Fun) -> Fun();
+with_message_nonce(_Conn, _Uid, _Scope, _Cid, _Plain, _Reply, invalid, _Fun) ->
+    throw({plainwire_error, invalid_client_nonce});
+with_message_nonce(Conn, Uid, Scope, Cid, Plain, Reply, Nonce, Fun) ->
+    %% A replay must still have current send access. Nonces belong to the
+    %% authenticated sender and cannot disclose another user's message.
+    Allowed = case Scope of
+        <<"direct">> -> conversation_can_send(Conn, Uid, Cid);
+        <<"channel">> -> case channel_message_access(Conn, Uid, Cid) of {ok, _} -> true; _ -> false end
+    end,
+    case Allowed of false -> throw({plainwire_error, forbidden}); true -> ok end,
+    case message_nonce_state(Conn, Uid, Scope, Cid, Plain, Reply, Nonce) of
+        new -> Fun();
+        {replay, Mid} ->
+            {ok, Row} = one(Conn, message_select() ++ " WHERE m.id=$1", [Mid]),
+            {ok, #{message => message_map(Conn, Row), replayed => true}}
+    end.
+
+message_nonce_state(Conn, Uid, Scope, Cid, Plain, Reply, Nonce) ->
+    %% Negative user IDs reserve a lock namespace separate from slowmode.
+    %% The index remains the durable uniqueness boundary after a restart.
+    _ = rows(Conn, "SELECT pg_advisory_xact_lock($1::integer,$2::integer)", [-Uid, erlang:phash2(Nonce, 2147483647)]),
+    case one(Conn, "SELECT id,scope,scope_id,body,reply_to_id,deleted_at FROM messages WHERE user_id=$1 AND client_nonce=$2", [Uid, Nonce]) of
+        {ok, undefined} -> new;
+        {ok, [Mid, Scope, Cid, Stored, StoredReply, null]} ->
+            case load_message(Stored) =:= Plain andalso db_null(StoredReply) =:= Reply of
+                true -> {replay, Mid};
+                false -> throw({plainwire_error, client_nonce_conflict})
+            end;
+        {ok, [_, Scope, Cid, _, _, Deleted]} when Deleted =/= null -> throw({plainwire_error, message_removed});
+        {ok, _} -> throw({plainwire_error, client_nonce_conflict});
+        {error, Reason} -> throw({plainwire_error, Reason})
+    end.
+
+-ifdef(TEST).
+test_message_nonce(Value) -> message_nonce(Value).
+test_message_nonce_state(Conn, Uid, Scope, Cid, Plain, Reply, Nonce) -> message_nonce_state(Conn, Uid, Scope, Cid, Plain, Reply, Nonce).
+test_overlay_scylla_row(Row, Core) -> overlay_scylla_row(Row, Core).
+test_direct_notification_members(Conn, Cid, Sender) -> direct_notification_members(Conn, Cid, Sender).
+test_chat_route(Conn, Msg) -> route(Msg, Conn).
+-endif.
+
 clean_message_input(Body) when is_binary(Body), byte_size(Body) =< 8192 -> pw_util:clean_text(Body, 8192);
 clean_message_input(_) -> <<>>.
 
@@ -8520,6 +8595,8 @@ message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edit
     message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, ForwardBody, RoleColor, false, false]);
 message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, ForwardBody, RoleColor, IsBot]) ->
     message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, ForwardBody, RoleColor, IsBot, false]);
+message_map(Row) when length(Row) =:= 21 ->
+    (message_map(lists:sublist(Row, 20)))#{client_nonce => db_null(lists:last(Row))};
 message_map([Id, Scope, ScopeId, Uid, U, D, Avatar, Body, ReplyTo, Created, Edited, Deleted, Kind, ForwardId, ForwardUid, ForwardName, _ForwardBody, RoleColor, IsBot, Pinned]) ->
     Base = #{id => Id, scope => Scope, scope_id => ScopeId, user_id => Uid, username => U, display_name => D,
       avatar_url => pw_util:proxied_image(Avatar), body => load_message(Body), reply_to_id => db_null(ReplyTo),
@@ -8708,7 +8785,7 @@ message_select() ->
     "(r.permissions & 128) DESC,(r.permissions & 2048) DESC,(r.permissions & 4096) DESC,"
     "(r.permissions & 256) DESC,(r.permissions & 512) DESC,(r.permissions & 2) DESC,"
     "(r.permissions & 1) DESC,r.position DESC,r.id ASC LIMIT 1),''), u.is_bot, "
-    "EXISTS(SELECT 1 FROM message_pins pin WHERE pin.message_id=m.id) "
+    "EXISTS(SELECT 1 FROM message_pins pin WHERE pin.message_id=m.id), m.client_nonce "
     "FROM messages m JOIN users u ON u.id = m.user_id "
     "LEFT JOIN channels mc ON m.scope='channel' AND mc.id=m.scope_id "
     "LEFT JOIN server_members sm ON sm.server_id=mc.server_id AND sm.user_id=m.user_id "
@@ -8821,11 +8898,11 @@ hydrate_scylla_rows(Conn, CoreRows) ->
         Error -> Error
     end.
 
-overlay_scylla_row([Id, _Scope, _ScopeId, _Uid, U, D, Avatar, _Body, _Reply, _Created, _Edited, _Deleted, _Kind, _ForwardId, ForwardUid, ForwardName, ForwardBody, RoleColor, IsBot], Core) ->
+overlay_scylla_row([Id, _Scope, _ScopeId, _Uid, U, D, Avatar, _Body, _Reply, _Created, _Edited, _Deleted, _Kind, _ForwardId, ForwardUid, ForwardName, ForwardBody, RoleColor, IsBot | Metadata], Core) ->
     [Id, maps:get(scope, Core), maps:get(scope_id, Core), maps:get(user_id, Core), U, D, Avatar, maps:get(body, Core),
      db_value(maps:get(reply_to_id, Core, undefined)), maps:get(created_at, Core),
      db_value(maps:get(edited_at, Core, undefined)), db_value(maps:get(deleted_at, Core, undefined)), maps:get(kind, Core, <<"text">>),
-     db_value(maps:get(forwarded_from_id, Core, undefined)), ForwardUid, ForwardName, ForwardBody, RoleColor, IsBot].
+     db_value(maps:get(forwarded_from_id, Core, undefined)), ForwardUid, ForwardName, ForwardBody, RoleColor, IsBot | Metadata].
 
 db_value(undefined) -> null;
 db_value(V) -> V.
@@ -9342,10 +9419,19 @@ best_effort_missed_call_notifications(Conn, Cid, Caller, Msg, Now) ->
         ok
     end.
 
+direct_no_block_sql() ->
+    "AND NOT EXISTS(SELECT 1 FROM direct_members other JOIN friendships f "
+    "ON f.user_low=LEAST(dm.user_id,other.user_id) AND f.user_high=GREATEST(dm.user_id,other.user_id) "
+    "WHERE other.thread_id=dm.thread_id AND other.user_id<>dm.user_id AND f.status='blocked')".
+
+direct_notification_members(Conn, Cid, Sender) ->
+    rows(Conn, "SELECT dm.user_id,dm.request_state FROM direct_members dm "
+        "WHERE dm.thread_id=$1 AND dm.user_id<>$2 AND dm.muted=false " ++ direct_no_block_sql(), [Cid, Sender]).
+
 notify_direct_members(Conn, Cid, Sender, Event, Now, SuppressMentions) ->
     Msg = maps:get(message, Event, #{}),
     PlainBody = maps:get(body, Msg, <<>>),
-    {ok, Rows} = rows(Conn, "SELECT user_id, request_state FROM direct_members WHERE thread_id = $1 AND user_id <> $2 AND muted = false", [Cid, Sender]),
+    {ok, Rows} = direct_notification_members(Conn, Cid, Sender),
     Mentioned = case SuppressMentions orelse pw_e2ee:is_envelope(PlainBody) of
         true -> [];
         false ->
@@ -9386,8 +9472,8 @@ notify_direct_members(Conn, Cid, Sender, Event, Now, SuppressMentions) ->
 
 notify_missed_call_members(Conn, Cid, Caller, Msg, Now) ->
     {ok, Rows} = rows(Conn,
-        "SELECT user_id FROM direct_members WHERE thread_id = $1 AND user_id <> $2 "
-        "AND request_state = 'accepted'", [Cid, Caller]),
+        "SELECT dm.user_id FROM direct_members dm WHERE dm.thread_id = $1 AND dm.user_id <> $2 "
+        "AND dm.request_state = 'accepted' " ++ direct_no_block_sql(), [Cid, Caller]),
     Name = maps:get(display_name, Msg, <<"Someone">>),
     Url = <<"#/dm/", (integer_to_binary(Cid))/binary>>,
     [begin

@@ -616,4 +616,8 @@ migrations() -> [
         "ALTER TABLE users ADD COLUMN server_layout text NOT NULL DEFAULT '[]'",
         "ALTER TABLE users ADD COLUMN server_layout_revision integer NOT NULL DEFAULT 0 CHECK(server_layout_revision>=0)"
     ]}
+    ,{60, [
+        "ALTER TABLE messages ADD COLUMN client_nonce text CHECK(client_nonce IS NULL OR client_nonce ~ '^[A-Za-z0-9:_-]{16,96}$')",
+        "CREATE UNIQUE INDEX idx_messages_client_nonce ON messages(user_id,client_nonce) WHERE client_nonce IS NOT NULL"
+    ]}
 ].

@@ -65,6 +65,45 @@ missing_production_key_never_writes_plaintext_test() ->
         end)
     end).
 
+empty_optional_keys_use_defaults_test() ->
+    with_env("PLAINWIRE_ENC_KEY", test_key(), fun() ->
+        with_env("PLAINWIRE_ENC_PREVIOUS_KEYS", "", fun() ->
+            with_env("PLAINWIRE_SEARCH_KEY", unset, fun() ->
+                with_env("PLAINWIRE_MEDIA_SIGNING_KEY", unset, fun() ->
+                    Fingerprint = pw_crypto:search_key_fingerprint(),
+                    Hashes = pw_crypto:search_hashes(<<"private words">>),
+                    Token = pw_crypto:proxy_token(<<"https://example.com/image.png">>),
+                    with_env("PLAINWIRE_SEARCH_KEY", "", fun() ->
+                        with_env("PLAINWIRE_MEDIA_SIGNING_KEY", "", fun() ->
+                            ?assertEqual(ok, pw_crypto:validate()),
+                            ?assert(pw_crypto:search_enabled()),
+                            ?assertEqual(Fingerprint, pw_crypto:search_key_fingerprint()),
+                            ?assertEqual(Hashes, pw_crypto:search_hashes(<<"private words">>)),
+                            ?assertEqual(Token, pw_crypto:proxy_token(<<"https://example.com/image.png">>)),
+                            ?assert(pw_crypto:verify_proxy_token(Token, <<"https://example.com/image.png">>))
+                        end)
+                    end)
+                end)
+            end)
+        end)
+    end).
+
+malformed_optional_keys_fail_validation_test() ->
+    with_env("PLAINWIRE_ENC_KEY", test_key(), fun() ->
+        with_env("PLAINWIRE_ENC_PREVIOUS_KEYS", "", fun() ->
+            with_env("PLAINWIRE_MEDIA_SIGNING_KEY", "", fun() ->
+                with_env("PLAINWIRE_SEARCH_KEY", "bad-key", fun() ->
+                    ?assertEqual({error, invalid_search_key}, pw_crypto:validate())
+                end),
+                with_env("PLAINWIRE_SEARCH_KEY", "", fun() ->
+                    with_env("PLAINWIRE_MEDIA_SIGNING_KEY", "bad-key", fun() ->
+                        ?assertEqual({error, invalid_media_signing_key}, pw_crypto:validate())
+                    end)
+                end)
+            end)
+        end)
+    end).
+
 test_key() ->
     binary_to_list(base64:encode(<<0:256>>)).
 

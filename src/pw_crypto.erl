@@ -152,7 +152,7 @@ verify_proxy_token(Token, Url) ->
 
 signing_key() ->
     case os:getenv("PLAINWIRE_MEDIA_SIGNING_KEY") of
-        false ->
+        Value when Value =:= false; Value =:= "" ->
             case primary_key() of
                 {ok, _} = Found -> Found;
                 _ -> ephemeral_signing_key()
@@ -172,7 +172,7 @@ ephemeral_signing_key() ->
 
 search_key() ->
     case os:getenv("PLAINWIRE_SEARCH_KEY") of
-        false ->
+        Value when Value =:= false; Value =:= "" ->
             case primary_key() of
                 {ok, EncKey} -> {ok, crypto:mac(hmac, sha256, EncKey, ?SEARCH_LABEL)};
                 Error -> Error
@@ -183,7 +183,7 @@ search_key() ->
 validate_optional_key(Name, ErrorAtom) ->
     case os:getenv(Name) of
         false -> ok;
-        "" -> {error, ErrorAtom};
+        "" -> ok;
         _ ->
             case env_key(Name) of
                 {ok, _} -> ok;

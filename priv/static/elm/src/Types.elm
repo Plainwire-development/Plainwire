@@ -180,6 +180,7 @@ type alias Message =
     , pinned : Bool
     , reactions : List Reaction
     , encryptionState : String
+    , clientNonce : String
     }
 
 
@@ -511,6 +512,7 @@ type alias Model =
     , clientVersion : String
     , me : Maybe User
     , csrf : String
+    , messageNoncePrefix : String
     , serverTime : Int
     , serverClockOffset : Int
     , timeZone : Time.Zone
@@ -923,6 +925,7 @@ decodeMessage =
         |> andMap (D.field "pinned" D.bool |> defaultValue False)
         |> andMap (D.field "reactions" (D.list decodeReaction) |> defaultValue [])
         |> andMap (D.field "encryption_state" D.string |> defaultValue "")
+        |> andMap (D.field "client_nonce" D.string |> defaultValue "")
 
 
 decodeReaction : D.Decoder Reaction
@@ -1139,7 +1142,7 @@ type alias SyncData r =
 
 defaultMsg : Message
 defaultMsg =
-    Message 0 "" 0 0 "" "" "" "" "text" Nothing Nothing 0 Nothing Nothing Nothing "" False False [] ""
+    Message 0 "" 0 0 "" "" "" "" "text" Nothing Nothing 0 Nothing Nothing Nothing "" False False [] "" ""
 
 
 
@@ -1161,12 +1164,13 @@ decodeCallUser =
         |> andMap (D.field "screen_audio" D.bool |> defaultValue False)
 
 
-encodeMessage : { body : String, replyToId : Maybe Int, encrypt : Bool } -> E.Value
+encodeMessage : { body : String, replyToId : Maybe Int, encrypt : Bool, clientNonce : String } -> E.Value
 encodeMessage m =
     E.object
         (List.filterMap identity
             [ Just ( "body", E.string m.body )
             , Just ( "encrypt_message", E.bool m.encrypt )
+            , Just ( "client_nonce", E.string m.clientNonce )
             , Maybe.map (\rid -> ( "reply_to_id", E.int rid )) m.replyToId
             ]
         )

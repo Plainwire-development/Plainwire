@@ -4,7 +4,7 @@
 -export([
     start_link/0,
     register/2, unregister/1,
-    subscribe/2, unsubscribe_all/1, remove_subscriptions/2,
+    subscribe/2, subscribe/3, access_epoch/1, revoke_access/2, unsubscribe_all/1, remove_subscriptions/2,
     subscriptions/1, user_pids/1, topic_pids/1, all_pids/0,
     replace_presence_watch/2, presence_watches/1, presence_watchers/1,
     sync_room/3, rtc_memberships/1, user_rtc_memberships/1, active_calls/1, relay_signal/6, relay_activity/5,
@@ -16,6 +16,7 @@
 
 -define(USER_TAB, pw_rt_users).
 -define(PID_TAB, pw_rt_pids).
+-define(ACCESS_TAB, pw_rt_access_epochs).
 -define(SUB_TAB, pw_rt_subscriptions).
 -define(PID_SUB_TAB, pw_rt_pid_subscriptions).
 -define(RTC_TAB, pw_rt_room_members).
@@ -36,6 +37,7 @@ register(Uid, Pid) when is_integer(Uid), Uid > 0, is_pid(Pid) ->
     safe(fun() ->
         case ets:insert_new(?PID_TAB, {Pid, Uid}) of
             true ->
+                ets:insert(?ACCESS_TAB, {Pid, erlang:unique_integer([positive, monotonic])}),
                 ets:insert(?DELIVERY_TAB, {Pid, 0}),
                 ets:insert(?USER_TAB, {Uid, Pid}),
                 count(websocket_connections, 1);
@@ -61,6 +63,21 @@ subscribe(Pid, Key) when is_pid(Pid) ->
         ok
     end, unavailable);
 subscribe(_, _) -> ignored.
+
+access_epoch(Pid) ->
+    safe(fun() -> case ets:lookup(?ACCESS_TAB, Pid) of
+        [{Pid, Epoch}] -> Epoch;
+        [] -> unavailable
+    end end, unavailable).
+
+subscribe(Pid, Key, Epoch) when is_pid(Pid), is_integer(Epoch) ->
+    safe(fun() -> gen_server:call(?MODULE, {subscribe_authorized, Pid, Key, Epoch}, infinity) end, unavailable);
+subscribe(_, _, _) -> {error, access_changed}.
+
+revoke_access(Uid, Keys) when is_integer(Uid), is_list(Keys) ->
+    %% Serialize subscription installation with revocation. The registry does
+    %% no database/network work; message fanout remains concurrent ETS work.
+    safe(fun() -> gen_server:call(?MODULE, {revoke_access, Uid, Keys}, infinity) end, unavailable).
 
 unsubscribe_all(Pid) when is_pid(Pid) -> safe(fun() -> unsubscribe_all_ets(Pid) end, unavailable);
 unsubscribe_all(_) -> ignored.
@@ -262,6 +279,7 @@ init([]) ->
     process_flag(message_queue_data, off_heap),
     ets:new(?USER_TAB, [named_table, public, bag, {read_concurrency, true}, {write_concurrency, auto}, {decentralized_counters, true}]),
     ets:new(?PID_TAB, [named_table, public, set, {read_concurrency, true}, {write_concurrency, auto}, {decentralized_counters, true}]),
+    ets:new(?ACCESS_TAB, [named_table, public, set, {read_concurrency, true}, {write_concurrency, auto}]),
     ets:new(?SUB_TAB, [named_table, public, bag, {read_concurrency, true}, {write_concurrency, auto}, {decentralized_counters, true}]),
     ets:new(?PID_SUB_TAB, [named_table, public, bag, {read_concurrency, true}, {write_concurrency, auto}, {decentralized_counters, true}]),
     ets:new(?RTC_TAB, [named_table, public, set, {read_concurrency, true}, {write_concurrency, auto}, {decentralized_counters, true}]),
@@ -282,10 +300,26 @@ init([]) ->
     end,
     {ok, #{}}.
 
+handle_call({subscribe_authorized, Pid, Key, Epoch}, _From, State) ->
+    Result = case access_epoch(Pid) =:= Epoch andalso ets:member(?PID_TAB, Pid) of
+        true -> subscribe(Pid, Key);
+        false -> {error, access_changed}
+    end,
+    {reply, Result, State};
+handle_call({revoke_access, Uid, Keys}, _From, State) ->
+    Pids = user_pids(Uid),
+    lists:foreach(fun(Pid) ->
+        ets:insert(?ACCESS_TAB, {Pid, erlang:unique_integer([positive, monotonic])}),
+        %% unregister/1 can run concurrently with this control operation.
+        case ets:member(?PID_TAB, Pid) of false -> ets:delete(?ACCESS_TAB, Pid); true -> ok end
+    end, Pids),
+    Result = remove_subscriptions(Pids, Keys),
+    {reply, Result, State};
 handle_call({replace_snapshot, Users, Subs, Voices, Calls}, _From, State) ->
     clear_indexes(),
     maps:foreach(fun(Uid, Pids) ->
         lists:foreach(fun(Pid) ->
+            ets:insert(?ACCESS_TAB, {Pid, erlang:unique_integer([positive, monotonic])}),
             ets:insert(?DELIVERY_TAB, {Pid, 0}),
             ets:insert(?USER_TAB, {Uid, Pid}),
             ets:insert(?PID_TAB, {Pid, Uid})
@@ -337,7 +371,7 @@ code_change(_, State, _) -> {ok, State}.
 clear_indexes() ->
     [erlang:demonitor(Ref, [flush]) || {_Pid, Ref} <- ets:tab2list(?MONITOR_TAB)],
     ets:delete_all_objects(?MONITOR_TAB),
-    [ets:delete_all_objects(Tab) || Tab <- [?USER_TAB, ?PID_TAB, ?SUB_TAB, ?PID_SUB_TAB, ?RTC_TAB, ?RTC_ROOM_TAB, ?RTC_PID_TAB, ?RTC_USER_TAB, ?CALL_AUDIENCE_TAB, ?CALL_USER_TAB, ?PRESENCE_WATCH_TAB, ?PID_PRESENCE_TAB, ?DELIVERY_TAB]],
+    [ets:delete_all_objects(Tab) || Tab <- [?USER_TAB, ?PID_TAB, ?ACCESS_TAB, ?SUB_TAB, ?PID_SUB_TAB, ?RTC_TAB, ?RTC_ROOM_TAB, ?RTC_PID_TAB, ?RTC_USER_TAB, ?CALL_AUDIENCE_TAB, ?CALL_USER_TAB, ?PRESENCE_WATCH_TAB, ?PID_PRESENCE_TAB, ?DELIVERY_TAB]],
     ets:insert(?COUNTER_TAB, {websocket_connections, 0}),
     ok.
 
@@ -386,6 +420,7 @@ unregister_ets(Pid) ->
             count(websocket_connections, -1);
         [] -> ok
     end,
+    ets:delete(?ACCESS_TAB, Pid),
     ets:delete(?DELIVERY_TAB, Pid),
     unsubscribe_all_ets(Pid),
     clear_presence_watch_ets(Pid),

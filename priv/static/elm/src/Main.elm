@@ -230,6 +230,7 @@ type alias Flags =
     , instanceDescription : String
     , defaultTheme : String
     , version : String
+    , messageNoncePrefix : String
     }
 
 
@@ -276,6 +277,7 @@ init flags url _ =
       , clientVersion = String.left 32 (String.trim flags.version)
       , me = Nothing
       , csrf = ""
+      , messageNoncePrefix = flags.messageNoncePrefix
       , serverTime = 0
       , serverClockOffset = 0
       , timeZone = Time.utc
@@ -1261,6 +1263,9 @@ update msg model =
             else if String.isEmpty body then
                 ( { model | toast = Just "A message cannot be empty." }, Cmd.none )
 
+            else if Composer.utf8Length body > 5000 then
+                ( { model | toast = Just "Message exceeds the 5000-byte limit. Shorten it before saving." }, Cmd.none )
+
             else
                 ( { model | ctxMenu = Nothing }
                 , apiSend (encodeApiRequest (ApiPost ("/edit_message/" ++ String.fromInt mid) (Just (E.object [ ( "body", E.string body ) ]))))
@@ -1418,7 +1423,7 @@ update msg model =
                                     ""
 
                         payload =
-                            encodeMessage { body = m.body, replyToId = m.replyToId, encrypt = m.encryptionState == "encrypted" }
+                            encodeMessage { body = m.body, replyToId = m.replyToId, encrypt = m.encryptionState == "encrypted", clientNonce = m.clientNonce }
                     in
                     if String.isEmpty path then
                         ( model, Cmd.none )
@@ -2727,7 +2732,14 @@ optimisticEcho real local =
         && local.scope == real.scope
         && local.scopeId == real.scopeId
         && local.replyToId == real.replyToId
-        && String.trim local.body == String.trim real.body
+        && (if not (String.isEmpty real.clientNonce) then
+                real.clientNonce == local.clientNonce
+
+            else
+                real.createdAt >= local.createdAt - 2000
+                    && real.createdAt <= local.createdAt + 120000
+                    && String.trim local.body == String.trim real.body
+           )
 
 
 dropOneOptimisticEcho : Message -> List Message -> ( List Message, Maybe Int )
@@ -4176,13 +4188,16 @@ sendMessage model =
         payload =
             encodeMessage { body = body, replyToId = replyField, encrypt = case model.active of
                 DmView cid -> Set.member cid model.encryptedDrafts || List.any (\c -> c.id == cid && c.e2eeEnabled) model.convs
-                _ -> False }
+                _ -> False, clientNonce = model.messageNoncePrefix ++ ":" ++ String.fromInt model.nextMessageId }
 
         scrollToBottom =
             bridgeSend (E.object [ ( "tag", E.string "scroll_messages_to_bottom" ), ( "data", E.bool True ) ])
     in
     if String.isEmpty body then
         ( model, Cmd.none )
+
+    else if Composer.utf8Length body > 5000 then
+        ( { model | toast = Just "Message exceeds the 5000-byte limit. Shorten it before sending." }, Cmd.none )
 
     else
         case model.active of
@@ -4325,6 +4340,7 @@ appendOptimisticMessage scope scopeId body model =
                         False
                         []
                         (if scope == "direct" && (Set.member scopeId model.encryptedDrafts || List.any (\c -> c.id == scopeId && c.e2eeEnabled) model.convs) then "encrypted" else "")
+                        (model.messageNoncePrefix ++ ":" ++ String.fromInt model.nextMessageId)
             in
             { model | msg = model.msg ++ [ optimistic ], inputText = "", replyTo = Nothing, drafts = Dict.remove (draftKeyFor model.active) model.drafts, outbox = Dict.insert optimistic.id optimistic model.outbox, nextMessageId = model.nextMessageId - 1 }
 

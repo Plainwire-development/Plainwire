@@ -1,0 +1,26 @@
+# Plainwire 2.9.1 review
+
+This pass traced first-load sending, authentication recovery, message acknowledgement, encryption policy and storage, blocked-user delivery, navigation responses and optional timeline hydration. It also reviewed the existing upload authorization, URL fetching, rich-text and plugin boundaries and ran their regression suites.
+
+| Finding | Fix and validation |
+| --- | --- |
+| A stale CSRF token left writes failing until refresh | Refresh a confirmed rejection once, coalesce concurrent refreshes, verify the account before replay and retain the encoded request. Do not replay transport failures or arbitrary server errors. Browser tests reproduce the first-send failure and verify account-change isolation. |
+| Identical historical content could consume an optimistic draft; retries could store duplicates | Persist a per-sender client nonce with a unique index and transaction lock. Bind replay to scope, content and reply, recheck current send access and skip duplicate delivery side effects. Test parallel PostgreSQL connections, scope/author/content/reply mismatches, deletion and pending history. |
+| Encrypted retries generated new IVs and authenticated message nonces | Retain a bounded prepared-ciphertext cache by account, conversation and request identity; clear it on account/device-lock changes and require an available key before using it. Test stable ciphertext and existing device-lock regressions. |
+| Returning to the same route could admit a response from an earlier visit | Check the route visit counter as well as the hash. A held history response cannot replace the current visit's results. |
+| Existing subscriptions and notifications bypassed blocked group-history access | Revoke both affected members' shared-DM subscriptions/calls. Filter group and missed-call notification recipients against all blocked relationships in that conversation. Revoke fanout allow entries synchronously before queuing hub cleanup. Test notification audiences and immediate subscription removal. |
+| A subscription authorized before revocation could finish after cleanup | Capture a connection access epoch before authorization and serialize its installation with revocation. Stale requests recheck current permissions; unrelated established subscriptions remain live. Test a delayed hub subscription and epoch cleanup. |
+| Blocking back could overwrite the original block owner, enabling unauthorized unblock | Preserve an existing block unless its original requester changes it. Test block-back and unblock attempts from the restricted account. |
+| Scylla hydration expected a legacy tuple without the current metadata columns | Preserve the PostgreSQL metadata tail when overlaying Scylla core fields; test legacy/current rows, pins and client nonce. |
+| Empty optional crypto keys from the example configuration prevented startup | Treat empty optional search/media signing keys like omitted values and keep malformed nonempty keys rejected. Test derived search identity, hashes, signed tokens and startup validation. |
+| Group sending unnecessarily depended on the browser's private-key database | Skip key storage only for a verified unencrypted group policy. Private DMs retain persistent fingerprint checks and fail closed if they cannot be checked. Test denied browser storage. |
+| Blocked browser database opens failed immediately or leaked late connections | Wait for version changes within a bounded window and close an eventual successful connection after failure. |
+| Partial DOM attribute changes could contaminate encryption policy | Keep DOM rendering separate from authoritative complete API/WebSocket metadata. Test DOM changes during an encrypted retry. |
+| Character limits differed from server UTF-8 limits | Count UTF-8 bytes for composing and editing, keep oversized drafts and disable submission before a request. Test emoji boundary cases. |
+| DM draft and pending previews could submit private URLs before policy display caught up | Use local private embeds for DM formatting previews and pending rows. Existing E2EE tests verify that automatic remote previews remain absent. |
+
+Migration 60 is additive. Existing clients can omit the client nonce; new human-client posts use it. Replay authorization stays in `pw_db` and does not bypass PostgreSQL transactions or optional storage intents/outbox handling. The retry cache is local, bounded and volatile; message bodies, keys and ciphertext are not added to diagnostics.
+
+The full checks include real PostgreSQL-backed tests, source contracts, desktop/mobile UI, encrypted DMs, plugins, reports, administration, RTC and archive validation. The npm advisory audit of all locked application dependencies reported zero known advisories during this pass.
+
+Live Redis, Scylla and Partisan deployments and external TURN infrastructure were not available for end-to-end operational testing; their source contracts and applicable local behavior tests remain part of validation. This is a repository review and regression pass, not an independent penetration test or cryptographic audit. Opt-in E2EE still covers text in accepted two-person human DMs, without forward secrecy or protection against a malicious delivered web client. See the [E2EE threat model](END_TO_END_ENCRYPTION.md).
