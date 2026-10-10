@@ -1574,7 +1574,7 @@
     const request = () => fetch('/api' + path, {...options, headers});
     let response = await request();
     if (protectedRequest && (epoch !== sessionGeneration || accountId !== meId)) throw sessionChanged();
-    if (protectedRequest && response.status === 401) scheduleAuthReload();
+    if (protectedRequest && accountId && response.status === 401) scheduleAuthReload();
     // bad_csrf is rejected by the server before route dispatch or mutation.
     // It is the only failed write we replay, once, and only for the same user.
     if (protectedRequest && accountId && response.status === 403 && (options.method || 'GET') !== 'GET') {
